@@ -1,0 +1,1062 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 — Spring Core, DI &amp; Boot Fundamentals | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <div class="breadcrumb"><a href="index.html">← Course Home</a></div>
+    <h1>05 — Spring Core, DI &amp; Boot Fundamentals</h1>
+    <p>The IoC container, bean lifecycle, and how Spring Boot auto-configuration really works — the mechanics behind the annotations.</p>
+  </div>
+</header>
+<main class="container">
+
+<section>
+  <h2 id="why">Why interviewers ask this</h2>
+  <p>Every Java backend interview touches Spring, but senior interviews probe <em>one level below the annotations</em>. Anyone can write <code>@Autowired</code>; the differentiator is explaining <strong>what the container actually does</strong>: how beans are discovered, in what order lifecycle callbacks fire, where proxies get woven in, why a constructor-injection cycle fails fast, and — the single most common Boot question — <strong>"how does auto-configuration work?"</strong></p>
+  <p>Coming from React/Angular you already have the mental model: Angular's injector and React context both solve "how does a component get its collaborators without constructing them?" Spring is the same idea, industrial-strength: a container that instantiates your object graph, manages lifecycles, and decorates objects with cross-cutting behavior (transactions, security, caching) via proxies. This page builds that model from first principles and then goes deep enough for a senior bar.</p>
+  <div class="note"><p><strong>Frontend bridge:</strong> Angular DI ≈ Spring DI (tokens ≈ bean types/names, <code>providedIn: 'root'</code> ≈ singleton scope, <code>@Injectable</code> ≈ <code>@Component</code>). React context is a poor man's DI — no lifecycle, no proxying, resolution at render time. Spring resolves the whole graph <em>at startup</em> and fails fast if it can't — a property you'll learn to love.</p></div>
+</section>
+
+<div class="toc">
+  <strong>On this page</strong>
+  <ol>
+    <li><a href="#ioc-di">IoC &amp; DI from first principles</a></li>
+    <li><a href="#injection-styles">Constructor vs setter vs field injection</a></li>
+    <li><a href="#stereotypes">Stereotype annotations &amp; component scanning</a></li>
+    <li><a href="#lifecycle">The bean lifecycle, in order</a></li>
+    <li><a href="#scopes">Bean scopes</a></li>
+    <li><a href="#configuration">@Configuration, @Bean &amp; circular dependencies</a></li>
+    <li><a href="#disambiguation">Disambiguation: @Qualifier, @Primary, collections, @Conditional, @Profile</a></li>
+    <li><a href="#container-internals">Container internals: BeanFactory, post-processors, events</a></li>
+    <li><a href="#autoconfig">Spring Boot auto-configuration mechanics</a></li>
+    <li><a href="#starters-config">Starters &amp; externalized configuration</a></li>
+    <li><a href="#actuator">Actuator</a></li>
+    <li><a href="#embedded">Embedded server &amp; how Boot starts</a></li>
+    <li><a href="#devtools">DevTools, runners &amp; startup tuning</a></li>
+    <li><a href="#qa">Interview Q&amp;A</a></li>
+    <li><a href="#exercises">Hands-on exercises</a></li>
+  </ol>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="ioc-di">IoC &amp; DI from first principles <span class="tier tier-1">T1</span></h2>
+
+<h3>The problem: manual wiring</h3>
+<p>Start without any framework. A service needs a repository, which needs a data source:</p>
+<pre><code><span class="kw">public class</span> <span class="typ">OrderService</span> {
+    <span class="kw">private final</span> <span class="typ">OrderRepository</span> repository;
+
+    <span class="kw">public</span> <span class="typ">OrderService</span>() {
+        <span class="com">// The service constructs its OWN dependency — tight coupling</span>
+        <span class="kw">this</span>.repository = <span class="kw">new</span> <span class="typ">JdbcOrderRepository</span>(
+            <span class="kw">new</span> <span class="typ">HikariDataSource</span>(loadDbConfigSomehow()));
+    }
+}</code></pre>
+  <p>Three problems, and they compound as the app grows:</p>
+  <ul>
+    <li><strong>Coupling to concrete classes.</strong> <code>OrderService</code> hard-codes <code>JdbcOrderRepository</code>. Swapping in a different implementation (or a different database) means editing the service.</li>
+    <li><strong>Untestable.</strong> You cannot unit-test <code>OrderService</code> without a real database, because the constructor insists on building the real repository. There is no seam to insert a fake.</li>
+    <li><strong>Duplicated wiring knowledge.</strong> Every class that needs a repository must know how to build one — connection pool config, credentials, all of it, scattered everywhere.</li>
+  </ul>
+
+<h3>Step 1: Dependency Injection (the pattern, no framework)</h3>
+<p>Flip it: the class <em>declares</em> what it needs and someone else provides it.</p>
+<pre><code><span class="kw">public class</span> <span class="typ">OrderService</span> {
+    <span class="kw">private final</span> <span class="typ">OrderRepository</span> repository; <span class="com">// interface, not impl</span>
+
+    <span class="kw">public</span> <span class="typ">OrderService</span>(<span class="typ">OrderRepository</span> repository) { <span class="com">// injected</span>
+        <span class="kw">this</span>.repository = repository;
+    }
+}
+
+<span class="com">// Somewhere at the top of the app — the "composition root":</span>
+<span class="typ">DataSource</span> ds = <span class="kw">new</span> <span class="typ">HikariDataSource</span>(config);
+<span class="typ">OrderRepository</span> repo = <span class="kw">new</span> <span class="typ">JdbcOrderRepository</span>(ds);
+<span class="typ">OrderService</span> service = <span class="kw">new</span> <span class="typ">OrderService</span>(repo);</code></pre>
+  <p>This is <strong>DI without Spring</strong> — just constructors and interfaces. The service is now testable (<code>new OrderService(fakeRepo)</code>) and decoupled. But the composition root becomes a giant, order-sensitive wiring file that you maintain by hand. In a real app with hundreds of components, plus concerns like "wrap every repository call in a transaction," this manual approach collapses.</p>
+
+<h3>Step 2: Inversion of Control — the container</h3>
+<p><strong>IoC</strong> is the broader principle: instead of your code driving object creation and lifecycle, a <em>container</em> does — control is inverted ("don't call us, we'll call you"). <strong>DI is the mechanism</strong> the container uses to deliver dependencies. Spring's container:</p>
+  <ul>
+    <li>Scans/reads <strong>bean definitions</strong> (recipes: class, scope, dependencies, init/destroy callbacks),</li>
+    <li>Instantiates beans <strong>in dependency order</strong> (it topologically sorts the graph for you),</li>
+    <li>Injects each bean's dependencies,</li>
+    <li>Runs lifecycle callbacks and <strong>wraps beans in proxies</strong> where cross-cutting behavior is declared (<code>@Transactional</code>, <code>@Cacheable</code>, security),</li>
+    <li>Hands you a fully-wired, ready object graph — and destroys it cleanly on shutdown.</li>
+  </ul>
+<p>The container interface you interact with is the <code>ApplicationContext</code>:</p>
+<pre><code><span class="ann">@SpringBootApplication</span>
+<span class="kw">public class</span> <span class="typ">ShopApplication</span> {
+    <span class="kw">public static void</span> main(<span class="typ">String</span>[] args) {
+        <span class="typ">ApplicationContext</span> ctx = <span class="typ">SpringApplication</span>.run(<span class="typ">ShopApplication</span>.<span class="kw">class</span>, args);
+        <span class="com">// You almost never touch ctx directly — beans get injected into beans.</span>
+        <span class="com">// But it's there: ctx.getBean(OrderService.class)</span>
+    }
+}</code></pre>
+  <div class="senior"><p>A senior answer defines both terms precisely: <em>"IoC is the principle — the framework controls object creation and lifecycle, not application code. DI is the dominant technique for implementing it — dependencies are supplied from outside rather than constructed internally. Spring's ApplicationContext is the IoC container: it builds the entire bean graph at startup, in dependency order, applying lifecycle callbacks and proxy-based AOP, and fails fast if the graph can't be satisfied."</em> Mentioning fail-fast startup and proxies signals depth.</p></div>
+  <div class="note"><p>Beans are just <strong>plain Java objects managed by the container</strong>. There is nothing special about the class itself — the same class can be a bean in one app and manually constructed in a test. "Bean" describes a relationship with the container, not a kind of object.</p></div>
+
+<!-- ============================================================ -->
+<h2 id="injection-styles">Constructor vs setter vs field injection <span class="tier tier-1">T1</span></h2>
+<p>Spring supports three injection styles. This is a guaranteed interview topic because the "wrong" one (<code>@Autowired</code> on fields) is what most tutorials show.</p>
+
+<pre><code><span class="com">// 1. FIELD injection — avoid</span>
+<span class="ann">@Service</span>
+<span class="kw">public class</span> <span class="typ">A</span> {
+    <span class="ann">@Autowired</span> <span class="kw">private</span> <span class="typ">OrderRepository</span> repo; <span class="com">// reflection magic</span>
+}
+
+<span class="com">// 2. SETTER injection — for optional/reconfigurable deps only</span>
+<span class="ann">@Service</span>
+<span class="kw">public class</span> <span class="typ">B</span> {
+    <span class="kw">private</span> <span class="typ">MetricsCollector</span> metrics;
+    <span class="ann">@Autowired</span>(required = <span class="kw">false</span>)
+    <span class="kw">public void</span> setMetrics(<span class="typ">MetricsCollector</span> metrics) { <span class="kw">this</span>.metrics = metrics; }
+}
+
+<span class="com">// 3. CONSTRUCTOR injection — the default choice</span>
+<span class="ann">@Service</span>
+<span class="kw">public class</span> <span class="typ">OrderService</span> {
+    <span class="kw">private final</span> <span class="typ">OrderRepository</span> repo;
+    <span class="kw">private final</span> <span class="typ">PaymentGateway</span> gateway;
+
+    <span class="com">// Since Spring 4.3: no @Autowired needed when there is exactly ONE constructor</span>
+    <span class="kw">public</span> <span class="typ">OrderService</span>(<span class="typ">OrderRepository</span> repo, <span class="typ">PaymentGateway</span> gateway) {
+        <span class="kw">this</span>.repo = repo;
+        <span class="kw">this</span>.gateway = gateway;
+    }
+}</code></pre>
+
+<h3>Why constructor injection wins</h3>
+<table>
+  <thead><tr><th>Property</th><th>Constructor</th><th>Setter</th><th>Field</th></tr></thead>
+  <tbody>
+    <tr><td>Fields can be <code>final</code> (immutability, safe publication across threads)</td><td>✅</td><td>❌</td><td>❌</td></tr>
+    <tr><td>Required dependencies are explicit in the API</td><td>✅</td><td>❌ (optional-looking)</td><td>❌ (hidden)</td></tr>
+    <tr><td>Object can never exist in a half-initialized state</td><td>✅</td><td>❌</td><td>❌</td></tr>
+    <tr><td>Testable with plain <code>new</code> — no Spring, no reflection utils</td><td>✅</td><td>⚠️ verbose</td><td>❌ needs <code>ReflectionTestUtils</code> or container</td></tr>
+    <tr><td>Fails fast on circular dependencies (surfaces design smells)</td><td>✅</td><td>❌ silently tolerated</td><td>❌ silently tolerated</td></tr>
+    <tr><td>Too many parameters becomes visibly painful → pressure to refactor</td><td>✅ (a feature!)</td><td>❌</td><td>❌ (easy to hoard 15 deps)</td></tr>
+  </tbody>
+</table>
+  <div class="pitfall"><p><strong>Field injection pitfalls</strong> to name in an interview: (1) you can't make the field <code>final</code>; (2) unit tests must either boot a container or use reflection to poke private fields; (3) the class silently accumulates dependencies because nothing hurts; (4) <code>NullPointerException</code> if someone instantiates the class with <code>new</code> outside Spring; (5) it hides a violation of the Single Responsibility Principle that a 9-parameter constructor would make obvious.</p></div>
+
+<h3>The Lombok idiom</h3>
+<p>In real codebases you'll rarely see the constructor written by hand. Lombok generates it:</p>
+<pre><code><span class="ann">@Service</span>
+<span class="ann">@RequiredArgsConstructor</span> <span class="com">// generates a constructor for all final fields</span>
+<span class="kw">public class</span> <span class="typ">OrderService</span> {
+    <span class="kw">private final</span> <span class="typ">OrderRepository</span> repo;
+    <span class="kw">private final</span> <span class="typ">PaymentGateway</span> gateway;
+    <span class="com">// no constructor code; Lombok writes it at compile time,</span>
+    <span class="com">// Spring sees a single constructor and injects into it</span>
+}</code></pre>
+  <div class="note"><p>This works because of two rules composing: Lombok's <code>@RequiredArgsConstructor</code> generates a constructor taking every <code>private final</code> field, and Spring auto-injects into a class's <em>single</em> constructor without needing <code>@Autowired</code>. Declaring a dependency becomes one line: add a <code>final</code> field. This is the de-facto standard idiom in Boot 3.x codebases.</p></div>
+  <div class="senior"><p>When is setter injection legitimate? For genuinely <em>optional</em> dependencies or ones that can be swapped at runtime (rare). Field injection survives mostly in test classes (<code>@Autowired</code> on a <code>@SpringBootTest</code> field is fine — the container owns the test instance) and legacy code. In production code, default to constructor injection and say so plainly in interviews.</p></div>
+
+<!-- ============================================================ -->
+<h2 id="stereotypes">Stereotype annotations &amp; component scanning <span class="tier tier-1">T1</span></h2>
+<p>How does Spring find your classes? Two mechanisms: <strong>component scanning</strong> (annotate the class, Spring discovers it) and <strong>explicit <code>@Bean</code> methods</strong> (covered later). Scanning uses <em>stereotype annotations</em>:</p>
+
+<table>
+  <thead><tr><th>Annotation</th><th>Layer</th><th>Extra behavior beyond @Component</th></tr></thead>
+  <tbody>
+    <tr><td><code>@Component</code></td><td>Generic</td><td>None — the base stereotype; all others are meta-annotated with it.</td></tr>
+    <tr><td><code>@Service</code></td><td>Business logic</td><td>None technically today — pure semantics/documentation (and a hook for future tooling &amp; AOP pointcuts targeting the annotation).</td></tr>
+    <tr><td><code>@Repository</code></td><td>Persistence</td><td><strong>Exception translation:</strong> a <code>PersistenceExceptionTranslationPostProcessor</code> proxies the bean so vendor-specific exceptions (JDBC <code>SQLException</code> wrapped, Hibernate exceptions) are translated into Spring's unified, unchecked <code>DataAccessException</code> hierarchy (e.g. <code>DuplicateKeyException</code>, <code>DataIntegrityViolationException</code>).</td></tr>
+    <tr><td><code>@Controller</code></td><td>Web (MVC views)</td><td>Detected by Spring MVC as a handler; methods return view names by default.</td></tr>
+    <tr><td><code>@RestController</code></td><td>Web (JSON APIs)</td><td>= <code>@Controller</code> + <code>@ResponseBody</code>: return values are serialized to the response body (via Jackson) instead of resolved as view names.</td></tr>
+    <tr><td><code>@Configuration</code></td><td>Wiring</td><td>Declares <code>@Bean</code> factory methods; CGLIB-proxied by default (see <a href="#configuration">full vs lite mode</a>).</td></tr>
+  </tbody>
+</table>
+  <div class="senior"><p>The exception-translation point on <code>@Repository</code> is the classic "do you actually know the difference?" trap. Interviewers ask "is @Service different from @Component?" — correct senior answer: <em>"Functionally identical today; it's semantic. @Repository is the one with real behavior: persistence exception translation into the DataAccessException hierarchy. That hierarchy matters because it's unchecked and vendor-neutral — service code can catch <code>DuplicateKeyException</code> without knowing whether JDBC or JPA is underneath."</em></p></div>
+
+<h3>Component scanning &amp; the classic "bean not found" pitfall</h3>
+<pre><code><span class="ann">@SpringBootApplication</span>  <span class="com">// includes @ComponentScan with NO basePackages set</span>
+<span class="kw">public class</span> <span class="typ">ShopApplication</span> { ... }</code></pre>
+<p>When <code>@ComponentScan</code> has no explicit base package, it scans <strong>from the package of the annotated class downward</strong>. Boot convention: put the main class in the root package (e.g. <code>com.acme.shop</code>) so everything under <code>com.acme.shop.*</code> is scanned automatically.</p>
+<pre><code>com.acme.shop.ShopApplication          ← scan root
+com.acme.shop.order.OrderService       ✅ found
+com.acme.shop.payment.PaymentGateway   ✅ found
+com.acme.billing.InvoiceService        ❌ NOT SCANNED — sibling package!</code></pre>
+  <div class="pitfall"><p><strong>The #1 beginner-to-Spring bug:</strong> a bean in a package that is not <em>under</em> the main class's package silently isn't registered, and you get <code>NoSuchBeanDefinitionException</code> / "required a bean of type X that could not be found" at startup. Fixes: move the class (preferred — keep the convention), or explicitly widen: <code>@SpringBootApplication(scanBasePackages = {"com.acme.shop", "com.acme.billing"})</code>. The same applies to JPA: <code>@EntityScan</code> and <code>@EnableJpaRepositories</code> also default to the main class's package.</p></div>
+  <div class="note"><p>Mechanically, scanning does <strong>not</strong> load every class with a ClassLoader — that would be slow and trigger static initializers. Spring reads the <code>.class</code> files' bytecode metadata with ASM (<code>ClassPathScanningCandidateComponentProvider</code>) to check for stereotype annotations, and only then registers <code>BeanDefinition</code>s. A nice detail to drop when asked "how does scanning work?"</p></div>
+
+<!-- ============================================================ -->
+<h2 id="lifecycle">The bean lifecycle, in order <span class="tier tier-1">T1</span></h2>
+<p>Interviewers love "walk me through the bean lifecycle" because the <em>order</em> reveals whether you understand where proxies come from and why <code>@PostConstruct</code> can't see the proxy. Learn it as a sequence:</p>
+
+<pre><code>            CONTAINER STARTUP
+┌──────────────────────────────────────────────────────────┐
+│ 1. Bean DEFINITIONS loaded (scanning, @Bean methods,      │
+│    auto-configuration) → BeanDefinition registry          │
+│ 2. BeanFactoryPostProcessors run                          │
+│    (edit definitions BEFORE any bean exists —             │
+│     e.g. property placeholder resolution)                 │
+└──────────────────────────────────────────────────────────┘
+            FOR EACH BEAN (dependency order)
+┌──────────────────────────────────────────────────────────┐
+│ 3. INSTANTIATION        constructor runs                  │
+│                         (constructor deps injected here)  │
+│ 4. POPULATE             @Autowired fields / setters set   │
+│ 5. AWARE callbacks      BeanNameAware, BeanFactoryAware,  │
+│                         ApplicationContextAware           │
+│ 6. BeanPostProcessor    postProcessBEFOREInitialization   │
+│ 7. INIT callbacks       ① @PostConstruct                  │
+│                         ② InitializingBean                │
+│                            .afterPropertiesSet()          │
+│                         ③ @Bean(initMethod = "...")       │
+│ 8. BeanPostProcessor    postProcessAFTERInitialization    │
+│    ★ PROXIES CREATED HERE (@Transactional, @Async,       │
+│      @Cacheable, security) — the container may return     │
+│      a DIFFERENT object than your instance                │
+│ 9. READY — bean is in the singleton cache, serving calls  │
+└──────────────────────────────────────────────────────────┘
+            CONTAINER SHUTDOWN (context.close())
+┌──────────────────────────────────────────────────────────┐
+│ 10. DESTROY callbacks   ① @PreDestroy                     │
+│                         ② DisposableBean.destroy()        │
+│                         ③ @Bean(destroyMethod = "...")    │
+└──────────────────────────────────────────────────────────┘</code></pre>
+
+<pre><code><span class="kw">import</span> jakarta.annotation.<span class="typ">PostConstruct</span>;   <span class="com">// Spring 6 / Boot 3: jakarta.*, NOT javax.*</span>
+<span class="kw">import</span> jakarta.annotation.<span class="typ">PreDestroy</span>;
+
+<span class="ann">@Service</span>
+<span class="ann">@RequiredArgsConstructor</span>
+<span class="kw">public class</span> <span class="typ">CacheWarmer</span> {
+    <span class="kw">private final</span> <span class="typ">ProductRepository</span> products;
+
+    <span class="ann">@PostConstruct</span>          <span class="com">// step 7①: deps are injected, safe to use them</span>
+    <span class="kw">void</span> warmUp() {
+        products.findTopSellers().forEach(<span class="kw">this</span>::preload);
+    }
+
+    <span class="ann">@PreDestroy</span>             <span class="com">// step 10①: graceful cleanup on shutdown</span>
+    <span class="kw">void</span> flush() { <span class="com">/* release resources, drain queues */</span> }
+}</code></pre>
+
+  <div class="pitfall"><p><strong>Why order matters — two classic bugs:</strong></p>
+  <ul>
+    <li><strong>Constructor uses an @Autowired field → NPE.</strong> Field/setter population (step 4) happens <em>after</em> the constructor (step 3). If you must run logic after injection, use <code>@PostConstruct</code> — or better, use constructor injection so everything is available in the constructor.</li>
+    <li><strong>Calling a <code>@Transactional</code> method from <code>@PostConstruct</code> on the same bean may run without a transaction.</strong> The transactional proxy is created at step 8, <em>after</em> <code>@PostConstruct</code> (step 7) — and even afterwards, self-invocation (<code>this.method()</code>) bypasses the proxy entirely. Proxies only intercept calls that arrive <em>from outside</em> through the proxy reference.</li>
+  </ul></div>
+  <div class="senior"><p>The one-sentence senior summary: <em>"The key insight in the lifecycle is that <code>BeanPostProcessor.postProcessAfterInitialization</code> is where AOP proxies wrap the bean — so the object other beans receive may not be your class at all, but a CGLIB subclass or JDK dynamic proxy delegating to it. That single fact explains @Transactional self-invocation failures, why final methods can't be advised by CGLIB, and why <code>@PostConstruct</code> runs on the raw target."</em> If you can say that fluently, this topic is done.</p></div>
+  <div class="note"><p>Preference order for init/destroy hooks in modern code: <code>@PostConstruct</code>/<code>@PreDestroy</code> (JSR-250, portable, no Spring import) &gt; <code>@Bean(initMethod/destroyMethod)</code> (for third-party classes you can't annotate) &gt; <code>InitializingBean</code>/<code>DisposableBean</code> interfaces (couple your class to Spring — avoid). Boot registers a JVM shutdown hook so <code>@PreDestroy</code> fires on normal SIGTERM — this is how graceful shutdown of connection pools works.</p></div>
+
+<!-- ============================================================ -->
+<h2 id="scopes">Bean scopes <span class="tier tier-1">T1</span></h2>
+<table>
+  <thead><tr><th>Scope</th><th>Instances</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td><code>singleton</code> <strong>(default)</strong></td><td>One per container</td><td>Cached in the singleton registry; shared by every injection point. <strong>Must be stateless or thread-safe</strong> — it's hit by all request threads concurrently.</td></tr>
+    <tr><td><code>prototype</code></td><td>New instance per <code>getBean()</code>/injection</td><td>Container creates &amp; injects, then <strong>forgets it</strong>: no destruction callbacks (<code>@PreDestroy</code> never fires), caller manages the lifecycle.</td></tr>
+    <tr><td><code>request</code></td><td>One per HTTP request</td><td>Web-only. Needs a scoped proxy to be injected into singletons.</td></tr>
+    <tr><td><code>session</code></td><td>One per HTTP session</td><td>Web-only; e.g., a shopping cart. Same proxy caveat.</td></tr>
+    <tr><td><code>application</code></td><td>One per <code>ServletContext</code></td><td>Rare; like singleton but scoped to the servlet context.</td></tr>
+  </tbody>
+</table>
+
+  <div class="pitfall"><p><strong>Singleton = one instance shared across all threads.</strong> Mutable instance fields on a singleton <code>@Service</code> are a race condition. This is the Spring equivalent of module-level mutable state in a Node server. Keep singletons stateless; per-request state belongs in method parameters, request-scoped beans, or (sparingly) <code>ThreadLocal</code>. Also: Spring's singleton is <em>per container</em>, not the GoF per-JVM-per-classloader singleton — worth distinguishing out loud.</p></div>
+
+<h3>The singleton-holding-prototype problem</h3>
+<p>A favorite interview trap. What's wrong here?</p>
+<pre><code><span class="ann">@Component</span>
+<span class="ann">@Scope</span>(<span class="str">"prototype"</span>)
+<span class="kw">public class</span> <span class="typ">ReportBuilder</span> { <span class="com">/* mutable, stateful */</span> }
+
+<span class="ann">@Service</span>
+<span class="ann">@RequiredArgsConstructor</span>
+<span class="kw">public class</span> <span class="typ">ReportService</span> {          <span class="com">// singleton</span>
+    <span class="kw">private final</span> <span class="typ">ReportBuilder</span> builder;  <span class="com">// ⚠️ injected ONCE, at startup</span>
+
+    <span class="kw">public</span> <span class="typ">Report</span> generate() {
+        <span class="kw">return</span> builder.addHeader().addRows().build(); <span class="com">// same instance every call!</span>
+    }
+}</code></pre>
+<p>Injection happens <strong>once</strong>, when the singleton is created. The "prototype" is effectively promoted to a singleton — and if it's stateful, requests now share (and corrupt) state. The fix is to ask the container for a fresh instance per use:</p>
+<pre><code><span class="ann">@Service</span>
+<span class="ann">@RequiredArgsConstructor</span>
+<span class="kw">public class</span> <span class="typ">ReportService</span> {
+    <span class="kw">private final</span> <span class="typ">ObjectProvider</span>&lt;<span class="typ">ReportBuilder</span>&gt; builders; <span class="com">// lazy handle, not the bean</span>
+
+    <span class="kw">public</span> <span class="typ">Report</span> generate() {
+        <span class="typ">ReportBuilder</span> builder = builders.getObject(); <span class="com">// NEW instance each call</span>
+        <span class="kw">return</span> builder.addHeader().addRows().build();
+    }
+}</code></pre>
+  <div class="note"><p>Alternatives: <code>ObjectProvider&lt;T&gt;</code> (preferred — also has <code>getIfAvailable()</code>, <code>stream()</code>), <code>@Lookup</code> method injection (Spring subclasses your class via CGLIB and overrides the method), or a scoped proxy. Honestly, in modern code you'd often skip the prototype bean entirely and just <code>new ReportBuilder()</code> — not everything needs to be a bean; only objects that need injection, lifecycle, or proxying do.</p></div>
+
+<h3>Web scopes need scoped proxies</h3>
+<p>The same shape of problem: injecting a request-scoped bean into a singleton. At startup there <em>is no request</em>, so there's nothing to inject. The fix is a proxy placeholder:</p>
+<pre><code><span class="ann">@Component</span>
+<span class="ann">@Scope</span>(value = <span class="typ">WebApplicationContext</span>.SCOPE_REQUEST,
+       proxyMode = <span class="typ">ScopedProxyMode</span>.TARGET_CLASS)
+<span class="kw">public class</span> <span class="typ">RequestContext</span> {
+    <span class="kw">private</span> <span class="typ">String</span> tenantId;   <span class="com">// per-request state, safe here</span>
+    <span class="com">// getters/setters</span>
+}
+
+<span class="ann">@Service</span>
+<span class="ann">@RequiredArgsConstructor</span>
+<span class="kw">public class</span> <span class="typ">PricingService</span> {              <span class="com">// singleton</span>
+    <span class="kw">private final</span> <span class="typ">RequestContext</span> requestContext; <span class="com">// actually a CGLIB proxy</span>
+
+    <span class="kw">public</span> <span class="typ">Price</span> priceFor(<span class="typ">String</span> sku) {
+        <span class="com">// each call: proxy looks up the bean bound to the CURRENT request thread</span>
+        <span class="kw">return</span> priceFor(sku, requestContext.getTenantId());
+    }
+}</code></pre>
+<p>The singleton holds one stable proxy object; on every method call the proxy resolves the real request-scoped instance from the current request (via a <code>ThreadLocal</code>-backed <code>RequestContextHolder</code>). Conceptually similar to how a React context <em>consumer</em> reads the nearest provider's current value at call time rather than capturing it once.</p>
+
+<!-- ============================================================ -->
+<h2 id="configuration">@Configuration, @Bean &amp; circular dependencies <span class="tier tier-2">T2</span></h2>
+<p>Component scanning works for <em>your</em> classes. For third-party classes (a Stripe client, an <code>ObjectMapper</code> tweak, a connection pool) you can't add <code>@Component</code> to code you don't own — instead you declare beans with factory methods:</p>
+<pre><code><span class="ann">@Configuration</span>
+<span class="kw">public class</span> <span class="typ">PaymentConfig</span> {
+
+    <span class="ann">@Bean</span>
+    <span class="kw">public</span> <span class="typ">StripeClient</span> stripeClient(<span class="ann">@Value</span>(<span class="str">"${stripe.api-key}"</span>) <span class="typ">String</span> key) {
+        <span class="kw">return new</span> <span class="typ">StripeClient</span>(key);          <span class="com">// method name = bean name</span>
+    }
+
+    <span class="ann">@Bean</span>
+    <span class="kw">public</span> <span class="typ">PaymentGateway</span> paymentGateway(<span class="typ">StripeClient</span> client) {
+        <span class="com">// dependencies as METHOD PARAMETERS — injected by the container</span>
+        <span class="kw">return new</span> <span class="typ">StripePaymentGateway</span>(client);
+    }
+}</code></pre>
+
+<h3>Full vs lite mode: the CGLIB trick</h3>
+<p>A subtle, senior-level detail. What does this print — one client or two?</p>
+<pre><code><span class="ann">@Configuration</span>
+<span class="kw">public class</span> <span class="typ">PaymentConfig</span> {
+    <span class="ann">@Bean</span> <span class="typ">StripeClient</span> stripeClient() { <span class="kw">return new</span> <span class="typ">StripeClient</span>(); }
+
+    <span class="ann">@Bean</span> <span class="typ">PaymentGateway</span> gateway()   { <span class="kw">return new</span> <span class="typ">StripePaymentGateway</span>(stripeClient()); }
+    <span class="ann">@Bean</span> <span class="typ">RefundService</span>  refunds()   { <span class="kw">return new</span> <span class="typ">RefundService</span>(stripeClient()); }
+    <span class="com">// stripeClient() called twice — two instances?</span>
+}</code></pre>
+<p><strong>One instance.</strong> <code>@Configuration</code> classes are subclassed by CGLIB at runtime (<strong>"full mode"</strong>): the proxy intercepts <code>@Bean</code> method calls and returns the cached container-managed singleton instead of executing the method body again. Inter-bean method calls behave like <code>getBean()</code>.</p>
+<pre><code><span class="com">// Opting out: "lite mode"</span>
+<span class="ann">@Configuration</span>(proxyBeanMethods = <span class="kw">false</span>)
+<span class="kw">public class</span> <span class="typ">PaymentConfig</span> {
+    <span class="com">// No CGLIB proxy → faster startup, less memory, GraalVM-native-friendly.</span>
+    <span class="com">// BUT direct @Bean method calls now execute the body → NEW instance each call.</span>
+    <span class="com">// Rule for lite mode: never call one @Bean method from another;</span>
+    <span class="com">// take dependencies as method parameters instead (as in the first example).</span>
+}</code></pre>
+  <div class="note"><p>Spring Boot's own auto-configuration classes all use <code>proxyBeanMethods = false</code> for startup speed — and they always pass dependencies as parameters. The parameter style is the safe habit: it works identically in both modes. <code>@Bean</code> methods inside a plain <code>@Component</code> are also "lite" — a source of one-instance-vs-many bugs when people copy code around.</p></div>
+
+<h3>Circular dependencies</h3>
+<p>A depends on B, B depends on A:</p>
+<pre><code><span class="ann">@Service</span> <span class="kw">class</span> <span class="typ">OrderService</span>   { <span class="kw">public</span> <span class="typ">OrderService</span>(<span class="typ">CustomerService</span> c) {...} }
+<span class="ann">@Service</span> <span class="kw">class</span> <span class="typ">CustomerService</span>{ <span class="kw">public</span> <span class="typ">CustomerService</span>(<span class="typ">OrderService</span> o) {...} }
+
+<span class="com">// Startup: BeanCurrentlyInCreationException —</span>
+<span class="com">// "The dependencies of some of the beans in the application context form a cycle"</span></code></pre>
+<ul>
+  <li><strong>Constructor injection: fails fast at startup.</strong> Neither constructor can complete without the other's finished instance. This is a <em>feature</em> — the cycle is a design smell (the two services are entangled; there's probably a hidden third concept).</li>
+  <li><strong>Setter/field injection <em>can</em> tolerate cycles</strong> via Spring's early-reference mechanism (it exposes a half-built bean from an "early singleton" cache so the other side can grab a reference before initialization finishes). You get two objects wired together, but one of them may observe the other before it's fully initialized — subtle bugs.</li>
+  <li><strong>Boot 2.6+ rejects circular references by default</strong> even where technically resolvable (<code>spring.main.allow-circular-references=false</code> is the default). The team's message: cycles are bugs; fix the design.</li>
+</ul>
+<p><strong>Fix hierarchy (best to worst):</strong></p>
+<ol>
+  <li><strong>Redesign.</strong> Extract the shared logic into a third bean both depend on; or invert one direction with events (<code>ApplicationEventPublisher</code> — B reacts to A's event instead of A calling B).</li>
+  <li><strong><code>@Lazy</code> on one side.</strong> <code>public OrderService(@Lazy CustomerService c)</code> injects a proxy that resolves the real bean on first use, breaking the cycle at construction time. Pragmatic, but the cycle still exists conceptually.</li>
+  <li><strong>Setter injection for one edge</strong> (plus re-enabling <code>allow-circular-references</code>). Last resort; hides the smell.</li>
+</ol>
+  <div class="senior"><p>Interview framing: <em>"I treat a circular-dependency failure as the container doing me a favor. Nine times out of ten there's a missing abstraction — I extract it, or I decouple one direction with domain events. <code>@Lazy</code> is my tactical escape hatch when I can't refactor immediately, and I never just flip <code>allow-circular-references=true</code> globally."</em></p></div>
+
+<!-- ============================================================ -->
+<h2 id="disambiguation">Disambiguation: @Qualifier, @Primary, collections, @Conditional, @Profile <span class="tier tier-2">T2</span></h2>
+<p>Spring injects <strong>by type</strong>. When one interface has multiple implementations, the container can't choose and throws <code>NoUniqueBeanDefinitionException</code> — "expected single matching bean but found 2". Your disambiguation toolbox:</p>
+
+<pre><code><span class="kw">public interface</span> <span class="typ">NotificationSender</span> { <span class="kw">void</span> send(<span class="typ">Notification</span> n); }
+
+<span class="ann">@Component</span>(<span class="str">"email"</span>) <span class="kw">class</span> <span class="typ">EmailSender</span> <span class="kw">implements</span> <span class="typ">NotificationSender</span> {...}
+<span class="ann">@Component</span>(<span class="str">"sms"</span>)   <span class="kw">class</span> <span class="typ">SmsSender</span>   <span class="kw">implements</span> <span class="typ">NotificationSender</span> {...}
+<span class="ann">@Component</span>(<span class="str">"push"</span>)  <span class="kw">class</span> <span class="typ">PushSender</span>  <span class="kw">implements</span> <span class="typ">NotificationSender</span> {...}
+
+<span class="com">// Option 1: @Primary — the default when nobody specifies</span>
+<span class="ann">@Primary</span> <span class="ann">@Component</span> <span class="kw">class</span> <span class="typ">EmailSender</span> <span class="kw">implements</span> <span class="typ">NotificationSender</span> {...}
+
+<span class="com">// Option 2: @Qualifier — the injection point picks by name</span>
+<span class="kw">public</span> <span class="typ">AlertService</span>(<span class="ann">@Qualifier</span>(<span class="str">"sms"</span>) <span class="typ">NotificationSender</span> sender) {...}</code></pre>
+<p><code>@Primary</code> sets a global default; <code>@Qualifier</code> is a per-injection-point override (and wins over <code>@Primary</code>). For type safety you can define custom qualifier annotations instead of strings.</p>
+
+<h3>Injecting all implementations — the strategy-pattern idiom</h3>
+<p>Often you don't want to choose — you want <em>all of them</em>, selected at runtime. Spring injects collections of a type, and this is the cleanest strategy-pattern implementation in Java:</p>
+<pre><code><span class="kw">public interface</span> <span class="typ">PaymentMethod</span> {
+    <span class="typ">String</span> key();                       <span class="com">// "card", "paypal", "wallet"</span>
+    <span class="typ">Receipt</span> charge(<span class="typ">Order</span> order);
+}
+
+<span class="ann">@Service</span>
+<span class="kw">public class</span> <span class="typ">CheckoutService</span> {
+    <span class="kw">private final</span> <span class="typ">Map</span>&lt;<span class="typ">String</span>, <span class="typ">PaymentMethod</span>&gt; methods;
+
+    <span class="com">// List&lt;PaymentMethod&gt; also works (ordered by @Order); with Map,</span>
+    <span class="com">// keys are BEAN NAMES — or build your own keyed map:</span>
+    <span class="kw">public</span> <span class="typ">CheckoutService</span>(<span class="typ">List</span>&lt;<span class="typ">PaymentMethod</span>&gt; all) {
+        <span class="kw">this</span>.methods = all.stream()
+            .collect(<span class="typ">Collectors</span>.toMap(<span class="typ">PaymentMethod</span>::key, m -&gt; m));
+    }
+
+    <span class="kw">public</span> <span class="typ">Receipt</span> checkout(<span class="typ">Order</span> order) {
+        <span class="typ">PaymentMethod</span> m = methods.get(order.paymentType());
+        <span class="kw">if</span> (m == <span class="kw">null</span>) <span class="kw">throw new</span> <span class="typ">UnsupportedPaymentException</span>(order.paymentType());
+        <span class="kw">return</span> m.charge(order);
+    }
+}</code></pre>
+  <div class="senior"><p>Adding a new payment method = adding one new <code>@Component</code> class. No <code>switch</code> statement to edit, no registration code — the container assembles the registry. This is Open/Closed via DI, and it's a fantastic thing to bring up unprompted when asked "how has DI changed how you design code?"</p></div>
+
+<h3>@Conditional — beans that exist only sometimes</h3>
+<p>The <code>@Conditional</code> family registers a bean only when a predicate holds at startup. Boot's pre-built conditions are the vocabulary of auto-configuration (next section), and you can use them in your own config:</p>
+<pre><code><span class="ann">@Configuration</span>
+<span class="kw">public class</span> <span class="typ">MessagingConfig</span> {
+
+    <span class="ann">@Bean</span>
+    <span class="ann">@ConditionalOnProperty</span>(name = <span class="str">"features.sms.enabled"</span>, havingValue = <span class="str">"true"</span>)
+    <span class="typ">SmsSender</span> smsSender() { <span class="kw">return new</span> <span class="typ">SmsSender</span>(); }        <span class="com">// feature flag</span>
+
+    <span class="ann">@Bean</span>
+    <span class="ann">@ConditionalOnClass</span>(name = <span class="str">"com.twilio.Twilio"</span>)
+    <span class="typ">TwilioAdapter</span> twilio() { <span class="kw">return new</span> <span class="typ">TwilioAdapter</span>(); }    <span class="com">// only if lib on classpath</span>
+
+    <span class="ann">@Bean</span>
+    <span class="ann">@ConditionalOnMissingBean</span>(<span class="typ">NotificationSender</span>.<span class="kw">class</span>)
+    <span class="typ">NotificationSender</span> fallback() { <span class="kw">return new</span> <span class="typ">LogOnlySender</span>(); } <span class="com">// back-off default</span>
+}</code></pre>
+<table>
+  <thead><tr><th>Condition</th><th>Bean registered when…</th><th>Typical use</th></tr></thead>
+  <tbody>
+    <tr><td><code>@ConditionalOnClass</code></td><td>a class is on the classpath</td><td>"you added the dependency, so you must want this"</td></tr>
+    <tr><td><code>@ConditionalOnMissingBean</code></td><td>no bean of this type exists yet</td><td>defaults that <strong>back off</strong> to user beans</td></tr>
+    <tr><td><code>@ConditionalOnBean</code></td><td>another bean exists</td><td>features layered on other features</td></tr>
+    <tr><td><code>@ConditionalOnProperty</code></td><td>a config property matches</td><td>feature flags, opt-in modules</td></tr>
+    <tr><td><code>@ConditionalOnWebApplication</code></td><td>running as a web app</td><td>servlet-only infrastructure</td></tr>
+  </tbody>
+</table>
+
+<h3>@Profile — environment-shaped wiring</h3>
+<pre><code><span class="ann">@Configuration</span>
+<span class="kw">public class</span> <span class="typ">StorageConfig</span> {
+    <span class="ann">@Bean</span> <span class="ann">@Profile</span>(<span class="str">"local"</span>)
+    <span class="typ">FileStore</span> localDisk()  { <span class="kw">return new</span> <span class="typ">LocalDiskStore</span>(<span class="str">"/tmp/uploads"</span>); }
+
+    <span class="ann">@Bean</span> <span class="ann">@Profile</span>(<span class="str">"prod | staging"</span>)   <span class="com">// profile expressions: | &amp; !</span>
+    <span class="typ">FileStore</span> s3()         { <span class="kw">return new</span> <span class="typ">S3Store</span>(); }
+}</code></pre>
+<pre><code><span class="com"># activate: application.yml, env var, or CLI</span>
+spring:
+  profiles:
+    active: prod
+<span class="com"># or: SPRING_PROFILES_ACTIVE=prod   /   --spring.profiles.active=prod</span></code></pre>
+  <div class="pitfall"><p>Profiles gate <em>bean registration</em>, not just properties. A common mistake is annotating a class <code>@Profile("test")</code> and forgetting the inverse — with no active profile, <em>neither</em> variant exists and injection fails. Also prefer <code>@ConditionalOnProperty</code> for feature flags and keep <code>@Profile</code> strictly for environment identity (local/staging/prod); profile-soup ("if prod-but-not-eu-and-batch") is a maintenance nightmare.</p></div>
+
+<!-- ============================================================ -->
+<h2 id="container-internals">Container internals: BeanFactory, post-processors, events <span class="tier tier-3">T3</span></h2>
+
+<h3>BeanFactory vs ApplicationContext</h3>
+<table>
+  <thead><tr><th></th><th><code>BeanFactory</code></th><th><code>ApplicationContext</code></th></tr></thead>
+  <tbody>
+    <tr><td>Role</td><td>Core container SPI: bean definitions, creation, lookup</td><td>Extends BeanFactory — the full application runtime</td></tr>
+    <tr><td>Extras</td><td>—</td><td>Auto-detects <code>BeanPostProcessor</code>s, <code>MessageSource</code> (i18n), event publishing, environment/property abstraction, resource loading</td></tr>
+    <tr><td>Instantiation</td><td>Lazy by default</td><td>Eagerly pre-instantiates singletons at startup → fail fast</td></tr>
+    <tr><td>You use…</td><td>Almost never directly</td><td>Always (Boot creates <code>AnnotationConfigServletWebServerApplicationContext</code> for a servlet web app)</td></tr>
+  </tbody>
+</table>
+
+<h3>BeanFactoryPostProcessor vs BeanPostProcessor — how @Autowired itself works</h3>
+<p>Two extension points, distinguished by <em>what</em> they operate on and <em>when</em>:</p>
+<ul>
+  <li><strong><code>BeanFactoryPostProcessor</code></strong> runs once, after definitions are loaded but <strong>before any bean is instantiated</strong>. It mutates <em>metadata</em> (BeanDefinitions). Example: <code>PropertySourcesPlaceholderConfigurer</code> resolving <code>${...}</code> placeholders in definitions.</li>
+  <li><strong><code>BeanPostProcessor</code></strong> runs <strong>for every bean instance</strong>, around initialization (steps 6 and 8 in the lifecycle). It can modify or <em>replace</em> the instance — this is the AOP hook.</li>
+</ul>
+<p>The punchline interviewers fish for: <strong>Spring's own annotations are implemented as post-processors, not compiler magic.</strong></p>
+<ul>
+  <li><code>AutowiredAnnotationBeanPostProcessor</code> — scans each bean's class for <code>@Autowired</code>/<code>@Value</code> members and injects them during population.</li>
+  <li><code>CommonAnnotationBeanPostProcessor</code> — handles <code>@PostConstruct</code>/<code>@PreDestroy</code> (jakarta annotations).</li>
+  <li><code>AnnotationAwareAspectJAutoProxyCreator</code> — in <code>postProcessAfterInitialization</code>, checks whether any advice (transactions, caching, <code>@Aspect</code>s) applies to the bean; if so, returns a <strong>proxy wrapping it</strong>. This is literally where <code>@Transactional</code> becomes behavior.</li>
+</ul>
+<pre><code><span class="com">// A trivial custom BeanPostProcessor — e.g., timing bean creation</span>
+<span class="ann">@Component</span>
+<span class="kw">public class</span> <span class="typ">StartupProfiler</span> <span class="kw">implements</span> <span class="typ">BeanPostProcessor</span> {
+    <span class="ann">@Override</span>
+    <span class="kw">public</span> <span class="typ">Object</span> postProcessAfterInitialization(<span class="typ">Object</span> bean, <span class="typ">String</span> name) {
+        <span class="kw">if</span> (bean.getClass().getPackageName().startsWith(<span class="str">"com.acme"</span>)) {
+            log.debug(<span class="str">"initialized bean {} ({})"</span>, name, bean.getClass().getSimpleName());
+        }
+        <span class="kw">return</span> bean;  <span class="com">// return a different object here and you've "become" AOP</span>
+    }
+}</code></pre>
+
+<h3>Application events — in-process pub/sub</h3>
+<p>Decouple beans without direct references (think of an in-process event bus / a typed EventEmitter):</p>
+<pre><code><span class="com">// The event — any object; records are perfect (no base class needed since Spring 4.2)</span>
+<span class="kw">public record</span> <span class="typ">OrderPlacedEvent</span>(<span class="typ">Long</span> orderId, <span class="typ">String</span> customerEmail) {}
+
+<span class="ann">@Service</span>
+<span class="ann">@RequiredArgsConstructor</span>
+<span class="kw">public class</span> <span class="typ">OrderService</span> {
+    <span class="kw">private final</span> <span class="typ">ApplicationEventPublisher</span> events;
+
+    <span class="ann">@Transactional</span>
+    <span class="kw">public void</span> placeOrder(<span class="typ">Order</span> order) {
+        repo.save(order);
+        events.publishEvent(<span class="kw">new</span> <span class="typ">OrderPlacedEvent</span>(order.getId(), order.getEmail()));
+    }
+}
+
+<span class="ann">@Component</span>
+<span class="kw">public class</span> <span class="typ">OrderNotifications</span> {
+    <span class="ann">@EventListener</span>                    <span class="com">// dispatched by event TYPE; sync by default,</span>
+    <span class="kw">void</span> onOrderPlaced(<span class="typ">OrderPlacedEvent</span> e) {   <span class="com">// same thread as publisher</span>
+        <span class="com">// add @Async (+ @EnableAsync) to run on a task-executor thread</span>
+        mailer.sendConfirmation(e.customerEmail());
+    }
+}</code></pre>
+  <div class="note"><p><strong>Teaser for the transactions chapter:</strong> synchronous <code>@EventListener</code> runs <em>inside</em> the publisher's transaction — an email could go out and then the transaction rolls back. <code>@TransactionalEventListener(phase = AFTER_COMMIT)</code> defers the listener until the transaction actually commits, which is what you almost always want for side effects. Full treatment when we cover <code>@Transactional</code>.</p></div>
+
+<!-- ============================================================ -->
+<h2 id="autoconfig">Spring Boot auto-configuration mechanics <span class="tier tier-1">T1</span></h2>
+<p><strong>This is the single most-asked Spring Boot interview question.</strong> "How does Spring Boot know to configure a DataSource / Tomcat / Jackson without you writing any config?" A senior answer walks the full chain. Here it is.</p>
+
+<h3>1. @SpringBootApplication is three annotations</h3>
+<pre><code><span class="ann">@SpringBootApplication</span>
+<span class="com">// ≡ (plus a couple of meta-details)</span>
+<span class="ann">@SpringBootConfiguration</span>      <span class="com">// specialization of @Configuration</span>
+<span class="ann">@EnableAutoConfiguration</span>      <span class="com">// ← the magic switch</span>
+<span class="ann">@ComponentScan</span>                <span class="com">// scan from this package down (with default filters)</span></code></pre>
+
+<h3>2. Where the candidate list comes from</h3>
+<p><code>@EnableAutoConfiguration</code> imports <code>AutoConfigurationImportSelector</code>, which reads a plain-text list of candidate configuration classes from every jar on the classpath:</p>
+<pre><code><span class="com"># In each auto-configuring jar (e.g. spring-boot-autoconfigure.jar):</span>
+META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports
+
+<span class="com"># contents: one fully-qualified class name per line, e.g.</span>
+org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration
+org.springframework.boot.autoconfigure.jackson.JacksonAutoConfiguration
+org.springframework.boot.autoconfigure.web.servlet.WebMvcAutoConfiguration
+...</code></pre>
+  <div class="note"><p><strong>History for older codebases:</strong> before Boot 2.7 this list lived under the <code>org.springframework.boot.autoconfigure.EnableAutoConfiguration</code> key in <code>META-INF/spring.factories</code>. Boot 2.7 introduced the dedicated <code>AutoConfiguration.imports</code> file, and <strong>Boot 3.0 removed spring.factories support for auto-configurations entirely</strong>. Knowing both signals you've seen real migrations.</p></div>
+
+<h3>3. Candidates are guarded by conditions</h3>
+<p>Roughly 150 candidate classes are listed, but most <em>evaluate to nothing</em>. Each is a <code>@Configuration</code> class fenced with <code>@Conditional*</code> guards, so it only takes effect when the classpath and existing beans say it should:</p>
+<pre><code><span class="com">// Simplified sketch of the CANONICAL example — DataSourceAutoConfiguration</span>
+<span class="ann">@AutoConfiguration</span>(before = <span class="typ">SqlInitializationAutoConfiguration</span>.<span class="kw">class</span>)
+<span class="ann">@ConditionalOnClass</span>({ <span class="typ">DataSource</span>.<span class="kw">class</span>, <span class="typ">EmbeddedDatabaseType</span>.<span class="kw">class</span> })
+<span class="ann">@EnableConfigurationProperties</span>(<span class="typ">DataSourceProperties</span>.<span class="kw">class</span>)  <span class="com">// binds spring.datasource.*</span>
+<span class="kw">public class</span> <span class="typ">DataSourceAutoConfiguration</span> {
+
+    <span class="ann">@Configuration</span>(proxyBeanMethods = <span class="kw">false</span>)
+    <span class="ann">@ConditionalOnClass</span>(<span class="typ">HikariDataSource</span>.<span class="kw">class</span>)       <span class="com">// Hikari on classpath?</span>
+    <span class="ann">@ConditionalOnMissingBean</span>(<span class="typ">DataSource</span>.<span class="kw">class</span>)        <span class="com">// user hasn't defined one?</span>
+    <span class="ann">@ConditionalOnProperty</span>(name = <span class="str">"spring.datasource.type"</span>,
+        havingValue = <span class="str">"com.zaxxer.hikari.HikariDataSource"</span>, matchIfMissing = <span class="kw">true</span>)
+    <span class="kw">static class</span> <span class="typ">Hikari</span> {
+        <span class="ann">@Bean</span>
+        <span class="typ">HikariDataSource</span> dataSource(<span class="typ">DataSourceProperties</span> properties) {
+            <span class="com">// url, username, password, pool size — all from application.yml</span>
+            <span class="kw">return</span> createDataSource(properties, <span class="typ">HikariDataSource</span>.<span class="kw">class</span>);
+        }
+    }
+}</code></pre>
+<p>Read the guards as a sentence: <em>"IF the JDBC classes are on the classpath (you added <code>spring-boot-starter-data-jpa</code> or <code>-jdbc</code>) AND Hikari is present AND you haven't declared your own <code>DataSource</code> bean, THEN create a Hikari pool configured from <code>spring.datasource.*</code> properties."</em></p>
+
+<h3>4. Backing off: your @Bean beats the default</h3>
+<pre><code><span class="ann">@Configuration</span>
+<span class="kw">public class</span> <span class="typ">MyDataConfig</span> {
+    <span class="ann">@Bean</span>
+    <span class="typ">DataSource</span> dataSource() {
+        <span class="com">// Your custom pool. Because of @ConditionalOnMissingBean on the</span>
+        <span class="com">// auto-config, Boot's default simply DOES NOT REGISTER. No override</span>
+        <span class="com">// ceremony, no config flag — the default "backs off".</span>
+        <span class="kw">return</span> myExoticDataSource();
+    }
+}</code></pre>
+<p>This is the core design contract of Boot: <strong>convention with graceful surrender</strong>. Auto-configuration provides opinionated defaults; user beans always win. To make ordering work (user configs must be processed before auto-configs so <code>@ConditionalOnMissingBean</code> sees your beans), auto-configurations are processed <em>last</em>, and order <em>among themselves</em> via <code>@AutoConfiguration(before/after = ...)</code>.</p>
+
+<h3>5. Debugging: the condition evaluation report</h3>
+<pre><code><span class="com"># application.properties</span>
+debug=true
+<span class="com"># or: java -jar app.jar --debug</span>
+
+<span class="com">============================</span>
+<span class="com">CONDITIONS EVALUATION REPORT</span>
+<span class="com">============================</span>
+<span class="com">Positive matches:  DataSourceAutoConfiguration matched:</span>
+<span class="com">   - @ConditionalOnClass found required classes 'javax.sql.DataSource', ...</span>
+<span class="com">Negative matches:  RabbitAutoConfiguration:</span>
+<span class="com">   - @ConditionalOnClass did not find required class 'com.rabbitmq.client.Channel'</span></code></pre>
+  <div class="senior"><p>The 30-second interview answer to memorize: <em>"<code>@SpringBootApplication</code> includes <code>@EnableAutoConfiguration</code>, which imports a selector that reads <code>META-INF/spring/…AutoConfiguration.imports</code> files from every jar to get candidate <code>@AutoConfiguration</code> classes. Each candidate is guarded by conditions — <code>@ConditionalOnClass</code> keys off what starters put on the classpath, <code>@ConditionalOnMissingBean</code> makes defaults back off when I define my own bean. They're evaluated after user configuration, ordered with before/after hints, and bind their settings from properties via <code>@EnableConfigurationProperties</code>. When something surprises me I run with <code>debug=true</code> and read the condition evaluation report."</em> Then offer DataSourceAutoConfiguration as a worked example.</p></div>
+  <div class="pitfall"><p>Excluding an auto-configuration you don't want: <code>@SpringBootApplication(exclude = DataSourceAutoConfiguration.class)</code> or <code>spring.autoconfigure.exclude=...</code>. Common in tests or when a transitive dependency drags in configuration you never asked for (classic example: adding a JPA starter to a service with no DB → startup fails wanting a DataSource URL; exclude it or supply the config).</p></div>
+
+<!-- ============================================================ -->
+<h2 id="starters-config">Starters &amp; externalized configuration <span class="tier tier-1">T1</span></h2>
+
+<h3>Starters: curated dependency bundles</h3>
+<p>A starter is (almost) <strong>just a pom</strong> — no code — that pulls in a coherent, version-tested set of dependencies. Auto-configuration then reacts to those classes being on the classpath. The two mechanisms compose: <em>starter puts classes on classpath → <code>@ConditionalOnClass</code> fires → beans appear</em>.</p>
+<pre><code>&lt;dependency&gt;
+  &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+  &lt;artifactId&gt;spring-boot-starter-web&lt;/artifactId&gt;
+&lt;/dependency&gt;
+
+<span class="com">what spring-boot-starter-web actually pulls in:</span>
+├── spring-boot-starter          <span class="com">(core: Boot itself, auto-configure, logging via Logback, SnakeYAML)</span>
+├── spring-boot-starter-json     <span class="com">(Jackson databind + JSR-310 java.time module)</span>
+├── spring-boot-starter-tomcat   <span class="com">(embedded Tomcat)</span>
+├── spring-web                   <span class="com">(HTTP abstractions, RestClient/RestTemplate)</span>
+└── spring-webmvc                <span class="com">(DispatcherServlet, @RestController programming model)</span></code></pre>
+<p>Versions come from the <code>spring-boot-starter-parent</code> / <code>spring-boot-dependencies</code> BOM, so you rarely write version numbers — the Boot team has integration-tested the whole matrix. (Analogy: a starter is like a meta-package with a lockfile-quality dependency set, curated upstream.) Swap pieces by exclusion: exclude <code>-tomcat</code>, add <code>-jetty</code>.</p>
+
+<h3>Externalized configuration</h3>
+<p>Same jar, different environments — config lives outside code. Boot reads <code>application.properties</code> or <code>application.yml</code> from the classpath, plus profile-specific variants:</p>
+<pre><code><span class="com"># application.yml — shared defaults</span>
+server:
+  port: <span class="num">8080</span>
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/shop
+    username: shop_app
+
+<span class="com"># application-prod.yml — loaded ONLY when profile "prod" is active,</span>
+<span class="com"># and OVERRIDES application.yml key-by-key</span>
+spring:
+  datasource:
+    url: jdbc:postgresql://prod-db.internal:5432/shop
+logging:
+  level:
+    com.acme: INFO</code></pre>
+
+<h3>Precedence: who wins when the same key is set twice</h3>
+<p>From <strong>highest priority (wins)</strong> to lowest — the shortened list to memorize, then the fuller one:</p>
+<pre><code>command-line args  &gt;  env vars  &gt;  profile-specific file  &gt;  application file  &gt;  defaults</code></pre>
+<table>
+  <thead><tr><th>Priority</th><th>Source</th><th>Example</th></tr></thead>
+  <tbody>
+    <tr><td>1 (highest)</td><td>Devtools global settings / test annotations (<code>@TestPropertySource</code>, <code>@DynamicPropertySource</code>)</td><td>tests only</td></tr>
+    <tr><td>2</td><td>Command-line arguments</td><td><code>--server.port=9090</code></td></tr>
+    <tr><td>3</td><td><code>SPRING_APPLICATION_JSON</code> (inline JSON in an env var)</td><td>container platforms</td></tr>
+    <tr><td>4</td><td>Java system properties</td><td><code>-Dserver.port=9090</code></td></tr>
+    <tr><td>5</td><td><strong>OS environment variables</strong></td><td><code>SERVER_PORT=9090</code></td></tr>
+    <tr><td>6</td><td>Profile-specific files <strong>outside</strong> the jar</td><td><code>./config/application-prod.yml</code></td></tr>
+    <tr><td>7</td><td>Non-profile files outside the jar</td><td><code>./application.yml</code></td></tr>
+    <tr><td>8</td><td>Profile-specific files <strong>inside</strong> the jar</td><td><code>application-prod.yml</code></td></tr>
+    <tr><td>9</td><td>Non-profile files inside the jar</td><td><code>application.yml</code></td></tr>
+    <tr><td>10 (lowest)</td><td><code>@PropertySource</code>, then <code>SpringApplication.setDefaultProperties</code></td><td>coded defaults</td></tr>
+  </tbody>
+</table>
+  <div class="note"><p><strong>Relaxed binding</strong> makes env vars practical: the property <code>spring.datasource.url</code> binds from <code>SPRING_DATASOURCE_URL</code>, and <code>my-app.timeout-ms</code> binds from <code>MY_APP_TIMEOUTMS</code>, <code>my-app.timeoutMs</code>, or <code>my-app.timeout-ms</code> alike. Dots→underscores, kebab/camel/snake all normalize to the same canonical key. This is why the 12-factor "config from environment" pattern is zero-effort in Boot.</p></div>
+
+<h3>@ConfigurationProperties vs @Value</h3>
+<pre><code><span class="com">// @Value — quick, one-off, stringly-typed</span>
+<span class="ann">@Value</span>(<span class="str">"${payment.stripe.api-key}"</span>) <span class="kw">private</span> <span class="typ">String</span> apiKey;
+<span class="ann">@Value</span>(<span class="str">"${payment.retries:3}"</span>)      <span class="kw">private int</span> retries;  <span class="com">// with default</span>
+
+<span class="com">// @ConfigurationProperties — typed, grouped, validated, IDE-completed</span>
+<span class="ann">@ConfigurationProperties</span>(prefix = <span class="str">"payment"</span>)
+<span class="ann">@Validated</span>
+<span class="kw">public record</span> <span class="typ">PaymentProperties</span>(     <span class="com">// records: constructor binding, immutable ✅</span>
+    <span class="ann">@NotBlank</span> <span class="typ">String</span> apiKey,
+    <span class="ann">@Min</span>(<span class="num">0</span>) <span class="ann">@Max</span>(<span class="num">10</span>) <span class="kw">int</span> retries,
+    <span class="typ">Duration</span> timeout,                 <span class="com">// "30s", "500ms" parse automatically</span>
+    <span class="typ">List</span>&lt;<span class="typ">String</span>&gt; allowedCurrencies
+) {}
+
+<span class="com">// enable it (Boot 3: scanning or explicit registration)</span>
+<span class="ann">@SpringBootApplication</span>
+<span class="ann">@ConfigurationPropertiesScan</span>
+<span class="kw">public class</span> <span class="typ">ShopApplication</span> { ... }
+
+<span class="com"># application.yml</span>
+payment:
+  api-key: sk_live_abc          <span class="com"># relaxed binding: api-key → apiKey</span>
+  retries: 5
+  timeout: 30s
+  allowed-currencies: [USD, EUR, INR]</code></pre>
+<table>
+  <thead><tr><th></th><th><code>@Value</code></th><th><code>@ConfigurationProperties</code></th></tr></thead>
+  <tbody>
+    <tr><td>Best for</td><td>Single scalar, quick injection</td><td>Any coherent group of settings</td></tr>
+    <tr><td>Type safety</td><td>Per-field, error only where used</td><td>Whole tree bound &amp; converted at startup</td></tr>
+    <tr><td>Validation</td><td>None</td><td>Bean Validation (<code>@Validated</code>) → <strong>fails startup</strong> on bad config</td></tr>
+    <tr><td>Relaxed binding</td><td>❌ exact key only</td><td>✅</td></tr>
+    <tr><td>IDE metadata / completion</td><td>❌</td><td>✅ (with <code>spring-boot-configuration-processor</code>)</td></tr>
+    <tr><td>SpEL expressions</td><td>✅ <code>#{...}</code></td><td>❌</td></tr>
+    <tr><td>Testability</td><td>Reflection or context</td><td>Plain object — construct in tests directly</td></tr>
+  </tbody>
+</table>
+  <div class="senior"><p>Rule of thumb worth saying verbatim: <em>"More than one related property, or anything crossing a module boundary → <code>@ConfigurationProperties</code> record with validation, so misconfiguration kills the app at startup instead of at 3 a.m. <code>@Value</code> only for a genuinely one-off scalar."</em> Startup-time validation of config is a production-maturity signal.</p></div>
+
+<!-- ============================================================ -->
+<h2 id="actuator">Actuator <span class="tier tier-2">T2</span></h2>
+<p>Add <code>spring-boot-starter-actuator</code> and your app grows production-ready operational endpoints under <code>/actuator</code> — the standard integration point for Kubernetes probes, Prometheus, and ops tooling.</p>
+<table>
+  <thead><tr><th>Endpoint</th><th>What it gives you</th><th>Exposed over HTTP by default?</th></tr></thead>
+  <tbody>
+    <tr><td><code>/actuator/health</code></td><td>Aggregated UP/DOWN from HealthIndicators (DB ping, disk space, brokers…); <code>/health/liveness</code> and <code>/health/readiness</code> groups for k8s probes</td><td>✅ (status only; details hidden by default)</td></tr>
+    <tr><td><code>/actuator/metrics</code></td><td>Micrometer metrics: JVM memory/GC, HTTP request timings, Hikari pool stats; <code>/metrics/http.server.requests</code> drills in</td><td>❌</td></tr>
+    <tr><td><code>/actuator/info</code></td><td>Build/git metadata, custom info contributors</td><td>❌</td></tr>
+    <tr><td><code>/actuator/env</code></td><td>Every property source and resolved value (secrets masked)</td><td>❌ — sensitive</td></tr>
+    <tr><td><code>/actuator/loggers</code></td><td>View <em>and change</em> log levels at runtime via POST — no restart</td><td>❌</td></tr>
+    <tr><td><code>/actuator/beans</code>, <code>/conditions</code>, <code>/mappings</code></td><td>All beans; the auto-configuration report; all MVC routes — great debugging</td><td>❌</td></tr>
+  </tbody>
+</table>
+<pre><code><span class="com"># application.yml — deliberate exposure (default over HTTP is health only)</span>
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info, metrics, prometheus
+  endpoint:
+    health:
+      show-details: when_authorized</code></pre>
+  <div class="pitfall"><p><strong>Never</strong> ship <code>include: "*"</code> on an internet-facing service: <code>/env</code> and <code>/heapdump</code> can leak credentials and memory contents (real CVE-grade incidents have started here). Standard hardening: expose only what ops needs, put actuator on a separate management port (<code>management.server.port: 8081</code>) reachable only inside the cluster, and/or require an <code>ACTUATOR</code> role via Spring Security for anything beyond health.</p></div>
+<p>Custom health checks plug into the same aggregation — one small bean:</p>
+<pre><code><span class="ann">@Component</span>   <span class="com">// bean name "paymentGateway" → contributes as "paymentGateway" in /health</span>
+<span class="ann">@RequiredArgsConstructor</span>
+<span class="kw">public class</span> <span class="typ">PaymentGatewayHealthIndicator</span> <span class="kw">implements</span> <span class="typ">HealthIndicator</span> {
+    <span class="kw">private final</span> <span class="typ">StripeClient</span> stripe;
+
+    <span class="ann">@Override</span>
+    <span class="kw">public</span> <span class="typ">Health</span> health() {
+        <span class="kw">try</span> {
+            <span class="kw">long</span> ms = stripe.ping();
+            <span class="kw">return</span> <span class="typ">Health</span>.up().withDetail(<span class="str">"latencyMs"</span>, ms).build();
+        } <span class="kw">catch</span> (<span class="typ">Exception</span> e) {
+            <span class="kw">return</span> <span class="typ">Health</span>.down(e).withDetail(<span class="str">"gateway"</span>, <span class="str">"stripe"</span>).build();
+        }
+    }
+}</code></pre>
+  <div class="note"><p>If any indicator reports DOWN, the aggregate <code>/actuator/health</code> goes DOWN (HTTP 503) — which is exactly what a load balancer or readiness probe consumes to stop routing traffic to a broken instance. Be careful what you wire into <em>readiness</em>: a flaky third-party API in the readiness group can take your whole fleet out of rotation.</p></div>
+
+<!-- ============================================================ -->
+<h2 id="embedded">Embedded server &amp; how Boot starts <span class="tier tier-2">T2</span></h2>
+
+<h3>Embedded vs legacy WAR</h3>
+<table>
+  <thead><tr><th></th><th>Legacy WAR</th><th>Boot executable jar</th></tr></thead>
+  <tbody>
+    <tr><td>Model</td><td>App deployed <em>into</em> an external Tomcat/WebLogic that ops manages</td><td><strong>Server embedded inside the app</strong>; <code>java -jar app.jar</code> and it listens</td></tr>
+    <tr><td>Versioning</td><td>Server version owned by ops; shared by many apps</td><td>Server is just a dependency your build owns and upgrades</td></tr>
+    <tr><td>Deployment unit</td><td>WAR + server config drift</td><td>Self-contained fat jar → trivially containerized (one jar per Docker image)</td></tr>
+    <tr><td>Isolation</td><td>Multiple apps per server, shared JVM failures</td><td>One app, one process — the microservice-native model</td></tr>
+  </tbody>
+</table>
+<p>The embedded model is <em>why</em> Boot took over: it inverted "deploy app into server" to "server is a library," which is what containers and 12-factor deployment want. (You <em>can</em> still build a WAR for a legacy container by extending <code>SpringBootServletInitializer</code>, but treat that as a migration artifact.)</p>
+
+<h3>SpringApplication.run — the high-level flow</h3>
+<pre><code>SpringApplication.run(ShopApplication.class, args)
+ 1. Create SpringApplication; deduce app type (SERVLET / REACTIVE / NONE)
+    by classpath sniffing (DispatcherServlet present? → SERVLET)
+ 2. Prepare Environment: load property sources &amp; profiles
+    (this is where application.yml + env vars + args are merged)
+ 3. Print banner; create the right ApplicationContext type
+    (AnnotationConfigServletWebServerApplicationContext for servlet apps)
+ 4. Read bean definitions: component scan + @Configuration + auto-config imports
+ 5. refresh() the context — THE big step:
+      • BeanFactoryPostProcessors → condition evaluation
+      • instantiate all singletons (lifecycle from the section above)
+      • onRefresh(): CREATE AND START THE EMBEDDED SERVER (Tomcat),
+        register DispatcherServlet
+ 6. Publish ready events; run CommandLineRunner / ApplicationRunner beans
+ 7. Application is up — main thread exits, Tomcat's threads keep the JVM alive</code></pre>
+<pre><code><span class="com"># the everyday knobs</span>
+server:
+  port: <span class="num">9090</span>              <span class="com"># or SERVER_PORT / --server.port=9090; 0 = random free port (tests)</span>
+  shutdown: graceful       <span class="com"># stop accepting, drain in-flight requests on SIGTERM</span>
+spring:
+  lifecycle:
+    timeout-per-shutdown-phase: 20s</code></pre>
+  <div class="senior"><p>Points that land in interviews: the embedded server is <em>itself a bean</em> created during <code>refresh()</code> by <code>ServletWebServerFactoryAutoConfiguration</code> (so swapping Tomcat→Jetty is a dependency change, and you can customize it via a <code>WebServerFactoryCustomizer</code> bean); and the app type is <em>deduced from the classpath</em>, which is why adding <code>spring-boot-starter-webflux</code> alongside <code>-web</code> silently stays servlet-based — classpath is configuration in Boot.</p></div>
+
+<!-- ============================================================ -->
+<h2 id="devtools">DevTools, runners &amp; startup tuning <span class="tier tier-3">T3</span></h2>
+
+<h3>DevTools</h3>
+<p><code>spring-boot-devtools</code> (a <code>runtime</code>-scoped dev dependency) gives you: <strong>automatic restart</strong> when classes change — fast because it uses two classloaders (a base loader for unchanging jars, a restart loader for your classes; only the second is thrown away), LiveReload triggering for the browser, and dev-friendly property defaults (caches off). It disables itself automatically in a fully-packaged production launch. It's a restart, not JRebel-style hot-swap — closer to nodemon than to Vite HMR.</p>
+
+<h3>Startup tasks: CommandLineRunner vs ApplicationRunner</h3>
+<p>Both are callbacks that run <strong>once, after the context is fully ready</strong> (all beans wired, server started) — the right home for seed data, cache warming, or startup validation. The only difference is the argument type:</p>
+<pre><code><span class="ann">@Component</span>
+<span class="ann">@Order</span>(<span class="num">1</span>)   <span class="com">// multiple runners? order them explicitly</span>
+<span class="ann">@RequiredArgsConstructor</span>
+<span class="kw">public class</span> <span class="typ">DataSeeder</span> <span class="kw">implements</span> <span class="typ">CommandLineRunner</span> {
+    <span class="kw">private final</span> <span class="typ">UserRepository</span> users;
+
+    <span class="ann">@Override</span>
+    <span class="kw">public void</span> run(<span class="typ">String</span>... args) {          <span class="com">// raw args</span>
+        <span class="kw">if</span> (users.count() == <span class="num">0</span>) users.save(defaultAdmin());
+    }
+}
+
+<span class="ann">@Component</span>
+<span class="kw">public class</span> <span class="typ">FlagsPrinter</span> <span class="kw">implements</span> <span class="typ">ApplicationRunner</span> {
+    <span class="ann">@Override</span>
+    <span class="kw">public void</span> run(<span class="typ">ApplicationArguments</span> args) { <span class="com">// PARSED args</span>
+        <span class="kw">if</span> (args.containsOption(<span class="str">"reindex"</span>)) {      <span class="com">// --reindex=products</span>
+            reindex(args.getOptionValues(<span class="str">"reindex"</span>));
+        }
+    }
+}</code></pre>
+  <div class="pitfall"><p>An exception thrown from a runner <strong>aborts startup</strong> — sometimes exactly what you want (fail fast on bad state), sometimes a paging incident. Also don't confuse runners with <code>@PostConstruct</code>: <code>@PostConstruct</code> runs per-bean mid-wiring; runners run once after <em>everything</em> is up, so they can safely use any bean, transactions and all.</p></div>
+
+<h3>Lazy initialization &amp; startup-time awareness</h3>
+<pre><code>spring:
+  main:
+    lazy-initialization: <span class="kw">true</span>   <span class="com"># beans created on FIRST USE, not at startup</span></code></pre>
+<p>Trade-off: faster startup (nice for dev loops), but you give up fail-fast — misconfigured beans now blow up on the first request that touches them, and the first request pays creation latency. Most teams keep it off in production, or use targeted <code>@Lazy</code> on a few heavy beans. Broader startup-tuning awareness (name these, don't memorize): the startup actuator endpoint / <code>BufferingApplicationStartup</code> for step timings, excluding unneeded auto-configurations, Class Data Sharing / AppCDS, CRaC checkpoint-restore, and GraalVM native images (Boot 3 AOT) for ~50ms cold starts at the cost of build complexity and closed-world reflection.</p>
+
+<!-- ============================================================ -->
+<h2 id="qa">Interview Q&amp;A</h2>
+
+<details class="qa"><summary>What is Inversion of Control, and how does it differ from Dependency Injection?</summary><div class="answer"><p>IoC is the principle: the framework, not application code, controls object creation, wiring, and lifecycle. DI is the dominant <em>technique</em> for implementing IoC — objects declare dependencies (ideally via constructor) and the container supplies them. Spring's ApplicationContext is the IoC container: it loads bean definitions, builds the whole graph in dependency order at startup, applies lifecycle callbacks and proxy-based AOP, and fails fast if the graph can't be satisfied. IoC also shows up beyond DI — template callbacks and lifecycle hooks are IoC too.</p></div></details>
+
+<details class="qa"><summary>Why is constructor injection preferred over field injection?</summary><div class="answer"><p>Constructor injection allows <code>final</code> fields (immutability and safe publication), makes required dependencies explicit in the type's API, guarantees the object is never observable half-initialized, and keeps the class testable with plain <code>new</code> — no container or reflection utilities. It also fails fast on circular dependencies, surfacing design smells, and a bloated constructor creates visible pressure to refactor. Field injection hides dependencies, requires reflection to test, can't be final, and NPEs if the class is instantiated outside Spring. In practice: <code>@RequiredArgsConstructor</code> + final fields; since Spring 4.3 a single constructor needs no <code>@Autowired</code>.</p></div></details>
+
+<details class="qa"><summary>How does @Autowired actually work under the hood?</summary><div class="answer"><p>It's not compiler magic — it's a <code>BeanPostProcessor</code>. <code>AutowiredAnnotationBeanPostProcessor</code> inspects each bean's class during the population phase, finds annotated members/constructors, resolves matching beans from the factory by type (then qualifier/name), and injects them reflectively. That's also why the mechanism is extensible — <code>@PostConstruct</code> is handled by <code>CommonAnnotationBeanPostProcessor</code>, and AOP proxying by another post-processor. Knowing that Spring's annotations are implemented via the container's own extension points is the senior-level framing.</p></div></details>
+
+<details class="qa"><summary>Difference between @Component, @Service, @Repository, and @Controller?</summary><div class="answer"><p>All are meta-annotated with <code>@Component</code> and picked up by component scanning. <code>@Service</code> is purely semantic today. <code>@Repository</code> adds real behavior: persistence exception translation — a post-processor proxies it so vendor-specific exceptions (SQL/Hibernate) become Spring's unchecked, vendor-neutral <code>DataAccessException</code> hierarchy (<code>DuplicateKeyException</code>, etc.). <code>@Controller</code> is detected by MVC as a request handler; <code>@RestController</code> adds <code>@ResponseBody</code>, so return values are written to the response body as JSON instead of resolved as views.</p></div></details>
+
+<details class="qa"><summary>Walk me through the Spring bean lifecycle.</summary><div class="answer"><p>Definitions are loaded first (scanning, <code>@Bean</code> methods, auto-config), then <code>BeanFactoryPostProcessor</code>s can modify definitions before anything is instantiated. Per bean, in dependency order: constructor (instantiation, constructor deps injected) → property population (<code>@Autowired</code> fields/setters) → Aware callbacks → <code>BeanPostProcessor.postProcessBeforeInitialization</code> → init callbacks in order <code>@PostConstruct</code>, <code>afterPropertiesSet()</code>, custom init-method → <code>postProcessAfterInitialization</code>, <strong>where AOP proxies are created</strong> → bean ready. On context close: <code>@PreDestroy</code>, <code>destroy()</code>, custom destroy-method. The key insight is proxy creation at post-init: it explains why <code>@PostConstruct</code> sees the raw object and why self-invocation bypasses <code>@Transactional</code>.</p></div></details>
+
+<details class="qa"><summary>Why must singleton beans be stateless, and what scope alternatives exist?</summary><div class="answer"><p>Singleton (the default) means one instance per container shared by every consumer — in a web app that instance is hit by many request threads concurrently, so mutable instance fields are race conditions. Keep state in method parameters, the database, or appropriately scoped beans. Alternatives: <code>prototype</code> (new instance per retrieval — but the container doesn't manage its destruction), and web scopes <code>request</code>/<code>session</code>/<code>application</code>, which need scoped proxies to be injectable into singletons. I'd also note Spring's singleton is per-container, not the GoF per-JVM singleton.</p></div></details>
+
+<details class="qa"><summary>What happens when you inject a prototype bean into a singleton, and how do you fix it?</summary><div class="answer"><p>Injection happens once, at singleton creation — so the "prototype" is captured and reused forever, effectively becoming a singleton; if it's stateful, requests share state. Fixes: inject <code>ObjectProvider&lt;T&gt;</code> and call <code>getObject()</code> per use (preferred), a <code>@Lookup</code> method (CGLIB overrides it to fetch a fresh bean), or a scoped proxy. Or step back: if the object is just a stateful helper needing no injection, don't make it a bean — <code>new</code> it.</p></div></details>
+
+<details class="qa"><summary>How does a request-scoped bean get injected into a singleton that's created before any request exists?</summary><div class="answer"><p>Via a scoped proxy (<code>proxyMode = ScopedProxyMode.TARGET_CLASS</code>). The singleton receives a stable CGLIB proxy at startup; on each method call the proxy resolves the real instance bound to the current request from <code>RequestContextHolder</code> (ThreadLocal-backed). Without the proxy you'd get a startup failure because there's no request scope active during wiring.</p></div></details>
+
+<details class="qa"><summary>Explain @Configuration full mode vs lite mode.</summary><div class="answer"><p>By default (<code>proxyBeanMethods = true</code>, "full mode") a <code>@Configuration</code> class is subclassed by CGLIB; calls between <code>@Bean</code> methods are intercepted and return the cached container singleton, preserving singleton semantics. With <code>proxyBeanMethods = false</code> ("lite mode") there's no proxy — faster startup, native-image friendly — but a direct <code>@Bean</code> method call executes the body and creates a new instance. Rule: in lite mode (which all of Boot's own auto-configurations use), never call <code>@Bean</code> methods directly; declare dependencies as method parameters. <code>@Bean</code> methods on plain <code>@Component</code> classes are always lite.</p></div></details>
+
+<details class="qa"><summary>How do you handle a circular dependency between two beans?</summary><div class="answer"><p>With constructor injection it fails fast at startup (<code>BeanCurrentlyInCreationException</code>) — which I treat as useful feedback: a cycle usually means a missing abstraction. Best fix is redesign: extract the shared piece into a third bean, or break one direction with application events. Tactical fix: <code>@Lazy</code> on one constructor parameter injects a resolve-on-first-use proxy. Last resort: setter injection for one edge plus <code>spring.main.allow-circular-references=true</code> — which Boot 2.6+ disables by default precisely because early-reference wiring can expose a half-initialized bean.</p></div></details>
+
+<details class="qa"><summary>How does Spring choose when multiple beans implement the same interface?</summary><div class="answer"><p>It can't by type alone — <code>NoUniqueBeanDefinitionException</code>. Resolution: <code>@Primary</code> marks a global default; <code>@Qualifier("name")</code> at the injection point overrides it; a parameter/field name matching a bean name is a fallback tiebreaker. Alternatively inject the whole set — <code>List&lt;T&gt;</code> or <code>Map&lt;String,T&gt;</code> (keyed by bean name) — and select at runtime, which is the idiomatic strategy-pattern implementation: adding an implementation is just adding a class, no dispatch code to edit.</p></div></details>
+
+<details class="qa"><summary>How does Spring Boot auto-configuration work? (the big one)</summary><div class="answer"><p><code>@SpringBootApplication</code> includes <code>@EnableAutoConfiguration</code>, which imports <code>AutoConfigurationImportSelector</code>. The selector reads <code>META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports</code> from every jar (pre-2.7: <code>spring.factories</code>; removed for auto-config in Boot 3) to get candidate <code>@AutoConfiguration</code> classes. Each is fenced with conditions: <code>@ConditionalOnClass</code> reacts to what starters put on the classpath, <code>@ConditionalOnMissingBean</code> makes defaults back off when the user defines their own bean, <code>@ConditionalOnProperty</code> gates on config. They're processed after user configuration and ordered via <code>@AutoConfiguration(before/after)</code>, binding settings via <code>@ConfigurationProperties</code>. Example: <code>DataSourceAutoConfiguration</code> creates a Hikari pool from <code>spring.datasource.*</code> iff JDBC and Hikari are on the classpath and no user <code>DataSource</code> exists. Debug with <code>debug=true</code> → condition evaluation report.</p></div></details>
+
+<details class="qa"><summary>How do you override a bean that auto-configuration provides?</summary><div class="answer"><p>Just declare your own <code>@Bean</code> of that type. Auto-configurations guard their defaults with <code>@ConditionalOnMissingBean</code> and are evaluated after user configuration, so the default detects your bean and never registers — "backing off." No flags or ceremony. If I want an entire auto-configuration gone (not just one bean), I exclude it: <code>@SpringBootApplication(exclude = ...)</code> or <code>spring.autoconfigure.exclude</code>. And I verify with the <code>debug=true</code> report or the actuator <code>/conditions</code> endpoint.</p></div></details>
+
+<details class="qa"><summary>What is a Spring Boot starter, really?</summary><div class="answer"><p>Essentially a code-less pom: a curated, version-coherent bundle of dependencies for one capability. <code>spring-boot-starter-web</code> pulls in Boot core + Jackson + embedded Tomcat + spring-web/webmvc. Starters work <em>with</em> auto-configuration as a pair: the starter puts classes on the classpath; <code>@ConditionalOnClass</code> in auto-config detects them and configures beans. Versions come from the Boot BOM so the whole matrix is integration-tested — you swap components by exclusion (Tomcat → Jetty) rather than by version wrangling.</p></div></details>
+
+<details class="qa"><summary>Explain Spring Boot's configuration precedence order.</summary><div class="answer"><p>Later/outer sources override earlier/inner ones. The list to give, highest first: command-line args → <code>SPRING_APPLICATION_JSON</code> → Java system properties → OS environment variables → profile-specific config files outside the jar → non-profile files outside → profile-specific inside the jar → <code>application.yml</code> inside → <code>@PropertySource</code> → coded defaults. Two rules of thumb cover 95%: "command line beats env vars beat files," and "profile-specific beats the base file." Plus relaxed binding: <code>SPRING_DATASOURCE_URL</code> binds to <code>spring.datasource.url</code>, making 12-factor env-based config free.</p></div></details>
+
+<details class="qa"><summary>@ConfigurationProperties vs @Value — when do you use each?</summary><div class="answer"><p><code>@Value</code> for a genuinely one-off scalar. For any coherent group: a <code>@ConfigurationProperties</code> record with a prefix — typed binding of the whole tree (including Durations, lists, nested objects), relaxed binding, IDE metadata, and crucially Bean-Validation via <code>@Validated</code> so bad config fails <em>startup</em>, not a 3 a.m. request. Records give immutable constructor binding in Boot 3, and the properties object is trivially constructible in tests. <code>@Value</code>'s one unique power is SpEL expressions.</p></div></details>
+
+<details class="qa"><summary>Why does "bean not found" happen for a class that clearly has @Service on it?</summary><div class="answer"><p>Almost always a component-scan miss: <code>@SpringBootApplication</code>'s implied <code>@ComponentScan</code> starts at the main class's package and scans <em>downward</em> only. A <code>@Service</code> in a sibling or parent package is never registered. Fix by moving the class under the root package (preferred convention) or widening with <code>scanBasePackages</code>. Related variants: JPA entities/repositories outside the default packages need <code>@EntityScan</code>/<code>@EnableJpaRepositories</code>; or the bean exists but is fenced off by a <code>@Profile</code>/<code>@Conditional</code> that didn't match — the <code>debug=true</code> report shows which.</p></div></details>
+
+<details class="qa"><summary>Why does calling a @Transactional method from another method of the same class not start a transaction?</summary><div class="answer"><p>Because <code>@Transactional</code> is implemented by a proxy created around the bean at post-initialization. Other beans hold the proxy, so external calls are intercepted; but inside the class, <code>this.method()</code> is a direct call on the raw target — the proxy never sees it, so no transactional advice runs. Same story for <code>@Cacheable</code> and <code>@Async</code>. Fixes: move the transactional method to a separate bean (best — usually a cohesion smell anyway), or self-inject the proxy / use <code>TransactionTemplate</code> programmatically. Root cause in one phrase: Spring AOP is proxy-based, not bytecode weaving.</p></div></details>
+
+<details class="qa"><summary>BeanFactory vs ApplicationContext?</summary><div class="answer"><p><code>BeanFactory</code> is the core container SPI — definitions, creation, lookup, lazy by default. <code>ApplicationContext</code> extends it and is what applications actually use: it auto-registers <code>BeanPostProcessor</code>s, adds event publishing, i18n <code>MessageSource</code>, the Environment/property abstraction, resource loading — and eagerly pre-instantiates singletons so misconfiguration fails at startup rather than first use. Boot picks the concrete type by app flavor (e.g. <code>AnnotationConfigServletWebServerApplicationContext</code>). You'd only touch a bare BeanFactory when building framework-level tooling.</p></div></details>
+
+<details class="qa"><summary>What are Spring application events, and when would you use them over a direct call?</summary><div class="answer"><p>In-process, typed pub/sub: inject <code>ApplicationEventPublisher</code>, publish any object (records work well), and any bean with a matching <code>@EventListener</code> method receives it — dispatched by type. Use them to decouple side effects from core flows (order placed → send email, update analytics) so the publisher doesn't accumulate dependencies on every consumer, and new reactions are added without touching the publisher. Caveats: listeners are synchronous and in the publisher's thread — and transaction — by default; use <code>@Async</code> for off-thread, and <code>@TransactionalEventListener(AFTER_COMMIT)</code> so side effects only fire when the data actually committed. For cross-service communication you'd graduate to a real broker.</p></div></details>
+
+<details class="qa"><summary>How do you secure Actuator endpoints in production?</summary><div class="answer"><p>Default HTTP exposure is health-only; keep the allowlist deliberate via <code>management.endpoints.web.exposure.include</code> — never <code>"*"</code> facing the internet, since <code>/env</code> and <code>/heapdump</code> can leak secrets. Standard layers: expose only health/info/metrics/prometheus; move actuator to a separate management port firewalled to the cluster; require a role via Spring Security (<code>EndpointRequest.toAnyEndpoint()</code> matcher) for anything sensitive; <code>show-details: when_authorized</code> on health. For Kubernetes, use the dedicated liveness/readiness health groups as probe targets.</p></div></details>
+
+<details class="qa"><summary>What actually happens inside SpringApplication.run()?</summary><div class="answer"><p>High level: deduce application type from the classpath (servlet vs reactive vs none) → prepare the Environment (merge property sources, resolve profiles) → create the matching ApplicationContext → register bean definitions from scanning, user configuration, and auto-configuration imports → <code>refresh()</code>: run factory post-processors and condition evaluation, instantiate all singletons through the bean lifecycle, and — for a web app — create and start the embedded server and register the DispatcherServlet as part of refresh → publish ready events and invoke <code>CommandLineRunner</code>/<code>ApplicationRunner</code> beans. The embedded server being a bean created during refresh is the detail worth naming.</p></div></details>
+
+<details class="qa"><summary>CommandLineRunner vs ApplicationRunner vs @PostConstruct for startup work?</summary><div class="answer"><p><code>@PostConstruct</code> runs per-bean, mid-wiring — fine for initializing <em>that bean's own</em> state, wrong for app-level tasks (other beans may not exist yet; proxies may not be applied). Runners execute once after the entire context is ready and the server is up — the right place for seed data, warmups, and startup validation; they can safely use any bean including transactional ones. The two runner interfaces differ only in argument style: raw <code>String...</code> vs parsed <code>ApplicationArguments</code> (<code>--option=value</code> access). Order multiple runners with <code>@Order</code>; an exception from a runner aborts startup.</p></div></details>
+
+<details class="qa"><summary>What does spring.main.lazy-initialization=true trade away?</summary><div class="answer"><p>It defers all bean creation to first use, cutting startup time — attractive in dev. The costs: you lose fail-fast (a misconfigured bean now explodes on the first request that needs it, in production, instead of in the deploy pipeline), and first-hit latency spikes as beans construct on demand. Sensible middle ground: keep eager init in production, use targeted <code>@Lazy</code> on a few genuinely heavy, rarely-used beans, and attack startup time with excluded auto-configs, CDS, or — where cold start really matters — GraalVM native images via Boot 3 AOT.</p></div></details>
+
+<details class="qa"><summary>Coming from frontend: is Spring DI just Angular DI on the server?</summary><div class="answer"><p>Directionally yes — same core idea (declare dependencies, container resolves them; tokens/types, hierarchical resolution, singleton-by-default). Key differences worth naming: Spring resolves the <em>entire</em> graph eagerly at startup and fails fast, rather than lazily at injection time; Spring beans have a rich managed lifecycle (<code>@PostConstruct</code>/<code>@PreDestroy</code>, post-processors); and — the big one — Spring uses DI as the delivery mechanism for proxy-based AOP: transactions, caching, security are woven around beans by the container. React context is a weaker analogy: value propagation only, no lifecycle, no interception, resolution at render time.</p></div></details>
+
+<!-- ============================================================ -->
+<h2 id="exercises">Hands-on exercises</h2>
+
+<div class="exercise">
+  <h4>Exercise 1 — DI by hand, then let Spring take over</h4>
+  <p>Without Spring: define <code>interface Notifier { void send(String msg); }</code>, an <code>EmailNotifier</code> implementation, and a <code>SignupService</code> that depends on <code>Notifier</code> via constructor. Wire them manually in <code>main</code> and write a plain JUnit test using a hand-rolled fake. Then convert to Spring Boot: annotate, delete the manual wiring, and add a <code>CommandLineRunner</code> that triggers a signup. Verify the unit test still passes <em>unchanged</em>.</p>
+  <details><summary>Solution</summary>
+<pre><code><span class="com">// Plain Java — no framework</span>
+<span class="kw">public interface</span> <span class="typ">Notifier</span> { <span class="kw">void</span> send(<span class="typ">String</span> msg); }
+
+<span class="kw">public class</span> <span class="typ">SignupService</span> {
+    <span class="kw">private final</span> <span class="typ">Notifier</span> notifier;
+    <span class="kw">public</span> <span class="typ">SignupService</span>(<span class="typ">Notifier</span> notifier) { <span class="kw">this</span>.notifier = notifier; }
+    <span class="kw">public void</span> signup(<span class="typ">String</span> email) { notifier.send(<span class="str">"Welcome "</span> + email); }
+}
+
+<span class="com">// Test — needs no Spring, before OR after the conversion</span>
+<span class="ann">@Test</span> <span class="kw">void</span> sendsWelcome() {
+    <span class="typ">List</span>&lt;<span class="typ">String</span>&gt; sent = <span class="kw">new</span> <span class="typ">ArrayList</span>&lt;&gt;();
+    <span class="typ">SignupService</span> svc = <span class="kw">new</span> <span class="typ">SignupService</span>(sent::add);   <span class="com">// lambda fake!</span>
+    svc.signup(<span class="str">"a@b.com"</span>);
+    assertEquals(<span class="typ">List</span>.of(<span class="str">"Welcome a@b.com"</span>), sent);
+}
+
+<span class="com">// Spring version: just annotations — the test above is untouched</span>
+<span class="ann">@Component</span> <span class="kw">class</span> <span class="typ">EmailNotifier</span> <span class="kw">implements</span> <span class="typ">Notifier</span> {
+    <span class="kw">public void</span> send(<span class="typ">String</span> msg) { <span class="typ">System</span>.out.println(<span class="str">"EMAIL: "</span> + msg); }
+}
+<span class="ann">@Service</span> <span class="ann">@RequiredArgsConstructor</span>
+<span class="kw">class</span> <span class="typ">SignupService</span> { <span class="kw">private final</span> <span class="typ">Notifier</span> notifier; <span class="com">/* as before */</span> }
+
+<span class="ann">@Component</span> <span class="ann">@RequiredArgsConstructor</span>
+<span class="kw">class</span> <span class="typ">Demo</span> <span class="kw">implements</span> <span class="typ">CommandLineRunner</span> {
+    <span class="kw">private final</span> <span class="typ">SignupService</span> svc;
+    <span class="kw">public void</span> run(<span class="typ">String</span>... args) { svc.signup(<span class="str">"demo@acme.com"</span>); }
+}</code></pre>
+  <p>The takeaway: constructor injection means Spring is an <em>assembly</em> concern only — the classes and their tests are framework-free.</p>
+  </details>
+</div>
+
+<div class="exercise">
+  <h4>Exercise 2 — Strategy pattern via collection injection</h4>
+  <p>Build a <code>DiscountEngine</code> with a <code>DiscountRule</code> interface (<code>boolean applies(Order o); BigDecimal discount(Order o);</code>) and three implementations (bulk order, first purchase, seasonal — seasonal only active when property <code>discounts.seasonal.enabled=true</code>). The engine must apply all applicable rules and require zero changes when a fourth rule is added.</p>
+  <details><summary>Solution</summary>
+<pre><code><span class="kw">public interface</span> <span class="typ">DiscountRule</span> {
+    <span class="kw">boolean</span> applies(<span class="typ">Order</span> o);
+    <span class="typ">BigDecimal</span> discount(<span class="typ">Order</span> o);
+}
+
+<span class="ann">@Component</span> <span class="kw">class</span> <span class="typ">BulkOrderRule</span> <span class="kw">implements</span> <span class="typ">DiscountRule</span> {
+    <span class="kw">public boolean</span> applies(<span class="typ">Order</span> o)  { <span class="kw">return</span> o.itemCount() &gt;= <span class="num">10</span>; }
+    <span class="kw">public</span> <span class="typ">BigDecimal</span> discount(<span class="typ">Order</span> o) { <span class="kw">return</span> o.total().multiply(<span class="kw">new</span> <span class="typ">BigDecimal</span>(<span class="str">"0.05"</span>)); }
+}
+
+<span class="ann">@Component</span> <span class="kw">class</span> <span class="typ">FirstPurchaseRule</span> <span class="kw">implements</span> <span class="typ">DiscountRule</span> { <span class="com">/* ... */</span> }
+
+<span class="ann">@Component</span>
+<span class="ann">@ConditionalOnProperty</span>(name = <span class="str">"discounts.seasonal.enabled"</span>, havingValue = <span class="str">"true"</span>)
+<span class="kw">class</span> <span class="typ">SeasonalRule</span> <span class="kw">implements</span> <span class="typ">DiscountRule</span> { <span class="com">/* ... */</span> }
+
+<span class="ann">@Service</span>
+<span class="ann">@RequiredArgsConstructor</span>
+<span class="kw">public class</span> <span class="typ">DiscountEngine</span> {
+    <span class="kw">private final</span> <span class="typ">List</span>&lt;<span class="typ">DiscountRule</span>&gt; rules;  <span class="com">// Spring injects ALL registered impls</span>
+
+    <span class="kw">public</span> <span class="typ">BigDecimal</span> totalDiscount(<span class="typ">Order</span> o) {
+        <span class="kw">return</span> rules.stream()
+            .filter(r -&gt; r.applies(o))
+            .map(r -&gt; r.discount(o))
+            .reduce(<span class="typ">BigDecimal</span>.ZERO, <span class="typ">BigDecimal</span>::add);
+    }
+}</code></pre>
+  <p>Adding rule #4 = one new class. The <code>@ConditionalOnProperty</code> rule simply isn't in the injected list when disabled — the engine never knows.</p>
+  </details>
+</div>
+
+<div class="exercise">
+  <h4>Exercise 3 — Write your own auto-configuration</h4>
+  <p>Create a tiny "audit" library module: an <code>AuditLogger</code> class (not annotated!), an auto-configuration that registers it only if the property <code>audit.enabled=true</code> and no user-defined <code>AuditLogger</code> bean exists, and the Boot 3 imports file. Then, in an app using the library, prove back-off by defining your own <code>AuditLogger</code> bean and checking which one wins with <code>debug=true</code>.</p>
+  <details><summary>Solution</summary>
+<pre><code><span class="com">// library: plain class, deliberately NOT @Component (libraries shouldn't rely on scanning)</span>
+<span class="kw">public class</span> <span class="typ">AuditLogger</span> {
+    <span class="kw">public void</span> record(<span class="typ">String</span> action) { <span class="typ">System</span>.out.println(<span class="str">"AUDIT: "</span> + action); }
+}
+
+<span class="com">// library: the auto-configuration</span>
+<span class="ann">@AutoConfiguration</span>
+<span class="ann">@ConditionalOnProperty</span>(name = <span class="str">"audit.enabled"</span>, havingValue = <span class="str">"true"</span>)
+<span class="kw">public class</span> <span class="typ">AuditAutoConfiguration</span> {
+    <span class="ann">@Bean</span>
+    <span class="ann">@ConditionalOnMissingBean</span>          <span class="com">// ← the back-off contract</span>
+    <span class="typ">AuditLogger</span> auditLogger() { <span class="kw">return new</span> <span class="typ">AuditLogger</span>(); }
+}</code></pre>
+<pre><code><span class="com"># library file: src/main/resources/META-INF/spring/</span>
+<span class="com">#   org.springframework.boot.autoconfigure.AutoConfiguration.imports</span>
+com.acme.audit.AuditAutoConfiguration</code></pre>
+<pre><code><span class="com">// consuming app — this bean makes the auto-configured one back off</span>
+<span class="ann">@Configuration</span>
+<span class="kw">class</span> <span class="typ">MyAuditConfig</span> {
+    <span class="ann">@Bean</span> <span class="typ">AuditLogger</span> auditLogger() { <span class="kw">return new</span> <span class="typ">JsonAuditLogger</span>(); }
+}
+<span class="com">// With debug=true, the report shows AuditAutoConfiguration under</span>
+<span class="com">// "Negative matches": @ConditionalOnMissingBean found bean 'auditLogger'.</span></code></pre>
+  <p>You've now reproduced the exact mechanism <code>DataSourceAutoConfiguration</code> uses — perfect interview show-and-tell.</p>
+  </details>
+</div>
+
+<div class="exercise">
+  <h4>Exercise 4 — Typed, validated configuration</h4>
+  <p>Model this YAML as an immutable <code>@ConfigurationProperties</code> record with validation: prefix <code>mail</code>, required non-blank <code>host</code>, port 1–65535, <code>Duration timeout</code> defaulting to 5s, and a nested <code>retry</code> object (<code>maxAttempts</code> 1–10, <code>backoff</code> Duration). Make a wrong port fail at startup, and unit-test the record without Spring.</p>
+  <details><summary>Solution</summary>
+<pre><code><span class="ann">@ConfigurationProperties</span>(prefix = <span class="str">"mail"</span>)
+<span class="ann">@Validated</span>
+<span class="kw">public record</span> <span class="typ">MailProperties</span>(
+    <span class="ann">@NotBlank</span> <span class="typ">String</span> host,
+    <span class="ann">@Min</span>(<span class="num">1</span>) <span class="ann">@Max</span>(<span class="num">65535</span>) <span class="kw">int</span> port,
+    <span class="ann">@DefaultValue</span>(<span class="str">"5s"</span>) <span class="typ">Duration</span> timeout,
+    <span class="ann">@Valid</span> <span class="typ">Retry</span> retry                      <span class="com">// @Valid cascades into nested record</span>
+) {
+    <span class="kw">public record</span> <span class="typ">Retry</span>(<span class="ann">@Min</span>(<span class="num">1</span>) <span class="ann">@Max</span>(<span class="num">10</span>) <span class="kw">int</span> maxAttempts, <span class="typ">Duration</span> backoff) {}
+}
+<span class="com">// register: @ConfigurationPropertiesScan on the app class</span></code></pre>
+<pre><code>mail:
+  host: smtp.acme.com
+  port: 587
+  retry:
+    max-attempts: 3        <span class="com"># relaxed binding → maxAttempts</span>
+    backoff: 200ms</code></pre>
+<pre><code><span class="com">// port: 99999 → startup fails with a BindValidationException listing the</span>
+<span class="com">// property, the value, and the violated constraint. Fail fast, not at send time.</span>
+
+<span class="com">// Unit test — no Spring context needed, it's just a record:</span>
+<span class="ann">@Test</span> <span class="kw">void</span> retryConfigIsUsable() {
+    <span class="kw">var</span> props = <span class="kw">new</span> <span class="typ">MailProperties</span>(<span class="str">"h"</span>, <span class="num">587</span>, <span class="typ">Duration</span>.ofSeconds(<span class="num">5</span>),
+        <span class="kw">new</span> <span class="typ">MailProperties</span>.<span class="typ">Retry</span>(<span class="num">3</span>, <span class="typ">Duration</span>.ofMillis(<span class="num">200</span>)));
+    assertEquals(<span class="num">3</span>, props.retry().maxAttempts());
+}</code></pre>
+  </details>
+</div>
+
+<div class="exercise">
+  <h4>Exercise 5 — Lifecycle + events + health, end to end</h4>
+  <p>Build a <code>FeatureFlagService</code> that (a) loads flags in <code>@PostConstruct</code>, (b) publishes a <code>FlagsReloadedEvent</code> whenever flags reload, (c) has a listener logging each reload, and (d) exposes a custom <code>HealthIndicator</code> reporting DOWN if flags have never loaded. Predict the startup log order before running.</p>
+  <details><summary>Solution</summary>
+<pre><code><span class="kw">public record</span> <span class="typ">FlagsReloadedEvent</span>(<span class="kw">int</span> count, <span class="typ">Instant</span> at) {}
+
+<span class="ann">@Service</span>
+<span class="ann">@RequiredArgsConstructor</span>
+<span class="kw">public class</span> <span class="typ">FeatureFlagService</span> {
+    <span class="kw">private final</span> <span class="typ">ApplicationEventPublisher</span> events;
+    <span class="kw">private final</span> <span class="typ">AtomicReference</span>&lt;<span class="typ">Map</span>&lt;<span class="typ">String</span>, <span class="typ">Boolean</span>&gt;&gt; flags =
+        <span class="kw">new</span> <span class="typ">AtomicReference</span>&lt;&gt;();   <span class="com">// singleton + concurrent reads → atomic swap, no locks</span>
+
+    <span class="ann">@PostConstruct</span>
+    <span class="kw">void</span> initialLoad() { reload(); }
+
+    <span class="kw">public void</span> reload() {
+        <span class="typ">Map</span>&lt;<span class="typ">String</span>, <span class="typ">Boolean</span>&gt; loaded = fetchFromSource();
+        flags.set(<span class="typ">Map</span>.copyOf(loaded));
+        events.publishEvent(<span class="kw">new</span> <span class="typ">FlagsReloadedEvent</span>(loaded.size(), <span class="typ">Instant</span>.now()));
+    }
+
+    <span class="kw">public boolean</span> isLoaded() { <span class="kw">return</span> flags.get() != <span class="kw">null</span>; }
+}
+
+<span class="ann">@Component</span>
+<span class="kw">class</span> <span class="typ">FlagAuditListener</span> {
+    <span class="ann">@EventListener</span>
+    <span class="kw">void</span> on(<span class="typ">FlagsReloadedEvent</span> e) { log.info(<span class="str">"{} flags loaded at {}"</span>, e.count(), e.at()); }
+}
+
+<span class="ann">@Component</span>
+<span class="ann">@RequiredArgsConstructor</span>
+<span class="kw">class</span> <span class="typ">FeatureFlagHealthIndicator</span> <span class="kw">implements</span> <span class="typ">HealthIndicator</span> {
+    <span class="kw">private final</span> <span class="typ">FeatureFlagService</span> flags;
+    <span class="ann">@Override</span> <span class="kw">public</span> <span class="typ">Health</span> health() {
+        <span class="kw">return</span> flags.isLoaded() ? <span class="typ">Health</span>.up().build()
+                                : <span class="typ">Health</span>.down().withDetail(<span class="str">"reason"</span>, <span class="str">"flags never loaded"</span>).build();
+    }
+}</code></pre>
+  <p><strong>Order prediction:</strong> the service's constructor → its <code>@PostConstruct</code> (which publishes the event; the listener bean is created on demand if needed and receives it <em>synchronously</em>, so the listener log prints during the service's initialization) → context finishes refresh → health endpoint reports UP. One subtlety worth noticing: the <code>@PostConstruct</code>-time event fires while the context is still starting — listeners must not assume the whole app is ready. If that matters, publish from an <code>ApplicationRunner</code> instead, or listen for <code>ApplicationReadyEvent</code>.</p>
+  </details>
+</div>
+
+<nav class="page-nav">
+  <a href="04-java-jvm.html">← Prev: JVM Internals</a>
+  <a href="06-spring-rest-api.html">Next: REST API Layer →</a>
+</nav>
+</main>
+</body>
+</html>

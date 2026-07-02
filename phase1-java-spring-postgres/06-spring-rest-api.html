@@ -1,0 +1,1083 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>06 — REST API Layer | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header"><div class="container"><div class="breadcrumb"><a href="index.html">← Course Home</a></div><h1>06 — REST API Layer</h1><p>The other side of <code>fetch()</code>: building the endpoints you've been calling for seven years</p></div></header>
+<main class="container">
+
+<p>You have spent years on the consumer side of HTTP: writing <code>fetch()</code> calls, wiring React Query, cursing at CORS errors, and reverse-engineering inconsistent error payloads. This chapter flips the table. Interviewers for senior Java roles probe the web layer hard because it is where <em>design judgment</em> shows: anyone can annotate a method with <code>@GetMapping</code>, but seniors are expected to defend DTO boundaries, produce a consistent error contract, pick correct status codes, explain the request pipeline, and know exactly why that CORS preflight fails. Your frontend experience is a genuine advantage here — you know what a <em>good</em> API feels like to consume. Now you learn to build one, and to explain every layer between the socket and your controller method.</p>
+
+<div class="toc"><strong>On this page</strong><ol>
+<li><a href="#controllers">Controllers &amp; request mapping</a></li>
+<li><a href="#jackson">Jackson: how JSON (de)serialization actually happens</a></li>
+<li><a href="#dto">The DTO pattern: never expose entities</a></li>
+<li><a href="#exceptions">Global exception handling &amp; ProblemDetail</a></li>
+<li><a href="#validation">Bean Validation (jakarta.validation)</a></li>
+<li><a href="#rest-design">REST design at senior level</a></li>
+<li><a href="#response-entity">ResponseEntity &amp; content negotiation</a></li>
+<li><a href="#pipeline">The request pipeline: Filter → DispatcherServlet → Interceptor</a></li>
+<li><a href="#cors">CORS — from the backend side this time</a></li>
+<li><a href="#clients">Calling other services, files, HATEOAS, OpenAPI</a></li>
+<li><a href="#qa">Interview Q&amp;A</a></li>
+<li><a href="#exercises">Hands-on exercises</a></li>
+</ol></div>
+
+<!-- ============================================================ -->
+<h2 id="controllers">Controllers &amp; request mapping <span class="tier tier-1">T1</span></h2>
+
+<h3>@RestController vs @Controller</h3>
+<p>Both are stereotypes (specializations of <code>@Component</code>, so they get picked up by component scanning — see chapter 05). The difference is what happens to a handler method's <em>return value</em>:</p>
+<ul>
+<li><strong><code>@Controller</code></strong> — the classic Spring MVC stereotype. By default, the return value (a <code>String</code>, typically) is interpreted as a <em>view name</em>, resolved by a <code>ViewResolver</code> to a server-rendered template (Thymeleaf, JSP). This is the pre-SPA world.</li>
+<li><strong><code>@ResponseBody</code></strong> — placed on a method (or class), it says: "do not resolve a view; instead serialize the return value directly into the HTTP response body via an <code>HttpMessageConverter</code>."</li>
+<li><strong><code>@RestController</code></strong> — literally just <code>@Controller + @ResponseBody</code> as a meta-annotation. Every method's return value goes to the body. This is what you use for JSON APIs, i.e. everything you've ever consumed from React.</li>
+</ul>
+
+<pre><code><span class="com">// The two are equivalent:</span>
+
+<span class="ann">@Controller</span>
+<span class="kw">public class</span> <span class="typ">UserHtmlController</span> {
+    <span class="ann">@GetMapping</span>(<span class="str">"/users/{id}"</span>)
+    <span class="kw">public</span> String userPage(<span class="ann">@PathVariable</span> Long id, Model model) {
+        model.addAttribute(<span class="str">"user"</span>, service.find(id));
+        <span class="kw">return</span> <span class="str">"user-detail"</span>;   <span class="com">// view name → templates/user-detail.html</span>
+    }
+
+    <span class="ann">@GetMapping</span>(<span class="str">"/api/legacy/users/{id}"</span>)
+    <span class="ann">@ResponseBody</span>                     <span class="com">// opt this ONE method into body serialization</span>
+    <span class="kw">public</span> UserResponse userJson(<span class="ann">@PathVariable</span> Long id) {
+        <span class="kw">return</span> service.find(id);      <span class="com">// serialized to JSON by Jackson</span>
+    }
+}
+
+<span class="ann">@RestController</span>                       <span class="com">// = @Controller + @ResponseBody on the class</span>
+<span class="ann">@RequestMapping</span>(<span class="str">"/api/users"</span>)         <span class="com">// class-level prefix, combined with method paths</span>
+<span class="kw">public class</span> <span class="typ">UserController</span> {
+    <span class="com">// every method's return value → response body</span>
+}
+</code></pre>
+
+<div class="senior"><p>Interview soundbite: "<code>@RestController</code> is a convenience meta-annotation combining <code>@Controller</code> and <code>@ResponseBody</code>. The real mechanism is <code>@ResponseBody</code>, which routes the return value through the <code>HttpMessageConverter</code> chain instead of the view-resolution pipeline." Naming the actual mechanism (message converters) is what separates a senior answer from a memorized one.</p></div>
+
+<h3>Mapping annotations</h3>
+<p><code>@RequestMapping(method = RequestMethod.GET)</code> is the general form; the HTTP-verb shortcuts are what everyone writes:</p>
+<table>
+<thead><tr><th>Annotation</th><th>Verb</th><th>Typical use</th></tr></thead>
+<tbody>
+<tr><td><code>@GetMapping</code></td><td>GET</td><td>Read a resource / collection</td></tr>
+<tr><td><code>@PostMapping</code></td><td>POST</td><td>Create; non-idempotent actions</td></tr>
+<tr><td><code>@PutMapping</code></td><td>PUT</td><td>Full replace (idempotent)</td></tr>
+<tr><td><code>@PatchMapping</code></td><td>PATCH</td><td>Partial update</td></tr>
+<tr><td><code>@DeleteMapping</code></td><td>DELETE</td><td>Delete (idempotent)</td></tr>
+</tbody>
+</table>
+
+<h3>Binding pieces of the request: the full menu</h3>
+<p>Think of each annotation as answering "which part of the HTTP request feeds this parameter?" — the same request you used to assemble on the React side with template strings and <code>JSON.stringify</code>:</p>
+
+<pre><code><span class="ann">@RestController</span>
+<span class="ann">@RequestMapping</span>(<span class="str">"/api/orders"</span>)
+<span class="kw">public class</span> <span class="typ">OrderController</span> {
+
+    <span class="kw">private final</span> OrderService orderService;
+    <span class="kw">public</span> OrderController(OrderService orderService) { <span class="kw">this</span>.orderService = orderService; }
+
+    <span class="com">// GET /api/orders/42            → path segment → @PathVariable</span>
+    <span class="ann">@GetMapping</span>(<span class="str">"/{id}"</span>)
+    <span class="kw">public</span> OrderResponse one(<span class="ann">@PathVariable</span> <span class="kw">long</span> id) {
+        <span class="kw">return</span> orderService.findById(id);
+    }
+
+    <span class="com">// GET /api/orders?status=SHIPPED&amp;page=0&amp;size=20   → query string → @RequestParam</span>
+    <span class="ann">@GetMapping</span>
+    <span class="kw">public</span> Page&lt;OrderResponse&gt; list(
+            <span class="ann">@RequestParam</span>(required = <span class="kw">false</span>) OrderStatus status,   <span class="com">// optional filter (null if absent)</span>
+            <span class="ann">@RequestParam</span>(defaultValue = <span class="str">"0"</span>) <span class="kw">int</span> page,           <span class="com">// default when absent</span>
+            <span class="ann">@RequestParam</span>(defaultValue = <span class="str">"20"</span>) <span class="kw">int</span> size) {
+        <span class="kw">return</span> orderService.search(status, page, size);
+    }
+
+    <span class="com">// POST /api/orders  with a JSON body       → @RequestBody (deserialized by Jackson)</span>
+    <span class="ann">@PostMapping</span>
+    <span class="ann">@ResponseStatus</span>(HttpStatus.CREATED)
+    <span class="kw">public</span> OrderResponse create(<span class="ann">@Valid @RequestBody</span> CreateOrderRequest request) {
+        <span class="kw">return</span> orderService.create(request);
+    }
+
+    <span class="com">// Header extraction — e.g. a tenant id or an idempotency key</span>
+    <span class="ann">@PostMapping</span>(<span class="str">"/{id}/refund"</span>)
+    <span class="kw">public</span> RefundResponse refund(
+            <span class="ann">@PathVariable</span> <span class="kw">long</span> id,
+            <span class="ann">@RequestHeader</span>(<span class="str">"Idempotency-Key"</span>) String idempotencyKey,
+            <span class="ann">@RequestHeader</span>(value = <span class="str">"X-Tenant-Id"</span>, required = <span class="kw">false</span>) String tenantId) {
+        <span class="kw">return</span> orderService.refund(id, idempotencyKey, tenantId);
+    }
+}
+</code></pre>
+
+<p>Key behaviors interviewers probe:</p>
+<ul>
+<li><strong><code>@RequestParam</code> required by default.</strong> A missing required param → <code>MissingServletRequestParameterException</code> → 400. Make it optional with <code>required = false</code> (use a wrapper type like <code>Integer</code>, not <code>int</code>, or you'll get an <code>IllegalStateException</code> trying to assign null to a primitive) or with <code>defaultValue</code> (which implies not-required). <code>Optional&lt;String&gt;</code> also works.</li>
+<li><strong><code>@PathVariable</code> name matching.</strong> If the parameter name matches the template variable (<code>{id}</code> ↔ <code>long id</code>) you can omit the annotation value — but only if the code is compiled with <code>-parameters</code> (Spring Boot's build plugins do this for you; since Spring 6.1 it fails fast with a clear message otherwise).</li>
+<li><strong><code>@RequestBody</code> reads the body once.</strong> There is exactly one body; you can't have two <code>@RequestBody</code> params. Malformed JSON → <code>HttpMessageNotReadableException</code> → 400.</li>
+<li><strong><code>@ModelAttribute</code></strong> (awareness): binds <em>query/form parameters</em> onto a POJO's setters — the form-post world. For JSON APIs you use <code>@RequestBody</code>; but <code>@ModelAttribute</code> is implicitly what happens when you declare a POJO parameter with no annotation on a GET (handy for binding many filter params into one <code>SearchCriteria</code> object). Know it exists and how it differs: <code>@RequestBody</code> = parse the body with Jackson; <code>@ModelAttribute</code> = bind request parameters via setters, with validation errors going to a <code>BindingResult</code>.</li>
+</ul>
+
+<div class="pitfall"><p>Type-conversion failures are 400s, not 500s: <code>GET /api/orders/abc</code> against <code>@PathVariable long id</code> throws <code>MethodArgumentTypeMismatchException</code>. If your global error handler doesn't map it, Boot's default does — but with a generic message. Handle it explicitly so the frontend gets "id must be a number", not a blob.</p></div>
+
+<div class="note"><p>Mapping from your React mental model: <code>fetch(`/api/orders/${id}?status=${s}`, { method: 'POST', headers: { 'Idempotency-Key': k }, body: JSON.stringify(payload) })</code> decomposes exactly into <code>@PathVariable</code> (the template literal segment), <code>@RequestParam</code> (the query string), <code>@RequestHeader</code> (the headers object), and <code>@RequestBody</code> (the JSON body). Every annotation is one field of the fetch options object.</p></div>
+
+<!-- ============================================================ -->
+<h2 id="jackson">Jackson: how JSON (de)serialization actually happens <span class="tier tier-1">T1</span></h2>
+
+<p>When your React app did <code>await res.json()</code>, someone on the server had already turned a Java object into those bytes. That someone is <strong>Jackson</strong>, invoked by Spring through the <code>HttpMessageConverter</code> abstraction.</p>
+
+<h3>HttpMessageConverter — the actual mechanism</h3>
+<p>Spring MVC keeps a list of converters. For each request/response, it picks one by matching the <strong>Content-Type</strong> (reading) or <strong>Accept</strong> header (writing) against each converter's supported media types, plus the Java type involved:</p>
+<ul>
+<li><code>MappingJackson2HttpMessageConverter</code> — <code>application/json</code> ↔ objects (the one you care about; auto-registered because Jackson is on the classpath via <code>spring-boot-starter-web</code>).</li>
+<li><code>StringHttpMessageConverter</code> — <code>text/plain</code> ↔ <code>String</code>.</li>
+<li><code>ByteArrayHttpMessageConverter</code>, <code>ResourceHttpMessageConverter</code> — binary payloads, file downloads.</li>
+</ul>
+<p>Flow for a POST: body bytes → converter selected by <code>Content-Type: application/json</code> → <code>ObjectMapper.readValue()</code> → your <code>@RequestBody</code> DTO. Flow for the response: your return value → converter selected by content negotiation → <code>ObjectMapper.writeValue()</code> → bytes on the wire.</p>
+
+<div class="pitfall"><p>Classic gotcha: return a plain <code>String</code> from a <code>@RestController</code> method and it goes through <code>StringHttpMessageConverter</code> as <code>text/plain</code> — <em>not</em> JSON-quoted. The frontend's <code>res.json()</code> then throws. Return a DTO (or a <code>Map</code>), or set <code>produces = MediaType.APPLICATION_JSON_VALUE</code> and return an object.</p></div>
+
+<h3>Jackson defaults and the annotations you'll actually use</h3>
+<p>Jackson serializes public getters and deserializes via a no-arg constructor + setters, or via a constructor whose parameter names it can see (records work out of the box — see the DTO section). The annotations that come up in interviews:</p>
+
+<pre><code><span class="kw">public class</span> <span class="typ">UserResponse</span> {
+
+    <span class="ann">@JsonProperty</span>(<span class="str">"user_name"</span>)          <span class="com">// rename: Java field ↔ JSON key</span>
+    <span class="kw">private</span> String userName;
+
+    <span class="ann">@JsonIgnore</span>                          <span class="com">// never serialized, never bound from input</span>
+    <span class="kw">private</span> String passwordHash;
+
+    <span class="ann">@JsonInclude</span>(JsonInclude.Include.NON_NULL)   <span class="com">// omit key entirely when null</span>
+    <span class="kw">private</span> String middleName;
+
+    <span class="ann">@JsonFormat</span>(pattern = <span class="str">"yyyy-MM-dd"</span>)  <span class="com">// override the default ISO output</span>
+    <span class="kw">private</span> LocalDate birthDate;
+
+    <span class="kw">private</span> Instant createdAt;           <span class="com">// → "2026-07-02T09:15:30Z" (ISO-8601)</span>
+}
+</code></pre>
+
+<table>
+<thead><tr><th>Annotation</th><th>Effect</th><th>Frontend-visible consequence</th></tr></thead>
+<tbody>
+<tr><td><code>@JsonProperty("x")</code></td><td>Renames field in JSON, both directions</td><td>Key is <code>x</code> regardless of Java name; also marks constructor params for binding</td></tr>
+<tr><td><code>@JsonIgnore</code></td><td>Excluded from serialization and deserialization</td><td>Field never appears; input value silently dropped</td></tr>
+<tr><td><code>@JsonInclude(NON_NULL)</code></td><td>Skip null values (also on class or globally)</td><td>Frontend must handle <em>missing</em> key, not <code>null</code></td></tr>
+<tr><td><code>@JsonIgnoreProperties(ignoreUnknown = true)</code></td><td>Class-level: tolerate unknown incoming keys</td><td>Forward-compatible clients</td></tr>
+<tr><td><code>@JsonFormat</code></td><td>Custom date/number shape</td><td>Controls the exact string your <code>new Date(...)</code> parses</td></tr>
+<tr><td><code>@JsonCreator</code></td><td>Marks a factory/constructor for deserialization</td><td>Needed for immutable non-record classes</td></tr>
+</tbody>
+</table>
+
+<h3>java.time handling — a Boot freebie people forget exists</h3>
+<p>Raw Jackson would serialize <code>Instant</code>/<code>LocalDate</code> as ugly numeric timestamps or fail entirely. Spring Boot auto-registers the <code>jackson-datatype-jsr310</code> module (<code>JavaTimeModule</code>) and sets <code>WRITE_DATES_AS_TIMESTAMPS=false</code>, so you get ISO-8601 strings by default: <code>"2026-07-02T09:15:30Z"</code> for <code>Instant</code>, <code>"2026-07-02"</code> for <code>LocalDate</code>. That is exactly what <code>new Date(iso)</code> and every JS date library expect. Global tweaks go in properties, not code:</p>
+
+<pre><code><span class="com"># application.yml — global Jackson tuning</span>
+spring:
+  jackson:
+    default-property-inclusion: non_null      <span class="com"># drop nulls everywhere</span>
+    deserialization:
+      fail-on-unknown-properties: false        <span class="com"># default; set true for strict APIs</span>
+    property-naming-strategy: SNAKE_CASE       <span class="com"># if your API contract is snake_case</span>
+</code></pre>
+
+<div class="senior"><p>Senior take on <code>fail-on-unknown-properties</code>: leaving it lenient (Boot's default) makes clients forward-compatible — the server can't be broken by an extra key. But for security-sensitive write endpoints, strict rejection surfaces client bugs early (a typoed field silently ignored is a data-loss bug the frontend team will hunt for days). Many teams keep it lenient globally and rely on Bean Validation to catch <em>missing</em> required fields, which is the failure mode that actually matters.</p></div>
+
+<!-- ============================================================ -->
+<h2 id="dto">The DTO pattern: never expose entities <span class="tier tier-1">T1</span></h2>
+
+<p>This is arguably the single most-asked API-design question in Java interviews: <em>"Why not return your JPA entity from the controller?"</em> You must have four reasons ready, not one.</p>
+
+<h3>The four reasons</h3>
+<ol>
+<li><strong>Coupling / contract stability.</strong> Your entity mirrors the database schema. If it's also your JSON contract, every column rename becomes a breaking API change, and every API-shape request from the frontend team pressures your schema. DTOs decouple the wire format from persistence so each can evolve independently — the same reason you don't let a backend response shape dictate your React component props without a mapping layer.</li>
+<li><strong>Lazy-loading serialization bombs.</strong> Entities have lazy relationships (<code>@ManyToOne(fetch = LAZY)</code>, collections). When Jackson walks the object graph it touches those getters and either (a) triggers N+1 queries mid-serialization, (b) throws <code>LazyInitializationException</code> because the session closed, or (c) recurses infinitely on a bidirectional relationship (<code>User → orders → user → orders…</code>) until <code>StackOverflowError</code>. People "fix" this with <code>@JsonIgnore</code>/<code>@JsonManagedReference</code> sprinkled on entities — which is just admitting the entity is doing two jobs.</li>
+<li><strong>Over-posting / mass assignment.</strong> If <code>@RequestBody User user</code> binds directly to the entity, a malicious client can send <code>{"role":"ADMIN","balance":999999}</code> and Jackson will happily populate those fields. A request DTO that simply <em>does not have</em> a <code>role</code> field is structurally immune. (Same class of bug as Rails' mass-assignment CVEs; interviewers love this one.)</li>
+<li><strong>Versioning &amp; shaping.</strong> Different endpoints need different projections (list view vs detail view), computed fields, aggregated data from multiple entities, or v1/v2 shapes. Entities can't be all of these at once.</li>
+</ol>
+
+<h3>Records as DTOs — the modern default</h3>
+<p>Java records (16+) are the idiomatic DTO since Boot 3: immutable, concise, value-based equality, and Jackson deserializes them via the canonical constructor with zero annotations:</p>
+
+<pre><code><span class="com">// Request DTO — only fields the client is ALLOWED to send</span>
+<span class="kw">public record</span> <span class="typ">CreateUserRequest</span>(
+        <span class="ann">@NotBlank @Size</span>(max = 100) String name,
+        <span class="ann">@NotBlank @Email</span> String email,
+        <span class="ann">@Size</span>(min = 12) String password        <span class="com">// note: no 'role', no 'id' — immune to over-posting</span>
+) {}
+
+<span class="com">// Response DTO — only fields the client SHOULD see (no passwordHash!)</span>
+<span class="kw">public record</span> <span class="typ">UserResponse</span>(
+        Long id,
+        String name,
+        String email,
+        Instant createdAt
+) {
+    <span class="com">// static factory keeps mapping next to the shape it produces</span>
+    <span class="kw">public static</span> UserResponse from(User entity) {
+        <span class="kw">return new</span> UserResponse(entity.getId(), entity.getName(),
+                                entity.getEmail(), entity.getCreatedAt());
+    }
+}
+</code></pre>
+
+<div class="note"><p><strong>Request DTO vs response DTO — keep them separate.</strong> They differ almost always: the request has <code>password</code> but no <code>id</code>; the response has <code>id</code>/<code>createdAt</code> but never <code>password</code>. One shared "UserDto" inevitably grows nullable fields with comments like "only set on create" — the Java equivalent of a TypeScript type where half the fields are <code>| undefined</code> depending on context. Two small records beat one ambiguous one.</p></div>
+
+<h3>Mapping options</h3>
+<p><strong>1. Manual mapping</strong> (static factory or a small mapper class) — zero magic, debuggable, compile-time safe, trivially fast. For most services this is the right answer and saying so in an interview reads as experienced, not lazy.</p>
+<p><strong>2. MapStruct</strong> — an <em>annotation processor</em> that generates the mapping code at <strong>compile time</strong>. You write an interface; MapStruct writes the implementation as plain Java:</p>
+
+<pre><code><span class="ann">@Mapper</span>(componentModel = <span class="str">"spring"</span>)      <span class="com">// generated impl is a Spring bean → inject it</span>
+<span class="kw">public interface</span> <span class="typ">UserMapper</span> {
+
+    <span class="ann">@Mapping</span>(target = <span class="str">"fullName"</span>, source = <span class="str">"name"</span>)   <span class="com">// rename</span>
+    <span class="ann">@Mapping</span>(target = <span class="str">"passwordHash"</span>, ignore = <span class="kw">true</span>)
+    UserResponse toResponse(User entity);
+
+    List&lt;UserResponse&gt; toResponses(List&lt;User&gt; entities);  <span class="com">// list version generated free</span>
+
+    <span class="ann">@Mapping</span>(target = <span class="str">"id"</span>, ignore = <span class="kw">true</span>)
+    <span class="ann">@Mapping</span>(target = <span class="str">"createdAt"</span>, expression = <span class="str">"java(java.time.Instant.now())"</span>)
+    User toEntity(CreateUserRequest request);
+}
+
+<span class="com">// Generated at build time — real code you can step through:</span>
+<span class="com">// public class UserMapperImpl implements UserMapper {</span>
+<span class="com">//     public UserResponse toResponse(User entity) {</span>
+<span class="com">//         if (entity == null) return null;</span>
+<span class="com">//         return new UserResponse(entity.getId(), entity.getName(), ...);</span>
+<span class="com">//     } ... }</span>
+</code></pre>
+
+<p><strong>3. Reflection-based mappers (ModelMapper, Dozer, Orika) — avoid.</strong> They resolve field matches via reflection <em>at runtime</em>, per call. Costs: measurable overhead in hot paths, silent breakage on rename (no compile error, fields just come back null), and opaque debugging. MapStruct gives the same convenience with compile-time errors and hand-written-speed code because it generates plain getters/setters calls. The interview phrasing: "MapStruct is codegen, ModelMapper is runtime reflection — I want mapping mistakes to be compile failures, not production nulls."</p>
+
+<table>
+<thead><tr><th>Approach</th><th>When it breaks</th><th>Speed</th><th>Verdict</th></tr></thead>
+<tbody>
+<tr><td>Manual / static factory</td><td>Compile time</td><td>Fastest</td><td>Default choice; explicit</td></tr>
+<tr><td>MapStruct</td><td>Compile time (unmapped-target warnings)</td><td>≈ manual (generated code)</td><td>Great at scale, many DTOs</td></tr>
+<tr><td>ModelMapper / Dozer</td><td>Runtime, often silently</td><td>Reflection-slow</td><td>Avoid, especially hot paths</td></tr>
+</tbody>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="exceptions">Global exception handling &amp; ProblemDetail <span class="tier tier-1">T1</span></h2>
+
+<p>As a frontend dev you've felt the pain of APIs where 404 returns HTML, validation errors return three different shapes, and 500s leak stack traces. The fix on the backend is <strong>one centralized error boundary</strong>: <code>@RestControllerAdvice</code>.</p>
+
+<h3>The machinery</h3>
+<ul>
+<li><strong><code>@ExceptionHandler(SomeException.class)</code></strong> — a method that handles that exception (and subclasses) thrown by handlers. Inside a controller it's local to that controller; that doesn't scale.</li>
+<li><strong><code>@ControllerAdvice</code> / <code>@RestControllerAdvice</code></strong> — a component whose <code>@ExceptionHandler</code> methods apply <em>globally</em> (scopeable by package/annotation). <code>@RestControllerAdvice</code> = <code>@ControllerAdvice + @ResponseBody</code>, same pattern as before.</li>
+<li><strong>Resolution order:</strong> Spring picks the handler with the <em>most specific</em> exception type — a handler for <code>OrderNotFoundException</code> beats one for <code>RuntimeException</code> beats one for <code>Exception</code>. This lets you write a precise ladder with a catch-all at the bottom.</li>
+</ul>
+
+<h3>ProblemDetail — RFC 7807 / RFC 9457</h3>
+<p>Instead of every team inventing its own <code>{error: ..., msg: ...}</code> envelope, <strong>RFC 7807 "Problem Details for HTTP APIs"</strong> (revised as RFC 9457) standardizes one: content type <code>application/problem+json</code> with fields <code>type</code> (URI identifying the error category), <code>title</code>, <code>status</code>, <code>detail</code>, <code>instance</code> — plus arbitrary extension members. Spring 6 / Boot 3 ships first-class support: the <code>ProblemDetail</code> class and <code>ErrorResponseException</code>.</p>
+
+<pre><code>HTTP/1.1 404 Not Found
+Content-Type: application/problem+json
+
+{
+  "type": "https://api.example.com/errors/not-found",
+  "title": "Resource not found",
+  "status": 404,
+  "detail": "Order 42 not found",
+  "instance": "/api/orders/42",
+  "timestamp": "2026-07-02T09:15:30Z",
+  "correlationId": "b9d1..."
+}
+</code></pre>
+
+<h3>A complete, production-shaped error setup</h3>
+
+<pre><code><span class="com">// 1. A domain exception — thrown from the service layer</span>
+<span class="kw">public class</span> <span class="typ">NotFoundException</span> <span class="kw">extends</span> RuntimeException {
+    <span class="kw">public</span> NotFoundException(String resource, Object id) {
+        <span class="kw">super</span>(resource + <span class="str">" "</span> + id + <span class="str">" not found"</span>);
+    }
+}
+
+<span class="com">// 2. The single global error boundary</span>
+<span class="ann">@RestControllerAdvice</span>
+<span class="kw">public class</span> <span class="typ">GlobalExceptionHandler</span> {
+
+    <span class="kw">private static final</span> Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.<span class="kw">class</span>);
+
+    <span class="com">// --- 404: domain "not found" ---</span>
+    <span class="ann">@ExceptionHandler</span>(NotFoundException.<span class="kw">class</span>)
+    <span class="kw">public</span> ProblemDetail handleNotFound(NotFoundException ex, HttpServletRequest req) {
+        ProblemDetail pd = ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND, ex.getMessage());
+        pd.setTitle(<span class="str">"Resource not found"</span>);
+        pd.setType(URI.create(<span class="str">"https://api.example.com/errors/not-found"</span>));
+        pd.setProperty(<span class="str">"timestamp"</span>, Instant.now());          <span class="com">// extension member</span>
+        <span class="kw">return</span> pd;                                            <span class="com">// status taken from the ProblemDetail</span>
+    }
+
+    <span class="com">// --- 400: @Valid failure on a @RequestBody → structured field errors ---</span>
+    <span class="ann">@ExceptionHandler</span>(MethodArgumentNotValidException.<span class="kw">class</span>)
+    <span class="kw">public</span> ProblemDetail handleValidation(MethodArgumentNotValidException ex) {
+        ProblemDetail pd = ProblemDetail.forStatusAndDetail(
+                HttpStatus.BAD_REQUEST, <span class="str">"Validation failed"</span>);
+        pd.setTitle(<span class="str">"Invalid request"</span>);
+        pd.setType(URI.create(<span class="str">"https://api.example.com/errors/validation"</span>));
+
+        List&lt;Map&lt;String, String&gt;&gt; errors = ex.getBindingResult().getFieldErrors().stream()
+                .map(fe -&gt; Map.of(
+                        <span class="str">"field"</span>, fe.getField(),
+                        <span class="str">"message"</span>, fe.getDefaultMessage() == <span class="kw">null</span> ? <span class="str">"invalid"</span> : fe.getDefaultMessage(),
+                        <span class="str">"rejectedValue"</span>, String.valueOf(fe.getRejectedValue())))
+                .toList();
+        pd.setProperty(<span class="str">"errors"</span>, errors);   <span class="com">// frontend can map these onto form fields</span>
+        <span class="kw">return</span> pd;
+    }
+
+    <span class="com">// --- 400: unreadable/malformed JSON body ---</span>
+    <span class="ann">@ExceptionHandler</span>(HttpMessageNotReadableException.<span class="kw">class</span>)
+    <span class="kw">public</span> ProblemDetail handleUnreadable(HttpMessageNotReadableException ex) {
+        ProblemDetail pd = ProblemDetail.forStatusAndDetail(
+                HttpStatus.BAD_REQUEST, <span class="str">"Malformed request body"</span>);
+        pd.setTitle(<span class="str">"Invalid request"</span>);
+        <span class="kw">return</span> pd;   <span class="com">// deliberately do NOT echo ex.getMessage() — leaks class names</span>
+    }
+
+    <span class="com">// --- 409: optimistic-lock / duplicate conflicts ---</span>
+    <span class="ann">@ExceptionHandler</span>(DataIntegrityViolationException.<span class="kw">class</span>)
+    <span class="kw">public</span> ProblemDetail handleConflict(DataIntegrityViolationException ex) {
+        ProblemDetail pd = ProblemDetail.forStatusAndDetail(
+                HttpStatus.CONFLICT, <span class="str">"Request conflicts with existing data"</span>);
+        pd.setTitle(<span class="str">"Conflict"</span>);
+        <span class="kw">return</span> pd;
+    }
+
+    <span class="com">// --- 500: the catch-all. NEVER leak internals. ---</span>
+    <span class="ann">@ExceptionHandler</span>(Exception.<span class="kw">class</span>)
+    <span class="kw">public</span> ProblemDetail handleUnexpected(Exception ex, HttpServletRequest req) {
+        String correlationId = MDC.get(<span class="str">"correlationId"</span>);
+        <span class="com">// log the FULL exception server-side with the correlation id…</span>
+        log.error(<span class="str">"Unhandled exception [{}] on {} {}"</span>, correlationId,
+                  req.getMethod(), req.getRequestURI(), ex);
+
+        <span class="com">// …but return only a generic body to the client</span>
+        ProblemDetail pd = ProblemDetail.forStatusAndDetail(
+                HttpStatus.INTERNAL_SERVER_ERROR, <span class="str">"An unexpected error occurred"</span>);
+        pd.setTitle(<span class="str">"Internal error"</span>);
+        pd.setProperty(<span class="str">"correlationId"</span>, correlationId);   <span class="com">// user can quote it to support</span>
+        <span class="kw">return</span> pd;
+    }
+}
+</code></pre>
+
+<div class="pitfall"><p><strong>Never leak stack traces.</strong> A raw stack trace in a 500 response reveals framework versions, internal class names, file paths, sometimes SQL. Log the full exception <em>with a correlation ID</em> server-side; send the client a generic message plus that ID. Also check <code>server.error.include-stacktrace=never</code> (Boot's default since 2.3) so the fallback <code>/error</code> endpoint doesn't leak either.</p></div>
+
+<div class="senior"><p>The senior framing: "The error contract is API surface, exactly like the success contract." Your React self can vouch for this — one consistent ProblemDetail envelope means the frontend writes <em>one</em> error interceptor (an axios interceptor / React Query <code>onError</code>) that maps <code>status</code> + <code>errors[]</code> to toasts and form-field messages, instead of per-endpoint special cases. Also worth mentioning: extending <code>ResponseEntityExceptionHandler</code> gives you Spring's ~15 built-in framework exceptions (unsupported media type, method not allowed…) pre-mapped to ProblemDetail, and you override only what you customize.</p></div>
+
+<!-- ============================================================ -->
+<h2 id="validation">Bean Validation (jakarta.validation) <span class="tier tier-1">T1</span></h2>
+
+<p>Client-side validation is UX; server-side validation is <em>the actual boundary</em> — you've always known the frontend can be bypassed with <code>curl</code>. Spring integrates Bean Validation (Jakarta Validation 3, implemented by Hibernate Validator; add <code>spring-boot-starter-validation</code>) declaratively.</p>
+
+<h3>Triggering it: @Valid on @RequestBody</h3>
+<pre><code><span class="ann">@PostMapping</span>
+<span class="kw">public</span> UserResponse create(<span class="ann">@Valid @RequestBody</span> CreateUserRequest request) { ... }
+<span class="com">// constraint violation → MethodArgumentNotValidException → your @RestControllerAdvice → 400</span>
+</code></pre>
+<p>Without <code>@Valid</code>, the annotations on the DTO are inert decoration — the single most common "why isn't my validation running" bug.</p>
+
+<h3>@NotNull vs @NotEmpty vs @NotBlank — the classic screener</h3>
+<table>
+<thead><tr><th>Annotation</th><th><code>null</code></th><th><code>""</code></th><th><code>"&nbsp;&nbsp;&nbsp;"</code> (whitespace)</th><th>Applies to</th></tr></thead>
+<tbody>
+<tr><td><code>@NotNull</code></td><td>✗ fails</td><td>✓ passes</td><td>✓ passes</td><td>Any type</td></tr>
+<tr><td><code>@NotEmpty</code></td><td>✗ fails</td><td>✗ fails</td><td>✓ passes</td><td>String, Collection, Map, array (size &gt; 0)</td></tr>
+<tr><td><code>@NotBlank</code></td><td>✗ fails</td><td>✗ fails</td><td>✗ fails</td><td>String only (trimmed length &gt; 0)</td></tr>
+</tbody>
+</table>
+<p>Rule of thumb: <code>@NotBlank</code> for user-facing strings, <code>@NotEmpty</code> for collections that must have members, <code>@NotNull</code> for everything else (numbers, dates, nested objects).</p>
+
+<h3>The working set, plus nested validation</h3>
+<pre><code><span class="kw">public record</span> <span class="typ">CreateOrderRequest</span>(
+        <span class="ann">@NotBlank</span>(message = <span class="str">"customer name is required"</span>)
+        <span class="ann">@Size</span>(max = 200)
+        String customerName,
+
+        <span class="ann">@NotBlank @Email</span>
+        String email,
+
+        <span class="ann">@NotNull @Positive</span>                    <span class="com">// &gt; 0; also @PositiveOrZero, @Negative, @Min, @Max</span>
+        BigDecimal totalAmount,
+
+        <span class="ann">@Pattern</span>(regexp = <span class="str">"^[A-Z]{2}-\\d{6}$"</span>, message = <span class="str">"promo code format XX-000000"</span>)
+        String promoCode,                     <span class="com">// note: @Pattern PASSES on null — combine with @NotNull if required</span>
+
+        <span class="ann">@Past</span>                                 <span class="com">// also @PastOrPresent, @Future, @FutureOrPresent</span>
+        LocalDate customerBirthDate,
+
+        <span class="ann">@NotEmpty</span>                             <span class="com">// list itself must be non-empty…</span>
+        List&lt;<span class="ann">@Valid</span> OrderLine&gt; lines          <span class="com">// …and EACH element is validated (cascade)</span>
+) {}
+
+<span class="kw">public record</span> <span class="typ">OrderLine</span>(
+        <span class="ann">@NotBlank</span> String sku,
+        <span class="ann">@Positive</span> <span class="kw">int</span> quantity
+) {}
+</code></pre>
+<div class="pitfall"><p>Most constraints (<code>@Email</code>, <code>@Pattern</code>, <code>@Size</code>, <code>@Past</code>…) treat <code>null</code> as <em>valid</em> — by design, so optionality is expressed separately. If a field is required <em>and</em> shaped, you need both: <code>@NotNull @Email</code>. Forgetting this ships "optional but validated" fields you meant to be mandatory. Also: nested objects need an explicit <code>@Valid</code> on the field or validation does not cascade into them.</p></div>
+
+<h3>@Validated on the class — validating params, not bodies</h3>
+<p><code>@Valid</code> works on <code>@RequestBody</code>. To validate simple params (<code>@PathVariable</code>, <code>@RequestParam</code>), put <code>@Validated</code> on the <em>controller class</em> — this enables method-level validation via an AOP proxy:</p>
+<pre><code><span class="ann">@RestController</span>
+<span class="ann">@Validated</span>                              <span class="com">// enables constraint checks on method params</span>
+<span class="ann">@RequestMapping</span>(<span class="str">"/api/products"</span>)
+<span class="kw">public class</span> <span class="typ">ProductController</span> {
+
+    <span class="ann">@GetMapping</span>
+    <span class="kw">public</span> Page&lt;ProductResponse&gt; list(
+            <span class="ann">@RequestParam @Min</span>(0) <span class="kw">int</span> page,
+            <span class="ann">@RequestParam @Min</span>(1) <span class="ann">@Max</span>(100) <span class="kw">int</span> size) {   <span class="com">// cap page size!</span>
+        ...
+    }
+}
+<span class="com">// violation → ConstraintViolationException (NOT MethodArgumentNotValidException)</span>
+<span class="com">// → returns 500 by default! Map it to 400 in your advice:</span>
+<span class="ann">@ExceptionHandler</span>(ConstraintViolationException.<span class="kw">class</span>)
+<span class="kw">public</span> ProblemDetail handleParamViolation(ConstraintViolationException ex) {
+    ProblemDetail pd = ProblemDetail.forStatusAndDetail(HttpStatus.BAD_REQUEST, <span class="str">"Invalid parameters"</span>);
+    pd.setProperty(<span class="str">"errors"</span>, ex.getConstraintViolations().stream()
+            .map(v -&gt; Map.of(<span class="str">"param"</span>, v.getPropertyPath().toString(),
+                             <span class="str">"message"</span>, v.getMessage())).toList());
+    <span class="kw">return</span> pd;
+}
+</code></pre>
+<div class="note"><p>Interview trap worth pre-empting: body validation fails with <code>MethodArgumentNotValidException</code> (400 by default), param validation fails with <code>ConstraintViolationException</code> (500 unless you map it). Knowing they are two different exceptions with two different default statuses is a reliable senior signal. (Spring 6.1's built-in method validation narrows this gap, but handle both explicitly and you're safe everywhere.)</p></div>
+
+<h3>Custom validator — full ConstraintValidator example</h3>
+<pre><code><span class="com">// 1. The annotation</span>
+<span class="ann">@Target</span>({ElementType.FIELD, ElementType.PARAMETER})
+<span class="ann">@Retention</span>(RetentionPolicy.RUNTIME)
+<span class="ann">@Constraint</span>(validatedBy = SkuFormatValidator.<span class="kw">class</span>)
+<span class="kw">public</span> <span class="ann">@interface</span> <span class="typ">ValidSku</span> {
+    String message() <span class="kw">default</span> <span class="str">"invalid SKU format"</span>;
+    Class&lt;?&gt;[] groups() <span class="kw">default</span> {};                       <span class="com">// boilerplate the spec requires</span>
+    Class&lt;? <span class="kw">extends</span> Payload&gt;[] payload() <span class="kw">default</span> {};
+}
+
+<span class="com">// 2. The validator — can be a Spring bean, so you CAN inject dependencies</span>
+<span class="kw">public class</span> <span class="typ">SkuFormatValidator</span> <span class="kw">implements</span> ConstraintValidator&lt;ValidSku, String&gt; {
+
+    <span class="kw">private static final</span> Pattern SKU = Pattern.compile(<span class="str">"^[A-Z]{3}-\\d{4}-[A-Z0-9]{2}$"</span>);
+
+    <span class="ann">@Override</span>
+    <span class="kw">public boolean</span> isValid(String value, ConstraintValidatorContext ctx) {
+        <span class="kw">if</span> (value == <span class="kw">null</span>) <span class="kw">return true</span>;      <span class="com">// convention: null-validity handled by @NotNull</span>
+        <span class="kw">return</span> SKU.matcher(value).matches();
+    }
+}
+
+<span class="com">// 3. Usage</span>
+<span class="kw">public record</span> <span class="typ">OrderLine</span>(<span class="ann">@NotNull @ValidSku</span> String sku, <span class="ann">@Positive</span> <span class="kw">int</span> quantity) {}
+</code></pre>
+
+<h3>Validation groups — awareness level</h3>
+<p>Groups let one DTO carry different rule sets per operation: <code>@NotNull(groups = OnCreate.class)</code> on <code>password</code>, then <code>@Validated(OnCreate.class)</code> at the binding site. Know the mechanism, and know the senior counter-position: in practice, separate <code>CreateXRequest</code> / <code>UpdateXRequest</code> records are clearer than one DTO with mode-dependent rules — groups are best left for legacy shared-DTO codebases.</p>
+
+<!-- ============================================================ -->
+<h2 id="rest-design">REST design at senior level <span class="tier tier-1">T1</span></h2>
+
+<p>Framework syntax is table stakes; this section is what senior interviews actually grade. You've consumed hundreds of these decisions — now you must be able to defend them.</p>
+
+<h3>Resource naming conventions</h3>
+<ul>
+<li><strong>Nouns, plural, lowercase, hyphenated:</strong> <code>/api/orders</code>, <code>/api/orders/42/line-items</code>. Not <code>/getOrders</code>, not <code>/api/Order</code>.</li>
+<li><strong>Hierarchy for ownership:</strong> <code>/customers/7/orders</code> when orders are meaningfully scoped to a customer; but don't nest past two levels — <code>/orders/42</code> beats <code>/customers/7/orders/42</code> once the order has its own identity.</li>
+<li><strong>Verbs are the HTTP method, not the path.</strong> Exception: genuinely non-CRUD operations get a sub-resource action — <code>POST /orders/42/cancellation</code> or the pragmatic <code>POST /orders/42/cancel</code>. Purists model it as a state resource; pragmatists ship the verb. Be able to say both.</li>
+<li><strong>Query params for cross-cutting concerns:</strong> filtering, sorting, pagination — never for identity.</li>
+</ul>
+
+<h3>HTTP verbs, idempotency &amp; safety</h3>
+<p>Idempotent = performing the request N times has the same effect as once (not: same response body). Safe = no state change at all. This matters concretely: proxies, clients and retry libraries will <em>automatically retry</em> idempotent methods after a timeout.</p>
+<table>
+<thead><tr><th>Verb</th><th>Safe</th><th>Idempotent</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>GET</td><td>Yes</td><td>Yes</td><td>Read-only; cacheable</td></tr>
+<tr><td>HEAD / OPTIONS</td><td>Yes</td><td>Yes</td><td>Metadata only</td></tr>
+<tr><td>PUT</td><td>No</td><td><strong>Yes</strong></td><td>Full replace: applying the same full state twice = same result</td></tr>
+<tr><td>DELETE</td><td>No</td><td><strong>Yes</strong></td><td>Deleting twice leaves the same end state (2nd may 404 — still idempotent in effect)</td></tr>
+<tr><td>POST</td><td>No</td><td><strong>No</strong></td><td>Two POSTs = two resources / two charges. Mitigate with an <code>Idempotency-Key</code> header pattern</td></tr>
+<tr><td>PATCH</td><td>No</td><td><strong>Depends</strong></td><td><code>{"status":"SHIPPED"}</code> is idempotent; <code>{"op":"increment"}</code> is not</td></tr>
+</tbody>
+</table>
+<div class="senior"><p>Money quote for payment-adjacent interviews: "POST is not idempotent, which is why payment APIs (Stripe et al.) require an <code>Idempotency-Key</code> header — the server stores the key with the first response and replays that response for retries, converting POST into an effectively idempotent operation. That's a design decision the backend must make; the client can't retrofit it."</p></div>
+
+<h3>Status codes done right</h3>
+<table>
+<thead><tr><th>Code</th><th>Meaning</th><th>Senior notes</th></tr></thead>
+<tbody>
+<tr><td><strong>200</strong> OK</td><td>Success with body</td><td>GET, PUT/PATCH returning the updated resource</td></tr>
+<tr><td><strong>201</strong> Created</td><td>Resource created</td><td>POST; include <code>Location: /api/orders/42</code> header pointing at the new resource</td></tr>
+<tr><td><strong>204</strong> No Content</td><td>Success, empty body</td><td>DELETE; PUT when you don't echo the resource. Frontend: don't call <code>res.json()</code>!</td></tr>
+<tr><td><strong>400</strong> Bad Request</td><td>Malformed / invalid input</td><td>Syntax and validation failures</td></tr>
+<tr><td><strong>401</strong> Unauthorized</td><td>Not authenticated</td><td>Misnamed — means "who are you?"; send <code>WWW-Authenticate</code></td></tr>
+<tr><td><strong>403</strong> Forbidden</td><td>Authenticated but not allowed</td><td>"I know who you are; you still can't." The 401/403 distinction is a stock question</td></tr>
+<tr><td><strong>404</strong> Not Found</td><td>No such resource</td><td>Also used to hide existence from unauthorized callers (vs 403 leaking that it exists)</td></tr>
+<tr><td><strong>409</strong> Conflict</td><td>State conflict</td><td>Duplicate unique key, optimistic-lock version mismatch, "already cancelled"</td></tr>
+<tr><td><strong>422</strong> Unprocessable</td><td>Well-formed but semantically invalid</td><td>Some teams: 400 = syntax, 422 = business rule. Pick one convention and be consistent</td></tr>
+<tr><td><strong>429</strong> Too Many Requests</td><td>Rate limited</td><td>Include <code>Retry-After</code>; clients back off</td></tr>
+<tr><td><strong>500</strong> Internal Server Error</td><td>Our bug</td><td>Never a validation failure. 4xx = client's fault, 5xx = ours — clients alert on 5xx rates</td></tr>
+<tr><td><strong>503</strong> Service Unavailable</td><td>Temporarily down</td><td>Maintenance, overload, failed dependency; retryable, unlike most 500s</td></tr>
+</tbody>
+</table>
+
+<h3>Pagination conventions</h3>
+<p>Offset pagination is the default; expose <code>page</code>/<code>size</code>/<code>sort</code> and return an envelope with metadata — precisely what your React tables always wanted:</p>
+<pre><code><span class="com">// GET /api/orders?page=1&amp;size=20&amp;sort=createdAt,desc — Spring Data binds this automatically</span>
+<span class="ann">@GetMapping</span>
+<span class="kw">public</span> PageResponse&lt;OrderResponse&gt; list(<span class="ann">@ParameterObject</span> Pageable pageable) {
+    Page&lt;Order&gt; page = repository.findAll(pageable);
+    <span class="kw">return</span> PageResponse.from(page.map(OrderResponse::from));
+}
+
+<span class="com">// Stable envelope (don't serialize Page&lt;&gt; directly — its JSON shape is not a guaranteed contract;</span>
+<span class="com">// Boot even logs a warning suggesting PagedModel/a DTO)</span>
+<span class="kw">public record</span> <span class="typ">PageResponse</span>&lt;T&gt;(List&lt;T&gt; content, <span class="kw">int</span> page, <span class="kw">int</span> size,
+                              <span class="kw">long</span> totalElements, <span class="kw">int</span> totalPages) {
+    <span class="kw">public static</span> &lt;T&gt; PageResponse&lt;T&gt; from(Page&lt;T&gt; p) {
+        <span class="kw">return new</span> PageResponse&lt;&gt;(p.getContent(), p.getNumber(), p.getSize(),
+                                  p.getTotalElements(), p.getTotalPages());
+    }
+}
+</code></pre>
+<p>Know the alternative: <strong>cursor (keyset) pagination</strong> — <code>?after=eyJpZCI6NDJ9&amp;size=20</code> — for infinite scroll and large/fast-moving datasets. Offset pagination does <code>OFFSET 100000</code> scans and skips/duplicates rows when data shifts between pages; keyset (<code>WHERE (created_at, id) &lt; (?, ?) ORDER BY created_at DESC, id DESC LIMIT 20</code>) is O(log n) and stable. Trade-off: no "jump to page 47". Filtering/sorting: whitelist sortable fields (<code>sort=createdAt,desc</code>) — never pass raw client input into an <code>ORDER BY</code>.</p>
+
+<h3>API versioning strategies</h3>
+<table>
+<thead><tr><th>Strategy</th><th>Example</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td><strong>URI</strong></td><td><code>/api/v1/orders</code></td><td>Visible, cacheable, trivially routable, easy to test in a browser</td><td>"Impure" (same resource, two URIs); v2 migration touches every client URL</td></tr>
+<tr><td><strong>Header</strong></td><td><code>X-API-Version: 2</code></td><td>Clean URIs</td><td>Invisible in logs/browser; caches must <code>Vary</code>; harder to demo</td></tr>
+<tr><td><strong>Media type</strong></td><td><code>Accept: application/vnd.acme.v2+json</code></td><td>The "correct" REST answer; version negotiates like any representation</td><td>Clunky for consumers; rare in practice outside GitHub-style APIs</td></tr>
+</tbody>
+</table>
+<p>Pragmatic senior answer: URI versioning wins on operability (routing, logs, dashboards, gateway rules all see the version), which is why it dominates in industry — and version <em>rarely</em>: additive, backward-compatible changes (new optional fields) shouldn't bump the version at all. Tolerant readers on both sides beat aggressive versioning.</p>
+
+<h3>Partial update: PUT vs PATCH</h3>
+<ul>
+<li><strong>PUT</strong> = full replacement: client sends the <em>complete</em> resource; omitted fields are semantically nulled. Idempotent by construction.</li>
+<li><strong>PATCH</strong> = partial: client sends only changes. Two standard body formats:
+  <ul>
+  <li><strong>JSON Merge Patch</strong> (RFC 7386, <code>application/merge-patch+json</code>): send the fields to change; <code>null</code> means "delete this field". Simple, but you cannot distinguish "field absent" from "set to null" with a plain DTO — the classic PATCH bug.</li>
+  <li><strong>JSON Patch</strong> (RFC 6902, <code>application/json-patch+json</code>): an array of operations — <code>[{"op":"replace","path":"/status","value":"SHIPPED"}]</code>. Precise (including test/copy/move ops) but heavyweight; rare in typical CRUD services.</li>
+  </ul></li>
+</ul>
+<pre><code><span class="com">// Merge-patch done correctly: read as JsonNode / Map so "absent" ≠ "null"</span>
+<span class="ann">@PatchMapping</span>(value = <span class="str">"/{id}"</span>, consumes = <span class="str">"application/merge-patch+json"</span>)
+<span class="kw">public</span> OrderResponse patch(<span class="ann">@PathVariable</span> <span class="kw">long</span> id, <span class="ann">@RequestBody</span> JsonNode patch) {
+    Order order = repository.findById(id).orElseThrow(() -&gt; <span class="kw">new</span> NotFoundException(<span class="str">"Order"</span>, id));
+    <span class="kw">if</span> (patch.has(<span class="str">"status"</span>)) {                 <span class="com">// key present at all?</span>
+        JsonNode v = patch.get(<span class="str">"status"</span>);
+        <span class="kw">if</span> (v.isNull()) <span class="kw">throw new</span> UnprocessableException(<span class="str">"status cannot be cleared"</span>);
+        order.setStatus(OrderStatus.valueOf(v.asText()));
+    }
+    <span class="kw">if</span> (patch.has(<span class="str">"note"</span>)) {
+        order.setNote(patch.get(<span class="str">"note"</span>).isNull() ? <span class="kw">null</span> : patch.get(<span class="str">"note"</span>).asText());
+    }
+    <span class="kw">return</span> OrderResponse.from(repository.save(order));
+}
+</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="response-entity">ResponseEntity &amp; content negotiation <span class="tier tier-2">T2</span></h2>
+
+<h3>ResponseEntity — full control over status, headers, body</h3>
+<p>Returning a bare DTO gives you 200 with default headers. <code>ResponseEntity&lt;T&gt;</code> is the fluent builder for everything else:</p>
+<pre><code><span class="ann">@PostMapping</span>
+<span class="kw">public</span> ResponseEntity&lt;OrderResponse&gt; create(<span class="ann">@Valid @RequestBody</span> CreateOrderRequest req,
+                                            UriComponentsBuilder uriBuilder) {
+    OrderResponse created = orderService.create(req);
+    URI location = uriBuilder.path(<span class="str">"/api/orders/{id}"</span>).buildAndExpand(created.id()).toUri();
+    <span class="kw">return</span> ResponseEntity.created(location)      <span class="com">// 201 + Location header — do this, interviewers check</span>
+                         .body(created);
+}
+
+<span class="ann">@GetMapping</span>(<span class="str">"/{id}"</span>)
+<span class="kw">public</span> ResponseEntity&lt;OrderResponse&gt; one(<span class="ann">@PathVariable</span> <span class="kw">long</span> id) {
+    <span class="kw">return</span> orderService.maybeFind(id)             <span class="com">// Optional&lt;OrderResponse&gt;</span>
+            .map(order -&gt; ResponseEntity.ok()
+                    .eTag(<span class="str">"\""</span> + order.version() + <span class="str">"\""</span>)          <span class="com">// conditional-request support</span>
+                    .cacheControl(CacheControl.maxAge(Duration.ofSeconds(60)))
+                    .body(order))
+            .orElseGet(() -&gt; ResponseEntity.notFound().build());   <span class="com">// 404, no body</span>
+}
+
+<span class="ann">@DeleteMapping</span>(<span class="str">"/{id}"</span>)
+<span class="kw">public</span> ResponseEntity&lt;Void&gt; delete(<span class="ann">@PathVariable</span> <span class="kw">long</span> id) {
+    orderService.delete(id);
+    <span class="kw">return</span> ResponseEntity.noContent().build();    <span class="com">// 204</span>
+}
+</code></pre>
+<p>Style guidance: prefer the plain-DTO return + <code>@ResponseStatus</code> where the status is fixed, and reserve <code>ResponseEntity</code> for genuinely dynamic status/headers. Mixing exceptions-for-errors with <code>ResponseEntity</code>-for-success keeps controllers thin — the advice handles the sad paths.</p>
+
+<h3>Content negotiation: Accept, produces, consumes</h3>
+<ul>
+<li><strong><code>consumes</code></strong> restricts which request <code>Content-Type</code> the mapping accepts. Mismatch → <strong>415 Unsupported Media Type</strong>.</li>
+<li><strong><code>produces</code></strong> restricts/declares what the handler emits, matched against the client's <code>Accept</code> header. No acceptable match → <strong>406 Not Acceptable</strong>.</li>
+<li>Two handlers can share a path and differ only in <code>consumes</code> — e.g. <code>application/json</code> vs <code>application/merge-patch+json</code> on the same PATCH URL.</li>
+</ul>
+<pre><code><span class="com">// Same URL, two representations — negotiated by Accept header</span>
+<span class="ann">@GetMapping</span>(value = <span class="str">"/{id}/invoice"</span>, produces = MediaType.APPLICATION_JSON_VALUE)
+<span class="kw">public</span> InvoiceResponse invoiceJson(<span class="ann">@PathVariable</span> <span class="kw">long</span> id) { ... }
+
+<span class="ann">@GetMapping</span>(value = <span class="str">"/{id}/invoice"</span>, produces = MediaType.APPLICATION_PDF_VALUE)
+<span class="kw">public</span> ResponseEntity&lt;Resource&gt; invoicePdf(<span class="ann">@PathVariable</span> <span class="kw">long</span> id) { ... }
+</code></pre>
+<div class="note"><p>From the fetch() side you set <code>Accept</code> without thinking (<code>axios</code> defaults to <code>application/json, text/plain, */*</code>). Now you're the one reading it: Spring's <code>ContentNegotiationManager</code> resolves the requested media type (header-based by default in Boot) and selects both the handler (via <code>produces</code>) and the message converter with it.</p></div>
+
+<!-- ============================================================ -->
+<h2 id="pipeline">The request pipeline: Filter → DispatcherServlet → Interceptor <span class="tier tier-2">T2</span></h2>
+
+<p>Interviewers ask "what happens when a request hits your Spring Boot app?" to check you see beyond the controller. The order of the layers:</p>
+
+<pre><code>TCP → Tomcat (connector, worker thread)
+  → <span class="typ">Servlet Filter chain</span>            <span class="com">← Servlet spec, pre-Spring-MVC (but filters can be Spring beans)</span>
+      (CorsFilter, Spring Security's filter chain, your correlation-ID filter…)
+  → <span class="typ">DispatcherServlet</span>               <span class="com">← Spring MVC's front controller: one servlet routes everything</span>
+      → HandlerMapping                <span class="com">finds the @RequestMapping method for the URL</span>
+      → <span class="typ">HandlerInterceptor.preHandle()</span>
+      → argument resolvers            <span class="com">@PathVariable/@RequestBody binding, validation</span>
+      → <span class="kw">your controller method</span>
+      → return-value handling         <span class="com">HttpMessageConverter serializes</span>
+      → <span class="typ">HandlerInterceptor.postHandle()</span>       <span class="com">(before the view/body finalized)</span>
+      → <span class="typ">HandlerInterceptor.afterCompletion()</span>  <span class="com">(always runs, even on exception — cleanup)</span>
+  ← back out through the filter chain (response passes through in reverse)
+</code></pre>
+
+<p><strong>Filter</strong> (jakarta.servlet.Filter): container-level, sees raw <code>ServletRequest</code>/<code>Response</code>, runs for <em>every</em> request including ones Spring never routes (static resources, 404s). Can short-circuit (never call <code>chain.doFilter</code>), wrap/mutate the request/response streams. <strong>Interceptor</strong> (HandlerInterceptor): Spring MVC-level, runs <em>after</em> handler resolution so it knows <em>which controller method</em> will execute; three hooks (<code>preHandle</code> can veto by returning false; <code>afterCompletion</code> is your finally-block). <strong>Exception subtlety:</strong> an exception thrown in a filter never reaches your <code>@ControllerAdvice</code> — advice only covers the DispatcherServlet's world. That's why Spring Security errors (401/403 from the filter chain) need their own <code>AuthenticationEntryPoint</code>/<code>AccessDeniedHandler</code>, not an <code>@ExceptionHandler</code>.</p>
+
+<h3>Filter vs Interceptor vs AOP vs @ControllerAdvice</h3>
+<table>
+<thead><tr><th>Mechanism</th><th>Layer</th><th>Knows about</th><th>Best for</th></tr></thead>
+<tbody>
+<tr><td><strong>Servlet Filter</strong></td><td>Container, before Spring MVC</td><td>Raw request/response, streams</td><td>Correlation IDs, request logging, compression, auth (Security), anything that must also cover non-MVC traffic</td></tr>
+<tr><td><strong>HandlerInterceptor</strong></td><td>Inside DispatcherServlet</td><td>Resolved handler (controller + method, annotations)</td><td>Per-endpoint concerns: rate-limit by <code>@RateLimited</code> annotation, tenant checks, timing per handler</td></tr>
+<tr><td><strong>AOP (@Aspect)</strong></td><td>Bean proxy, any layer</td><td>Method signature, args, return value</td><td>Cross-cutting on <em>services</em> not just web: transactions, retries, audit on business methods</td></tr>
+<tr><td><strong>@ControllerAdvice</strong></td><td>MVC exception/binding phase</td><td>Exceptions, model, binder</td><td>Global error mapping, shared <code>@InitBinder</code>/<code>@ModelAttribute</code></td></tr>
+</tbody>
+</table>
+
+<h3>Correlation-ID filter — the canonical example</h3>
+<pre><code><span class="ann">@Component</span>
+<span class="ann">@Order</span>(Ordered.HIGHEST_PRECEDENCE)          <span class="com">// run first so EVERYTHING downstream is tagged</span>
+<span class="kw">public class</span> <span class="typ">CorrelationIdFilter</span> <span class="kw">extends</span> OncePerRequestFilter {
+                                            <span class="com">// OncePerRequestFilter: guaranteed single execution per request,</span>
+                                            <span class="com">// even with forwards/error dispatches</span>
+    <span class="kw">public static final</span> String HEADER = <span class="str">"X-Correlation-Id"</span>;
+
+    <span class="ann">@Override</span>
+    <span class="kw">protected void</span> doFilterInternal(HttpServletRequest request,
+                                    HttpServletResponse response,
+                                    FilterChain chain) <span class="kw">throws</span> ServletException, IOException {
+        <span class="com">// honor an inbound id (gateway / calling service), else mint one</span>
+        String id = request.getHeader(HEADER);
+        <span class="kw">if</span> (id == <span class="kw">null</span> || id.isBlank()) id = UUID.randomUUID().toString();
+
+        MDC.put(<span class="str">"correlationId"</span>, id);       <span class="com">// every log line on this thread now carries it</span>
+        response.setHeader(HEADER, id);      <span class="com">// echo it so the frontend can log/report it too</span>
+        <span class="kw">try</span> {
+            chain.doFilter(request, response);
+        } <span class="kw">finally</span> {
+            MDC.remove(<span class="str">"correlationId"</span>);    <span class="com">// CRITICAL: threads are pooled and reused —</span>
+        }                                    <span class="com">// leaked MDC values bleed into other users' requests</span>
+    }
+}
+</code></pre>
+<div class="senior"><p>This one filter closes the debugging loop you know from the frontend: user reports an error toast showing a correlation ID → grep the ID in centralized logs → the exact request's full trail, including the 500's stack trace your ProblemDetail deliberately hid. Mention the MDC-cleanup-in-finally detail; it demonstrates you understand servlet thread pooling.</p></div>
+
+<!-- ============================================================ -->
+<h2 id="cors">CORS — from the backend side this time <span class="tier tier-2">T2</span></h2>
+
+<p>You have lost hours to <em>"blocked by CORS policy"</em>. Time to internalize the truth you half-knew: <strong>CORS errors are almost always backend configuration issues.</strong> The browser enforces; the server declares the policy; the frontend can do nothing but proxy around it in dev.</p>
+
+<h3>Preflight mechanics, 60-second recap</h3>
+<ol>
+<li><strong>Simple requests</strong> (GET/HEAD/POST with form-ish content types, no custom headers) are sent directly; the browser checks <code>Access-Control-Allow-Origin</code> on the <em>response</em> and blocks your JS from reading it on mismatch. The request <em>did reach the server</em> — CORS is read-protection, not a firewall.</li>
+<li><strong>Everything a JSON API does is non-simple</strong>: <code>Content-Type: application/json</code>, an <code>Authorization</code> header, PUT/DELETE — each alone triggers a <strong>preflight</strong>: an <code>OPTIONS</code> request with <code>Origin</code>, <code>Access-Control-Request-Method</code>, <code>Access-Control-Request-Headers</code>. The server must answer with matching <code>Access-Control-Allow-*</code> headers or the browser never sends the real request.</li>
+<li><code>Access-Control-Max-Age</code> lets the browser cache the preflight verdict and skip repeats.</li>
+</ol>
+
+<h3>@CrossOrigin vs global configuration</h3>
+<p><code>@CrossOrigin(origins = "https://app.example.com")</code> on a controller/method works but scatters policy across the codebase and is easy to forget on new controllers. Production answer: one global config —</p>
+<pre><code><span class="ann">@Configuration</span>
+<span class="kw">public class</span> <span class="typ">CorsConfig</span> {
+
+    <span class="ann">@Bean</span>
+    <span class="kw">public</span> WebMvcConfigurer corsConfigurer(
+            <span class="ann">@Value</span>(<span class="str">"${app.cors.allowed-origins}"</span>) String[] allowedOrigins) {  <span class="com">// per-env property!</span>
+        <span class="kw">return new</span> WebMvcConfigurer() {
+            <span class="ann">@Override</span>
+            <span class="kw">public void</span> addCorsMappings(CorsRegistry registry) {
+                registry.addMapping(<span class="str">"/api/**"</span>)
+                        .allowedOrigins(allowedOrigins)          <span class="com">// e.g. https://app.example.com</span>
+                        .allowedMethods(<span class="str">"GET"</span>, <span class="str">"POST"</span>, <span class="str">"PUT"</span>, <span class="str">"PATCH"</span>, <span class="str">"DELETE"</span>, <span class="str">"OPTIONS"</span>)
+                        .allowedHeaders(<span class="str">"Authorization"</span>, <span class="str">"Content-Type"</span>, <span class="str">"X-Correlation-Id"</span>)
+                        .exposedHeaders(<span class="str">"X-Correlation-Id"</span>)     <span class="com">// headers JS may READ from responses</span>
+                        .allowCredentials(<span class="kw">true</span>)                  <span class="com">// only if using cookies</span>
+                        .maxAge(<span class="num">3600</span>);                            <span class="com">// cache preflight for 1h</span>
+            }
+        };
+    }
+}
+</code></pre>
+<div class="pitfall"><p><strong>Credentials + wildcard = broken by spec.</strong> With <code>allowCredentials(true)</code>, the browser rejects <code>Access-Control-Allow-Origin: *</code> — the server must echo a specific origin (and should send <code>Vary: Origin</code>). Spring throws at startup if you combine <code>allowedOrigins("*")</code> with credentials; the escape hatch is <code>allowedOriginPatterns("https://*.example.com")</code>, which echoes the matching origin back. Also remember <code>exposedHeaders</code>: by default JS can read only a handful of "safelisted" response headers — your custom <code>X-Correlation-Id</code> is invisible to <code>response.headers.get()</code> until you expose it. You've probably hit that one from the other side.</p></div>
+<div class="note"><p>With Spring Security in play, configure CORS <em>through Security</em> too (<code>http.cors(...)</code> with a <code>CorsConfigurationSource</code> bean), because the security filter chain runs before MVC and will 401 the anonymous preflight <code>OPTIONS</code> otherwise. "CORS works until we add Spring Security" is a rite of passage — and a great interview anecdote about filter ordering.</p></div>
+
+<!-- ============================================================ -->
+<h2 id="clients">Calling other services, files, HATEOAS, OpenAPI <span class="tier tier-3">T3</span></h2>
+
+<h3>HTTP clients: RestClient vs WebClient vs RestTemplate</h3>
+<p>Your service will also <em>consume</em> APIs (now you're back on familiar ground — this is the server's <code>fetch()</code>). Three options, one recommendation:</p>
+<table>
+<thead><tr><th>Client</th><th>Model</th><th>Status</th><th>Use when</th></tr></thead>
+<tbody>
+<tr><td><code>RestTemplate</code></td><td>Blocking, template methods</td><td><strong>Maintenance mode</strong> (not deprecated, but no new features)</td><td>Legacy codebases only</td></tr>
+<tr><td><code>WebClient</code></td><td>Reactive (Mono/Flux), non-blocking</td><td>Active (WebFlux)</td><td>Reactive stacks, streaming, high-concurrency fan-out</td></tr>
+<tr><td><code>RestClient</code></td><td>Blocking, fluent (Spring 6.1+)</td><td><strong>Recommended default</strong></td><td>New synchronous code — WebClient ergonomics without the reactive dependency</td></tr>
+</tbody>
+</table>
+<pre><code><span class="ann">@Configuration</span>
+<span class="kw">class</span> <span class="typ">ClientConfig</span> {
+    <span class="ann">@Bean</span>
+    RestClient paymentsClient(RestClient.Builder builder) {   <span class="com">// Boot pre-configures the builder</span>
+        <span class="kw">return</span> builder.baseUrl(<span class="str">"https://payments.internal"</span>)
+                      .defaultHeader(HttpHeaders.ACCEPT, MediaType.APPLICATION_JSON_VALUE)
+                      .build();
+    }
+}
+
+<span class="ann">@Service</span>
+<span class="kw">class</span> <span class="typ">PaymentGateway</span> {
+    <span class="kw">private final</span> RestClient client;
+    PaymentGateway(RestClient paymentsClient) { <span class="kw">this</span>.client = paymentsClient; }
+
+    ChargeResult charge(ChargeRequest req) {
+        <span class="kw">return</span> client.post()
+                .uri(<span class="str">"/v1/charges"</span>)
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(req)
+                .retrieve()
+                .onStatus(HttpStatusCode::is4xxClientError, (r, res) -&gt; {
+                    <span class="kw">throw new</span> PaymentRejectedException(res.getStatusCode());
+                })
+                .body(ChargeResult.<span class="kw">class</span>);       <span class="com">// blocking, returns the deserialized DTO</span>
+    }
+}
+</code></pre>
+<p>Senior extras to name-drop: set connect/read <strong>timeouts</strong> (defaults are dangerous), consider resilience wrappers (Resilience4j retry/circuit-breaker), propagate the correlation-ID header, and know <code>@HttpExchange</code> declarative interfaces (Spring's Feign-alike) exist on top of these clients.</p>
+
+<h3>File upload &amp; download</h3>
+<pre><code><span class="com">// Upload: multipart/form-data — the FormData you've posted from React</span>
+<span class="ann">@PostMapping</span>(value = <span class="str">"/{id}/attachments"</span>, consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+<span class="ann">@ResponseStatus</span>(HttpStatus.CREATED)
+<span class="kw">public</span> AttachmentResponse upload(<span class="ann">@PathVariable</span> <span class="kw">long</span> id,
+                                 <span class="ann">@RequestPart</span>(<span class="str">"file"</span>) MultipartFile file,      <span class="com">// the binary part</span>
+                                 <span class="ann">@RequestPart</span>(<span class="str">"meta"</span>) UploadMeta meta) {       <span class="com">// a JSON part alongside</span>
+    <span class="kw">if</span> (file.isEmpty()) <span class="kw">throw new</span> UnprocessableException(<span class="str">"file is empty"</span>);
+    <span class="com">// validate content type / size server-side; never trust file.getOriginalFilename() for paths</span>
+    <span class="kw">return</span> attachmentService.store(id, file.getInputStream(),
+                                   file.getSize(), file.getContentType(), meta);
+}
+<span class="com">// spring.servlet.multipart.max-file-size=10MB / max-request-size=12MB — else 413-ish errors</span>
+
+<span class="com">// Download: Resource + Content-Disposition</span>
+<span class="ann">@GetMapping</span>(<span class="str">"/{id}/attachments/{attId}"</span>)
+<span class="kw">public</span> ResponseEntity&lt;Resource&gt; download(<span class="ann">@PathVariable</span> <span class="kw">long</span> id, <span class="ann">@PathVariable</span> <span class="kw">long</span> attId) {
+    StoredFile f = attachmentService.load(id, attId);
+    <span class="kw">return</span> ResponseEntity.ok()
+            .contentType(MediaType.parseMediaType(f.contentType()))
+            .contentLength(f.size())
+            .header(HttpHeaders.CONTENT_DISPOSITION,
+                    ContentDisposition.attachment()          <span class="com">// "attachment" → save dialog; "inline" → render</span>
+                            .filename(f.filename(), StandardCharsets.UTF_8)
+                            .build().toString())
+            .body(f.resource());                             <span class="com">// InputStreamResource — streamed, not buffered in heap</span>
+}
+</code></pre>
+
+<h3>HATEOAS — awareness</h3>
+<p>Hypermedia As The Engine Of Application State: responses embed links (<code>"_links": {"self": ..., "cancel": ...}</code>) so clients <em>discover</em> available transitions instead of hardcoding URLs — Richardson Maturity Model level 3, supported by Spring HATEOAS (<code>EntityModel</code>, <code>linkTo(methodOn(...))</code>). Honest senior take: few teams use it fully, because real frontends are built against known, documented contracts (OpenAPI + generated TS types), and generic hypermedia-driven clients are rare. One idea that <em>does</em> survive in practice: returning permitted actions/links per resource so the UI can enable/disable buttons from server truth rather than duplicating authorization logic in React.</p>
+
+<h3>OpenAPI / springdoc — awareness</h3>
+<p>Add <code>springdoc-openapi-starter-webmvc-ui</code> and you get a generated OpenAPI 3 spec at <code>/v3/api-docs</code> plus Swagger UI at <code>/swagger-ui.html</code>, derived from your mappings, DTOs, and validation annotations (<code>@NotNull</code> → required, <code>@Size</code> → constraints). Enrich with <code>@Operation</code>/<code>@Schema</code> where names aren't self-explanatory. The frontend tie-in you can speak to first-hand: that spec feeds <code>openapi-typescript</code>/Orval to generate the TS types and clients you used to write by hand — the API contract becomes the single source of truth across the stack, and contract drift becomes a compile error in the frontend build.</p>
+
+<!-- ============================================================ -->
+<h2 id="qa">Interview Q&amp;A</h2>
+
+<details class="qa"><summary>What's the difference between @Controller and @RestController?</summary><div class="answer"><p><code>@RestController</code> = <code>@Controller</code> + <code>@ResponseBody</code> as a meta-annotation. With plain <code>@Controller</code>, return values are treated as view names and go through <code>ViewResolver</code> (server-rendered templates). <code>@ResponseBody</code> — per method or inherited from <code>@RestController</code> — routes the return value through the <code>HttpMessageConverter</code> chain instead, serializing it (typically Jackson → JSON) straight into the response body. For a JSON API, use <code>@RestController</code>; the mixed form (<code>@Controller</code> + per-method <code>@ResponseBody</code>) exists for apps serving both HTML and JSON.</p></div></details>
+
+<details class="qa"><summary>How does a Java object become JSON on the wire? Walk through the mechanism.</summary><div class="answer"><p>The controller returns an object; because of <code>@ResponseBody</code>, Spring's return-value handler asks the registered <code>HttpMessageConverter</code>s which can write that type for the media type negotiated from the <code>Accept</code> header. <code>MappingJackson2HttpMessageConverter</code> matches for <code>application/json</code> and calls Jackson's <code>ObjectMapper.writeValue()</code>, streaming JSON to the response output. Inbound is symmetric: <code>Content-Type</code> selects the converter, which calls <code>readValue()</code> to build the <code>@RequestBody</code> argument; failures surface as <code>HttpMessageNotReadableException</code> → 400. Boot auto-configures the <code>ObjectMapper</code> (JavaTimeModule, ISO-8601 dates) and honors <code>spring.jackson.*</code> properties.</p></div></details>
+
+<details class="qa"><summary>@RequestParam vs @PathVariable — when do you use which?</summary><div class="answer"><p><code>@PathVariable</code> binds a URI template segment and should carry <em>identity</em> — which resource: <code>/orders/{id}</code>. <code>@RequestParam</code> binds the query string and should carry <em>modifiers</em> — filtering, sorting, pagination: <code>?status=SHIPPED&amp;page=2</code>. Behavioral differences: request params support <code>required=false</code> and <code>defaultValue</code>; a missing path variable is usually just a different route (404) rather than a binding error. Rule: if removing it changes <em>which</em> resource you mean, it's a path variable; if it changes <em>how</em> you view a collection, it's a query param.</p></div></details>
+
+<details class="qa"><summary>Why should you never return JPA entities from controllers?</summary><div class="answer"><p>Four reasons. (1) <strong>Contract coupling</strong> — the entity mirrors the DB schema, so schema changes become breaking API changes. (2) <strong>Lazy-loading hazards</strong> — Jackson walking lazy relationships triggers <code>LazyInitializationException</code> or N+1 queries, and bidirectional relationships cause infinite recursion. (3) <strong>Over-posting / mass assignment</strong> — binding a request straight to an entity lets clients set fields like <code>role</code> or <code>id</code>; a request DTO that lacks those fields is structurally immune. (4) <strong>Shaping/versioning</strong> — different endpoints need different projections and computed fields. Fix: separate request/response DTOs (records), mapped manually or with MapStruct.</p></div></details>
+
+<details class="qa"><summary>What is mass assignment / over-posting and how do DTOs prevent it?</summary><div class="answer"><p>Mass assignment is when a data binder populates <em>any</em> field the client sends. If <code>@RequestBody User</code> binds to the entity, <code>{"name":"x","role":"ADMIN"}</code> silently escalates privileges because Jackson sets every matching property. Defenses: a request DTO containing <em>only</em> client-settable fields (best — the dangerous field can't be expressed), <code>@JsonIgnore</code> on sensitive setters (fragile), or strict allow-lists in the binder. The DTO approach also documents the contract explicitly, which is why it's the standard answer.</p></div></details>
+
+<details class="qa"><summary>@NotNull vs @NotEmpty vs @NotBlank?</summary><div class="answer"><p><code>@NotNull</code>: only rejects <code>null</code> — <code>""</code> passes; works on any type. <code>@NotEmpty</code>: rejects <code>null</code> and empty — for String, Collection, Map, arrays; <code>"&nbsp;&nbsp;"</code> (whitespace) still passes. <code>@NotBlank</code>: String-only; rejects <code>null</code>, <code>""</code>, and whitespace-only. So for a user's name field you want <code>@NotBlank</code>. Bonus point: most other constraints (<code>@Email</code>, <code>@Size</code>, <code>@Pattern</code>) treat <code>null</code> as valid, so "required and well-formed" needs a null-check annotation <em>plus</em> the format annotation.</p></div></details>
+
+<details class="qa"><summary>How do you implement consistent error responses across an API?</summary><div class="answer"><p>One <code>@RestControllerAdvice</code> as the global boundary, returning RFC 7807/9457 <code>ProblemDetail</code> (built into Spring 6) for every failure: specific handlers for domain exceptions (<code>NotFoundException</code> → 404), <code>MethodArgumentNotValidException</code> → 400 with an <code>errors[]</code> extension listing field/message pairs, <code>ConstraintViolationException</code> → 400, conflict-type exceptions → 409, and a catch-all <code>Exception</code> handler → generic 500 that logs the full stack trace with a correlation ID but never returns it. Spring resolves the most specific matching handler. The payoff is the frontend writes exactly one error interceptor. For the framework's own ~15 exceptions, extend <code>ResponseEntityExceptionHandler</code>.</p></div></details>
+
+<details class="qa"><summary>What is ProblemDetail / RFC 7807?</summary><div class="answer"><p>A standardized error body for HTTP APIs (RFC 7807, revised as RFC 9457): media type <code>application/problem+json</code> with members <code>type</code> (URI categorizing the error), <code>title</code>, <code>status</code>, <code>detail</code>, <code>instance</code>, plus arbitrary extension members (e.g. <code>errors</code>, <code>correlationId</code>). Spring 6 provides the <code>ProblemDetail</code> class; returning it from an <code>@ExceptionHandler</code> sets the status and content type automatically. Value: clients and gateways can handle errors generically instead of learning each API's bespoke envelope.</p></div></details>
+
+<details class="qa"><summary>A validation error on a @RequestBody vs on a @RequestParam — what's different?</summary><div class="answer"><p>Different exceptions and different defaults. <code>@Valid @RequestBody</code> failure throws <code>MethodArgumentNotValidException</code>, which Spring maps to 400 out of the box and which carries a <code>BindingResult</code> with structured field errors. Parameter constraints (enabled by <code>@Validated</code> on the class) throw <code>ConstraintValidationException</code>… precisely <code>ConstraintViolationException</code>, which is <em>not</em> mapped by default and surfaces as a 500 unless your advice maps it to 400. Knowing this asymmetry (and that Spring 6.1's method-validation integration improves it) is the senior detail.</p></div></details>
+
+<details class="qa"><summary>Which HTTP methods are idempotent, and why does it matter operationally?</summary><div class="answer"><p>GET/HEAD/OPTIONS (also safe), PUT and DELETE are idempotent; POST is not; PATCH depends on the patch semantics (absolute set = yes, relative op like increment = no). It matters because intermediaries and client libraries will retry idempotent requests after timeouts without fear of double effects — retrying a POST can double-charge. That's why POST-based operations that must be retry-safe adopt an <code>Idempotency-Key</code> header: the server stores the first outcome per key and replays it for duplicates, making the operation effectively idempotent.</p></div></details>
+
+<details class="qa"><summary>401 vs 403 vs 404 — when do you return each?</summary><div class="answer"><p><strong>401 Unauthorized</strong>: not authenticated — credentials missing/invalid/expired; the client should (re)authenticate. <strong>403 Forbidden</strong>: authenticated, but this principal lacks permission; re-authenticating as the same user won't help. <strong>404 Not Found</strong>: resource doesn't exist — and deliberately also used <em>instead of 403</em> when you don't want to reveal that a resource exists (GitHub returns 404 for private repos you can't see). Note 401/403 typically originate in the security filter chain, before MVC, so they're handled by security's entry point / access-denied handler, not <code>@ControllerAdvice</code>.</p></div></details>
+
+<details class="qa"><summary>PUT vs PATCH — and what is JSON Merge Patch?</summary><div class="answer"><p>PUT replaces the full resource: the client sends the complete representation, omitted fields are removed/nulled, and it's idempotent by construction. PATCH sends only changes. JSON Merge Patch (RFC 7386, <code>application/merge-patch+json</code>) is the common PATCH format: keys present are set, <code>null</code> means delete the field, absent keys are untouched. Implementation gotcha: a plain DTO can't distinguish "absent" from "explicit null" — both deserialize to <code>null</code> — so you read the patch as <code>JsonNode</code>/Map (checking <code>has()</code> vs <code>isNull()</code>) or use a patching library. RFC 6902 JSON Patch (operation array) is the more precise, less-used alternative.</p></div></details>
+
+<details class="qa"><summary>How do you design pagination for a large collection endpoint?</summary><div class="answer"><p>Default: offset pagination with <code>page</code>/<code>size</code>/<code>sort</code> (Spring Data binds a <code>Pageable</code> automatically), a hard cap on <code>size</code>, a whitelist of sortable fields, and a stable response envelope (<code>content</code> + <code>page/size/totalElements/totalPages</code>) instead of serializing <code>Page</code> directly, since its JSON shape isn't a guaranteed contract. For deep or fast-moving datasets, switch to keyset/cursor pagination (<code>?after=&lt;cursor&gt;</code>): the DB seeks on an indexed <code>(sortKey, id)</code> tuple instead of scanning an OFFSET, and results don't skip/duplicate when rows are inserted between pages — the right fit for infinite scroll. Trade-off: no random page access and no cheap total count.</p></div></details>
+
+<details class="qa"><summary>Compare API versioning via URI, header, and media type.</summary><div class="answer"><p>URI (<code>/api/v1/…</code>): explicit, visible in logs/browsers, trivial gateway routing and caching — but the same resource has multiple URIs and migrations touch every client URL. Header (<code>X-API-Version</code>): clean URIs, but invisible in casual debugging, needs <code>Vary</code> for caches, harder to demo. Media type (<code>Accept: application/vnd.acme.v2+json</code>): the most "RESTful" — version is a representation concern — but clunky for consumers and rare outside APIs like GitHub's. Pragmatically most teams choose URI versioning for operability, and — more importantly — version rarely: additive optional fields plus tolerant readers avoid most version bumps.</p></div></details>
+
+<details class="qa"><summary>Filter vs HandlerInterceptor — differences and when to choose each?</summary><div class="answer"><p>A servlet <code>Filter</code> is a container-spec construct running <em>before</em> the <code>DispatcherServlet</code>: it sees every request (including non-MVC ones), works on raw request/response, can wrap streams and short-circuit — right level for correlation IDs, logging, compression, and where Spring Security lives. A <code>HandlerInterceptor</code> runs <em>inside</em> Spring MVC after handler resolution, so it knows exactly which controller method will run (can read its annotations) and offers <code>preHandle</code>/<code>postHandle</code>/<code>afterCompletion</code> — right level for per-endpoint policies like annotation-driven rate limiting. Key consequence: exceptions thrown in filters never reach <code>@ControllerAdvice</code>; MVC exception handling only covers the dispatcher's world.</p></div></details>
+
+<details class="qa"><summary>What happens between Tomcat accepting a connection and your controller method running?</summary><div class="answer"><p>Tomcat parses the request on a worker thread and passes it through the servlet <strong>filter chain</strong> (security, CORS, correlation-ID filters). It reaches the <strong>DispatcherServlet</strong> — Spring MVC's front controller — which asks <code>HandlerMapping</code>s to resolve the <code>@RequestMapping</code> method, invokes <code>HandlerInterceptor.preHandle</code>, then runs <strong>argument resolvers</strong> (path/param binding, <code>HttpMessageConverter</code> for <code>@RequestBody</code>, Bean Validation for <code>@Valid</code>), then the controller method. The return value goes through return-value handlers/message converters, <code>postHandle</code>, then <code>afterCompletion</code> (even on exceptions), and the response travels back out through the filters. Exceptions from the handler are routed to <code>HandlerExceptionResolver</code>s, which is where <code>@ExceptionHandler</code>/<code>@ControllerAdvice</code> plug in.</p></div></details>
+
+<details class="qa"><summary>A React dev on your team reports a CORS error calling your API. Walk through your diagnosis.</summary><div class="answer"><p>First: CORS errors are a browser-enforced, server-declared policy problem — fix it on the backend. Check (1) is the failing request the <em>preflight</em>? JSON + <code>Authorization</code> header always preflights; look for the <code>OPTIONS</code> call and whether it returns the <code>Access-Control-Allow-*</code> headers. (2) Is the exact origin (scheme+host+port) in the allowed list — <code>http://localhost:5173</code> ≠ <code>http://localhost:3000</code>. (3) If cookies are involved: <code>allowCredentials(true)</code> forbids wildcard origin — must echo the specific origin. (4) With Spring Security, is CORS configured in the security chain so the anonymous preflight isn't 401'd? (5) If JS can't read a custom response header, it's missing from <code>exposedHeaders</code>. And the non-CORS red herring: a 500 without CORS headers <em>looks like</em> a CORS failure in the browser console.</p></div></details>
+
+<details class="qa"><summary>Why can't Access-Control-Allow-Origin be * when credentials are allowed?</summary><div class="answer"><p>Spec-level protection: credentialed requests attach the user's cookies, so "any site may read responses made with the victim's cookies" would let a malicious page exfiltrate personal data from any credentialed API — CSRF escalated to full read access. Browsers therefore require an explicit, specific origin echo (plus <code>Access-Control-Allow-Credentials: true</code>) so servers must consciously enumerate trusted origins. Spring enforces this at config time (startup error for <code>allowedOrigins("*")</code> + credentials); <code>allowedOriginPatterns</code> is the mechanism for wildcard <em>subdomain</em> matching that still echoes a concrete origin, and responses should carry <code>Vary: Origin</code> for cache correctness.</p></div></details>
+
+<details class="qa"><summary>RestTemplate vs WebClient vs RestClient — which do you pick in 2026?</summary><div class="answer"><p><code>RestTemplate</code> is in maintenance mode — fine in legacy code, wrong for new code. <code>WebClient</code> is the reactive client: non-blocking, returns <code>Mono</code>/<code>Flux</code>; the right tool on a WebFlux stack or for streaming/high-fan-out — but on a servlet stack calling <code>.block()</code> everywhere buys complexity without benefit. <code>RestClient</code> (Spring 6.1+) is the modern <em>blocking</em> client with WebClient's fluent API and message-converter integration — the default for typical MVC services. Regardless of client: configure timeouts explicitly, add retry/circuit-breaking where appropriate, and propagate correlation headers. <code>@HttpExchange</code> interfaces can sit on top of either for declarative clients.</p></div></details>
+
+<details class="qa"><summary>How does file download work — why Resource and Content-Disposition?</summary><div class="answer"><p>Return <code>ResponseEntity&lt;Resource&gt;</code> (e.g. <code>InputStreamResource</code>) so the file is <em>streamed</em> via <code>ResourceHttpMessageConverter</code> rather than loaded into heap — critical for large files. Set <code>Content-Type</code> to the real MIME type, <code>Content-Length</code> when known, and <code>Content-Disposition</code> to control browser behavior: <code>attachment; filename="report.pdf"</code> triggers a save dialog, <code>inline</code> renders in-browser. Use Spring's <code>ContentDisposition</code> builder to get RFC 6266/5987 filename encoding right for non-ASCII names. On the frontend this is the endpoint you consumed with <code>res.blob()</code> + object URL.</p></div></details>
+
+<details class="qa"><summary>What is HATEOAS, and why do so few teams use it?</summary><div class="answer"><p>HATEOAS embeds hypermedia links in responses (<code>_links.self</code>, <code>_links.cancel</code>…) so clients navigate the API dynamically by following links, not hardcoding URLs — Richardson Level 3, supported by Spring HATEOAS. In practice adoption is thin because real clients are built against a known contract: OpenAPI specs plus generated typed clients deliver the discoverability value at build time with less runtime payload and complexity, and truly generic hypermedia clients basically don't exist outside browsers. The durable subset: returning permitted actions per resource so UIs render buttons from server-side authorization truth. Being able to define it <em>and</em> explain the pragmatic trade-off is exactly the senior expectation.</p></div></details>
+
+<details class="qa"><summary>How would you add request/response documentation to a Spring API, and how does it help a frontend team?</summary><div class="answer"><p>Add springdoc-openapi: it introspects mappings, DTOs, and jakarta.validation annotations to generate an OpenAPI 3 document at <code>/v3/api-docs</code> with Swagger UI on top; annotate with <code>@Operation</code>/<code>@Schema</code> where inference isn't enough, and document error responses (ProblemDetail schemas) too. For the frontend, the spec is machine-readable contract: generate TypeScript types and clients (openapi-typescript, Orval), so a backend field rename fails the frontend <em>build</em> instead of failing in production. It also enables contract testing and mock servers. Keep the spec generated from code (or code-first with review) so it can't drift from reality.</p></div></details>
+
+<details class="qa"><summary>Where do you put cross-cutting logic: Filter, Interceptor, AOP, or ControllerAdvice?</summary><div class="answer"><p>Decide by the layer the concern belongs to. Must cover <em>all</em> HTTP traffic, needs raw streams, or must run before Spring (auth, correlation ID, logging, compression) → <strong>Filter</strong>. Needs to know <em>which handler</em> will run, HTTP-only, per-endpoint policy (annotation-driven rate limits, tenant guards) → <strong>Interceptor</strong>. Not HTTP-specific, applies to service-layer methods (transactions, retries, auditing, timing business operations) → <strong>AOP aspect</strong>. Exception-to-response mapping and shared binder/model configuration → <strong>@ControllerAdvice</strong>. Anti-pattern to call out: business logic in filters/aspects where it's invisible and untestable — cross-cutting mechanisms are for cross-cutting concerns only.</p></div></details>
+
+<details class="qa"><summary>How do you validate a request param like ?size= so clients can't ask for a million rows?</summary><div class="answer"><p>Put <code>@Validated</code> on the controller class to enable method-parameter validation, then constrain the param: <code>@RequestParam @Min(1) @Max(100) int size</code>. Violations throw <code>ConstraintViolationException</code>, which you map to 400 in the global advice (unmapped it's a 500). Defense in depth: also clamp in code or configure Spring Data's <code>max-page-size</code>, because validation annotations only protect endpoints where someone remembered to add them. This is a resource-exhaustion guard, not just tidiness — unbounded page sizes are an easy self-DoS.</p></div></details>
+
+<details class="qa"><summary>Your endpoint returns dates that the React app misparses. What controls date JSON format in Spring Boot?</summary><div class="answer"><p>Boot registers Jackson's <code>JavaTimeModule</code> and disables <code>WRITE_DATES_AS_TIMESTAMPS</code>, so <code>java.time</code> types serialize as ISO-8601 strings — <code>Instant</code> → <code>"2026-07-02T09:15:30Z"</code>, <code>LocalDate</code> → <code>"2026-07-02"</code> — which JS <code>Date</code> and libraries parse natively. Misparses usually mean: someone used legacy <code>java.util.Date</code> (epoch millis by default), a stray <code>@JsonFormat</code> with a non-ISO pattern, or a <code>LocalDateTime</code> with no zone information being treated as UTC/local inconsistently — prefer <code>Instant</code>/<code>OffsetDateTime</code> for moments in time. Global tuning belongs in <code>spring.jackson.*</code> properties or a <code>Jackson2ObjectMapperBuilderCustomizer</code>, not per-field annotations scattered everywhere.</p></div></details>
+
+<!-- ============================================================ -->
+<h2 id="exercises">Hands-on exercises</h2>
+
+<div class="exercise">
+<h4>Exercise 1 — Full CRUD controller with DTOs</h4>
+<p>Build a <code>BookController</code> under <code>/api/books</code>: list (paginated, filter by <code>author</code>), get by id, create (201 + Location), full update (PUT → 200), delete (204). Use records <code>CreateBookRequest</code>/<code>BookResponse</code>; never expose the entity. Correct status codes throughout.</p>
+<details><summary>Solution</summary>
+<pre><code><span class="kw">public record</span> <span class="typ">CreateBookRequest</span>(<span class="ann">@NotBlank @Size</span>(max = <span class="num">300</span>) String title,
+                                <span class="ann">@NotBlank</span> String author,
+                                <span class="ann">@Positive</span> BigDecimal price) {}
+
+<span class="kw">public record</span> <span class="typ">BookResponse</span>(Long id, String title, String author,
+                           BigDecimal price, Instant createdAt) {
+    <span class="kw">static</span> BookResponse from(Book b) {
+        <span class="kw">return new</span> BookResponse(b.getId(), b.getTitle(), b.getAuthor(),
+                                b.getPrice(), b.getCreatedAt());
+    }
+}
+
+<span class="ann">@RestController</span>
+<span class="ann">@RequestMapping</span>(<span class="str">"/api/books"</span>)
+<span class="ann">@Validated</span>
+<span class="kw">public class</span> <span class="typ">BookController</span> {
+
+    <span class="kw">private final</span> BookService service;
+    <span class="kw">public</span> BookController(BookService service) { <span class="kw">this</span>.service = service; }
+
+    <span class="ann">@GetMapping</span>
+    <span class="kw">public</span> PageResponse&lt;BookResponse&gt; list(
+            <span class="ann">@RequestParam</span>(required = <span class="kw">false</span>) String author,
+            <span class="ann">@RequestParam</span>(defaultValue = <span class="str">"0"</span>) <span class="ann">@Min</span>(0) <span class="kw">int</span> page,
+            <span class="ann">@RequestParam</span>(defaultValue = <span class="str">"20"</span>) <span class="ann">@Min</span>(1) <span class="ann">@Max</span>(100) <span class="kw">int</span> size) {
+        <span class="kw">return</span> service.search(author, PageRequest.of(page, size)).map(BookResponse::from);
+    }
+
+    <span class="ann">@GetMapping</span>(<span class="str">"/{id}"</span>)
+    <span class="kw">public</span> BookResponse one(<span class="ann">@PathVariable</span> <span class="kw">long</span> id) {
+        <span class="kw">return</span> BookResponse.from(service.getOrThrow(id));   <span class="com">// throws NotFoundException → 404 via advice</span>
+    }
+
+    <span class="ann">@PostMapping</span>
+    <span class="kw">public</span> ResponseEntity&lt;BookResponse&gt; create(<span class="ann">@Valid @RequestBody</span> CreateBookRequest req,
+                                               UriComponentsBuilder uri) {
+        BookResponse created = BookResponse.from(service.create(req));
+        <span class="kw">return</span> ResponseEntity
+                .created(uri.path(<span class="str">"/api/books/{id}"</span>).buildAndExpand(created.id()).toUri())
+                .body(created);
+    }
+
+    <span class="ann">@PutMapping</span>(<span class="str">"/{id}"</span>)
+    <span class="kw">public</span> BookResponse replace(<span class="ann">@PathVariable</span> <span class="kw">long</span> id,
+                                <span class="ann">@Valid @RequestBody</span> CreateBookRequest req) {
+        <span class="kw">return</span> BookResponse.from(service.replace(id, req)); <span class="com">// full replacement — idempotent</span>
+    }
+
+    <span class="ann">@DeleteMapping</span>(<span class="str">"/{id}"</span>)
+    <span class="ann">@ResponseStatus</span>(HttpStatus.NO_CONTENT)
+    <span class="kw">public void</span> delete(<span class="ann">@PathVariable</span> <span class="kw">long</span> id) {
+        service.delete(id);
+    }
+}
+</code></pre>
+<p>Grading points: 201 with <code>Location</code>, 204 on delete, capped page size, DTOs on both directions, not-found delegated to the global advice.</p>
+</details>
+</div>
+
+<div class="exercise">
+<h4>Exercise 2 — Global error boundary with ProblemDetail</h4>
+<p>Write a <code>@RestControllerAdvice</code> handling: <code>NotFoundException</code> → 404, <code>MethodArgumentNotValidException</code> → 400 with an <code>errors</code> array of <code>{field, message}</code>, and any other exception → 500 with a correlation ID and no internal details. Verify with curl that invalid input produces field-level errors and that a forced <code>RuntimeException</code> leaks nothing.</p>
+<details><summary>Solution</summary>
+<p>See the complete <code>GlobalExceptionHandler</code> in the <a href="#exceptions">exception-handling section</a> — the exercise version needs the three handlers plus tests:</p>
+<pre><code><span class="com"># 400 with field errors</span>
+curl -s -X POST localhost:8080/api/books -H <span class="str">'Content-Type: application/json'</span> \
+     -d <span class="str">'{"title":"","author":"","price":-5}'</span> | jq
+<span class="com"># → status 400, "errors": [{"field":"title","message":"must not be blank"}, ...]</span>
+
+<span class="com"># 404 ProblemDetail</span>
+curl -s localhost:8080/api/books/999999 | jq
+<span class="com"># → {"type":"…/not-found","title":"Resource not found","status":404,"detail":"Book 999999 not found"}</span>
+
+<span class="com"># 500: throw new RuntimeException("db password is hunter2") in a test endpoint —</span>
+<span class="com"># the response must show only "An unexpected error occurred" + correlationId;</span>
+<span class="com"># the message and stack trace appear ONLY in the server log, tagged with the same id.</span>
+</code></pre>
+<p>Key check: the 500 handler logs <code>ex</code> as the last logger argument (full stack trace) and returns a body containing neither <code>ex.getMessage()</code> nor exception class names.</p>
+</details>
+</div>
+
+<div class="exercise">
+<h4>Exercise 3 — Custom validator: @UniqueEmail</h4>
+<p>Create a custom constraint <code>@UniqueEmail</code> for <code>CreateUserRequest.email</code> that consults <code>UserRepository.existsByEmail()</code>. Wire it so a duplicate registration returns 400 with a clear field error. Then answer: why is this validation alone <em>not</em> sufficient to guarantee uniqueness?</p>
+<details><summary>Solution</summary>
+<pre><code><span class="ann">@Target</span>(ElementType.FIELD)
+<span class="ann">@Retention</span>(RetentionPolicy.RUNTIME)
+<span class="ann">@Constraint</span>(validatedBy = UniqueEmailValidator.<span class="kw">class</span>)
+<span class="kw">public</span> <span class="ann">@interface</span> <span class="typ">UniqueEmail</span> {
+    String message() <span class="kw">default</span> <span class="str">"email is already registered"</span>;
+    Class&lt;?&gt;[] groups() <span class="kw">default</span> {};
+    Class&lt;? <span class="kw">extends</span> Payload&gt;[] payload() <span class="kw">default</span> {};
+}
+
+<span class="com">// Spring instantiates ConstraintValidators as beans → constructor injection works</span>
+<span class="kw">public class</span> <span class="typ">UniqueEmailValidator</span> <span class="kw">implements</span> ConstraintValidator&lt;UniqueEmail, String&gt; {
+    <span class="kw">private final</span> UserRepository users;
+    <span class="kw">public</span> UniqueEmailValidator(UserRepository users) { <span class="kw">this</span>.users = users; }
+
+    <span class="ann">@Override</span>
+    <span class="kw">public boolean</span> isValid(String email, ConstraintValidatorContext ctx) {
+        <span class="kw">if</span> (email == <span class="kw">null</span> || email.isBlank()) <span class="kw">return true</span>;  <span class="com">// @NotBlank's job</span>
+        <span class="kw">return</span> !users.existsByEmail(email.toLowerCase());
+    }
+}
+
+<span class="kw">public record</span> <span class="typ">CreateUserRequest</span>(
+        <span class="ann">@NotBlank @Email @UniqueEmail</span> String email,
+        <span class="ann">@NotBlank</span> String name) {}
+</code></pre>
+<p><strong>Why it's insufficient:</strong> check-then-act race — two concurrent registrations can both pass <code>existsByEmail</code> before either inserts. The database <code>UNIQUE</code> constraint is the real guarantee; the validator is UX. So you also catch <code>DataIntegrityViolationException</code> at insert time and map it to 409 (or a 400 field error). Validation for fast feedback, constraint for correctness — saying both is the senior answer.</p>
+</details>
+</div>
+
+<div class="exercise">
+<h4>Exercise 4 — Correlation-ID filter + timing interceptor</h4>
+<p>Implement (a) a <code>OncePerRequestFilter</code> that reads or generates <code>X-Correlation-Id</code>, stores it in MDC, echoes it on the response, and cleans up; (b) a <code>HandlerInterceptor</code> that logs <code>method, path, status, durationMs</code> per request. Register the interceptor for <code>/api/**</code>. Explain why (a) must be a filter and (b) fits an interceptor.</p>
+<details><summary>Solution</summary>
+<p>The filter is in the <a href="#pipeline">pipeline section</a>. The interceptor and registration:</p>
+<pre><code><span class="ann">@Component</span>
+<span class="kw">public class</span> <span class="typ">TimingInterceptor</span> <span class="kw">implements</span> HandlerInterceptor {
+    <span class="kw">private static final</span> Logger log = LoggerFactory.getLogger(TimingInterceptor.<span class="kw">class</span>);
+    <span class="kw">private static final</span> String START = <span class="str">"req.start"</span>;
+
+    <span class="ann">@Override</span>
+    <span class="kw">public boolean</span> preHandle(HttpServletRequest req, HttpServletResponse res, Object handler) {
+        req.setAttribute(START, System.nanoTime());
+        <span class="kw">return true</span>;                                  <span class="com">// false would veto the request</span>
+    }
+
+    <span class="ann">@Override</span>
+    <span class="kw">public void</span> afterCompletion(HttpServletRequest req, HttpServletResponse res,
+                                Object handler, Exception ex) {   <span class="com">// runs even on exceptions</span>
+        <span class="kw">long</span> ms = (System.nanoTime() - (<span class="kw">long</span>) req.getAttribute(START)) / <span class="num">1_000_000</span>;
+        log.info(<span class="str">"{} {} -&gt; {} ({} ms)"</span>, req.getMethod(), req.getRequestURI(),
+                 res.getStatus(), ms);                <span class="com">// correlationId auto-included via MDC pattern</span>
+    }
+}
+
+<span class="ann">@Configuration</span>
+<span class="kw">public class</span> <span class="typ">WebConfig</span> <span class="kw">implements</span> WebMvcConfigurer {
+    <span class="kw">private final</span> TimingInterceptor timing;
+    <span class="kw">public</span> WebConfig(TimingInterceptor timing) { <span class="kw">this</span>.timing = timing; }
+
+    <span class="ann">@Override</span>
+    <span class="kw">public void</span> addInterceptors(InterceptorRegistry registry) {
+        registry.addInterceptor(timing).addPathPatterns(<span class="str">"/api/**"</span>);
+    }
+}
+</code></pre>
+<p><strong>Why the split:</strong> the correlation ID must exist for <em>everything</em> — including security-filter rejections, static resources, and errors that never reach MVC — and must wrap the entire processing including other filters, so it's a filter at highest precedence. Timing per <em>handler</em> only cares about MVC endpoints, benefits from path patterns and handler awareness, and wants the <code>afterCompletion</code> guarantee — a natural interceptor.</p>
+</details>
+</div>
+
+<div class="exercise">
+<h4>Exercise 5 — Merge-patch endpoint that distinguishes absent from null</h4>
+<p>Add <code>PATCH /api/books/{id}</code> consuming <code>application/merge-patch+json</code> supporting partial updates of <code>title</code> and <code>price</code>, where <code>{"price": null}</code> is rejected with 422 ("price cannot be cleared") but an absent <code>price</code> key leaves it untouched. Prove with three curl calls that title-only, price-only, and explicit-null behave correctly.</p>
+<details><summary>Solution</summary>
+<pre><code><span class="ann">@PatchMapping</span>(value = <span class="str">"/{id}"</span>, consumes = <span class="str">"application/merge-patch+json"</span>)
+<span class="kw">public</span> BookResponse patch(<span class="ann">@PathVariable</span> <span class="kw">long</span> id, <span class="ann">@RequestBody</span> JsonNode patch) {
+    Book book = service.getOrThrow(id);
+
+    <span class="kw">if</span> (patch.has(<span class="str">"title"</span>)) {                        <span class="com">// key present (maybe null)</span>
+        JsonNode v = patch.get(<span class="str">"title"</span>);
+        <span class="kw">if</span> (v.isNull() || v.asText().isBlank())
+            <span class="kw">throw new</span> UnprocessableException(<span class="str">"title cannot be cleared"</span>);
+        book.setTitle(v.asText());
+    }
+    <span class="kw">if</span> (patch.has(<span class="str">"price"</span>)) {
+        JsonNode v = patch.get(<span class="str">"price"</span>);
+        <span class="kw">if</span> (v.isNull())
+            <span class="kw">throw new</span> UnprocessableException(<span class="str">"price cannot be cleared"</span>);
+        BigDecimal price = v.decimalValue();
+        <span class="kw">if</span> (price.signum() &lt;= <span class="num">0</span>)
+            <span class="kw">throw new</span> UnprocessableException(<span class="str">"price must be positive"</span>);
+        book.setPrice(price);
+    }
+    <span class="kw">return</span> BookResponse.from(service.save(book));
+}
+
+<span class="com">// In the advice: UnprocessableException → ProblemDetail with HttpStatus.UNPROCESSABLE_ENTITY (422)</span>
+</code></pre>
+<pre><code><span class="com"># 1. title only — price untouched</span>
+curl -s -X PATCH localhost:8080/api/books/1 \
+     -H <span class="str">'Content-Type: application/merge-patch+json'</span> -d <span class="str">'{"title":"New Title"}'</span>
+
+<span class="com"># 2. price only — title untouched</span>
+curl -s -X PATCH localhost:8080/api/books/1 \
+     -H <span class="str">'Content-Type: application/merge-patch+json'</span> -d <span class="str">'{"price": 19.99}'</span>
+
+<span class="com"># 3. explicit null — rejected 422</span>
+curl -s -X PATCH localhost:8080/api/books/1 \
+     -H <span class="str">'Content-Type: application/merge-patch+json'</span> -d <span class="str">'{"price": null}'</span>
+<span class="com"># → {"status":422,"detail":"price cannot be cleared"}</span>
+</code></pre>
+<p>The load-bearing insight: a typed DTO cannot express the absent-vs-null distinction (both bind to <code>null</code>), which is why the handler reads <code>JsonNode</code> and checks <code>has()</code> before <code>isNull()</code>. That distinction <em>is</em> the merge-patch spec.</p>
+</details>
+</div>
+
+<nav class="page-nav"><a href="05-spring-core-di.html">← Prev: Spring Core &amp; DI</a><a href="07-spring-jpa-hibernate.html">Next: JPA &amp; Hibernate →</a></nav>
+</main></body></html>

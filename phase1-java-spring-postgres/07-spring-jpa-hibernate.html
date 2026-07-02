@@ -1,0 +1,1125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>07 — Spring Data JPA &amp; Hibernate | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header"><div class="container"><div class="breadcrumb"><a href="index.html">← Course Home</a></div><h1>07 — Spring Data JPA &amp; Hibernate</h1><p>Entities, relationships, the N+1 problem, transactions, and the persistence context — the topics that decide senior Java interviews.</p></div></header>
+<main class="container">
+
+<section>
+  <h2 id="why">Why interviewers ask this</h2>
+  <p>Every Java backend interview eventually lands on JPA, and this is where the interviewer separates the seniors from the annotation-users. Anyone can put <code>@Entity</code> on a class and call <code>repository.save()</code>. What interviewers probe is whether you understand the <em>machinery underneath</em>: what SQL Hibernate actually generates, why a lazy collection blows up outside a transaction, why an update happened even though you never called <code>save()</code>, and why the service went from 3 queries to 3,000 in production.</p>
+  <p>Coming from the JS world: think of JPA/Hibernate as roughly the role Prisma plays, but with a fundamentally different design. Prisma is a <em>query builder</em> — you ask for data, you get plain objects back, the story ends. Hibernate is a <em>stateful ORM with a unit-of-work</em>: it tracks every entity you load, detects your changes automatically, and decides when to write them back. That statefulness is the source of both its power (dirty checking, batching, caching) and nearly every interview trap in this file. Internalize the persistence context and the rest follows.</p>
+  <div class="note">
+    <p><strong>Terminology map:</strong> JPA (Jakarta Persistence API) is the <em>specification</em> — annotations and interfaces like <code>@Entity</code>, <code>EntityManager</code>. Hibernate is the dominant <em>implementation</em>. Spring Data JPA is a Spring layer <em>on top of</em> JPA that generates repository implementations for you. In interviews, say "Spring Data JPA generates the repository, JPA defines the contract, Hibernate executes the SQL" and you have already scored a point.</p>
+  </div>
+</section>
+
+<div class="toc"><strong>On this page</strong>
+  <ol>
+    <li><a href="#why">Why interviewers ask this</a></li>
+    <li><a href="#entity-mapping">Entity mapping &amp; ID generation</a></li>
+    <li><a href="#relationships">Relationships: owning side, cascades, orphans</a></li>
+    <li><a href="#n-plus-one">FetchType &amp; the N+1 problem (centerpiece)</a></li>
+    <li><a href="#transactional">@Transactional, deeply</a></li>
+    <li><a href="#persistence-context">The persistence context &amp; entity lifecycle</a></li>
+    <li><a href="#repositories">Spring Data repositories</a></li>
+    <li><a href="#pagination">Pagination &amp; sorting</a></li>
+    <li><a href="#locking">Optimistic &amp; pessimistic locking</a></li>
+    <li><a href="#hikari">HikariCP connection pooling</a></li>
+    <li><a href="#l2-cache">Second-level cache awareness</a></li>
+    <li><a href="#specifications">Dynamic queries: Specifications</a></li>
+    <li><a href="#auditing">Auditing</a></li>
+    <li><a href="#flyway">Schema migrations with Flyway</a></li>
+    <li><a href="#qa">Interview Q&amp;A</a></li>
+    <li><a href="#exercises">Hands-on exercises</a></li>
+  </ol>
+</div>
+
+<!-- ============================================================ -->
+<section>
+<h2 id="entity-mapping">Entity mapping &amp; ID generation <span class="tier tier-1">T1</span></h2>
+
+<p>An entity is a Java class mapped to a table. The minimum viable entity:</p>
+
+<pre><code><span class="ann">@Entity</span>
+<span class="ann">@Table</span>(name = <span class="str">"customers"</span>)   <span class="com">// otherwise table name defaults to the class name</span>
+<span class="kw">public class</span> <span class="typ">Customer</span> {
+
+    <span class="ann">@Id</span>
+    <span class="ann">@GeneratedValue</span>(strategy = GenerationType.SEQUENCE, generator = <span class="str">"customer_seq"</span>)
+    <span class="ann">@SequenceGenerator</span>(name = <span class="str">"customer_seq"</span>, sequenceName = <span class="str">"customer_seq"</span>, allocationSize = <span class="num">50</span>)
+    <span class="kw">private</span> <span class="typ">Long</span> id;
+
+    <span class="ann">@Column</span>(name = <span class="str">"email"</span>, nullable = <span class="kw">false</span>, unique = <span class="kw">true</span>, length = <span class="num">320</span>)
+    <span class="kw">private</span> <span class="typ">String</span> email;
+
+    <span class="ann">@Column</span>(nullable = <span class="kw">false</span>)
+    <span class="kw">private</span> <span class="typ">String</span> name;
+
+    <span class="ann">@Enumerated</span>(EnumType.STRING)   <span class="com">// NEVER ORDINAL — reordering the enum corrupts data</span>
+    <span class="kw">private</span> <span class="typ">CustomerStatus</span> status;
+
+    <span class="kw">protected</span> <span class="typ">Customer</span>() {}          <span class="com">// JPA requires a no-arg constructor (can be protected)</span>
+
+    <span class="kw">public</span> <span class="typ">Customer</span>(<span class="typ">String</span> email, <span class="typ">String</span> name) {
+        <span class="kw">this</span>.email = email;
+        <span class="kw">this</span>.name = name;
+        <span class="kw">this</span>.status = CustomerStatus.ACTIVE;
+    }
+    <span class="com">// getters, setters (or accessors) omitted</span>
+}
+</code></pre>
+
+<p>Key rules that trip people up:</p>
+<ul>
+  <li>JPA needs a <strong>no-arg constructor</strong> (at least <code>protected</code>) because Hibernate instantiates entities reflectively and populates fields afterward.</li>
+  <li>Entities cannot be Java <code>record</code>s (records are final, no no-arg constructor, no mutable fields for dirty checking). Records are perfect for <em>DTO projections</em>, not entities.</li>
+  <li>Avoid Lombok's <code>@Data</code>/<code>@EqualsAndHashCode</code>/<code>@ToString</code> on entities — they touch lazy fields and generate broken <code>equals</code> (see below).</li>
+</ul>
+
+<h3>ID generation strategies — IDENTITY vs SEQUENCE (this matters on Postgres)</h3>
+
+<table>
+  <thead><tr><th>Strategy</th><th>How it works</th><th>Batching?</th><th>Verdict for Postgres</th></tr></thead>
+  <tbody>
+    <tr><td><code>IDENTITY</code></td><td>DB assigns the id during INSERT (Postgres <code>bigserial</code> / <code>GENERATED ... AS IDENTITY</code>). Hibernate must execute the INSERT <em>immediately</em> at <code>persist()</code> to learn the id.</td><td><strong>No — JDBC batch inserts are disabled</strong></td><td>Works, but forfeits batching</td></tr>
+    <tr><td><code>SEQUENCE</code></td><td>Hibernate calls <code>select nextval('customer_seq')</code> <em>before</em> insert; with <code>allocationSize=50</code> one DB round-trip yields 50 ids (pooled optimizer). INSERTs can be deferred and batched at flush.</td><td><strong>Yes</strong></td><td><strong>Preferred</strong></td></tr>
+    <tr><td><code>UUID</code></td><td>Generated in the application (JPA 3.1: <code>GenerationType.UUID</code>). No DB round-trip at all; id known before insert.</td><td>Yes</td><td>Good for distributed id creation; watch index locality</td></tr>
+    <tr><td><code>AUTO</code></td><td>"Let the provider choose." On Postgres with Hibernate 6 this picks SEQUENCE, but the choice can shift between dialects/versions.</td><td>Depends</td><td>Be explicit instead</td></tr>
+  </tbody>
+</table>
+
+<p>Why IDENTITY kills batching, mechanically: the persistence context must know every managed entity's id (it's the key in the first-level cache). With IDENTITY, the only way to get the id is to run the INSERT. So <code>persist()</code> can't just queue the insert for flush time — it fires it right away, one statement at a time, and Hibernate silently ignores <code>hibernate.jdbc.batch_size</code> for that entity.</p>
+
+<p>With SEQUENCE + <code>allocationSize=50</code>, saving 50 entities in one transaction looks like this in the SQL log:</p>
+
+<pre><code><span class="com">-- one round trip fetches an id block (pooled optimizer)</span>
+select nextval('customer_seq')          <span class="com">-- returns e.g. 100; Hibernate hands out 51..100 locally</span>
+
+<span class="com">-- at flush, with spring.jpa.properties.hibernate.jdbc.batch_size=50:</span>
+insert into customers (email, name, status, id) values (?, ?, ?, ?)
+<span class="com">-- ...sent as ONE JDBC batch of 50 parameter sets, not 50 statements</span>
+</code></pre>
+
+<div class="pitfall">
+  <p><code>allocationSize</code> must match the sequence's <code>INCREMENT BY</code> in the database. If the DDL says <code>INCREMENT BY 1</code> but Hibernate assumes 50, you get duplicate-key errors or huge id gaps depending on the optimizer. When Flyway owns the schema, create the sequence yourself: <code>CREATE SEQUENCE customer_seq START WITH 1 INCREMENT BY 50;</code></p>
+</div>
+
+<h3>UUID keys</h3>
+<pre><code><span class="ann">@Id</span>
+<span class="ann">@GeneratedValue</span>(strategy = GenerationType.UUID)
+<span class="kw">private</span> <span class="typ">UUID</span> id;   <span class="com">// maps to Postgres uuid column</span>
+</code></pre>
+<p>Random UUIDv4 keys scatter writes across a B-tree index (poor locality, index bloat under heavy insert). If you need UUIDs at scale, prefer time-ordered <strong>UUIDv7</strong> (Hibernate 6.5+: <code>@UuidGenerator(style = UuidGenerator.Style.TIME)</code> or a custom generator). Mentioning v7 in an interview signals you've operated Postgres at volume.</p>
+
+<h3>equals() and hashCode() — the id-is-null-before-persist problem</h3>
+<p>A classic senior question. The trap: a generated id is <code>null</code> until the entity is persisted. If <code>equals/hashCode</code> are based on the id, then:</p>
+<ol>
+  <li>You add a transient entity to a <code>HashSet</code> — hashCode computed from <code>id = null</code>.</li>
+  <li>You persist it — id gets assigned, hashCode changes.</li>
+  <li><code>set.contains(entity)</code> now returns <strong>false</strong> for an object that is in the set. The set is corrupted.</li>
+</ol>
+<p>Two accepted solutions:</p>
+<pre><code><span class="com">// Option A: natural/business key (best when one exists, e.g. email, ISBN)</span>
+<span class="ann">@Override</span> <span class="kw">public boolean</span> equals(<span class="typ">Object</span> o) {
+    <span class="kw">if</span> (<span class="kw">this</span> == o) <span class="kw">return true</span>;
+    <span class="kw">if</span> (!(o <span class="kw">instanceof</span> <span class="typ">Customer</span> other)) <span class="kw">return false</span>;
+    <span class="kw">return</span> email.equals(other.getEmail());
+}
+<span class="ann">@Override</span> <span class="kw">public int</span> hashCode() { <span class="kw">return</span> email.hashCode(); }
+
+<span class="com">// Option B: id-based, null-safe, with a CONSTANT hashCode (Vlad Mihalcea's pattern)</span>
+<span class="ann">@Override</span> <span class="kw">public boolean</span> equals(<span class="typ">Object</span> o) {
+    <span class="kw">if</span> (<span class="kw">this</span> == o) <span class="kw">return true</span>;
+    <span class="kw">if</span> (!(o <span class="kw">instanceof</span> <span class="typ">Customer</span> other)) <span class="kw">return false</span>;  <span class="com">// instanceof, NOT getClass() —</span>
+    <span class="kw">return</span> getId() != <span class="kw">null</span> &amp;&amp; getId().equals(other.getId()); <span class="com">// Hibernate proxies are subclasses!</span>
+}
+<span class="ann">@Override</span> <span class="kw">public int</span> hashCode() { <span class="kw">return</span> getClass().hashCode(); } <span class="com">// constant: never changes across lifecycle</span>
+</code></pre>
+<p>Details worth saying out loud in an interview: use <code>instanceof</code> (or <code>Hibernate.getClass()</code>) rather than <code>getClass() ==</code> because a lazy proxy is a runtime <em>subclass</em> of your entity; and call <code>other.getId()</code> through the getter, because on a proxy the <em>field</em> is null — only the getter triggers initialization/returns the identifier. Two transient entities (both ids null) compare unequal under Option B, which is the safe behavior. The constant hashCode means all entities of a type land in one hash bucket — fine, because entity sets are small (a parent's children), and correctness beats bucket distribution.</p>
+</section>
+
+<!-- ============================================================ -->
+<section>
+<h2 id="relationships">Relationships: owning side, cascades, orphans <span class="tier tier-1">T1</span></h2>
+
+<h3>@ManyToOne — the workhorse</h3>
+<pre><code><span class="ann">@Entity</span>
+<span class="ann">@Table</span>(name = <span class="str">"orders"</span>)
+<span class="kw">public class</span> <span class="typ">Order</span> {
+    <span class="ann">@Id</span> <span class="ann">@GeneratedValue</span>(strategy = GenerationType.SEQUENCE, generator = <span class="str">"order_seq"</span>)
+    <span class="ann">@SequenceGenerator</span>(name = <span class="str">"order_seq"</span>, allocationSize = <span class="num">50</span>)
+    <span class="kw">private</span> <span class="typ">Long</span> id;
+
+    <span class="ann">@ManyToOne</span>(fetch = FetchType.LAZY, optional = <span class="kw">false</span>)  <span class="com">// default is EAGER — always override!</span>
+    <span class="ann">@JoinColumn</span>(name = <span class="str">"customer_id"</span>, nullable = <span class="kw">false</span>)
+    <span class="kw">private</span> <span class="typ">Customer</span> customer;
+
+    <span class="kw">private</span> <span class="typ">BigDecimal</span> total;
+    <span class="kw">private</span> <span class="typ">Instant</span> createdAt;
+}
+</code></pre>
+<p>The <code>orders</code> table carries the <code>customer_id</code> foreign key. <strong>The FK always lives on the many side</strong> — that fact drives everything about owning vs inverse sides below.</p>
+
+<div class="pitfall">
+  <p><code>@ManyToOne</code> and <code>@OneToOne</code> default to <strong>EAGER</strong> fetching (JPA spec decision, widely regarded as a mistake). Every senior codebase overrides them to <code>LAZY</code>. EAGER isn't just "one extra join" — it's <em>unremovable at query time</em>: even a query that only needs orders will drag customers along, and EAGER on the wrong path cascades into loading half the object graph.</p>
+</div>
+
+<h3>@OneToMany(mappedBy) — owning side vs inverse side</h3>
+<pre><code><span class="ann">@Entity</span>
+<span class="kw">public class</span> <span class="typ">Customer</span> {
+    <span class="com">// ... id, fields ...</span>
+
+    <span class="ann">@OneToMany</span>(mappedBy = <span class="str">"customer"</span>, cascade = CascadeType.ALL, orphanRemoval = <span class="kw">true</span>)
+    <span class="kw">private</span> <span class="typ">List</span>&lt;<span class="typ">Order</span>&gt; orders = <span class="kw">new</span> <span class="typ">ArrayList</span>&lt;&gt;();  <span class="com">// initialize inline — never null</span>
+}
+</code></pre>
+<p><code>mappedBy = "customer"</code> means: "the <code>Order.customer</code> field owns this relationship; I'm just the mirror." Hibernate writes the FK column based <strong>only on the owning side</strong>. This is the classic trap:</p>
+
+<pre><code><span class="com">// TRAP: modifying only the inverse side — nothing is persisted to the FK column</span>
+customer.getOrders().add(order);      <span class="com">// order.customer is still null</span>
+orderRepository.save(order);          <span class="com">// INSERT ... customer_id = NULL (or constraint violation)</span>
+
+<span class="com">// CORRECT: set the owning side (the FK column follows the @ManyToOne field)</span>
+order.setCustomer(customer);
+</code></pre>
+
+<p>To keep the in-memory graph consistent (so both sides agree within the same persistence context), use <strong>helper methods</strong> that sync both sides — the idiomatic pattern interviewers expect:</p>
+<pre><code><span class="com">// inside Customer</span>
+<span class="kw">public void</span> addOrder(<span class="typ">Order</span> order) {
+    orders.add(order);
+    order.setCustomer(<span class="kw">this</span>);
+}
+<span class="kw">public void</span> removeOrder(<span class="typ">Order</span> order) {
+    orders.remove(order);
+    order.setCustomer(<span class="kw">null</span>);   <span class="com">// with orphanRemoval=true this DELETEs the order at flush</span>
+}
+</code></pre>
+
+<div class="senior">
+  <p>A genuinely senior take: you often don't need the <code>@OneToMany</code> at all. A unidirectional <code>@ManyToOne</code> plus a repository query (<code>findByCustomerId(Long id, Pageable p)</code>) is simpler, avoids loading unbounded collections into memory, and paginates properly. Model bidirectional associations only when you traverse them together and the collection is naturally bounded (order → order lines: yes; customer → all orders ever: no).</p>
+</div>
+
+<h3>@ManyToMany — and why you'll usually replace it</h3>
+<pre><code><span class="ann">@Entity</span>
+<span class="kw">public class</span> <span class="typ">Student</span> {
+    <span class="ann">@ManyToMany</span>
+    <span class="ann">@JoinTable</span>(name = <span class="str">"student_course"</span>,
+        joinColumns = <span class="ann">@JoinColumn</span>(name = <span class="str">"student_id"</span>),
+        inverseJoinColumns = <span class="ann">@JoinColumn</span>(name = <span class="str">"course_id"</span>))
+    <span class="kw">private</span> <span class="typ">Set</span>&lt;<span class="typ">Course</span>&gt; courses = <span class="kw">new</span> <span class="typ">HashSet</span>&lt;&gt;();
+}
+</code></pre>
+<p>This works until the day product asks: "when did the student enroll?" A join table managed by <code>@ManyToMany</code> <strong>cannot hold extra columns</strong>. The standard evolution is to promote the join table to a real entity:</p>
+<pre><code><span class="ann">@Entity</span>
+<span class="ann">@Table</span>(name = <span class="str">"enrollments"</span>)
+<span class="kw">public class</span> <span class="typ">Enrollment</span> {
+    <span class="ann">@Id</span> <span class="ann">@GeneratedValue</span>(strategy = GenerationType.SEQUENCE, generator = <span class="str">"enrollment_seq"</span>)
+    <span class="kw">private</span> <span class="typ">Long</span> id;
+
+    <span class="ann">@ManyToOne</span>(fetch = FetchType.LAZY) <span class="kw">private</span> <span class="typ">Student</span> student;
+    <span class="ann">@ManyToOne</span>(fetch = FetchType.LAZY) <span class="kw">private</span> <span class="typ">Course</span> course;
+
+    <span class="kw">private</span> <span class="typ">Instant</span> enrolledAt;
+    <span class="kw">private</span> <span class="typ">Grade</span> grade;
+}
+</code></pre>
+<p>Now it's just two <code>@ManyToOne</code>s — easier to query, paginate, and extend. In interviews: "<code>@ManyToMany</code> is fine for a pure link with no attributes, but I reach for a join entity by default because join tables almost always grow columns."</p>
+
+<h3>@OneToOne — and its lazy-loading limitation</h3>
+<pre><code><span class="ann">@Entity</span>
+<span class="kw">public class</span> <span class="typ">User</span> {
+    <span class="ann">@OneToOne</span>(mappedBy = <span class="str">"user"</span>, fetch = FetchType.LAZY)  <span class="com">// LAZY here is a LIE — see note</span>
+    <span class="kw">private</span> <span class="typ">UserProfile</span> profile;   <span class="com">// non-owning side (no FK column in users)</span>
+}
+</code></pre>
+<div class="pitfall">
+  <p>On the <strong>non-owning</strong> (<code>mappedBy</code>) side of a <code>@OneToOne</code>, <code>LAZY</code> generally cannot be honored without bytecode enhancement. Reason: Hibernate must decide whether the field is <code>null</code> or a proxy — and since the FK lives in the <em>other</em> table, the only way to know is to query it. So it queries eagerly anyway. Fixes: map only the owning side (put the FK where you query from), share the primary key with <code>@MapsId</code>, or just query the child by <code>user_id</code> via its repository.</p>
+</div>
+
+<h3>Cascade types &amp; orphanRemoval</h3>
+<table>
+  <thead><tr><th>Cascade</th><th>Effect</th><th>Sane usage</th></tr></thead>
+  <tbody>
+    <tr><td><code>PERSIST</code></td><td><code>persist(parent)</code> also persists new children</td><td>Parent-child aggregates (order → lines)</td></tr>
+    <tr><td><code>MERGE</code></td><td><code>merge(parent)</code> also merges children</td><td>Same aggregates</td></tr>
+    <tr><td><code>REMOVE</code></td><td><code>remove(parent)</code> deletes children</td><td>Only when children can't exist alone</td></tr>
+    <tr><td><code>ALL</code></td><td>All of the above (+ refresh, detach)</td><td>True composition only</td></tr>
+  </tbody>
+</table>
+<div class="pitfall">
+  <p><strong>Never put <code>CascadeType.REMOVE</code> (or ALL) on <code>@ManyToMany</code>.</strong> Deleting a <code>Course</code> would cascade-delete its <code>Student</code>s — entities that other courses still reference. Cascade semantics assume exclusive ownership; many-to-many is by definition shared. Cascades belong on composition relationships (Order owns its OrderLines), not associations between independent aggregates (never cascade from Order to Customer).</p>
+</div>
+<p><strong><code>orphanRemoval</code> vs <code>cascade = REMOVE</code></strong> — a favorite distinction question:</p>
+<ul>
+  <li><code>cascade = REMOVE</code>: when the <em>parent is deleted</em>, delete the children too.</li>
+  <li><code>orphanRemoval = true</code>: when a child is <em>disconnected from the parent</em> (removed from the collection, or the reference nulled), delete that child — even though the parent lives on. "No parent → no right to exist."</li>
+</ul>
+<pre><code>order.getLines().remove(<span class="num">0</span>);   <span class="com">// with orphanRemoval=true, at flush Hibernate runs:</span>
+<span class="com">-- delete from order_lines where id=?</span>
+<span class="com">// with only cascade=REMOVE: nothing is deleted; the line is merely disassociated</span>
+</code></pre>
+</section>
+
+<!-- ============================================================ -->
+<section>
+<h2 id="n-plus-one">FetchType &amp; the N+1 problem <span class="tier tier-1">T1</span></h2>
+
+<p>If you remember one section from this whole course, make it this one. N+1 is the single most-asked JPA interview topic and the single most common production performance bug in Spring apps.</p>
+
+<h3>The fetch defaults (memorize this table)</h3>
+<table>
+  <thead><tr><th>Association</th><th>JPA default</th><th>What seniors do</th></tr></thead>
+  <tbody>
+    <tr><td><code>@ManyToOne</code></td><td><strong>EAGER</strong></td><td>Set LAZY explicitly</td></tr>
+    <tr><td><code>@OneToOne</code></td><td><strong>EAGER</strong></td><td>Set LAZY (owning side; see 1:1 caveat)</td></tr>
+    <tr><td><code>@OneToMany</code></td><td>LAZY</td><td>Keep LAZY</td></tr>
+    <tr><td><code>@ManyToMany</code></td><td>LAZY</td><td>Keep LAZY</td></tr>
+  </tbody>
+</table>
+<p>Rule of thumb: <strong>everything LAZY, always</strong> — then fetch eagerly <em>per query</em> where the use case needs it. EAGER is a global, irreversible decision; LAZY is a per-query choice. LAZY works by giving you a <em>proxy</em> (a runtime subclass for <code>@ManyToOne</code>, a special <code>PersistentBag/PersistentSet</code> for collections) that loads on first access — <em>if</em> a persistence context is still open.</p>
+
+<h3>N+1 demonstrated — with the actual SQL</h3>
+<pre><code><span class="com">// The innocent-looking code (Order.customer is @ManyToOne LAZY)</span>
+<span class="ann">@Transactional</span>(readOnly = <span class="kw">true</span>)
+<span class="kw">public</span> <span class="typ">List</span>&lt;<span class="typ">OrderSummary</span>&gt; recentOrders() {
+    <span class="kw">return</span> orderRepository.findTop100ByOrderByCreatedAtDesc().stream()
+        .map(o -&gt; <span class="kw">new</span> <span class="typ">OrderSummary</span>(o.getId(), o.getTotal(),
+                    o.getCustomer().getName()))   <span class="com">// &lt;-- proxy access, one query EACH</span>
+        .toList();
+}
+</code></pre>
+<p>The SQL log (this is what you must be able to narrate in an interview):</p>
+<pre><code><span class="com">-- 1 query for the orders:</span>
+select o1_0.id, o1_0.customer_id, o1_0.total, o1_0.created_at
+from orders o1_0 order by o1_0.created_at desc fetch first 100 rows only
+
+<span class="com">-- ...then N queries, one per DISTINCT customer touched:</span>
+select c1_0.id, c1_0.email, c1_0.name, c1_0.status from customers c1_0 where c1_0.id=?
+select c1_0.id, c1_0.email, c1_0.name, c1_0.status from customers c1_0 where c1_0.id=?
+select c1_0.id, c1_0.email, c1_0.name, c1_0.status from customers c1_0 where c1_0.id=?
+<span class="com">-- ... up to 100 more times. 1 + N round trips.</span>
+</code></pre>
+<p>At 1ms per round trip that's ~100ms of pure latency for a page that needed one join. With EAGER it's no better — EAGER on <code>@ManyToOne</code> in a <em>list query</em> also produces N+1 (Hibernate runs the main query, then eagerly initializes each reference with a secondary select). EAGER doesn't fix N+1; it just makes it mandatory.</p>
+
+<h3>LazyInitializationException — the flip side of the same coin</h3>
+<pre><code>org.hibernate.LazyInitializationException:
+  could not initialize proxy [com.shop.Customer#42] - no Session
+</code></pre>
+<p>Why: a lazy proxy needs a live persistence context (Hibernate <code>Session</code>) to load itself. The session is bound to the transaction. If you return an entity from a <code>@Transactional</code> service method and Jackson serializes it in the controller — <em>after</em> the transaction closed — touching a lazy field throws. The entity is <strong>detached</strong>; the proxy is a dangling pointer to a closed session.</p>
+
+<h3>Open Session In View — the band-aid and the debate</h3>
+<p>Spring Boot enables <strong>OSIV</strong> by default (<code>spring.jpa.open-in-view=true</code>, with a startup warning). OSIV keeps the persistence context open for the <em>entire HTTP request</em>, including view rendering / JSON serialization — so lazy loads from the controller "just work."</p>
+<p>Why seniors typically disable it:</p>
+<ul>
+  <li>A DB connection is held for the whole request — including while you call downstream HTTP services. Under load this exhausts the Hikari pool.</li>
+  <li>It hides N+1: serialization silently triggers dozens of lazy loads that no one wrote or reviewed. Queries issued during rendering run <em>outside</em> your service transaction (auto-commit or separate tx), so you can even read inconsistent state.</li>
+  <li>It blurs the architecture: the web layer can do I/O the service layer never sanctioned.</li>
+</ul>
+<pre><code><span class="com"># application.yml — the senior default</span>
+spring:
+  jpa:
+    open-in-view: <span class="kw">false</span>
+</code></pre>
+<p>Disabling OSIV forces the discipline that fixes N+1 for real: <strong>fetch everything the response needs inside the transaction</strong>, ideally as a DTO. The honest interview answer acknowledges the trade-off: OSIV is convenient for small CRUD apps; at scale connection-holding and hidden queries make it a liability.</p>
+
+<h3>Fix #1 — JOIN FETCH (JPQL)</h3>
+<pre><code><span class="kw">public interface</span> <span class="typ">OrderRepository</span> <span class="kw">extends</span> <span class="typ">JpaRepository</span>&lt;<span class="typ">Order</span>, <span class="typ">Long</span>&gt; {
+
+    <span class="ann">@Query</span>(<span class="str">"""
+        select o from Order o
+        join fetch o.customer
+        where o.createdAt &gt;= :since
+        order by o.createdAt desc
+        """</span>)
+    <span class="typ">List</span>&lt;<span class="typ">Order</span>&gt; findRecentWithCustomer(<span class="ann">@Param</span>(<span class="str">"since"</span>) <span class="typ">Instant</span> since);
+}
+</code></pre>
+<pre><code><span class="com">-- ONE query, customers hydrated in the same result set:</span>
+select o1_0.id, o1_0.created_at, c1_0.id, c1_0.email, c1_0.name, c1_0.status, o1_0.total
+from orders o1_0
+join customers c1_0 on c1_0.id=o1_0.customer_id
+where o1_0.created_at&gt;=?
+order by o1_0.created_at desc
+</code></pre>
+<div class="pitfall">
+  <p><strong>Fetch-joining a collection + pagination = in-memory pagination.</strong> <code>join fetch o.lines</code> multiplies rows (one row per order line), so SQL-level <code>LIMIT</code> would cut orders mid-collection. Hibernate therefore fetches <em>every</em> matching row and paginates in the JVM, logging: <code>HHH90003004: firstResult/maxResults specified with collection fetch; applying in memory</code>. On a large table this is an OOM waiting to happen. Fixes: paginate the parent query first and fetch collections in a second query (or with <code>@BatchSize</code>), or use two queries keyed by the page of ids. Also: you can't fetch-join two different collections in one query (<code>MultipleBagFetchException</code> with <code>List</code>s).</p>
+</div>
+<div class="note">
+  <p>On Hibernate 5, <code>select distinct o ... join fetch o.lines</code> needed <code>distinct</code> to deduplicate parent entities (plus <code>hibernate.query.passdistinctthrough=false</code> to keep it out of the SQL). Hibernate 6 deduplicates entity results automatically, so <code>distinct</code> is no longer required for this — a nice "I know what changed in Hibernate 6" flex.</p>
+</div>
+
+<h3>Fix #2 — @EntityGraph</h3>
+<p>Declarative fetch plan on top of derived or existing queries — no JPQL needed:</p>
+<pre><code><span class="ann">@EntityGraph</span>(attributePaths = {<span class="str">"customer"</span>})
+<span class="typ">List</span>&lt;<span class="typ">Order</span>&gt; findByStatus(<span class="typ">OrderStatus</span> status);
+
+<span class="ann">@EntityGraph</span>(attributePaths = {<span class="str">"customer"</span>, <span class="str">"lines.product"</span>})  <span class="com">// nested paths work</span>
+<span class="typ">Optional</span>&lt;<span class="typ">Order</span>&gt; findWithDetailsById(<span class="typ">Long</span> id);
+</code></pre>
+<p>Generates the same LEFT JOIN as a fetch join. Nice because one derived method can exist in graph and non-graph variants. Same collection-pagination caveat applies.</p>
+
+<h3>Fix #3 — @BatchSize / default_batch_fetch_size</h3>
+<p>When you genuinely need lazy loading but want it in chunks instead of one-by-one:</p>
+<pre><code><span class="com"># global (recommended) — application.yml</span>
+spring:
+  jpa:
+    properties:
+      hibernate:
+        default_batch_fetch_size: <span class="num">50</span>
+
+<span class="com">// or per association:</span>
+<span class="ann">@OneToMany</span>(mappedBy = <span class="str">"customer"</span>)
+<span class="ann">@BatchSize</span>(size = <span class="num">50</span>)
+<span class="kw">private</span> <span class="typ">List</span>&lt;<span class="typ">Order</span>&gt; orders;
+</code></pre>
+<pre><code><span class="com">-- N+1 becomes 1 + ceil(N/50): lazy loads are grouped into IN queries</span>
+select c1_0.id, c1_0.email, c1_0.name, c1_0.status
+from customers c1_0
+where c1_0.id in (?, ?, ?, ?, ?, ?, ?, ?, ... ) <span class="com">-- up to 50 ids per round trip</span>
+</code></pre>
+<p>This is a superb <em>safety net</em>: it turns catastrophic N+1s into mild ones globally, without touching queries. Many teams set <code>default_batch_fetch_size</code> as a baseline and use fetch joins/DTOs for hot paths.</p>
+
+<h3>Fix #4 — DTO projections (often the best fix)</h3>
+<p>The senior insight: <strong>most read endpoints don't need entities at all.</strong> If you're not going to modify the data, skip the persistence context entirely and select exactly the columns you need.</p>
+<pre><code><span class="com">// (a) Constructor expression with a record</span>
+<span class="kw">public record</span> <span class="typ">OrderSummary</span>(<span class="typ">Long</span> id, <span class="typ">BigDecimal</span> total, <span class="typ">String</span> customerName) {}
+
+<span class="ann">@Query</span>(<span class="str">"""
+    select new com.shop.dto.OrderSummary(o.id, o.total, c.name)
+    from Order o join o.customer c
+    where o.createdAt &gt;= :since
+    """</span>)
+<span class="typ">List</span>&lt;<span class="typ">OrderSummary</span>&gt; findSummaries(<span class="ann">@Param</span>(<span class="str">"since"</span>) <span class="typ">Instant</span> since);
+
+<span class="com">// (b) Interface projection — Spring Data generates the implementation</span>
+<span class="kw">public interface</span> <span class="typ">OrderView</span> {
+    <span class="typ">Long</span> getId();
+    <span class="typ">BigDecimal</span> getTotal();
+    <span class="typ">String</span> getCustomerName();   <span class="com">// maps to alias customerName / nested path</span>
+}
+<span class="typ">List</span>&lt;<span class="typ">OrderView</span>&gt; findByStatus(<span class="typ">OrderStatus</span> status);  <span class="com">// works on derived queries too</span>
+</code></pre>
+<pre><code><span class="com">-- Only the needed columns; a plain join; no entities, no dirty-check overhead:</span>
+select o1_0.id, o1_0.total, c1_0.name
+from orders o1_0 join customers c1_0 on c1_0.id=o1_0.customer_id
+where o1_0.created_at&gt;=?
+</code></pre>
+<p>Benefits: no N+1 possible (no proxies exist), no <code>LazyInitializationException</code> possible, less data over the wire, no accidental dirty-checking flush, pagination works normally. Cost: one query per read shape — which is honestly how SQL wants to be used. Prefer <em>closed</em> (getter-only) interface projections; nested/open projections can secretly load whole entities.</p>
+
+<h3>Detecting N+1 — properly</h3>
+<pre><code><span class="com"># NOT this — show-sql prints to stdout, unformatted, no params, can't be toggled per-env cleanly:</span>
+spring.jpa.show-sql: <span class="kw">true</span>       <span class="com"># fine for a scratch demo only</span>
+
+<span class="com"># THIS — real logging through your log framework:</span>
+logging:
+  level:
+    org.hibernate.SQL: DEBUG                          <span class="com"># the statements</span>
+    org.hibernate.orm.jdbc.bind: TRACE                <span class="com"># bound parameters (Hibernate 6)</span>
+spring:
+  jpa:
+    properties:
+      hibernate:
+        format_sql: <span class="kw">true</span>
+</code></pre>
+<ul>
+  <li><strong>Hibernate statistics</strong>: <code>hibernate.generate_statistics=true</code> logs per-transaction query counts and times — a sudden "executed 147 JDBC statements" is your smoking gun.</li>
+  <li><strong>Hypersistence Utils</strong> (Vlad Mihalcea): assert query counts in tests — e.g. wrap datasource with a query-count listener and fail the build if an endpoint exceeds N statements. Saying "we made N+1 a failing test, not a code-review hope" is a strong senior line.</li>
+  <li>APM traces (Datadog/New Relic) showing dozens of identical selects per request are the production tell.</li>
+</ul>
+</section>
+
+<!-- ============================================================ -->
+<section>
+<h2 id="transactional">@Transactional, deeply <span class="tier tier-1">T1</span></h2>
+
+<h3>Where it belongs and how it actually works</h3>
+<p><code>@Transactional</code> belongs on the <strong>service layer</strong> — the unit of business work. Not on controllers (the web layer shouldn't own DB semantics; keep connections short) and not usually on repositories (Spring Data methods already run in their own short transactions; you want <em>one</em> transaction spanning the whole use case, not five tiny ones with no atomicity between them).</p>
+<p>Mechanics: Spring wraps your bean in an <strong>AOP proxy</strong>. A call from outside hits the proxy, which opens (or joins) a transaction, obtains a connection, binds the JPA <code>EntityManager</code> to the thread, invokes your method, then commits (flushing the persistence context) or rolls back, and returns the connection to the pool.</p>
+
+<pre><code><span class="com">// Conceptually, the proxy does:</span>
+<span class="typ">TransactionStatus</span> tx = txManager.getTransaction(definition);
+<span class="kw">try</span> {
+    <span class="typ">Object</span> result = target.actualMethod(args);   <span class="com">// your code</span>
+    txManager.commit(tx);                        <span class="com">// flush + COMMIT here</span>
+    <span class="kw">return</span> result;
+} <span class="kw">catch</span> (<span class="typ">RuntimeException</span> | <span class="typ">Error</span> e) {
+    txManager.rollback(tx);                      <span class="com">// only unchecked, by default</span>
+    <span class="kw">throw</span> e;
+}
+</code></pre>
+
+<h3>The self-invocation trap (proxy mechanics)</h3>
+<pre><code><span class="ann">@Service</span>
+<span class="kw">public class</span> <span class="typ">OrderService</span> {
+
+    <span class="kw">public void</span> importOrders(<span class="typ">List</span>&lt;<span class="typ">OrderDto</span>&gt; dtos) {
+        <span class="kw">for</span> (<span class="typ">OrderDto</span> dto : dtos) {
+            <span class="kw">this</span>.saveOne(dto);   <span class="com">// TRAP: 'this' is the raw object, NOT the proxy</span>
+        }                        <span class="com">// @Transactional on saveOne is SILENTLY ignored</span>
+    }
+
+    <span class="ann">@Transactional</span>
+    <span class="kw">public void</span> saveOne(<span class="typ">OrderDto</span> dto) { ... }
+}
+</code></pre>
+<p>Why: the transaction logic lives in the proxy that <em>wraps</em> your bean. Internal calls via <code>this</code> bypass the proxy entirely, so no transaction starts — no error, no warning, just missing atomicity discovered in an incident. Same root cause explains why <code>@Transactional</code> on <strong>private</strong> methods does nothing: the JDK/CGLIB proxy can't intercept (or even see) them, and Spring ignores the annotation.</p>
+<p>Fixes, in order of preference: (1) restructure — move the transactional method to another bean so the call crosses a proxy boundary; (2) inject the bean into itself (<code>ObjectProvider&lt;OrderService&gt;</code> or <code>ApplicationContext.getBean</code>) and call through it; (3) <code>TransactionTemplate</code> for programmatic control. (AspectJ weaving also solves it, but almost nobody deploys that.)</p>
+
+<h3>Propagation levels — with scenarios</h3>
+<table>
+  <thead><tr><th>Propagation</th><th>Behavior</th><th>Scenario</th></tr></thead>
+  <tbody>
+    <tr><td><code>REQUIRED</code> (default)</td><td>Join the caller's tx; start one if none exists</td><td>99% of service methods</td></tr>
+    <tr><td><code>REQUIRES_NEW</code></td><td><strong>Suspend</strong> the caller's tx; run in a brand-new one that commits/rolls back independently</td><td>Audit log that must survive business rollback</td></tr>
+    <tr><td><code>NESTED</code></td><td>JDBC <strong>savepoint</strong> within the same tx; inner rollback rewinds to the savepoint, outer commit commits all</td><td>"Try this sub-step; on failure keep the rest"</td></tr>
+    <tr><td><code>SUPPORTS</code></td><td>Join if present, else run non-transactionally</td><td>Read helpers callable from anywhere</td></tr>
+    <tr><td><code>NOT_SUPPORTED</code></td><td>Suspend any tx; run without one</td><td>Long external call mid-flow (release the connection)</td></tr>
+    <tr><td><code>MANDATORY</code></td><td>Throw if no tx exists</td><td>Enforce "must be called inside a tx"</td></tr>
+    <tr><td><code>NEVER</code></td><td>Throw if a tx exists</td><td>Guard genuinely non-transactional code</td></tr>
+  </tbody>
+</table>
+
+<pre><code><span class="com">// The canonical REQUIRES_NEW example: the audit row must persist even if the order fails</span>
+<span class="ann">@Service</span>
+<span class="kw">public class</span> <span class="typ">AuditService</span> {
+    <span class="ann">@Transactional</span>(propagation = Propagation.REQUIRES_NEW)
+    <span class="kw">public void</span> recordAttempt(<span class="typ">String</span> action, <span class="typ">String</span> detail) {
+        auditRepository.save(<span class="kw">new</span> <span class="typ">AuditEntry</span>(action, detail, Instant.now()));
+    }   <span class="com">// commits HERE, immediately, regardless of the caller's fate</span>
+}
+
+<span class="ann">@Service</span>
+<span class="kw">public class</span> <span class="typ">OrderService</span> {
+    <span class="ann">@Transactional</span>
+    <span class="kw">public void</span> placeOrder(<span class="typ">PlaceOrderCommand</span> cmd) {
+        auditService.recordAttempt(<span class="str">"PLACE_ORDER"</span>, cmd.toString()); <span class="com">// separate bean → proxy works</span>
+        <span class="com">// ... business logic that may throw → outer tx rolls back, audit stays</span>
+    }
+}
+</code></pre>
+<div class="pitfall">
+  <p><code>REQUIRES_NEW</code> takes a <strong>second connection from the pool</strong> while the outer one sits suspended. With <code>maximumPoolSize=10</code> and 10 concurrent requests each needing an inner tx, everyone holds one connection and waits for a second — a pool-exhaustion deadlock. Use REQUIRES_NEW sparingly and know your pool math. Also note <code>NESTED</code> works with JDBC savepoints via <code>DataSourceTransactionManager</code>; <code>JpaTransactionManager</code> does not support it for JPA — another reason REQUIRES_NEW gets (over)used.</p>
+</div>
+
+<h3>Rollback rules — checked vs unchecked</h3>
+<p>Default: rollback on <code>RuntimeException</code> and <code>Error</code> only. <strong>Checked exceptions do NOT roll back</strong> — a historic EJB-inherited default ("checked = anticipated business condition, maybe you handled it"). This surprises everyone once:</p>
+<pre><code><span class="ann">@Transactional</span>
+<span class="kw">public void</span> process() <span class="kw">throws</span> <span class="typ">IOException</span> {
+    repo.save(entity);
+    <span class="kw">throw new</span> <span class="typ">IOException</span>(<span class="str">"boom"</span>);   <span class="com">// tx COMMITS — the save is persisted!</span>
+}
+
+<span class="com">// Fix: be explicit</span>
+<span class="ann">@Transactional</span>(rollbackFor = <span class="typ">Exception</span>.<span class="kw">class</span>)
+<span class="kw">public void</span> process() <span class="kw">throws</span> <span class="typ">IOException</span> { ... }
+</code></pre>
+<div class="pitfall">
+  <p>Related trap: catching an exception inside the method doesn't always save the commit. If an inner <code>REQUIRED</code> method threw a RuntimeException through <em>its</em> proxy, the shared transaction is already marked <strong>rollback-only</strong>; when the outer method tries to commit you get <code>UnexpectedRollbackException</code>. You can't "catch and continue" a poisoned transaction.</p>
+</div>
+
+<h3>readOnly = true — what it actually does</h3>
+<pre><code><span class="ann">@Transactional</span>(readOnly = <span class="kw">true</span>)
+<span class="kw">public</span> <span class="typ">CustomerDto</span> getCustomer(<span class="typ">Long</span> id) { ... }
+</code></pre>
+<ul>
+  <li>Sets Hibernate's flush mode to <code>MANUAL</code>: no dirty-check flush at commit — big win when you loaded hundreds of entities (no snapshot comparison walk).</li>
+  <li>Hibernate can skip keeping detached-state snapshots for loaded entities, reducing memory.</li>
+  <li>Hints the JDBC driver/DB (<code>Connection.setReadOnly(true)</code>); on Postgres the tx runs <code>SET TRANSACTION READ ONLY</code>-equivalent, and read-only transactions can be routed to replicas by proxies/drivers configured for it.</li>
+  <li>It is an <em>optimization + intent marker</em>, not a security boundary: it doesn't hard-prevent every write path, so don't present it as one.</li>
+</ul>
+
+<h3>Isolation</h3>
+<p><code>@Transactional(isolation = Isolation.REPEATABLE_READ)</code> simply asks the <em>database</em> for that isolation level on the transaction's connection — Spring implements nothing itself. Postgres defaults to <code>READ_COMMITTED</code>; its <code>REPEATABLE_READ</code> is snapshot-based and stronger than the ANSI minimum. Full treatment (anomalies, SSI serializable) lives in tutorial 14 — in a JPA interview it's enough to say isolation delegates to the DB and that you mostly combine READ_COMMITTED with optimistic locking.</p>
+
+<h3>The @Async pitfall</h3>
+<pre><code><span class="ann">@Transactional</span>
+<span class="kw">public void</span> placeOrder(...) {
+    orderRepository.save(order);
+    emailService.sendConfirmationAsync(order);   <span class="com">// @Async method</span>
+}
+</code></pre>
+<p>Transaction context is bound to the <strong>thread</strong> (a <code>ThreadLocal</code>). An <code>@Async</code> method runs on an executor thread: it does <em>not</em> join the caller's transaction; annotating it <code>@Transactional</code> starts a <em>new, independent</em> one. Worse timing bug: the async task may run <em>before the caller commits</em> — it queries for the order and finds nothing (READ_COMMITTED can't see uncommitted rows). Fixes: fire the async work <em>after commit</em> via <code>@TransactionalEventListener(phase = AFTER_COMMIT)</code> or <code>TransactionSynchronization.afterCommit</code>, or use the transactional-outbox pattern for reliability.</p>
+</section>
+
+<!-- ============================================================ -->
+<section>
+<h2 id="persistence-context">The persistence context &amp; entity lifecycle <span class="tier tier-1">T1</span></h2>
+
+<p>The persistence context (Hibernate's <code>Session</code>, JPA's <code>EntityManager</code> scope) is a <strong>unit-of-work</strong>: an identity map of every entity loaded or persisted in the current transaction, plus a snapshot of each one's original state. Nothing in JPA makes sense until this clicks.</p>
+
+<h3>Entity states</h3>
+<pre><code>            persist()                       flush/commit
+ NEW ────────────────────▶ MANAGED ────────────────────▶ (rows in DB)
+ (transient:                  │  ▲
+  no id, unknown              │  │ merge(detached) returns a managed copy
+  to any context)   detach()/ │  │
+                 tx commit/   ▼  │
+                 clear()   DETACHED          remove() ─▶ REMOVED ─▶ deleted at flush
+                           (has id, but no
+                            context tracks it)
+</code></pre>
+<table>
+  <thead><tr><th>State</th><th>Meaning</th><th>How you get there</th></tr></thead>
+  <tbody>
+    <tr><td>Transient (new)</td><td>Plain object; JPA knows nothing about it</td><td><code>new Customer(...)</code></td></tr>
+    <tr><td>Managed</td><td>Tracked by the context; changes auto-detected</td><td><code>persist()</code>, <code>find()</code>, query results, <code>merge()</code>'s return value</td></tr>
+    <tr><td>Detached</td><td>Has an id but no live context tracks it</td><td>Tx ended, <code>em.detach()</code>, entity deserialized from a request</td></tr>
+    <tr><td>Removed</td><td>Scheduled for DELETE at flush</td><td><code>remove()</code> on a managed entity</td></tr>
+  </tbody>
+</table>
+
+<h3>First-level cache: find twice = one query</h3>
+<pre><code><span class="ann">@Transactional</span>
+<span class="kw">public void</span> demo(<span class="typ">Long</span> id) {
+    <span class="typ">Customer</span> a = customerRepository.findById(id).orElseThrow(); <span class="com">// SELECT ... where id=?</span>
+    <span class="typ">Customer</span> b = customerRepository.findById(id).orElseThrow(); <span class="com">// NO SQL — served from the context</span>
+    assert a == b;   <span class="com">// same Java object — the identity map guarantees it</span>
+}
+</code></pre>
+<p>Within one persistence context there is exactly <strong>one object per (entity type, id)</strong>. This is per-transaction and never shared between requests — don't confuse it with the second-level cache. (JPQL/derived <em>queries</em> always hit the DB, but returned rows resolve to the already-managed instances.)</p>
+
+<h3>Dirty checking — the "update without save()" surprise</h3>
+<pre><code><span class="ann">@Transactional</span>
+<span class="kw">public void</span> rename(<span class="typ">Long</span> id, <span class="typ">String</span> newName) {
+    <span class="typ">Customer</span> c = customerRepository.findById(id).orElseThrow();
+    c.setName(newName);
+    <span class="com">// NO save() call. And yet, at commit:</span>
+}
+<span class="com">-- update customers set email=?, name=?, status=? where id=?</span>
+</code></pre>
+<p>At flush, Hibernate compares each managed entity against its load-time snapshot and emits UPDATEs for anything that changed. This is the single biggest mental-model shift from Prisma: <strong>a setter on a managed entity is a write</strong>. Consequences interviewers probe:</p>
+<ul>
+  <li><code>save()</code> on an already-managed entity is a no-op ritual (it just returns the same managed instance) — harmless but reveals the author doesn't know the model.</li>
+  <li>The dangerous inverse: mutating a managed entity "temporarily" (say, for display math) inside a transaction <strong>persists that mutation</strong>. Never mutate managed entities unless you mean it; map to DTOs for presentation.</li>
+  <li>By default Hibernate updates <em>all</em> columns (as shown above — precompiled statement caching); <code>@DynamicUpdate</code> switches to changed-columns-only, useful for wide rows/lock contention, at the cost of statement-cache reuse.</li>
+</ul>
+
+<h3>Flush timing</h3>
+<p>Flush = write pending changes as SQL (still inside the tx; <em>not</em> commit). With <code>FlushModeType.AUTO</code>, flushing happens:</p>
+<ol>
+  <li><strong>Before a query</strong> whose result could be affected by pending changes (Hibernate 6 compares the query's tables against dirty entities' tables) — so a JPQL <code>select</code> sees your in-transaction inserts;</li>
+  <li><strong>At commit</strong>;</li>
+  <li>On explicit <code>em.flush()</code> / <code>saveAndFlush()</code> — mostly useful to force constraint violations to surface at a known line, or before native queries Hibernate can't analyze.</li>
+</ol>
+
+<h3>persist vs merge, and the detached-entity error</h3>
+<pre><code>em.persist(entity);   <span class="com">// entity itself becomes managed; INSERT scheduled; entity must be NEW</span>
+<span class="typ">Customer</span> managed = em.merge(entity);  <span class="com">// COPIES state onto a managed instance (loading it if needed)</span>
+                                       <span class="com">// and returns THAT; the argument stays detached!</span>
+</code></pre>
+<div class="pitfall">
+  <p>Two classic failures: (1) <code>persist()</code> on a detached entity (id already set from an earlier tx or a client payload) → <code>EntityExistsException</code> / Hibernate's "detached entity passed to persist", surfaced by Spring as <code>InvalidDataAccessApiUsageException</code>. Use <code>merge</code> — or better, load-then-mutate. (2) Continuing to use the <em>argument</em> of <code>merge()</code> instead of its return value — your subsequent setters silently go nowhere.</p>
+</div>
+<p>Spring Data's <code>save()</code> hides this switch: <code>SimpleJpaRepository.save</code> calls <code>persist</code> if the entity is new (id null / version null / <code>Persistable.isNew()</code>), else <code>merge</code>. That's why saving a client-supplied object with an id triggers a surprise <strong>SELECT before the UPDATE</strong> — merge must load current state to copy onto. The cleaner update pattern in a service: <code>findById → mutate → let dirty checking flush</code>.</p>
+</section>
+
+<!-- ============================================================ -->
+<section>
+<h2 id="repositories">Spring Data repositories <span class="tier tier-2">T2</span></h2>
+
+<h3>The hierarchy</h3>
+<pre><code>Repository&lt;T, ID&gt;                    <span class="com">// marker interface — no methods</span>
+  └── CrudRepository&lt;T, ID&gt;          <span class="com">// save, saveAll, findById, findAll, delete, count...</span>
+        └── PagingAndSortingRepository&lt;T, ID&gt;   <span class="com">// findAll(Pageable), findAll(Sort)</span>
+              └── JpaRepository&lt;T, ID&gt;          <span class="com">// JPA extras: flush, saveAndFlush,</span>
+                                                <span class="com">// deleteAllInBatch, getReferenceById, List returns</span>
+</code></pre>
+<p>You write the interface; at startup Spring Data creates a proxy backed by <code>SimpleJpaRepository</code>. Extend <code>JpaRepository</code> in app code; extending a narrower interface (or annotating methods onto <code>Repository</code> directly) deliberately restricts the API — e.g. a repository that can't delete.</p>
+
+<h3>getReferenceById vs findById — proxy!</h3>
+<pre><code><span class="typ">Customer</span> c1 = customerRepository.findById(id).orElseThrow();
+<span class="com">// SELECT immediately; returns the real entity or empty Optional</span>
+
+<span class="typ">Customer</span> c2 = customerRepository.getReferenceById(id);
+<span class="com">// NO SQL AT ALL — returns a lazy proxy holding just the id.</span>
+<span class="com">// SQL fires only if you touch a non-id field; if the row doesn't exist,</span>
+<span class="com">// EntityNotFoundException throws at first ACCESS, not at the call site.</span>
+</code></pre>
+<p>The killer use case — setting an FK without a pointless SELECT:</p>
+<pre><code>order.setCustomer(customerRepository.getReferenceById(customerId));
+orderRepository.save(order);
+<span class="com">-- generated SQL: just the INSERT into orders with customer_id=? — zero customer SELECTs</span>
+</code></pre>
+
+<h3>Derived query methods</h3>
+<pre><code><span class="typ">Optional</span>&lt;<span class="typ">Customer</span>&gt; findByEmail(<span class="typ">String</span> email);
+<span class="typ">List</span>&lt;<span class="typ">Order</span>&gt; findByCustomerIdAndStatusOrderByCreatedAtDesc(<span class="typ">Long</span> customerId, <span class="typ">OrderStatus</span> status);
+<span class="kw">long</span> countByStatus(<span class="typ">OrderStatus</span> status);
+<span class="kw">boolean</span> existsByEmail(<span class="typ">String</span> email);
+</code></pre>
+<pre><code><span class="com">-- findByCustomerIdAndStatusOrderByCreatedAtDesc generates:</span>
+select o1_0.id, o1_0.created_at, o1_0.customer_id, o1_0.status, o1_0.total
+from orders o1_0
+where o1_0.customer_id=? and o1_0.status=?
+order by o1_0.created_at desc
+</code></pre>
+<p>Mechanics: at bootstrap, Spring Data parses the method name into a predicate tree (property references validated against the entity model — typos fail at startup, which is a feature) and compiles it to JPQL. Supported keywords: <code>And, Or, Between, LessThan, GreaterThanEqual, Like, Containing, In, IsNull, True, Not, IgnoreCase, First/Top, Distinct...</code></p>
+<p>When they stop being a good idea: <code>findByStatusInAndCreatedAtBetweenAndCustomerRegionAndTotalGreaterThanOrderByCreatedAtDesc(...)</code> — unreadable, and each new filter combination is a new method. Rule of thumb: <strong>1–3 conditions → derived; more → @Query; dynamic combinations → Specifications</strong>.</p>
+
+<h3>@Query: JPQL vs native</h3>
+<pre><code><span class="com">// JPQL — portable, entity-based, named parameters</span>
+<span class="ann">@Query</span>(<span class="str">"select o from Order o where o.customer.email = :email and o.total &gt; :min"</span>)
+<span class="typ">List</span>&lt;<span class="typ">Order</span>&gt; findBigOrdersFor(<span class="ann">@Param</span>(<span class="str">"email"</span>) <span class="typ">String</span> email, <span class="ann">@Param</span>(<span class="str">"min"</span>) <span class="typ">BigDecimal</span> min);
+
+<span class="com">// Native — when you need SQL that JPQL can't express</span>
+<span class="ann">@Query</span>(value = <span class="str">"""
+    select customer_id, total, rank() over (partition by customer_id order by total desc) rnk
+    from orders
+    """</span>, nativeQuery = <span class="kw">true</span>)
+<span class="typ">List</span>&lt;<span class="typ">TopOrderView</span>&gt; rankOrdersPerCustomer();
+</code></pre>
+<p>Reach for <code>nativeQuery = true</code> when you need: <strong>window functions</strong> (rank/lag/lead), <strong>CTEs</strong>/recursive queries, Postgres-specific features (<code>jsonb</code> operators, <code>ON CONFLICT</code>, arrays, full-text search), or hand-tuned performance SQL. Costs: no entity-model validation, dialect lock-in, and pagination requires Spring to derive/accept a count query. Always prefer <strong>named parameters</strong> (<code>:email</code>) over positional (<code>?1</code>) — refactoring-safe and self-documenting.</p>
+
+<h3>@Modifying — bulk update/delete bypasses the persistence context</h3>
+<pre><code><span class="ann">@Modifying</span>(clearAutomatically = <span class="kw">true</span>)   <span class="com">// evict stale managed entities after the bulk op</span>
+<span class="ann">@Query</span>(<span class="str">"update Order o set o.status = :to where o.status = :from and o.createdAt &lt; :cutoff"</span>)
+<span class="kw">int</span> expireStale(<span class="ann">@Param</span>(<span class="str">"from"</span>) <span class="typ">OrderStatus</span> from, <span class="ann">@Param</span>(<span class="str">"to"</span>) <span class="typ">OrderStatus</span> to,
+                <span class="ann">@Param</span>(<span class="str">"cutoff"</span>) <span class="typ">Instant</span> cutoff);
+</code></pre>
+<pre><code><span class="com">-- ONE statement, no matter how many rows:</span>
+update orders set status=? where status=? and created_at&lt;?
+</code></pre>
+<div class="pitfall">
+  <p>Bulk JPQL goes <strong>straight to the database</strong>, skipping the persistence context: managed entities already loaded still hold the OLD values, no <code>@Version</code> increments, no lifecycle callbacks, no cascades. If the same transaction reads those entities afterward it sees stale state. <code>clearAutomatically = true</code> clears the context after the update (detaching everything — unsaved changes to other entities are lost, so consider <code>flushAutomatically = true</code> too). Bulk ops need <code>@Modifying</code> and a transaction; forgetting <code>@Modifying</code> throws at runtime ("Update/delete queries cannot be typed").</p>
+</div>
+</section>
+
+<!-- ============================================================ -->
+<section>
+<h2 id="pagination">Pagination &amp; sorting <span class="tier tier-2">T2</span></h2>
+
+<pre><code><span class="typ">Page</span>&lt;<span class="typ">Order</span>&gt; findByStatus(<span class="typ">OrderStatus</span> status, <span class="typ">Pageable</span> pageable);
+
+<span class="com">// caller:</span>
+<span class="typ">Pageable</span> page = PageRequest.of(<span class="num">0</span>, <span class="num">20</span>, Sort.by(Sort.Direction.DESC, <span class="str">"createdAt"</span>));
+<span class="typ">Page</span>&lt;<span class="typ">Order</span>&gt; result = orderRepository.findByStatus(OrderStatus.PAID, page);
+result.getTotalElements();  result.getTotalPages();  result.getContent();
+</code></pre>
+<pre><code><span class="com">-- Page&lt;T&gt; executes TWO statements:</span>
+select o1_0.* from orders o1_0 where o1_0.status=?
+order by o1_0.created_at desc offset ? rows fetch first ? rows only
+
+select count(o1_0.id) from orders o1_0 where o1_0.status=?   <span class="com">-- the count query — this costs!</span>
+</code></pre>
+
+<table>
+  <thead><tr><th>Return type</th><th>Queries</th><th>Knows total?</th><th>Use when</th></tr></thead>
+  <tbody>
+    <tr><td><code>Page&lt;T&gt;</code></td><td>data + <strong>count</strong></td><td>Yes (totalElements/totalPages)</td><td>UI needs page numbers; accept the count cost</td></tr>
+    <tr><td><code>Slice&lt;T&gt;</code></td><td>data only (fetches size+1 rows)</td><td>No — only <code>hasNext()</code></td><td>Infinite scroll / "Load more"</td></tr>
+    <tr><td><code>List&lt;T&gt;</code></td><td>data only</td><td>No</td><td>You just want a limited chunk</td></tr>
+  </tbody>
+</table>
+<p>The count query is a full-predicate <code>count(*)</code> — on a 50M-row table it can dominate the request. Reach for <code>Slice</code> whenever the UI doesn't literally render "Page 3 of 1,204".</p>
+
+<h3>Keyset (seek) pagination — for deep pages</h3>
+<p><code>OFFSET 199980</code> forces Postgres to <em>produce and discard</em> 199,980 rows before returning 20 — page latency grows linearly with depth. Keyset pagination seeks directly using the last-seen sort key:</p>
+<pre><code><span class="com">-- instead of OFFSET, remember the last row's (created_at, id) and:</span>
+select * from orders
+where status = ?
+  and (created_at, id) &lt; (?, ?)          <span class="com">-- Postgres row-value comparison; id breaks ties</span>
+order by created_at desc, id desc
+fetch first 20 rows only                   <span class="com">-- constant time at any depth (index on (status, created_at, id))</span>
+</code></pre>
+<p>Trade-offs: no jump-to-page-N, needs a deterministic unique sort key. Spring Data supports this natively since 3.1 via <code>ScrollPosition.keyset()</code> and <code>Window&lt;T&gt;</code> — worth name-dropping.</p>
+<div class="note"><p>Sorting on API-supplied fields: whitelist them. <code>Sort.by(request.getParam("sort"))</code> on arbitrary properties invites errors and (with native queries via string concat) injection. Map allowed sort keys explicitly.</p></div>
+</section>
+
+<!-- ============================================================ -->
+<section>
+<h2 id="locking">Optimistic &amp; pessimistic locking <span class="tier tier-2">T2</span></h2>
+
+<h3>Optimistic — @Version</h3>
+<pre><code><span class="ann">@Entity</span>
+<span class="kw">public class</span> <span class="typ">Product</span> {
+    <span class="ann">@Id</span> <span class="kw">private</span> <span class="typ">Long</span> id;
+    <span class="kw">private</span> <span class="kw">int</span> stock;
+
+    <span class="ann">@Version</span>
+    <span class="kw">private</span> <span class="kw">long</span> version;   <span class="com">// Hibernate manages it — never set it yourself</span>
+}
+</code></pre>
+<pre><code><span class="com">-- every UPDATE carries the version in the WHERE clause and increments it:</span>
+update products set stock=?, version=? where id=? and version=?
+<span class="com">-- if another tx committed first, version no longer matches → 0 rows updated →</span>
+<span class="com">-- Hibernate throws OptimisticLockException, Spring wraps it as</span>
+<span class="com">-- ObjectOptimisticLockingFailureException → the whole tx rolls back</span>
+</code></pre>
+<p>Handling: catch <em>outside</em> the transactional method and retry the whole use case (re-read, re-apply, re-commit):</p>
+<pre><code><span class="ann">@Retryable</span>(retryFor = ObjectOptimisticLockingFailureException.<span class="kw">class</span>,
+           maxAttempts = <span class="num">3</span>, backoff = <span class="ann">@Backoff</span>(delay = <span class="num">50</span>))   <span class="com">// spring-retry; or a manual loop</span>
+<span class="kw">public void</span> decrementStock(<span class="typ">Long</span> productId, <span class="kw">int</span> qty) {
+    txTemplate.executeWithoutResult(tx -&gt; {
+        <span class="typ">Product</span> p = productRepository.findById(productId).orElseThrow();
+        p.decrement(qty);      <span class="com">// dirty checking flushes with the version check</span>
+    });
+}
+</code></pre>
+
+<h3>Pessimistic — @Lock</h3>
+<pre><code><span class="ann">@Lock</span>(LockModeType.PESSIMISTIC_WRITE)
+<span class="ann">@Query</span>(<span class="str">"select p from Product p where p.id = :id"</span>)
+<span class="typ">Optional</span>&lt;<span class="typ">Product</span>&gt; findByIdForUpdate(<span class="ann">@Param</span>(<span class="str">"id"</span>) <span class="typ">Long</span> id);
+</code></pre>
+<pre><code><span class="com">-- Postgres SQL:</span>
+select p1_0.id, p1_0.stock, p1_0.version from products p1_0 where p1_0.id=? <strong>for update</strong>
+<span class="com">-- PESSIMISTIC_READ would generate FOR SHARE;</span>
+<span class="com">-- other writers block on this row until our tx commits or rolls back</span>
+</code></pre>
+<p>The row lock lives for the rest of the transaction. Add a timeout so contention fails fast instead of piling up: <code>@QueryHints(@QueryHint(name = "jakarta.persistence.lock.timeout", value = "3000"))</code> (Postgres also supports <code>FOR UPDATE NOWAIT / SKIP LOCKED</code> via native SQL — SKIP LOCKED is the classic job-queue trick).</p>
+
+<h3>When each</h3>
+<table>
+  <thead><tr><th></th><th>Optimistic (@Version)</th><th>Pessimistic (FOR UPDATE)</th></tr></thead>
+  <tbody>
+    <tr><td>Contention profile</td><td>Low/medium — conflicts rare</td><td>Hot rows — conflicts expected</td></tr>
+    <tr><td>Cost when no conflict</td><td>~zero (one extra column)</td><td>Lock acquisition + held connection</td></tr>
+    <tr><td>Cost on conflict</td><td>Rollback + retry (wasted work)</td><td>Blocking (waiting, deadlock risk)</td></tr>
+    <tr><td>Works across requests?</td><td>Yes — version survives detachment (edit forms, APIs via ETag)</td><td>No — lock dies with the tx</td></tr>
+    <tr><td>Examples</td><td>Product edits, user profiles, CMS content — the sensible default</td><td>Inventory decrement, account balance transfer, seat booking</td></tr>
+  </tbody>
+</table>
+<div class="senior"><p>Strong interview answer: "Default to optimistic — it costs nothing until a conflict happens, and conflicts should be rare in a well-partitioned domain. Go pessimistic for hot rows where retry storms would be worse than short blocking — inventory counters, balances. And keep pessimistic transactions tiny, because that row lock also pins a pool connection." Bonus point: for pure counters, a single atomic <code>UPDATE ... SET stock = stock - ? WHERE stock &gt;= ?</code> beats both.</p></div>
+</section>
+
+<!-- ============================================================ -->
+<section>
+<h2 id="hikari">HikariCP connection pooling <span class="tier tier-2">T2</span></h2>
+
+<p>Opening a Postgres connection is expensive: TCP handshake, TLS, authentication, and a forked backend <em>process</em> per connection on the server — several milliseconds plus real server memory. A pool keeps warm connections and leases them out. HikariCP is Spring Boot's default and effectively the industry standard.</p>
+
+<pre><code><span class="com"># application.yml</span>
+spring:
+  datasource:
+    hikari:
+      maximum-pool-size: <span class="num">10</span>        <span class="com"># default 10 — usually about right; see formula</span>
+      minimum-idle: <span class="num">10</span>             <span class="com"># fixed-size pool: simplest, most predictable</span>
+      connection-timeout: <span class="num">30000</span>    <span class="com"># ms to wait for a lease before throwing</span>
+      max-lifetime: <span class="num">1800000</span>        <span class="com"># retire connections before infra (LB/DB) kills them</span>
+      leak-detection-threshold: <span class="num">60000</span>  <span class="com"># log a stack trace if a lease outlives 60s</span>
+</code></pre>
+
+<h3>Small is beautiful</h3>
+<p>Counter-intuitive but well-documented (HikariCP's own wiki): a <em>smaller</em> pool usually delivers <em>higher</em> throughput. Postgres executes one task per backend at a time per core; hundreds of connections mean context-switching, lock thrash, and memory pressure. Starting formula:</p>
+<pre><code>pool_size ≈ (cpu_cores × 2) + effective_spindle_count
+<span class="com">-- e.g. a 4-core DB server → ~9–10 connections. Then measure.</span>
+<span class="com">-- And it's PER INSTANCE: 10 app pods × pool 10 = 100 server connections.</span>
+</code></pre>
+
+<h3>Pool exhaustion — symptoms and the classic anti-pattern</h3>
+<pre><code>java.sql.SQLTransientConnectionException:
+  HikariPool-1 - Connection is not available, request timed out after 30000ms
+</code></pre>
+<p>Symptoms: healthy CPU but requests stall exactly <code>connectionTimeout</code> ms then 500; <code>hikaricp.connections.pending</code> climbing in metrics; thread dumps full of threads parked in <code>HikariPool.getConnection</code>. Root cause is almost always <strong>connections held too long</strong>, and the number-one offender is:</p>
+<pre><code><span class="com">// ANTI-PATTERN: slow remote I/O inside a transaction</span>
+<span class="ann">@Transactional</span>
+<span class="kw">public void</span> placeOrder(<span class="typ">PlaceOrderCommand</span> cmd) {
+    <span class="typ">Order</span> order = createOrder(cmd);                 <span class="com">// fast DB work</span>
+    paymentClient.charge(cmd.card(), order.total()); <span class="com">// 2–8s HTTP call — CONNECTION HELD THE WHOLE TIME</span>
+    order.markPaid();
+}   <span class="com">// 10 concurrent checkouts with pool=10 → entire app is frozen for everything</span>
+</code></pre>
+<p>Fix: keep transactions <em>short and DB-only</em>. Split into tx #1 (create PENDING order, commit — connection returned), then the HTTP call with no transaction, then tx #2 (mark paid / compensate). Related: OSIV (above) is this same disease applied to every request; and remember each <code>REQUIRES_NEW</code> doubles a request's connection footprint.</p>
+</section>
+
+<!-- ============================================================ -->
+<section>
+<h2 id="l2-cache">Second-level cache awareness <span class="tier tier-3">T3</span></h2>
+<p>The L2 cache is a <em>shared, cross-transaction</em> cache of entity data by id (backed by Ehcache/Infinispan/etc.), sitting between the per-transaction first-level cache and the DB. Enable per entity with <code>@Cacheable @org.hibernate.annotations.Cache(usage = CacheConcurrencyStrategy.READ_WRITE)</code>; <code>find()</code> then checks L1 → L2 → DB.</p>
+<p>Why it's <em>rarely</em> the right tool today: it only helps id-based lookups (queries need the separate, invalidation-happy query cache); in a multi-node deployment it's stale unless you run a distributed cache, at which point most teams prefer an explicit Redis/Caffeine cache at the service layer (<code>@Cacheable</code> from Spring Cache) with visible TTLs and keys; and any non-Hibernate writer (bulk JPQL, native SQL, another service) silently invalidates nothing. Legit niche: small, hot, read-mostly reference data (countries, currencies, feature flags). Interview line: "I know it exists and how it's layered; I've almost always preferred service-level caching because the invalidation story is explicit."</p>
+</section>
+
+<!-- ============================================================ -->
+<section>
+<h2 id="specifications">Dynamic queries: Specifications <span class="tier tier-3">T3</span></h2>
+<p>For search screens with optional filters, derived methods explode combinatorially. <code>Specification&lt;T&gt;</code> wraps the JPA Criteria API into composable predicates:</p>
+<pre><code><span class="kw">public interface</span> <span class="typ">OrderRepository</span> <span class="kw">extends</span> <span class="typ">JpaRepository</span>&lt;<span class="typ">Order</span>, <span class="typ">Long</span>&gt;,
+                                         <span class="typ">JpaSpecificationExecutor</span>&lt;<span class="typ">Order</span>&gt; {}
+
+<span class="kw">public final class</span> <span class="typ">OrderSpecs</span> {
+    <span class="kw">public static</span> <span class="typ">Specification</span>&lt;<span class="typ">Order</span>&gt; hasStatus(<span class="typ">OrderStatus</span> s) {
+        <span class="kw">return</span> (root, query, cb) -&gt; s == <span class="kw">null</span> ? <span class="kw">null</span> : cb.equal(root.get(<span class="str">"status"</span>), s);
+    }   <span class="com">// returning null = "no constraint" — makes optional filters trivial</span>
+    <span class="kw">public static</span> <span class="typ">Specification</span>&lt;<span class="typ">Order</span>&gt; minTotal(<span class="typ">BigDecimal</span> min) {
+        <span class="kw">return</span> (root, query, cb) -&gt; min == <span class="kw">null</span> ? <span class="kw">null</span> : cb.ge(root.get(<span class="str">"total"</span>), min);
+    }
+}
+
+<span class="com">// service — compose only what the request supplied:</span>
+<span class="typ">Page</span>&lt;<span class="typ">Order</span>&gt; results = orderRepository.findAll(
+    OrderSpecs.hasStatus(filter.status()).and(OrderSpecs.minTotal(filter.minTotal())),
+    pageable);
+<span class="com">-- SQL contains only the non-null predicates:</span>
+<span class="com">-- select ... from orders o1_0 where o1_0.status=? and o1_0.total&gt;=? order by ... offset ...</span>
+</code></pre>
+<p>Alternatives worth naming: QueryDSL (typesafe generated metamodel, nicer syntax, extra build step) and hand-built JPQL with <code>Query by Example</code> for trivial cases.</p>
+</section>
+
+<!-- ============================================================ -->
+<section>
+<h2 id="auditing">Auditing <span class="tier tier-3">T3</span></h2>
+<pre><code><span class="ann">@Configuration</span>
+<span class="ann">@EnableJpaAuditing</span>   <span class="com">// don't forget this — the #1 reason auditing "doesn't work"</span>
+<span class="kw">class</span> <span class="typ">JpaConfig</span> {}
+
+<span class="ann">@MappedSuperclass</span>
+<span class="ann">@EntityListeners</span>(AuditingEntityListener.<span class="kw">class</span>)
+<span class="kw">public abstract class</span> <span class="typ">Auditable</span> {
+    <span class="ann">@CreatedDate</span>       <span class="ann">@Column</span>(nullable = <span class="kw">false</span>, updatable = <span class="kw">false</span>)
+    <span class="kw">private</span> <span class="typ">Instant</span> createdAt;
+
+    <span class="ann">@LastModifiedDate</span>  <span class="kw">private</span> <span class="typ">Instant</span> updatedAt;
+    <span class="ann">@CreatedBy</span>         <span class="ann">@Column</span>(updatable = <span class="kw">false</span>) <span class="kw">private</span> <span class="typ">String</span> createdBy;
+    <span class="ann">@LastModifiedBy</span>    <span class="kw">private</span> <span class="typ">String</span> updatedBy;
+}
+<span class="com">// entities: public class Order extends Auditable { ... }</span>
+<span class="com">// @CreatedBy/@LastModifiedBy need an AuditorAware&lt;String&gt; bean (e.g. from SecurityContext)</span>
+</code></pre>
+<p>Populated at persist/update time by an entity listener — note bulk <code>@Modifying</code> queries bypass listeners, so <code>updatedAt</code> won't change on bulk updates. For row-history auditing ("who changed what, all versions"), the tools are Hibernate Envers or DB-level triggers/temporal tables — different problem, worth distinguishing in an interview.</p>
+</section>
+
+<!-- ============================================================ -->
+<section>
+<h2 id="flyway">Schema migrations with Flyway <span class="tier tier-3">T3</span></h2>
+<p>Coming from Prisma Migrate, Flyway will feel familiar: versioned SQL scripts, applied in order, tracked in a history table (<code>flyway_schema_history</code>) with checksums.</p>
+<pre><code>src/main/resources/db/migration/
+  V1__create_customers.sql
+  V2__create_orders.sql
+  V3__add_orders_status_index.sql
+<span class="com">-- naming: V&lt;version&gt;__&lt;description&gt;.sql (double underscore). Boot runs pending ones at startup.</span>
+</code></pre>
+<pre><code><span class="com">-- V2__create_orders.sql</span>
+create sequence order_seq start with 1 increment by 50;   <span class="com">-- matches allocationSize!</span>
+
+create table orders (
+    id          bigint primary key,
+    customer_id bigint not null references customers(id),
+    status      varchar(32) not null,
+    total       numeric(12,2) not null,
+    version     bigint not null default 0,
+    created_at  timestamptz not null default now()
+);
+create index idx_orders_customer on orders(customer_id);  <span class="com">-- FKs are NOT auto-indexed in PG</span>
+</code></pre>
+<p>Iron rules:</p>
+<ul>
+  <li><strong>Never edit an applied migration.</strong> Flyway checksums every script; editing one that already ran fails validation on every environment that ran the original. Fix mistakes with a <em>new</em> migration (V4 alters what V3 got wrong).</li>
+  <li><strong><code>spring.jpa.hibernate.ddl-auto=validate</code> in production — never <code>update</code>.</strong> <code>update</code> lets Hibernate mutate a production schema on boot: it can't rename (it adds a new column and strands the old), never drops, ignores your index strategy, and couples deploys to uncontrolled DDL. <code>validate</code> checks that entities match the Flyway-owned schema and fails fast on drift. (<code>create-drop</code> is for throwaway tests only.)</li>
+  <li>Migrations are forward-only in the free tier — design them to be safe (additive first; destructive changes in a later release after code stops reading the old column — the expand/contract pattern).</li>
+</ul>
+<div class="note"><p>Liquibase is the main alternative (XML/YAML changelogs, rollback support). Interviews rarely care which; they care that <em>the schema is versioned in the repo and the ORM does not own it</em>.</p></div>
+</section>
+
+<!-- ============================================================ -->
+<section>
+<h2 id="qa">Interview Q&amp;A</h2>
+
+<details class="qa"><summary>What's the difference between JPA, Hibernate, and Spring Data JPA?</summary><div class="answer"><p>JPA is the specification — annotations (<code>@Entity</code>, <code>@Id</code>), interfaces (<code>EntityManager</code>), and JPQL semantics, but no code that runs. Hibernate is the most common implementation: it does the actual SQL generation, dirty checking, caching, and proxying. Spring Data JPA sits on top of JPA: it generates repository implementations from interfaces, adds derived queries, pagination, auditing, and translates JPA exceptions into Spring's <code>DataAccessException</code> hierarchy. So a <code>findById</code> call goes Spring Data proxy → <code>EntityManager</code> (JPA API) → Hibernate → JDBC → Postgres.</p></div></details>
+
+<details class="qa"><summary>Why is SEQUENCE preferred over IDENTITY for ID generation on Postgres?</summary><div class="answer"><p>With IDENTITY, the id is assigned by the database during the INSERT, so Hibernate must execute each INSERT immediately at <code>persist()</code> to learn the id it needs for the persistence context — which makes JDBC batch inserts impossible for that entity. With SEQUENCE, Hibernate fetches ids up front via <code>select nextval(...)</code>, and with <code>allocationSize=50</code> (pooled optimizer) one round trip yields 50 ids; INSERTs are deferred to flush and sent as JDBC batches. For bulk-insert workloads that's an order-of-magnitude difference. Caveat: <code>allocationSize</code> must match the sequence's <code>INCREMENT BY</code> in the DDL.</p></div></details>
+
+<details class="qa"><summary>How should you implement equals() and hashCode() on a JPA entity, and why is it tricky?</summary><div class="answer"><p>The trap is that a generated id is null before persist, and Hibernate proxies are runtime subclasses. If you hash on the id, the hashCode changes when the id is assigned, corrupting any HashSet the entity already sits in. Two accepted patterns: (1) use an immutable natural key (email, ISBN) if one exists; (2) id-based equals using <code>instanceof</code> (not <code>getClass()==</code>, because of proxies), returning true only when both ids are non-null and equal, paired with a <em>constant</em> hashCode (e.g. <code>getClass().hashCode()</code>) so it never changes across the lifecycle. Also access the other object's id through its getter, since a proxy's fields are null. And don't use Lombok's <code>@EqualsAndHashCode</code> on entities.</p></div></details>
+
+<details class="qa"><summary>Explain owning side vs inverse side in a bidirectional @OneToMany.</summary><div class="answer"><p>The foreign key column lives on the many side, so the <code>@ManyToOne</code> field is the owning side — Hibernate writes the FK based only on it. The <code>@OneToMany(mappedBy=...)</code> side is the inverse/mirror side; changes to it alone are ignored at flush. The classic bug: <code>parent.getChildren().add(child)</code> without <code>child.setParent(parent)</code> — the FK column stays null. The fix is helper methods (<code>addChild</code>/<code>removeChild</code>) that keep both sides in sync. I'd add that a unidirectional <code>@ManyToOne</code> plus a repository query is often the better model — bidirectional collections should exist only when bounded and traversed together.</p></div></details>
+
+<details class="qa"><summary>What is the N+1 problem? Walk me through the SQL.</summary><div class="answer"><p>You run one query returning N rows, then accessing a lazy (or list-EAGER) association on each row triggers one additional query per row: 1 + N round trips. Example: <code>select ... from orders</code> (1 query), then <code>o.getCustomer().getName()</code> in a loop fires <code>select ... from customers where id=?</code> up to N times. At 1ms per round trip, a 500-row page costs 500ms of pure latency. It's invisible in dev (small data, local DB) and devastating in prod. Detection: hibernate SQL logging, <code>generate_statistics</code> statement counts, query-count assertions in tests (Hypersistence Utils), APM traces showing repeated identical selects.</p></div></details>
+
+<details class="qa"><summary>What fixes exist for N+1, and when do you use which?</summary><div class="answer"><p>(1) <code>join fetch</code> in JPQL / <code>@EntityGraph</code> — one query with a join, best for a specific use case that needs the association; beware fetch-joining collections with pagination (in-memory paging) and multiple bag fetches. (2) <code>@BatchSize</code>/<code>default_batch_fetch_size</code> — turns N lazy loads into ceil(N/size) IN-queries; excellent as a global safety net. (3) DTO projections (constructor expressions or interface projections) — select exactly the needed columns; no proxies exist, so N+1 and LazyInitializationException are structurally impossible; usually the best fix for read endpoints. (4) For to-one paths, sometimes just <code>getReferenceById</code>/redesign. My default: DTOs for reads, fetch joins for aggregate loads, batch size as insurance.</p></div></details>
+
+<details class="qa"><summary>Why does LazyInitializationException happen, and what's your position on Open Session In View?</summary><div class="answer"><p>A lazy proxy needs a live persistence context to initialize; the context closes with the transaction. If serialization (Jackson) touches a lazy field after the service method returned, there's no session — exception. OSIV "fixes" it by keeping the context open for the whole HTTP request, and Boot enables it by default. I disable it in serious services: it holds a pooled connection across the entire request (including downstream HTTP calls — pool exhaustion under load), it hides unplanned queries triggered by serialization, and those queries run outside the service transaction. Disabling it forces you to load everything the response needs inside the transaction, preferably as DTOs — which is where you want to end up anyway. Fair counterpoint: for a small internal CRUD app OSIV is a pragmatic convenience.</p></div></details>
+
+<details class="qa"><summary>Why does @Transactional on a private method, or a method called via <code>this</code>, do nothing?</summary><div class="answer"><p>Spring implements <code>@Transactional</code> with an AOP proxy that wraps the bean. Transaction begin/commit only happens when a call passes <em>through the proxy</em>. Self-invocation (<code>this.method()</code>) is a plain Java call on the target object — no proxy, no transaction, silently. Private methods can't be overridden/intercepted by a CGLIB subclass proxy at all, so the annotation is ignored. Fixes: move the method to another bean (best — usually a design smell anyway), self-inject the proxy, or use <code>TransactionTemplate</code> programmatically.</p></div></details>
+
+<details class="qa"><summary>Explain REQUIRED vs REQUIRES_NEW vs NESTED with a concrete scenario.</summary><div class="answer"><p>REQUIRED (default): join the caller's transaction — one atomic unit; right for normal service composition. REQUIRES_NEW: suspend the caller and run an independent transaction — the audit-log case, where the audit row must commit even if the business operation rolls back; cost: a second pool connection held while the outer sits suspended, so it's a pool-exhaustion risk. NESTED: a savepoint inside the same transaction — an inner failure rolls back to the savepoint without dooming the outer; but it needs JDBC savepoint support and doesn't work with <code>JpaTransactionManager</code> for JPA, so in Hibernate apps you rarely see it. Also worth naming MANDATORY (assert a tx exists) and NOT_SUPPORTED (suspend around non-DB work).</p></div></details>
+
+<details class="qa"><summary>A @Transactional method throws a checked exception. What happens?</summary><div class="answer"><p>The transaction <em>commits</em>. Spring's default rollback rule covers only <code>RuntimeException</code> and <code>Error</code> — checked exceptions are treated as anticipated business outcomes (an EJB-era default). So work done before the throw is persisted, which is almost never what the author intended. Fix: <code>@Transactional(rollbackFor = Exception.class)</code>, or design services to throw unchecked exceptions. Related: if an inner REQUIRED method already threw a RuntimeException through its proxy, the shared tx is marked rollback-only, and the outer method's catch-and-commit attempt throws <code>UnexpectedRollbackException</code>.</p></div></details>
+
+<details class="qa"><summary>What does @Transactional(readOnly = true) actually do?</summary><div class="answer"><p>Three things: (1) sets Hibernate's flush mode to MANUAL, so no dirty-checking flush occurs at commit — a real CPU/memory win when many entities are loaded, since Hibernate can also skip retaining detachment snapshots; (2) calls <code>Connection.setReadOnly(true)</code>, a driver/DB hint — Postgres can enforce read-only mode and some infrastructures route read-only transactions to replicas; (3) documents intent. What it's not: a security boundary or a guarantee — it's an optimization and a contract marker.</p></div></details>
+
+<details class="qa"><summary>Explain the persistence context and the first-level cache.</summary><div class="answer"><p>It's a unit-of-work bound to the transaction: an identity map from (entity class, id) to the single managed instance, plus load-time snapshots for dirty checking. Consequences: two <code>findById</code> calls for the same id in one transaction issue one SELECT and return the same object reference; changes to managed entities are auto-detected and flushed as UPDATEs; JPQL queries still hit the DB but resolve rows to the already-managed instances. It's per-transaction and private — not to be confused with the shared second-level cache.</p></div></details>
+
+<details class="qa"><summary>Why did an UPDATE happen when the code never calls save()?</summary><div class="answer"><p>Dirty checking. Any entity loaded inside a transaction is managed; at flush Hibernate diffs each managed entity against its load-time snapshot and generates UPDATEs for changes. So <code>findById(...).setName(...)</code> inside <code>@Transactional</code> persists without <code>save()</code> — <code>save()</code> on a managed entity is redundant. The flip side is the real danger: mutating a managed entity "just for display" writes to the database. The discipline is: only mutate managed entities when you intend a write, and map to DTOs for everything else.</p></div></details>
+
+<details class="qa"><summary>persist() vs merge() — and what does Spring Data's save() do?</summary><div class="answer"><p><code>persist()</code> makes the passed instance itself managed and schedules an INSERT; it fails on detached entities ("detached entity passed to persist"). <code>merge()</code> copies the state of a (possibly detached) instance onto a managed instance — loading it with a SELECT if it isn't in the context — and returns <em>that managed copy</em>; the argument stays detached, so you must keep using the return value. <code>SimpleJpaRepository.save()</code> picks between them: persist if "new" (null id/version, or <code>Persistable.isNew()</code>), else merge — which is why saving a client-supplied object with an id costs a hidden SELECT before the UPDATE. Cleaner update pattern: load, mutate, let dirty checking flush.</p></div></details>
+
+<details class="qa"><summary>When exactly does Hibernate flush?</summary><div class="answer"><p>With AUTO flush mode: before executing a query whose result could be affected by pending in-memory changes (Hibernate 6 compares the query's table spaces with dirty entities' tables), at transaction commit, and on explicit <code>flush()</code>. Flush writes SQL but does not commit — the changes are still invisible to other transactions and still rollbackable. Explicit <code>flush()</code>/<code>saveAndFlush()</code> is useful to surface constraint violations at a known point or before native queries whose table usage Hibernate can't infer. Bulk <code>@Modifying</code> queries do <em>not</em> pass through flush semantics — they hit the DB directly.</p></div></details>
+
+<details class="qa"><summary>What's the difference between findById and getReferenceById?</summary><div class="answer"><p><code>findById</code> executes a SELECT immediately and returns <code>Optional</code> with the real entity. <code>getReferenceById</code> returns a lazy proxy carrying only the id, with <em>no SQL at all</em>; the SELECT happens on first access to a non-id field, and a missing row throws <code>EntityNotFoundException</code> at that access point, not at the call. The canonical use is setting foreign keys without a wasted round trip: <code>order.setCustomer(repo.getReferenceById(id))</code> generates only the INSERT with <code>customer_id</code> bound. Use <code>findById</code> when you need the data or need to validate existence now.</p></div></details>
+
+<details class="qa"><summary>When do you switch from derived query methods to @Query, and to native SQL?</summary><div class="answer"><p>Derived methods for 1–3 simple conditions — they're validated against the entity model at startup, which catches typos early. Beyond that, method names become unreadable (<code>findByAAndBOrCInOrderBy...</code>) and each filter combination is a new method — switch to <code>@Query</code> JPQL with named parameters. Go native when the SQL exceeds JPQL: window functions, CTEs/recursive queries, Postgres <code>jsonb</code>/array operators, <code>ON CONFLICT</code> upserts, <code>FOR UPDATE SKIP LOCKED</code>, or hand-optimized queries. Costs of native: no model validation, dialect coupling, and count queries for pagination need care. For dynamic filter combinations, Specifications or QueryDSL instead of a method explosion.</p></div></details>
+
+<details class="qa"><summary>What are the pitfalls of @Modifying bulk updates?</summary><div class="answer"><p>A bulk JPQL UPDATE/DELETE compiles to one SQL statement that goes straight to the database, bypassing the persistence context entirely: already-loaded managed entities keep stale values, <code>@Version</code> columns don't increment, lifecycle callbacks and auditing listeners don't fire, cascades and orphanRemoval don't apply. If the same transaction reads affected entities afterward it sees the old state from the L1 cache. Mitigations: <code>@Modifying(clearAutomatically = true)</code> to evict the context after (plus <code>flushAutomatically = true</code> so pending changes aren't lost), or run bulk ops in dedicated transactions. The trade is worth it: one statement for a million rows instead of loading them all.</p></div></details>
+
+<details class="qa"><summary>Page vs Slice — what's the cost difference?</summary><div class="answer"><p><code>Page</code> runs two statements: the data query with LIMIT/OFFSET and a <code>count(*)</code> with the same predicate — on large tables the count can cost more than the page itself. <code>Slice</code> skips the count by fetching <code>size + 1</code> rows and exposing only <code>hasNext()</code> — ideal for infinite scroll. I'd also volunteer offset pagination's deep-page problem: <code>OFFSET 200000</code> makes Postgres produce and discard 200k rows, so latency grows with depth; keyset/seek pagination (<code>WHERE (created_at, id) &lt; (?, ?) ORDER BY ... LIMIT 20</code> on an index) is constant-time at any depth, and Spring Data 3.1+ supports it via <code>ScrollPosition.keyset()</code>/<code>Window</code>.</p></div></details>
+
+<details class="qa"><summary>How does optimistic locking with @Version work mechanically?</summary><div class="answer"><p>Hibernate adds the version to every UPDATE's WHERE clause and increments it: <code>update ... set ..., version=? where id=? and version=?</code>. If a concurrent transaction committed first, the version no longer matches, zero rows are affected, and Hibernate throws <code>OptimisticLockException</code> (Spring: <code>ObjectOptimisticLockingFailureException</code>), rolling back the transaction. Handling: retry the entire use case — re-read, re-apply logic, re-commit — from <em>outside</em> the transactional boundary (spring-retry or a loop), or surface HTTP 409 to the client for user-mediated conflicts. The version even survives detachment, which is how you protect web edit forms and ETag-based APIs against lost updates.</p></div></details>
+
+<details class="qa"><summary>When do you choose pessimistic locking, and what SQL does it generate on Postgres?</summary><div class="answer"><p><code>@Lock(PESSIMISTIC_WRITE)</code> on a repository query appends <code>FOR UPDATE</code> to the SELECT (PESSIMISTIC_READ → <code>FOR SHARE</code>), taking a row lock held until commit — concurrent writers block. Choose it for hot rows where conflicts are the norm and optimistic retry storms would waste more than brief blocking: inventory decrements, account balances, seat reservations. Rules of use: keep the transaction tiny (the lock also pins a pool connection), set <code>jakarta.persistence.lock.timeout</code> so contention fails fast, and lock in consistent order to avoid deadlocks. For queue-like workloads, native <code>FOR UPDATE SKIP LOCKED</code> lets N workers claim disjoint rows. For simple counters, a single atomic conditional UPDATE beats locking entirely.</p></div></details>
+
+<details class="qa"><summary>How do you size a HikariCP pool, and what are the symptoms of exhaustion?</summary><div class="answer"><p>Small is beautiful: Postgres runs one backend process per connection, so throughput peaks around <code>(cores × 2) + spindles</code> connections on the DB server — roughly 10 for a small instance — then degrades with more due to context switching and contention. Remember it's per app instance: 10 pods × 10 = 100 server connections. Exhaustion symptoms: requests stall for exactly <code>connectionTimeout</code> then throw <code>SQLTransientConnectionException: connection is not available</code>; pending-connection metrics climb; thread dumps park in <code>getConnection</code>. Root cause is nearly always long-held connections: slow HTTP calls inside <code>@Transactional</code>, OSIV holding connections through rendering, REQUIRES_NEW doubling footprints. <code>leakDetectionThreshold</code> logs the stack of any lease held too long — the fastest way to find the offender.</p></div></details>
+
+<details class="qa"><summary>Why is putting a remote HTTP call inside a @Transactional method an anti-pattern?</summary><div class="answer"><p>The transaction holds a pooled DB connection for its whole duration. A 5-second payment API call inside the transaction means 5 seconds of a scarce connection doing nothing; with pool size 10, ten concurrent checkouts freeze the entire application — every other endpoint times out waiting for connections. It also stretches lock hold times and makes the DB work (locks, possible bloat from long-running transactions) hostage to third-party latency. Fix: shorten transactions to DB-only work — commit a PENDING state, make the remote call outside any transaction, then a second transaction records the outcome, with compensation/outbox patterns for reliability.</p></div></details>
+
+<details class="qa"><summary>Why should ddl-auto=update never run in production, and what replaces it?</summary><div class="answer"><p><code>update</code> hands schema evolution to Hibernate's diff heuristics at boot time: it can't rename anything (a renamed field becomes a new column, stranding the old data), never drops columns or constraints, knows nothing about your indexing strategy or data backfills, and applies DDL outside any review or rollback process. The replacement is versioned migrations (Flyway/Liquibase) owned by the team and reviewed like code, with <code>ddl-auto=validate</code> so the app fails fast if entities drift from the real schema. Corollary rules: never edit an applied migration (checksum validation breaks everywhere it already ran — write a new one), and make changes expand/contract-safe for zero-downtime deploys.</p></div></details>
+
+<details class="qa"><summary>Why doesn't @Transactional propagate into an @Async method, and how do you run work "after the transaction commits"?</summary><div class="answer"><p>Spring binds the transaction (and the EntityManager) to the current thread via ThreadLocals. <code>@Async</code> executes on a different executor thread that has none of that context — it won't join the caller's transaction, and <code>@Transactional</code> on it starts a brand-new one. There's also a race: the async task may run before the caller commits, so its reads can't see the caller's uncommitted data. The clean pattern is to publish an application event and handle it with <code>@TransactionalEventListener(phase = AFTER_COMMIT)</code> (optionally <code>@Async</code> on the listener), so side effects fire only for committed state; for at-least-once delivery guarantees, a transactional outbox table polled by a relay is the production-grade answer.</p></div></details>
+
+<details class="qa"><summary>You fetch-join a collection and add a Pageable. What happens?</summary><div class="answer"><p>Hibernate cannot apply SQL LIMIT/OFFSET, because the join multiplies rows (one per child) and a row-level limit would truncate a parent's collection mid-way. So it fetches <em>the entire result set</em> and paginates in memory, logging <code>HHH90003004: firstResult/maxResults specified with collection fetch; applying in memory</code>. On a big table that's a latency and OOM hazard. Solutions: paginate the parent ids first (query 1: ids with LIMIT; query 2: fetch-join those ids), rely on <code>@BatchSize</code> for children after a paginated parent query, or project to DTOs and assemble. Related: fetch-joining two <code>List</code> collections at once throws <code>MultipleBagFetchException</code>; and on Hibernate 5 you needed <code>distinct</code> to dedupe parents, which Hibernate 6 does automatically.</p></div></details>
+
+</section>
+
+<!-- ============================================================ -->
+<section>
+<h2 id="exercises">Hands-on exercises</h2>
+
+<div class="exercise">
+<h4>Exercise 1 — Model the aggregate, prove the owning side</h4>
+<p>Create <code>Customer</code> (id: SEQUENCE with allocationSize 50, unique email) and <code>Order</code> (LAZY <code>@ManyToOne</code> to customer, status enum as STRING, <code>total</code>). Make the association bidirectional with sync helper methods. Then write a test that adds an order only to <code>customer.getOrders()</code> (without setting <code>order.customer</code>), saves, clears the context, and reloads — observe the FK is null (or the insert fails on the not-null constraint). Fix it with the helper method.</p>
+<details><summary>Solution</summary>
+<pre><code><span class="ann">@Entity</span> <span class="ann">@Table</span>(name = <span class="str">"customers"</span>)
+<span class="kw">public class</span> <span class="typ">Customer</span> {
+    <span class="ann">@Id</span> <span class="ann">@GeneratedValue</span>(strategy = GenerationType.SEQUENCE, generator = <span class="str">"customer_seq"</span>)
+    <span class="ann">@SequenceGenerator</span>(name = <span class="str">"customer_seq"</span>, allocationSize = <span class="num">50</span>)
+    <span class="kw">private</span> <span class="typ">Long</span> id;
+
+    <span class="ann">@Column</span>(nullable = <span class="kw">false</span>, unique = <span class="kw">true</span>) <span class="kw">private</span> <span class="typ">String</span> email;
+
+    <span class="ann">@OneToMany</span>(mappedBy = <span class="str">"customer"</span>, cascade = {CascadeType.PERSIST, CascadeType.MERGE})
+    <span class="kw">private</span> <span class="typ">List</span>&lt;<span class="typ">Order</span>&gt; orders = <span class="kw">new</span> <span class="typ">ArrayList</span>&lt;&gt;();
+
+    <span class="kw">public void</span> addOrder(<span class="typ">Order</span> o) { orders.add(o); o.setCustomer(<span class="kw">this</span>); }
+}
+
+<span class="com">// Test sketch (@DataJpaTest):</span>
+<span class="typ">Customer</span> c = repo.save(<span class="kw">new</span> <span class="typ">Customer</span>(<span class="str">"a@b.com"</span>));
+c.getOrders().add(order);                <span class="com">// inverse side only</span>
+em.flush(); em.clear();
+<span class="com">// order.customer_id was never written → constraint violation (nullable=false)</span>
+<span class="com">// or, if nullable, reload shows customer == null. Replacing with c.addOrder(order) fixes it,</span>
+<span class="com">// because addOrder sets the OWNING side (order.customer), which is what Hibernate persists.</span>
+</code></pre>
+</details>
+</div>
+
+<div class="exercise">
+<h4>Exercise 2 — Manufacture an N+1, then fix it three ways</h4>
+<p>Seed 50 customers × 4 orders. Enable <code>org.hibernate.SQL: DEBUG</code>. Write a service returning "order id + customer name" for all 200 orders and count the queries (expect 1 + up to 50). Fix it with (a) <code>join fetch</code>, (b) <code>@EntityGraph</code>, (c) a record-based DTO projection — verifying one query each time. State which you'd ship and why.</p>
+<details><summary>Solution</summary>
+<pre><code><span class="com">// Naive: findAll() then o.getCustomer().getName() → 1 + N SELECTs in the log.</span>
+
+<span class="com">// (a) fetch join</span>
+<span class="ann">@Query</span>(<span class="str">"select o from Order o join fetch o.customer"</span>)
+<span class="typ">List</span>&lt;<span class="typ">Order</span>&gt; findAllWithCustomer();
+
+<span class="com">// (b) entity graph on a derived method</span>
+<span class="ann">@EntityGraph</span>(attributePaths = <span class="str">"customer"</span>)
+<span class="typ">List</span>&lt;<span class="typ">Order</span>&gt; findAllByOrderByIdAsc();
+
+<span class="com">// (c) DTO — the one to ship for a read endpoint</span>
+<span class="kw">public record</span> <span class="typ">Row</span>(<span class="typ">Long</span> orderId, <span class="typ">String</span> customerName) {}
+<span class="ann">@Query</span>(<span class="str">"select new com.shop.Row(o.id, c.name) from Order o join o.customer c"</span>)
+<span class="typ">List</span>&lt;<span class="typ">Row</span>&gt; findRows();
+<span class="com">// SQL: select o1_0.id, c1_0.name from orders o1_0 join customers c1_0 ... — one query,</span>
+<span class="com">// two columns, no managed entities, no possible LazyInitializationException downstream.</span>
+</code></pre>
+<p>Ship (c) for pure reads: minimal data, no persistence-context overhead, immune to N+1 by construction. Use (a)/(b) when you need the managed entity to mutate it.</p>
+</details>
+</div>
+
+<div class="exercise">
+<h4>Exercise 3 — Break @Transactional two ways, then repair it</h4>
+<p>Write <code>ReportService.generateAll()</code> that loops and calls <code>this.generateOne(id)</code> where <code>generateOne</code> is <code>@Transactional(REQUIRES_NEW)</code>. Prove (log <code>TransactionSynchronizationManager.isActualTransactionActive()</code> / tx name) that no new transaction starts. Then make <code>generateOne</code> throw a checked exception after a save and show the save committed. Repair both.</p>
+<details><summary>Solution</summary>
+<pre><code><span class="com">// Bug 1: self-invocation — this.generateOne() bypasses the proxy; REQUIRES_NEW never happens.</span>
+<span class="com">// Inside generateOne: TransactionSynchronizationManager.getCurrentTransactionName()</span>
+<span class="com">// shows the OUTER method's tx (or none) instead of a new one.</span>
+<span class="com">// Fix: move generateOne to ReportItemService and inject it — the call now crosses a proxy:</span>
+<span class="ann">@Service</span> <span class="kw">class</span> <span class="typ">ReportItemService</span> {
+    <span class="ann">@Transactional</span>(propagation = Propagation.REQUIRES_NEW,
+                   rollbackFor = <span class="typ">Exception</span>.<span class="kw">class</span>)          <span class="com">// fixes Bug 2 as well</span>
+    <span class="kw">public void</span> generateOne(<span class="typ">Long</span> id) <span class="kw">throws</span> <span class="typ">ReportException</span> { ... }
+}
+
+<span class="com">// Bug 2: checked exception → default rule doesn't roll back → the save committed.</span>
+<span class="com">// rollbackFor = Exception.class makes checked exceptions roll back too.</span>
+<span class="com">// Bonus observation: with per-item REQUIRES_NEW, each iteration briefly needs its own</span>
+<span class="com">// connection — fine sequentially, dangerous if the loop is parallelized against a small pool.</span>
+</code></pre>
+</details>
+</div>
+
+<div class="exercise">
+<h4>Exercise 4 — Dirty checking &amp; flush timing, observed</h4>
+<p>In one <code>@Transactional</code> test method: load a customer, change its name (no save), run a JPQL query <code>select c from Customer c where c.name = :newName</code>, and read the SQL log. Explain the order of statements. Then repeat with <code>readOnly = true</code> and explain the difference.</p>
+<details><summary>Solution</summary>
+<pre><code><span class="com">-- Log order with a read-write tx:</span>
+select ... from customers where id=?          <span class="com">-- the find</span>
+update customers set email=?, name=?, ... where id=?   <span class="com">-- AUTO flush BEFORE the query!</span>
+select ... from customers c1_0 where c1_0.name=?       <span class="com">-- the JPQL query — and it FINDS the row</span>
+</code></pre>
+<p>Hibernate flushes before the query because the query reads the <code>customers</code> table, which has pending in-memory changes — otherwise the query would miss your own update (the "auto flush before overlapping query" rule). The UPDATE is still uncommitted; commit happens at method end. With <code>readOnly = true</code> the flush mode is MANUAL: no UPDATE is emitted before the query or at commit — the JPQL query does <em>not</em> find the renamed row, and the rename is silently discarded. Moral: <code>readOnly</code> isn't just an optimization flag; it changes visible semantics if you (wrongly) mutate entities inside it.</p>
+</details>
+</div>
+
+<div class="exercise">
+<h4>Exercise 5 — Optimistic locking under concurrency</h4>
+<p>Add <code>@Version</code> to <code>Product</code>. Write a test with two threads (or two <code>TransactionTemplate</code> blocks) that both load product #1 (stock 10), both decrement by 1, and commit one after the other. Assert the second commit throws <code>ObjectOptimisticLockingFailureException</code>. Then add a retry wrapper so both decrements eventually apply and final stock is 8.</p>
+<details><summary>Solution</summary>
+<pre><code><span class="com">// Tx A and Tx B both read (stock=10, version=0).</span>
+<span class="com">// A commits: update products set stock=9, version=1 where id=1 and version=0  → 1 row.</span>
+<span class="com">// B commits: update products set stock=9, version=1 where id=1 and version=0  → 0 rows</span>
+<span class="com">//            → ObjectOptimisticLockingFailureException, B rolls back.</span>
+
+<span class="kw">public void</span> decrementWithRetry(<span class="typ">Long</span> id) {
+    <span class="kw">for</span> (<span class="kw">int</span> attempt = <span class="num">1</span>; ; attempt++) {
+        <span class="kw">try</span> {
+            txTemplate.executeWithoutResult(s -&gt; {          <span class="com">// fresh tx per attempt</span>
+                <span class="typ">Product</span> p = repo.findById(id).orElseThrow(); <span class="com">// RE-READ fresh state + version</span>
+                p.setStock(p.getStock() - <span class="num">1</span>);
+            });
+            <span class="kw">return</span>;
+        } <span class="kw">catch</span> (<span class="typ">ObjectOptimisticLockingFailureException</span> e) {
+            <span class="kw">if</span> (attempt == <span class="num">3</span>) <span class="kw">throw</span> e;   <span class="com">// give up → surface as 409/error</span>
+        }
+    }
+}
+<span class="com">// Key detail: the retry must wrap the WHOLE transaction (re-read included).</span>
+<span class="com">// Retrying just the save with the stale entity would fail forever.</span>
+</code></pre>
+</details>
+</div>
+
+<div class="exercise">
+<h4>Exercise 6 — Flyway + validate: catch drift on purpose</h4>
+<p>Set <code>spring.jpa.hibernate.ddl-auto=validate</code> and let Flyway own the schema. Write <code>V1__customers.sql</code> and <code>V2__orders.sql</code> (with the sequence at INCREMENT BY 50, FK + index). Boot the app — it should start clean. Now add a new field <code>String nickname</code> to the entity <em>without</em> a migration and boot again. Observe the failure, then write <code>V3</code> to fix it.</p>
+<details><summary>Solution</summary>
+<pre><code><span class="com">-- V1__customers.sql</span>
+create sequence customer_seq start with 1 increment by 50;
+create table customers (
+  id bigint primary key,
+  email varchar(320) not null unique,
+  name varchar(200) not null,
+  status varchar(32) not null
+);
+
+<span class="com">-- Boot after adding the unmapped field fails fast with Hibernate's schema validator:</span>
+<span class="com">-- SchemaManagementException: Schema-validation: missing column [nickname]</span>
+<span class="com">-- in table [customers]</span>
+
+<span class="com">-- V3__add_customer_nickname.sql (a NEW file — never edit V1, its checksum is recorded)</span>
+alter table customers add column nickname varchar(100);
+</code></pre>
+<p>This is exactly the safety net you want in prod: entity/schema drift becomes a deploy-time failure instead of a runtime surprise, and every schema change exists as a reviewed, versioned file.</p>
+</details>
+</div>
+
+</section>
+
+<nav class="page-nav"><a href="06-spring-rest-api.html">← Prev: REST API Layer</a><a href="08-spring-security.html">Next: Spring Security →</a></nav>
+</main></body></html>

@@ -1,0 +1,1643 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>11 — SQL Fluency | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <div class="breadcrumb"><a href="index.html">← Course Home</a></div>
+    <h1>11 — SQL Fluency</h1>
+    <p>Write PostgreSQL live, on the spot: joins, window functions, NULL traps, and the classic problems every interviewer asks.</p>
+  </div>
+</header>
+<main class="container">
+
+  <section>
+    <h2 id="why">Why interviewers ask this</h2>
+    <p>
+      As a senior full-stack candidate you will almost certainly face a <strong>live SQL round</strong>: a shared editor,
+      a small schema, and questions like "top 3 salaries per department" or "month-over-month growth". Interviewers use SQL
+      because it is impossible to fake — either you can produce a correct <code>LEFT JOIN</code> with the filter in the right
+      place, or you can't. Unlike system design, there is a right answer, and they can watch you get there.
+    </p>
+    <p>
+      Coming from 7 years of frontend, your risk is not concepts — it's <em>fluency</em>. You know what a join is; the question
+      is whether you can type one in 30 seconds without hesitating over <code>ON</code> vs <code>WHERE</code>. This page is built
+      for exactly that: every concept comes with a runnable PostgreSQL query against <strong>one consistent sample schema</strong>,
+      the expected result, and the trap interviewers are secretly testing. Work through the "Classic problems" section with your
+      hands on a real <code>psql</code> session (setup at the bottom) — reading SQL and writing SQL are different skills.
+    </p>
+    <div class="senior">
+      <p>Senior-level signal in a SQL round is not exotic syntax. It's: (1) narrating your plan before typing, (2) knowing the
+      logical evaluation order (<code>FROM → WHERE → GROUP BY → HAVING → SELECT → ORDER BY → LIMIT</code>), (3) reaching for
+      window functions instead of self-join gymnastics, and (4) spotting NULL traps before the interviewer points them out.</p>
+    </div>
+  </section>
+
+  <section>
+    <h2 id="schema">The sample schema (used everywhere below)</h2>
+    <p>
+      Four tables: a classic HR pair (<code>employees</code>/<code>departments</code>) for joins, self-joins, and window
+      functions, plus a commerce pair (<code>customers</code>/<code>orders</code>) for aggregation and time-series questions.
+      Paste this into psql once and every query on this page will run.
+    </p>
+<pre><code><span class="com">-- Departments and employees (note: Marketing has no employees, Omar has no department)</span>
+CREATE TABLE departments (
+  id    integer PRIMARY KEY,
+  name  text NOT NULL
+);
+
+CREATE TABLE employees (
+  id          integer PRIMARY KEY,
+  name        text NOT NULL,
+  salary      numeric(10,2) NOT NULL,
+  dept_id     integer REFERENCES departments(id),
+  manager_id  integer REFERENCES employees(id),
+  hired_at    date NOT NULL
+);
+
+CREATE TABLE customers (
+  id       integer PRIMARY KEY,
+  name     text NOT NULL,
+  country  text NOT NULL
+);
+
+CREATE TABLE orders (
+  id           integer PRIMARY KEY,
+  customer_id  integer NOT NULL REFERENCES customers(id),
+  amount       numeric(10,2) NOT NULL,
+  status       text NOT NULL,          <span class="com">-- 'paid' | 'pending' | 'cancelled'</span>
+  created_at   date NOT NULL
+);
+
+INSERT INTO departments VALUES
+  (1,'Engineering'), (2,'Sales'), (3,'HR'), (4,'Marketing');
+
+INSERT INTO employees VALUES
+  (1,'Priya', 180000, 1, NULL, '2018-03-01'),
+  (2,'Arjun', 140000, 1, 1,    '2019-06-15'),
+  (3,'Maya',  140000, 1, 1,    '2020-01-10'),
+  (4,'Dev',    95000, 1, 2,    '2022-08-01'),
+  (5,'Sana',  120000, 2, 1,    '2019-11-20'),
+  (6,'Ravi',  130000, 2, 5,    '2021-04-05'),
+  (7,'Lena',   70000, 3, 1,    '2023-02-14'),
+  (8,'Omar',   70000, NULL, 5, '2024-07-01');
+
+INSERT INTO customers VALUES
+  (1,'Acme','US'), (2,'Globex','DE'), (3,'Initech','US'),
+  (4,'Umbrella','UK'), (5,'Soylent','US');   <span class="com">-- Soylent has no orders</span>
+
+INSERT INTO orders VALUES
+  (101, 1, 250.00, 'paid',      '2025-01-05'),
+  (102, 1, 120.00, 'paid',      '2025-01-20'),
+  (103, 2, 300.00, 'pending',   '2025-01-22'),
+  (104, 3, 450.00, 'paid',      '2025-02-02'),
+  (105, 1,  90.00, 'cancelled', '2025-02-10'),
+  (106, 2, 500.00, 'paid',      '2025-02-14'),
+  (107, 4,  75.00, 'paid',      '2025-02-27'),
+  (108, 3, 200.00, 'paid',      '2025-03-03'),
+  (109, 2, 150.00, 'pending',   '2025-03-15'),
+  (110, 1, 320.00, 'paid',      '2025-03-18');
+</code></pre>
+    <p>The employee data at a glance — memorize the shape, we'll refer to it constantly:</p>
+    <table>
+      <thead><tr><th>id</th><th>name</th><th>salary</th><th>dept_id</th><th>manager_id</th><th>hired_at</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>Priya</td><td>180000</td><td>1 (Eng)</td><td>NULL</td><td>2018-03-01</td></tr>
+        <tr><td>2</td><td>Arjun</td><td>140000</td><td>1 (Eng)</td><td>1</td><td>2019-06-15</td></tr>
+        <tr><td>3</td><td>Maya</td><td>140000</td><td>1 (Eng)</td><td>1</td><td>2020-01-10</td></tr>
+        <tr><td>4</td><td>Dev</td><td>95000</td><td>1 (Eng)</td><td>2</td><td>2022-08-01</td></tr>
+        <tr><td>5</td><td>Sana</td><td>120000</td><td>2 (Sales)</td><td>1</td><td>2019-11-20</td></tr>
+        <tr><td>6</td><td>Ravi</td><td>130000</td><td>2 (Sales)</td><td>5</td><td>2021-04-05</td></tr>
+        <tr><td>7</td><td>Lena</td><td>70000</td><td>3 (HR)</td><td>1</td><td>2023-02-14</td></tr>
+        <tr><td>8</td><td>Omar</td><td>70000</td><td>NULL</td><td>5</td><td>2024-07-01</td></tr>
+      </tbody>
+    </table>
+    <div class="note">
+      <p>The data is deliberately booby-trapped: a salary tie (Arjun/Maya at 140k), an employee with a NULL
+      <code>dept_id</code> (Omar), a department with no employees (Marketing), a customer with no orders (Soylent),
+      and an employee who out-earns their manager (Ravi &gt; Sana). These are exactly the edge cases interview data has.</p>
+    </div>
+  </section>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ol>
+      <li><a href="#why">Why interviewers ask this</a></li>
+      <li><a href="#schema">The sample schema</a></li>
+      <li><a href="#joins">Joins mastery</a></li>
+      <li><a href="#aggregation">Aggregation: GROUP BY, HAVING, FILTER</a></li>
+      <li><a href="#nulls">NULL gotchas &amp; three-valued logic</a></li>
+      <li><a href="#windows">Window functions</a></li>
+      <li><a href="#subqueries">Subqueries &amp; CTEs</a></li>
+      <li><a href="#upsert">UPSERT &amp; RETURNING</a></li>
+      <li><a href="#recursive">Recursive CTEs &amp; set operations</a></li>
+      <li><a href="#pgfunctions">Handy Postgres functions</a></li>
+      <li><a href="#problems">Classic interview problems — solve before revealing</a></li>
+      <li><a href="#qa">Interview Q&amp;A</a></li>
+      <li><a href="#exercises">Hands-on exercises</a></li>
+    </ol>
+  </div>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="joins">Joins mastery <span class="tier tier-1">T1</span></h2>
+
+    <h3>The five joins in one mental model</h3>
+    <p>
+      A join matches rows from two tables using a predicate. The join <em>type</em> only decides what happens to rows
+      that <strong>don't</strong> match:
+    </p>
+<pre><code>INNER JOIN        LEFT JOIN         RIGHT JOIN        FULL JOIN
+  A      B          A      B          A      B          A      B
+ ___    ___        ___    ___        ___    ___        ___    ___
+(   )  (   )      (###)  (   )      (   )  (###)      (###)  (###)
+( ##)##(## )      (###)##(## )      ( ##)##(###)      (###)##(###)
+(   )  (   )      (###)  (   )      (   )  (###)      (###)  (###)
+ ---    ---        ---    ---        ---    ---        ---    ---
+only overlap      all of A +        all of B +        everything;
+                  matches from B    matches from A    unmatched side
+                  (B cols NULL      (A cols NULL      padded with NULL
+                   if no match)      if no match)
+</code></pre>
+    <ul>
+      <li><strong>INNER JOIN</strong> — keep only matching pairs.</li>
+      <li><strong>LEFT JOIN</strong> — keep every left row; right-side columns become NULL when there's no match.</li>
+      <li><strong>RIGHT JOIN</strong> — mirror of LEFT. In practice, seniors rewrite it as a LEFT JOIN with tables swapped (easier to read top-to-bottom).</li>
+      <li><strong>FULL JOIN</strong> — keep everything from both sides; NULL-pad whichever side is missing.</li>
+      <li><strong>CROSS JOIN</strong> — no predicate at all: every left row paired with every right row (Cartesian product).</li>
+    </ul>
+
+    <h3>Walkthrough on our data</h3>
+<pre><code>SELECT AS employee, AS department
+FROM employees e
+JOIN departments d ON e.dept_id =;   <span class="com">-- JOIN means INNER JOIN</span>
+</code></pre>
+    <p><strong>Result: 7 rows.</strong> Omar disappears — his <code>dept_id</code> is NULL and <code>NULL = anything</code>
+    is never true, so he matches nothing. Marketing also never appears — no employee points at it.</p>
+<pre><code>SELECT AS employee, AS department
+FROM employees e
+LEFT JOIN departments d ON e.dept_id =;
+</code></pre>
+    <p><strong>Result: 8 rows.</strong> Omar comes back with <code>department = NULL</code>. Marketing is still absent
+    (it lives on the <em>right</em> side).</p>
+<pre><code>SELECT AS employee, AS department
+FROM employees e
+FULL JOIN departments d ON e.dept_id =;
+</code></pre>
+    <p><strong>Result: 9 rows.</strong> The 7 matches, plus <code>(Omar, NULL)</code>, plus <code>(NULL, Marketing)</code>.
+    FULL JOIN is the "reconciliation" join — great for "what's in A but not B, and vice versa, in one query".</p>
+<pre><code>SELECT COUNT(*) FROM employees CROSS JOIN departments;   <span class="com">-- 8 × 4 = 32</span>
+</code></pre>
+    <p>CROSS JOIN is rarely wanted directly, but it's the right tool for generating combinations
+    (e.g., every month × every region for a report grid — see <a href="#pgfunctions">generate_series</a>).</p>
+
+    <h3>Self-join</h3>
+    <p>A self-join is just a table joined to itself under two aliases. The canonical example — employee with their manager:</p>
+<pre><code>SELECT AS employee, AS manager
+FROM employees e
+LEFT JOIN employees m ON e.manager_id =;
+</code></pre>
+    <table>
+      <thead><tr><th>employee</th><th>manager</th></tr></thead>
+      <tbody>
+        <tr><td>Priya</td><td>NULL</td></tr>
+        <tr><td>Arjun</td><td>Priya</td></tr>
+        <tr><td>Maya</td><td>Priya</td></tr>
+        <tr><td>Dev</td><td>Arjun</td></tr>
+        <tr><td>Sana</td><td>Priya</td></tr>
+        <tr><td>Ravi</td><td>Sana</td></tr>
+        <tr><td>Lena</td><td>Priya</td></tr>
+        <tr><td>Omar</td><td>Sana</td></tr>
+      </tbody>
+    </table>
+    <div class="pitfall">
+      <p>Using an INNER join here silently drops Priya (the CEO, <code>manager_id IS NULL</code>). "Show each employee
+      and their manager" almost always means LEFT JOIN — say that out loud in the interview, it's an easy senior point.</p>
+    </div>
+
+    <h3>THE trap: ON vs WHERE on a LEFT JOIN</h3>
+    <p>
+      This is the single most common join mistake in live interviews. Task: <em>"For every department, count employees
+      hired since 2021 — departments with zero must still appear."</em>
+    </p>
+<pre><code><span class="com">-- WRONG: filter on the right table in WHERE</span>
+SELECT, COUNT( AS cnt
+FROM departments d
+LEFT JOIN employees e ON e.dept_id =
+WHERE e.hired_at &gt;= DATE '2021-01-01'    <span class="com">-- ← kills the NULL-padded rows!</span>
+GROUP BY;
+</code></pre>
+    <p><strong>Result (wrong):</strong> Engineering 1 (Dev), Sales 1 (Ravi), HR 1 (Lena). Marketing has vanished.
+    Why: the LEFT JOIN dutifully produced a <code>(Marketing, NULL)</code> row, but then
+    <code>WHERE e.hired_at &gt;= '2021-01-01'</code> evaluated to <code>NULL &gt;= '2021-01-01'</code> → UNKNOWN → row filtered out.
+    <strong>A WHERE condition on right-table columns turns a LEFT JOIN into an INNER JOIN.</strong></p>
+<pre><code><span class="com">-- RIGHT: put right-table filters in the ON clause</span>
+SELECT, COUNT( AS cnt
+FROM departments d
+LEFT JOIN employees e
+       ON e.dept_id =
+      AND e.hired_at &gt;= DATE '2021-01-01'   <span class="com">-- filter BEFORE the outer join pads</span>
+GROUP BY
+ORDER BY;
+</code></pre>
+    <p><strong>Result (right):</strong> Engineering 1, HR 1, Marketing 0, Sales 1. The rule:</p>
+    <table>
+      <thead><tr><th>Filter target</th><th>Where it goes</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>Left (preserved) table</td><td><code>WHERE</code></td><td>You genuinely want to exclude those left rows</td></tr>
+        <tr><td>Right (nullable) table</td><td><code>ON</code></td><td>Filter match candidates, keep unmatched left rows</td></tr>
+        <tr><td>Right table, and you <em>want</em> INNER semantics</td><td><code>WHERE</code> — but then just write <code>JOIN</code></td><td>Be honest about intent</td></tr>
+      </tbody>
+    </table>
+    <div class="senior">
+      <p>Also note <code>COUNT(</code>, not <code>COUNT(*)</code>. <code>COUNT(*)</code> counts the NULL-padded row
+      too, so Marketing would show 1 instead of 0. Counting a right-table column on a LEFT JOIN is the idiomatic
+      "count matches, zero allowed" pattern.</p>
+    </div>
+
+    <h3>Anti-joins: "rows in A with no match in B"</h3>
+    <p>Two idiomatic patterns; know both, prefer <code>NOT EXISTS</code> when in doubt:</p>
+<pre><code><span class="com">-- Pattern 1: LEFT JOIN ... IS NULL</span>
+SELECT
+FROM departments d
+LEFT JOIN employees e ON e.dept_id =
+WHERE IS NULL;                         <span class="com">-- probe a NOT NULL column of the right table</span>
+
+<span class="com">-- Pattern 2: NOT EXISTS (usually the same plan in Postgres, and NULL-safe)</span>
+SELECT
+FROM departments d
+WHERE NOT EXISTS (
+  SELECT 1 FROM employees e WHERE e.dept_id =
+);
+</code></pre>
+    <p><strong>Result of both: Marketing.</strong> The IS NULL test must be on a column that can only be NULL because
+    the join failed — the right table's primary key is the safe choice. Never write <code>NOT IN (SELECT dept_id ...)</code>
+    here: <code>dept_id</code> contains a NULL (Omar) and the query returns <em>zero rows</em> — full explanation in the
+    <a href="#nulls">NULL section</a>.</p>
+    <p>The mirror pattern, a <strong>semi-join</strong> ("rows in A that have at least one match in B"), is
+    <code>EXISTS</code> — better than <code>JOIN + DISTINCT</code> because it never duplicates left rows:</p>
+<pre><code>SELECT FROM customers c
+WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = AND o.status = 'paid');
+<span class="com">-- Acme, Globex, Initech, Umbrella (Soylent excluded)</span>
+</code></pre>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="aggregation">Aggregation: GROUP BY, HAVING, FILTER <span class="tier tier-1">T1</span></h2>
+
+    <h3>GROUP BY mechanics</h3>
+    <p>
+      <code>GROUP BY</code> collapses rows into one row per distinct group key. After grouping, the only things you may
+      SELECT are (a) the grouping columns and (b) aggregates of everything else. This is the #1 beginner error interviewers watch for:
+    </p>
+<pre><code><span class="com">-- ERROR: column "" must appear in the GROUP BY clause or be used in an aggregate</span>
+SELECT dept_id, name, AVG(salary) FROM employees GROUP BY dept_id;
+</code></pre>
+    <p>Postgres refuses because after collapsing Engineering's 4 rows into 1, "the name" is ambiguous — whose name?
+    (If you actually want "a name per group", that's the top-1-per-group problem — window functions or
+    <code>DISTINCT ON</code>, later.) The correct aggregate query:</p>
+<pre><code>SELECT AS department,
+       COUNT(*)              AS headcount,
+       ROUND(AVG(e.salary))  AS avg_salary,
+       MAX(e.salary)         AS top_salary
+FROM employees e
+JOIN departments d ON =
+GROUP BY,
+ORDER BY avg_salary DESC;
+</code></pre>
+    <table>
+      <thead><tr><th>department</th><th>headcount</th><th>avg_salary</th><th>top_salary</th></tr></thead>
+      <tbody>
+        <tr><td>Engineering</td><td>4</td><td>138750</td><td>180000</td></tr>
+        <tr><td>Sales</td><td>2</td><td>125000</td><td>130000</td></tr>
+        <tr><td>HR</td><td>1</td><td>70000</td><td>70000</td></tr>
+      </tbody>
+    </table>
+    <div class="note">
+      <p>Postgres lets you group by the primary key alone (<code>GROUP BY</code>) and still select any column of
+      that table — the PK functionally determines the rest. Also, <code>GROUP BY 1</code> means "group by the first
+      SELECT expression"; handy live, but say what it means as you type it.</p>
+    </div>
+
+    <h3>WHERE vs HAVING</h3>
+    <p><code>WHERE</code> filters <strong>rows before grouping</strong>; <code>HAVING</code> filters
+    <strong>groups after aggregation</strong>. Mnemonic: WHERE can't see aggregates because they don't exist yet.</p>
+<pre><code><span class="com">-- Departments whose average PAID... no — whose avg salary among post-2019 hires exceeds 100k</span>
+SELECT dept_id, ROUND(AVG(salary)) AS avg_salary
+FROM employees
+WHERE hired_at &gt;= DATE '2019-01-01'   <span class="com">-- row filter (cheap, can use indexes)</span>
+GROUP BY dept_id
+HAVING AVG(salary) &gt; 100000;          <span class="com">-- group filter (needs the aggregate)</span>
+</code></pre>
+    <p><strong>Result:</strong> dept 1 → 125000 (Arjun, Maya, Dev — Priya's 180k excluded by WHERE),
+    dept 2 → 125000. HR's 70000 group is computed, then discarded by HAVING; Omar's NULL dept group (70000) likewise.</p>
+    <div class="pitfall">
+      <p>Putting a plain row condition in HAVING (<code>HAVING hired_at &gt; ...</code>) is both an error (not grouped,
+      not aggregated) and a smell even where legal: filter rows as early as possible. In interviews, misplacing the filter
+      is read as "doesn't understand evaluation order".</p>
+    </div>
+
+    <h3>COUNT(*) vs COUNT(col) vs COUNT(DISTINCT col)</h3>
+<pre><code>SELECT COUNT(*)                 AS all_rows,        <span class="com">-- 8: counts rows, period</span>
+       COUNT(dept_id)           AS with_dept,       <span class="com">-- 7: skips NULLs (Omar)</span>
+       COUNT(DISTINCT dept_id)  AS distinct_depts   <span class="com">-- 3: distinct non-NULL values</span>
+FROM employees;
+</code></pre>
+    <p>All aggregates except <code>COUNT(*)</code> ignore NULLs. That's why <code>COUNT(right_table.pk)</code> gives a
+    true zero on LEFT JOINs, and why <code>AVG</code> can silently exclude rows you thought you were averaging.</p>
+
+    <h3>FILTER — the Postgres gem for conditional aggregation</h3>
+    <p>Standard SQL forces <code>SUM(CASE WHEN ... THEN 1 ELSE 0 END)</code>. Postgres has a cleaner, faster-to-type form
+    that reads like English — using it in an interview instantly marks you as someone who actually uses Postgres:</p>
+<pre><code>SELECT AS customer,
+       COUNT(                                        AS total_orders,
+       COUNT( FILTER (WHERE o.status = 'paid')      AS paid,
+       COALESCE(SUM(o.amount) FILTER (WHERE o.status = 'paid'), 0) AS paid_revenue
+FROM customers c
+LEFT JOIN orders o ON o.customer_id =
+GROUP BY,
+ORDER BY paid_revenue DESC;
+</code></pre>
+    <table>
+      <thead><tr><th>customer</th><th>total_orders</th><th>paid</th><th>paid_revenue</th></tr></thead>
+      <tbody>
+        <tr><td>Acme</td><td>4</td><td>3</td><td>690.00</td></tr>
+        <tr><td>Initech</td><td>2</td><td>2</td><td>650.00</td></tr>
+        <tr><td>Globex</td><td>3</td><td>1</td><td>500.00</td></tr>
+        <tr><td>Umbrella</td><td>1</td><td>1</td><td>75.00</td></tr>
+        <tr><td>Soylent</td><td>0</td><td>0</td><td>0</td></tr>
+      </tbody>
+    </table>
+    <p>One pass over the data, several differently-filtered aggregates. This is also the backbone of "pivot" questions
+    (statuses as columns) — see <a href="#problems">classic problem 12</a>.</p>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="nulls">NULL gotchas &amp; three-valued logic <span class="tier tier-1">T1</span></h2>
+
+    <h3>Three-valued logic in 60 seconds</h3>
+    <p>
+      NULL means "unknown", not "empty". Any comparison with NULL yields <strong>UNKNOWN</strong> — not true, not false.
+      <code>WHERE</code> keeps only rows where the predicate is <em>true</em>, so UNKNOWN rows are dropped, silently.
+    </p>
+<pre><code>SELECT NULL = NULL;      <span class="com">-- NULL   (not true!)</span>
+SELECT NULL &lt;&gt; 5;        <span class="com">-- NULL</span>
+SELECT NULL AND false;   <span class="com">-- false  (false wins regardless of unknown)</span>
+SELECT NULL OR true;     <span class="com">-- true   (true wins regardless of unknown)</span>
+SELECT NULL IS NULL;     <span class="com">-- true   (IS is the only safe NULL test)</span>
+SELECT NULL IS DISTINCT FROM 5;   <span class="com">-- true: NULL-safe "not equal"</span>
+</code></pre>
+    <p>Consequence: <code>WHERE dept_id = 1</code> plus <code>WHERE dept_id &lt;&gt; 1</code> does <strong>not</strong>
+    cover all employees — Omar (NULL dept) is in neither. To partition data completely you need
+    <code>dept_id &lt;&gt; 1 OR dept_id IS NULL</code>, or the NULL-safe operator
+    <code>dept_id IS DISTINCT FROM 1</code>.</p>
+
+    <h3>The NOT IN trap (the most famous NULL bug in SQL)</h3>
+<pre><code><span class="com">-- "Departments with no employees" — looks right, returns NOTHING:</span>
+SELECT name FROM departments
+WHERE id NOT IN (SELECT dept_id FROM employees);
+<span class="com">-- 0 rows. Expected: Marketing.</span>
+</code></pre>
+    <p>Why: the subquery returns <code>{1, 1, 1, 1, 2, 2, 3, NULL}</code> (Omar's NULL).
+    <code>4 NOT IN (1,2,3,NULL)</code> expands to <code>4&lt;&gt;1 AND 4&lt;&gt;2 AND 4&lt;&gt;3 AND 4&lt;&gt;NULL</code>
+    = <code>true AND true AND true AND UNKNOWN</code> = <strong>UNKNOWN</strong> → filtered out.
+    One NULL in the list poisons the entire NOT IN. Fixes, best first:</p>
+<pre><code><span class="com">-- 1. NOT EXISTS: NULL-safe, and the planner turns it into an efficient anti-join</span>
+SELECT name FROM departments d
+WHERE NOT EXISTS (SELECT 1 FROM employees e WHERE e.dept_id =;
+
+<span class="com">-- 2. Strip NULLs explicitly (works, but you must remember to do it)</span>
+SELECT name FROM departments
+WHERE id NOT IN (SELECT dept_id FROM employees WHERE dept_id IS NOT NULL);
+</code></pre>
+    <div class="pitfall">
+      <p>Plain <code>IN</code> is safe-ish (a NULL can only fail to match, never wrongly match), but
+      <code>NOT IN</code> against a nullable column is a landmine. Interviewers plant this deliberately. Default to
+      <code>NOT EXISTS</code> and mention the NULL reason — it's a scripted "gotcha" you can turn into a strong moment.</p>
+    </div>
+
+    <h3>COALESCE and NULLIF</h3>
+<pre><code><span class="com">-- COALESCE: first non-NULL argument (like JS ?? but variadic)</span>
+SELECT name, COALESCE(dept_id::text, 'unassigned') AS dept FROM employees;
+
+<span class="com">-- NULLIF(a, b): NULL if a = b, else a. Classic use: dodge division by zero</span>
+SELECT paid / NULLIF(total, 0) AS paid_ratio FROM (...) t;   <span class="com">-- NULL, not an error, when total = 0</span>
+
+<span class="com">-- They compose: default the ratio to 0</span>
+SELECT COALESCE(paid / NULLIF(total, 0), 0) FROM (...) t;
+</code></pre>
+
+    <h3>NULLs in ORDER BY</h3>
+    <p>Postgres treats NULL as <em>larger than everything</em> for sorting: <code>ORDER BY x ASC</code> puts NULLs last,
+    <code>ORDER BY x DESC</code> puts NULLs <strong>first</strong> — which surprises people building "top N" lists on a
+    nullable column:</p>
+<pre><code>SELECT name, dept_id FROM employees ORDER BY dept_id DESC;
+<span class="com">-- Omar (NULL) comes FIRST. Usually not what you want:</span>
+SELECT name, dept_id FROM employees ORDER BY dept_id DESC NULLS LAST;
+</code></pre>
+
+    <h3>NULLs and aggregates</h3>
+    <ul>
+      <li><code>SUM/AVG/MIN/MAX/COUNT(col)</code> all <strong>skip</strong> NULLs. <code>AVG</code> divides by the count of non-NULL values, not the row count.</li>
+      <li>Aggregating an empty set: <code>COUNT</code> → 0, everything else → NULL. Wrap in <code>COALESCE(SUM(x), 0)</code> for reports.</li>
+      <li><code>GROUP BY</code> and <code>DISTINCT</code> treat NULLs as <em>equal to each other</em> (unlike <code>=</code>): all NULL dept_ids form one group. Same for <code>PARTITION BY</code> and <code>UNION</code> dedup.</li>
+      <li><code>string_agg</code>, <code>array_agg</code> skip NULL inputs too.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="windows">Window functions <span class="tier tier-1">T1</span></h2>
+    <p>
+      Window functions are <strong>the</strong> modern-SQL differentiator in interviews. They compute an aggregate-like value
+      <em>per row</em> over a "window" of related rows — without collapsing the rows like GROUP BY does. If you learn one
+      section on this page cold, make it this one.
+    </p>
+
+    <h3>OVER(): the anatomy</h3>
+<pre><code>function(args) OVER (
+  PARTITION BY ...   <span class="com">-- restart the calculation per group (optional)</span>
+  ORDER BY ...       <span class="com">-- ordering within the partition (needed for rank/lag/running)</span>
+  ROWS BETWEEN ...   <span class="com">-- frame: which neighbors to include (optional)</span>
+)
+</code></pre>
+
+    <h3>PARTITION BY vs GROUP BY — rows are preserved</h3>
+<pre><code><span class="com">-- GROUP BY: 3 rows out (one per dept). Individual employees are GONE.</span>
+SELECT dept_id, AVG(salary) FROM employees GROUP BY dept_id;
+
+<span class="com">-- Window: 8 rows out — every employee, WITH their department's average alongside</span>
+SELECT name, dept_id, salary,
+       ROUND(AVG(salary) OVER (PARTITION BY dept_id))       AS dept_avg,
+       salary - AVG(salary) OVER (PARTITION BY dept_id)     AS diff_from_avg
+FROM employees;
+</code></pre>
+    <table>
+      <thead><tr><th>name</th><th>dept_id</th><th>salary</th><th>dept_avg</th><th>diff_from_avg</th></tr></thead>
+      <tbody>
+        <tr><td>Priya</td><td>1</td><td>180000</td><td>138750</td><td>+41250</td></tr>
+        <tr><td>Arjun</td><td>1</td><td>140000</td><td>138750</td><td>+1250</td></tr>
+        <tr><td>Maya</td><td>1</td><td>140000</td><td>138750</td><td>+1250</td></tr>
+        <tr><td>Dev</td><td>1</td><td>95000</td><td>138750</td><td>-43750</td></tr>
+        <tr><td>Sana</td><td>2</td><td>120000</td><td>125000</td><td>-5000</td></tr>
+        <tr><td>Ravi</td><td>2</td><td>130000</td><td>125000</td><td>+5000</td></tr>
+        <tr><td>Lena</td><td>3</td><td>70000</td><td>70000</td><td>0</td></tr>
+        <tr><td>Omar</td><td>NULL</td><td>70000</td><td>70000</td><td>0</td></tr>
+      </tbody>
+    </table>
+    <p>"Row detail + group context in the same result" is impossible with plain GROUP BY without a self-join —
+    this one-liner replaces it. Note Omar's NULL partition: NULLs form their own partition.</p>
+    <div class="pitfall">
+      <p>Window functions are evaluated <em>after</em> WHERE/GROUP BY/HAVING, so you <strong>cannot filter on them
+      directly</strong>: <code>WHERE ROW_NUMBER() OVER (...) &lt;= 3</code> is a syntax error. Wrap in a subquery or CTE
+      and filter outside — that's the whole trick behind top-N-per-group below.</p>
+    </div>
+
+    <h3>ROW_NUMBER vs RANK vs DENSE_RANK — the tie test</h3>
+<pre><code>SELECT name, salary,
+       ROW_NUMBER() OVER (ORDER BY salary DESC) AS row_num,
+       RANK()       OVER (ORDER BY salary DESC) AS rnk,
+       DENSE_RANK() OVER (ORDER BY salary DESC) AS dense
+FROM employees;
+</code></pre>
+    <table>
+      <thead><tr><th>name</th><th>salary</th><th>row_num</th><th>rnk</th><th>dense</th></tr></thead>
+      <tbody>
+        <tr><td>Priya</td><td>180000</td><td>1</td><td>1</td><td>1</td></tr>
+        <tr><td>Arjun</td><td>140000</td><td>2</td><td>2</td><td>2</td></tr>
+        <tr><td>Maya</td><td>140000</td><td>3</td><td>2</td><td>2</td></tr>
+        <tr><td>Ravi</td><td>130000</td><td>4</td><td>4</td><td>3</td></tr>
+        <tr><td>Sana</td><td>120000</td><td>5</td><td>5</td><td>4</td></tr>
+        <tr><td>Dev</td><td>95000</td><td>6</td><td>6</td><td>5</td></tr>
+        <tr><td>Lena</td><td>70000</td><td>7</td><td>7</td><td>6</td></tr>
+        <tr><td>Omar</td><td>70000</td><td>8</td><td>7</td><td>6</td></tr>
+      </tbody>
+    </table>
+    <ul>
+      <li><strong>ROW_NUMBER</strong>: unique 1..n, ties broken <em>arbitrarily</em> (add a tiebreaker like <code>, id</code> for determinism).</li>
+      <li><strong>RANK</strong>: ties share a rank, then <em>skips</em> (2, 2, 4 — "Olympic ranking").</li>
+      <li><strong>DENSE_RANK</strong>: ties share a rank, <em>no gaps</em> (2, 2, 3) — the right one for "Nth highest <em>salary value</em>".</li>
+    </ul>
+
+    <h3>LAG / LEAD — compare with the previous/next row</h3>
+<pre><code><span class="com">-- Month-over-month paid revenue and its change</span>
+WITH monthly AS (
+  SELECT date_trunc('month', created_at)::date AS month,
+         SUM(amount) AS revenue
+  FROM orders
+  WHERE status = 'paid'
+  GROUP BY 1
+)
+SELECT month, revenue,
+       LAG(revenue) OVER (ORDER BY month)            AS prev_revenue,
+       revenue - LAG(revenue) OVER (ORDER BY month)  AS change
+FROM monthly
+ORDER BY month;
+</code></pre>
+    <table>
+      <thead><tr><th>month</th><th>revenue</th><th>prev_revenue</th><th>change</th></tr></thead>
+      <tbody>
+        <tr><td>2025-01-01</td><td>370.00</td><td>NULL</td><td>NULL</td></tr>
+        <tr><td>2025-02-01</td><td>1025.00</td><td>370.00</td><td>+655.00</td></tr>
+        <tr><td>2025-03-01</td><td>520.00</td><td>1025.00</td><td>-505.00</td></tr>
+      </tbody>
+    </table>
+    <p><code>LAG(col, n, default)</code> looks n rows back within the partition; <code>LEAD</code> looks forward.
+    The first row has no previous row → NULL (or the default you pass as the 3rd argument).</p>
+
+    <h3>Running totals</h3>
+<pre><code>SELECT id, customer_id, created_at, amount,
+       SUM(amount) OVER (ORDER BY created_at, id) AS running_total
+FROM orders;
+</code></pre>
+    <p>Adding <code>ORDER BY</code> inside <code>OVER</code> turns SUM into a cumulative sum: each row gets the sum of
+    everything up to and including itself. First rows: 250.00 → 370.00 → 670.00 → 1120.00 … Add
+    <code>PARTITION BY customer_id</code> for a per-customer running balance (classic problem 10). The <code>, id</code>
+    tiebreaker makes the total deterministic when two orders share a date.</p>
+
+    <h3>Moving averages — the frame clause</h3>
+<pre><code>SELECT id, created_at, amount,
+       ROUND(AVG(amount) OVER (
+         ORDER BY created_at, id
+         ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+       ), 2) AS moving_avg_3
+FROM orders;
+</code></pre>
+    <p><code>ROWS BETWEEN 2 PRECEDING AND CURRENT ROW</code> = "this row and the two before it": a 3-order moving average.
+    Other useful frames: <code>ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW</code> (explicit running total),
+    <code>RANGE BETWEEN INTERVAL '7 days' PRECEDING AND CURRENT ROW</code> (time-based window, PG11+).</p>
+    <div class="note">
+      <p>Subtlety worth mentioning if probed: with <code>ORDER BY</code> and no explicit frame, the default frame is
+      <code>RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW</code> — RANGE, not ROWS — so <em>ties in the ORDER BY key
+      are included together</em>. For running totals over a non-unique column, spell out <code>ROWS</code> or add a
+      unique tiebreaker.</p>
+    </div>
+
+    <h3>NTILE — bucketing</h3>
+<pre><code>SELECT name, salary, NTILE(4) OVER (ORDER BY salary) AS quartile
+FROM employees;
+<span class="com">-- Splits the 8 employees into 4 buckets of 2: Omar/Lena → 1 ... Arjun-or-Maya/Priya → 4</span>
+</code></pre>
+
+    <h3>Top-N-per-group — THE most-asked advanced query</h3>
+    <p>"Top 2 earners in each department." Memorize this shape; it answers a whole family of questions
+    (latest order per customer, best score per student, newest event per device…):</p>
+<pre><code>SELECT dept_id, name, salary
+FROM (
+  SELECT e.*,
+         ROW_NUMBER() OVER (PARTITION BY dept_id
+                            ORDER BY salary DESC, id) AS rn
+  FROM employees e
+) ranked
+WHERE rn &lt;= 2
+ORDER BY dept_id, salary DESC;
+</code></pre>
+    <table>
+      <thead><tr><th>dept_id</th><th>name</th><th>salary</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>Priya</td><td>180000</td></tr>
+        <tr><td>1</td><td>Arjun</td><td>140000</td></tr>
+        <tr><td>2</td><td>Ravi</td><td>130000</td></tr>
+        <tr><td>2</td><td>Sana</td><td>120000</td></tr>
+        <tr><td>3</td><td>Lena</td><td>70000</td></tr>
+        <tr><td>NULL</td><td>Omar</td><td>70000</td></tr>
+      </tbody>
+    </table>
+    <p>Three decisions to narrate: <em>partition</em> (per department), <em>order</em> (salary desc, id as deterministic
+    tiebreak), <em>ranking function</em> — <code>ROW_NUMBER</code> gives exactly N rows; use <code>DENSE_RANK</code> if
+    "top 2 salaries" should include everyone tied at those values (then Maya appears too). Asking the interviewer
+    "how should ties behave?" is itself a senior signal.</p>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="subqueries">Subqueries &amp; CTEs <span class="tier tier-2">T2</span></h2>
+
+    <h3>The three shapes of subquery</h3>
+<pre><code><span class="com">-- Scalar subquery: returns exactly one value; usable anywhere a value goes</span>
+SELECT name, salary,
+       salary - (SELECT AVG(salary) FROM employees) AS vs_company_avg
+FROM employees;
+
+<span class="com">-- Row/column subquery: feeds IN / comparison with a set</span>
+SELECT name FROM employees
+WHERE dept_id IN (SELECT id FROM departments WHERE name IN ('Sales','HR'));
+
+<span class="com">-- Table subquery (derived table): a query in FROM — must be aliased</span>
+SELECT dept_id, max_sal
+FROM (SELECT dept_id, MAX(salary) AS max_sal
+      FROM employees GROUP BY dept_id) t
+WHERE max_sal &gt; 100000;
+</code></pre>
+    <div class="pitfall">
+      <p>A scalar subquery that returns more than one row throws
+      <code>ERROR: more than one row returned by a subquery used as an expression</code> — at <em>runtime</em>, only when
+      the data misbehaves. If multiple rows are possible, force one with <code>LIMIT 1</code>, an aggregate, or rewrite as a join.</p>
+    </div>
+
+    <h3>Correlated subqueries</h3>
+    <p>A correlated subquery references columns of the outer query, so conceptually it re-runs <em>per outer row</em>:</p>
+<pre><code><span class="com">-- Employees earning above their own department's average</span>
+SELECT name, dept_id, salary
+FROM employees e
+WHERE salary &gt; (SELECT AVG(salary)
+                FROM employees e2
+                WHERE e2.dept_id = e.dept_id);   <span class="com">-- ← correlation</span>
+<span class="com">-- Priya, Arjun, Maya (Eng avg 138750... Priya yes; 140000 &gt; 138750 yes), Ravi (130k &gt; 125k)</span>
+</code></pre>
+    <p><strong>Performance note:</strong> Postgres often can't decorrelate an arbitrary correlated subquery — think
+    O(outer × inner) unless an index saves you. <code>EXISTS</code>-style correlation is fine (planned as a semi-join);
+    correlated <em>aggregates</em> like the above are cleaner and usually faster as a window function:</p>
+<pre><code>SELECT name, dept_id, salary
+FROM (SELECT *, AVG(salary) OVER (PARTITION BY dept_id) AS dept_avg
+      FROM employees) t
+WHERE salary &gt; dept_avg;   <span class="com">-- one scan instead of N subquery executions</span>
+</code></pre>
+
+    <h3>EXISTS vs IN</h3>
+    <table>
+      <thead><tr><th></th><th><code>IN (subquery)</code></th><th><code>EXISTS (subquery)</code></th></tr></thead>
+      <tbody>
+        <tr><td>Semantics</td><td>value matches any element of the produced set</td><td>at least one row satisfies the predicate</td></tr>
+        <tr><td>NULL safety</td><td><code>NOT IN</code> breaks with NULLs in the set</td><td>Fully NULL-safe both ways</td></tr>
+        <tr><td>Planner</td><td>Both are typically rewritten to a hash semi-join — performance is usually a wash in Postgres</td><td>Anti-join (<code>NOT EXISTS</code>) plans are reliably good</td></tr>
+        <tr><td>Reads best for</td><td>small static lists, single-column match</td><td>multi-column conditions, "has at least one …"</td></tr>
+      </tbody>
+    </table>
+    <p>Rule of thumb to say out loud: <em>"IN for positive membership, NOT EXISTS for negative — never NOT IN against a
+    nullable column."</em></p>
+
+    <h3>CTEs (WITH) — structuring a query like functions</h3>
+    <p>CTEs name intermediate result sets. In a live interview they are your best friend: build the answer in named steps,
+    testing each step as you go — exactly like extracting helper functions:</p>
+<pre><code><span class="com">-- "Which customers' paid revenue is above the average customer's paid revenue?"</span>
+WITH per_customer AS (
+  SELECT customer_id, SUM(amount) AS revenue
+  FROM orders
+  WHERE status = 'paid'
+  GROUP BY customer_id
+),
+avg_revenue AS (
+  SELECT AVG(revenue) AS avg_rev FROM per_customer
+)
+SELECT, pc.revenue
+FROM per_customer pc
+JOIN customers c ON = pc.customer_id
+CROSS JOIN avg_revenue a
+WHERE pc.revenue &gt; a.avg_rev;
+<span class="com">-- avg is (690+500+650+75)/4 = 478.75 → Acme (690), Initech (650), Globex (500)</span>
+</code></pre>
+
+    <h3>MATERIALIZED / NOT MATERIALIZED (PG12+)</h3>
+    <p>
+      Before PostgreSQL 12, every CTE was an <em>optimization fence</em>: computed once into a temp result, predicates
+      from outside could not be pushed in. Since PG12, single-use CTEs are inlined into the main query by default
+      (so indexes and filters apply through them). You can override:
+    </p>
+<pre><code>WITH big AS MATERIALIZED (          <span class="com">-- force compute-once (fence): dedupe expensive work,</span>
+  SELECT ...                        <span class="com">-- or pin a plan the optimizer keeps getting wrong</span>
+)
+SELECT ... ;
+
+WITH big AS NOT MATERIALIZED (      <span class="com">-- force inlining even if referenced twice</span>
+  SELECT ...
+)
+SELECT ... ;
+</code></pre>
+    <div class="senior">
+      <p>Interview soundbite: "CTEs are for readability; since PG12 they're inlined by default so there's no
+      performance penalty for single-use CTEs. If a CTE is referenced multiple times or I explicitly want it computed
+      once, I mark it MATERIALIZED." That one sentence covers 95% of CTE follow-up questions.</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="upsert">UPSERT &amp; RETURNING <span class="tier tier-2">T2</span></h2>
+
+    <h3>INSERT ... ON CONFLICT</h3>
+    <p>Postgres's atomic upsert. Requirement: the conflict target must be covered by a <strong>unique index or
+    constraint</strong> (PK, UNIQUE, or a unique partial index) — that's how Postgres detects the collision race-free.</p>
+<pre><code><span class="com">-- DO NOTHING: idempotent insert (retries, imports, at-least-once consumers)</span>
+INSERT INTO customers (id, name, country)
+VALUES (2, 'Globex', 'DE')
+ON CONFLICT (id) DO NOTHING;         <span class="com">-- INSERT 0 0 — row existed, no error, no change</span>
+
+<span class="com">-- DO UPDATE: insert-or-update. EXCLUDED = the row you TRIED to insert.</span>
+INSERT INTO customers (id, name, country)
+VALUES (2, 'Globex GmbH', 'DE')
+ON CONFLICT (id) DO UPDATE
+SET name    =,       <span class="com">-- take the incoming value</span>
+    country =
+WHERE IS DISTINCT FROM;  <span class="com">-- optional: skip no-op updates (avoids dead tuples + triggers)</span>
+</code></pre>
+    <p>Mental model for the two row aliases inside <code>DO UPDATE</code>:
+    <code>customers.col</code> (or the table alias) = the <em>existing</em> row;
+    <code>EXCLUDED.col</code> = the <em>incoming</em> row that conflicted. Mixing them lets you do merge logic:</p>
+<pre><code><span class="com">-- Accumulate instead of overwrite (e.g. a counters table)</span>
+INSERT INTO page_views (page, views) VALUES ('/pricing', 1)
+ON CONFLICT (page) DO UPDATE SET views = page_views.views + EXCLUDED.views;
+</code></pre>
+    <div class="pitfall">
+      <p><code>ON CONFLICT</code> without a target (<code>ON CONFLICT DO NOTHING</code>) matches <em>any</em> unique
+      violation; <code>DO UPDATE</code> always requires an explicit target — Postgres must know which constraint's
+      collision you're handling. And no unique constraint = <code>there is no unique or exclusion constraint matching
+      the ON CONFLICT specification</code> error. Interviewers love asking "what does ON CONFLICT need to work?"</p>
+    </div>
+
+    <h3>RETURNING — skip the follow-up SELECT</h3>
+    <p><code>INSERT</code>/<code>UPDATE</code>/<code>DELETE</code> can hand back the affected rows in the same statement:</p>
+<pre><code>INSERT INTO orders (id, customer_id, amount, status, created_at)
+VALUES (111, 5, 42.00, 'pending', CURRENT_DATE)
+RETURNING id, created_at;            <span class="com">-- get generated ids/defaults without a second round-trip</span>
+
+UPDATE orders SET status = 'paid'
+WHERE status = 'pending' AND created_at &lt; DATE '2025-02-01'
+RETURNING id, customer_id;           <span class="com">-- exactly which rows changed</span>
+
+DELETE FROM orders WHERE status = 'cancelled'
+RETURNING *;                         <span class="com">-- audit what was removed</span>
+</code></pre>
+    <div class="note">
+      <p>Connection to your Java track: when JPA/Hibernate saves an entity with
+      <code>GenerationType.IDENTITY</code>, the generated key comes back via exactly this mechanism —
+      the driver runs <code>INSERT ... RETURNING id</code> under the hood. Knowing that links your ORM knowledge to raw SQL
+      nicely in an interview.</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="recursive">Recursive CTEs &amp; set operations <span class="tier tier-3">T3</span></h2>
+
+    <h3>Recursive CTE: walking the org chart</h3>
+    <p>Hierarchies (org charts, category trees, comment threads) live in adjacency lists like our
+    <code>manager_id</code>. A recursive CTE traverses them:</p>
+<pre><code>WITH RECURSIVE org AS (
+  <span class="com">-- 1. Base case: the root(s) — runs once</span>
+  SELECT id, name, manager_id,
+         1 AS depth,
+         name AS path
+  FROM employees
+  WHERE manager_id IS NULL
+
+  UNION ALL
+
+  <span class="com">-- 2. Recursive step: join NEW rows from last iteration ("org") to their reports</span>
+  SELECT,, e.manager_id,
+         o.depth + 1,
+         o.path || ' &gt; ' ||
+  FROM employees e
+  JOIN org o ON e.manager_id =
+)
+SELECT depth, path FROM org ORDER BY path;
+</code></pre>
+    <p>Line by line: the <strong>base case</strong> seeds the working set with Priya (depth 1). Each
+    <strong>iteration</strong> joins <code>employees</code> against only the rows produced by the <em>previous</em>
+    iteration — so round 2 finds Priya's directs (Arjun, Maya, Sana, Lena), round 3 finds their reports (Dev under Arjun;
+    Ravi and Omar under Sana), round 4 finds nothing and recursion stops. Result:</p>
+    <table>
+      <thead><tr><th>depth</th><th>path</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>Priya</td></tr>
+        <tr><td>2</td><td>Priya &gt; Arjun</td></tr>
+        <tr><td>3</td><td>Priya &gt; Arjun &gt; Dev</td></tr>
+        <tr><td>2</td><td>Priya &gt; Lena</td></tr>
+        <tr><td>2</td><td>Priya &gt; Maya</td></tr>
+        <tr><td>2</td><td>Priya &gt; Sana</td></tr>
+        <tr><td>3</td><td>Priya &gt; Sana &gt; Omar</td></tr>
+        <tr><td>3</td><td>Priya &gt; Sana &gt; Ravi</td></tr>
+      </tbody>
+    </table>
+    <ul>
+      <li>It's <em>iteration</em>, not true recursion: each round only sees the previous round's new rows.</li>
+      <li><code>UNION ALL</code> is standard here; plain <code>UNION</code> also dedups across rounds (useful to break cycles in graph data, at a sorting/hashing cost).</li>
+      <li>Cyclic data (A manages B manages A) loops forever — guard with a depth cap (<code>WHERE depth &lt; 20</code>) or PG14's <code>CYCLE id SET is_cycle USING path_ids</code>.</li>
+      <li>Flip the direction (<code>JOIN org o ON = e.manager_id</code> … seeded from a leaf) to walk <em>up</em>: "management chain above Dev".</li>
+    </ul>
+
+    <h3>UNION vs UNION ALL, INTERSECT, EXCEPT</h3>
+<pre><code>SELECT country FROM customers          <span class="com">-- US, DE, US, UK, US</span>
+UNION
+SELECT 'US';                           <span class="com">-- UNION dedups: {US, DE, UK} — 3 rows</span>
+
+SELECT country FROM customers
+UNION ALL
+SELECT 'US';                           <span class="com">-- keeps everything: 6 rows</span>
+</code></pre>
+    <ul>
+      <li><strong>UNION ALL</strong>: concatenate, cheap, streams. <strong>UNION</strong>: concatenate + de-duplicate —
+        a hash/sort over the whole result. If the branches can't overlap (or duplicates are fine), UNION ALL; saying
+        "UNION ALL, because dedup costs a sort and I know these sets are disjoint" is free senior credit.</li>
+      <li><strong>INTERSECT</strong>: rows in both. <strong>EXCEPT</strong>: rows in the first minus the second. Both dedup
+        (there are <code>ALL</code> variants). Handy: they compare <em>whole rows</em> and treat NULLs as equal — a quick
+        NULL-safe diff of two tables: <code>(TABLE a EXCEPT TABLE b) UNION ALL (TABLE b EXCEPT TABLE a)</code>.</li>
+      <li>All branches must have the same number of columns with compatible types; <code>ORDER BY</code>/<code>LIMIT</code>
+        apply to the combined result (parenthesize a branch to sort it alone).</li>
+    </ul>
+<pre><code><span class="com">-- Customers who ordered in BOTH January and February (also see classic problem 9)</span>
+SELECT customer_id FROM orders WHERE created_at &gt;= '2025-01-01' AND created_at &lt; '2025-02-01'
+INTERSECT
+SELECT customer_id FROM orders WHERE created_at &gt;= '2025-02-01' AND created_at &lt; '2025-03-01';
+<span class="com">-- → 1 (Acme), 2 (Globex)</span>
+</code></pre>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="pgfunctions">Handy Postgres functions <span class="tier tier-3">T3</span></h2>
+
+    <h3>date_trunc &amp; interval arithmetic</h3>
+<pre><code>SELECT date_trunc('month', DATE '2025-03-18');        <span class="com">-- 2025-03-01 00:00:00 (start of month)</span>
+SELECT date_trunc('week',  now());                    <span class="com">-- Monday of current week</span>
+
+SELECT now() - INTERVAL '30 days';                    <span class="com">-- timestamp arithmetic just works</span>
+SELECT DATE '2025-01-31' + INTERVAL '1 month';        <span class="com">-- 2025-02-28: month math clamps</span>
+SELECT age(TIMESTAMP '2019-06-15', TIMESTAMP '2018-03-01'); <span class="com">-- 1 year 3 mons 14 days</span>
+
+<span class="com">-- The standard "this month's orders" filter — half-open range, index-friendly:</span>
+SELECT * FROM orders
+WHERE created_at &gt;= date_trunc('month', CURRENT_DATE)
+  AND created_at &lt;  date_trunc('month', CURRENT_DATE) + INTERVAL '1 month';
+</code></pre>
+    <div class="pitfall">
+      <p>Never write <code>WHERE date_trunc('month', created_at) = ...</code> in production-flavored answers: wrapping the
+      column in a function defeats a plain index on <code>created_at</code>. The half-open range above is sargable.
+      (In pure logic puzzles it's fine — but mentioning the index angle earns points.)</p>
+    </div>
+
+    <h3>generate_series — the gap-filling trick</h3>
+    <p>Aggregating orders by month silently <em>skips months with no orders</em> — a chart with missing bars. Generate the
+    calendar first, LEFT JOIN the data onto it:</p>
+<pre><code>SELECT gs.month::date AS month,
+       COALESCE(SUM(o.amount), 0) AS revenue
+FROM generate_series(DATE '2025-01-01', DATE '2025-04-01', INTERVAL '1 month') AS gs(month)
+LEFT JOIN orders o
+       ON o.created_at &gt;= gs.month
+      AND o.created_at &lt; gs.month + INTERVAL '1 month'
+      AND o.status = 'paid'
+GROUP BY gs.month
+ORDER BY gs.month;
+</code></pre>
+    <table>
+      <thead><tr><th>month</th><th>revenue</th></tr></thead>
+      <tbody>
+        <tr><td>2025-01-01</td><td>370.00</td></tr>
+        <tr><td>2025-02-01</td><td>1025.00</td></tr>
+        <tr><td>2025-03-01</td><td>520.00</td></tr>
+        <tr><td>2025-04-01</td><td>0</td></tr>
+      </tbody>
+    </table>
+    <p>April appears with 0 — impossible with a plain GROUP BY over orders. <code>generate_series</code> also does numbers
+    (<code>generate_series(1, 10)</code>) — great for synthesizing test data on the spot.</p>
+
+    <h3>string_agg &amp; friends</h3>
+<pre><code>SELECT AS department,
+       string_agg(, ', ' ORDER BY e.salary DESC) AS team
+FROM departments d
+LEFT JOIN employees e ON e.dept_id =
+GROUP BY;
+</code></pre>
+    <table>
+      <thead><tr><th>department</th><th>team</th></tr></thead>
+      <tbody>
+        <tr><td>Engineering</td><td>Priya, Arjun, Maya, Dev</td></tr>
+        <tr><td>Sales</td><td>Ravi, Sana</td></tr>
+        <tr><td>HR</td><td>Lena</td></tr>
+        <tr><td>Marketing</td><td>NULL</td></tr>
+      </tbody>
+    </table>
+    <p>Sibling aggregates: <code>array_agg(col)</code> (into a Postgres array), <code>jsonb_agg(...)</code>
+    / <code>jsonb_object_agg(k, v)</code> — the trick behind returning a parent with its children as nested JSON in one query.</p>
+
+    <h3>CASE expressions</h3>
+<pre><code>SELECT name, salary,
+       CASE
+         WHEN salary &gt;= 150000 THEN 'exec'
+         WHEN salary &gt;= 100000 THEN 'senior'
+         ELSE 'standard'                 <span class="com">-- no ELSE → NULL for unmatched rows</span>
+       END AS band
+FROM employees;
+
+<span class="com">-- CASE inside aggregates = portable conditional aggregation (FILTER is the PG-native spelling)</span>
+SELECT SUM(CASE WHEN status = 'paid' THEN amount ELSE 0 END) AS paid_revenue FROM orders;
+
+<span class="com">-- CASE in ORDER BY: custom sort orders</span>
+SELECT * FROM orders
+ORDER BY CASE status WHEN 'pending' THEN 1 WHEN 'paid' THEN 2 ELSE 3 END, created_at;
+</code></pre>
+
+    <h3>DISTINCT ON — Postgres's one-line top-1-per-group</h3>
+<pre><code><span class="com">-- Latest order per customer</span>
+SELECT DISTINCT ON (customer_id)
+       customer_id, id AS order_id, amount, created_at
+FROM orders
+ORDER BY customer_id, created_at DESC, id DESC;
+</code></pre>
+    <table>
+      <thead><tr><th>customer_id</th><th>order_id</th><th>amount</th><th>created_at</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>110</td><td>320.00</td><td>2025-03-18</td></tr>
+        <tr><td>2</td><td>109</td><td>150.00</td><td>2025-03-15</td></tr>
+        <tr><td>3</td><td>108</td><td>200.00</td><td>2025-03-03</td></tr>
+        <tr><td>4</td><td>107</td><td>75.00</td><td>2025-02-27</td></tr>
+      </tbody>
+    </table>
+    <p>Rules: the <code>DISTINCT ON</code> expressions must be the <em>leading</em> <code>ORDER BY</code> expressions;
+    the remaining ORDER BY keys decide <em>which</em> row survives per group (here: newest, id as tiebreak).
+    It's Postgres-specific — offer it as "the Postgres shortcut", with <code>ROW_NUMBER() ... WHERE rn = 1</code> as the
+    portable version (and the only option when you need top-<em>N</em> rather than top-1).</p>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="problems">Classic interview problems — solve before revealing</h2>
+    <p>
+      These are the questions that actually get asked, ordered roughly by frequency. <strong>Protocol:</strong> read the
+      problem, write your answer in psql against the sample schema, <em>then</em> open the solution. If you couldn't produce
+      it in ~3 minutes, redo it from scratch tomorrow.
+    </p>
+
+    <details class="qa">
+      <summary>1. Find the second highest salary (be ready to show 3 ways).</summary>
+      <div class="answer">
+<pre><code><span class="com">-- Way 1: DISTINCT + OFFSET (shortest)</span>
+SELECT DISTINCT salary FROM employees
+ORDER BY salary DESC
+OFFSET 1 LIMIT 1;                                   <span class="com">-- → 140000</span>
+
+<span class="com">-- Way 2: max below max (returns NULL, not empty, if no 2nd — often the asked-for behavior)</span>
+SELECT MAX(salary) FROM employees
+WHERE salary &lt; (SELECT MAX(salary) FROM employees);
+
+<span class="com">-- Way 3: DENSE_RANK (generalizes to "Nth highest" — say this!)</span>
+SELECT DISTINCT salary
+FROM (SELECT salary, DENSE_RANK() OVER (ORDER BY salary DESC) AS rnk
+      FROM employees) t
+WHERE rnk = 2;
+</code></pre>
+        <p><strong>Common wrong answer:</strong> <code>ORDER BY salary DESC OFFSET 1 LIMIT 1</code> <em>without</em>
+        DISTINCT. If the top salary is duplicated (imagine two people at 180000), row #2 is still 180000 — you return the
+        highest salary, not the second highest. On our data it happens to work, which is exactly how this bug ships.
+        Also state the tie question up front: "second highest <em>value</em> or second <em>person</em>?" —
+        DENSE_RANK vs ROW_NUMBER.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>2. Employees who earn more than their manager.</summary>
+      <div class="answer">
+<pre><code>SELECT AS employee, e.salary, AS manager, m.salary AS manager_salary
+FROM employees e
+JOIN employees m ON e.manager_id =
+WHERE e.salary &gt; m.salary;
+<span class="com">-- → Ravi (130000) vs Sana (120000)</span>
+</code></pre>
+        <p>Self-join: alias the table twice, join child-to-parent on <code>manager_id</code>, compare in WHERE.
+        INNER join is correct here — an employee with no manager (Priya) can't out-earn one.</p>
+        <p><strong>Common wrong answers:</strong> joining <code>ON =</code> (matches every row to itself —
+        the join key must be <code>manager_id</code> to <code>id</code>); or trying a GROUP BY, which has nothing to
+        aggregate — this is a row-to-row comparison, not an aggregation.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>3. Find duplicate emails (a users(id, email) table; on our schema: duplicate customer names).</summary>
+      <div class="answer">
+<pre><code>SELECT name, COUNT(*) AS occurrences
+FROM customers
+GROUP BY name
+HAVING COUNT(*) &gt; 1;
+<span class="com">-- Our data has no dupes; run: INSERT INTO customers VALUES (6,'Acme','US'); → Acme | 2</span>
+</code></pre>
+        <p>"Duplicate" = group by the candidate key, keep groups with more than one member. To see the actual duplicate
+        <em>rows</em> (not just the values), use a window instead:</p>
+<pre><code>SELECT * FROM (
+  SELECT c.*, COUNT(*) OVER (PARTITION BY name) AS n
+  FROM customers c) t
+WHERE n &gt; 1;
+</code></pre>
+        <p><strong>Common wrong answers:</strong> putting <code>COUNT(*) &gt; 1</code> in WHERE (aggregates don't exist
+        yet at WHERE time — must be HAVING); or <code>SELECT DISTINCT name</code>, which lists <em>all</em> names once,
+        telling you nothing about duplication.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>4. Delete duplicate rows, keeping the one with the lowest id.</summary>
+      <div class="answer">
+<pre><code><span class="com">-- Way 1: self-delete with USING (Postgres's DELETE-with-join)</span>
+DELETE FROM customers a
+USING customers b
+WHERE = AND &gt;;   <span class="com">-- a is a dupe of an earlier-id row → delete a</span>
+
+<span class="com">-- Way 2: ROW_NUMBER (generalizes: keep newest, keep highest-score, ...)</span>
+DELETE FROM customers
+WHERE id IN (
+  SELECT id FROM (
+    SELECT id, ROW_NUMBER() OVER (PARTITION BY name ORDER BY id) AS rn
+    FROM customers) t
+  WHERE rn &gt; 1
+);
+
+<span class="com">-- No usable primary key at all? ctid — Postgres's physical row address:</span>
+DELETE FROM customers a
+USING customers b
+WHERE = AND a.ctid &gt; b.ctid;
+</code></pre>
+        <p><code>ctid</code> is the tuple's physical location — unique at any instant but rewritten by UPDATE/VACUUM FULL,
+        so it's a last resort for dedup, never something to store.</p>
+        <p><strong>Common wrong answers:</strong> <code>DELETE ... WHERE id NOT IN (SELECT MIN(id) ... GROUP BY name)</code>
+        is actually correct-but-slower — the truly wrong version forgets the GROUP BY and keeps only one row in the whole
+        table. Also, MySQL-style <code>DELETE ... JOIN</code> syntax doesn't parse in Postgres — it's <code>USING</code>.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>5. Department-wise top 3 salaries (include the department name).</summary>
+      <div class="answer">
+<pre><code>SELECT department, name, salary
+FROM (
+  SELECT AS department,, e.salary,
+         DENSE_RANK() OVER (PARTITION BY ORDER BY e.salary DESC) AS rnk
+  FROM employees e
+  JOIN departments d ON = e.dept_id
+) t
+WHERE rnk &lt;= 3
+ORDER BY department, salary DESC;
+</code></pre>
+        <table>
+          <thead><tr><th>department</th><th>name</th><th>salary</th></tr></thead>
+          <tbody>
+            <tr><td>Engineering</td><td>Priya</td><td>180000</td></tr>
+            <tr><td>Engineering</td><td>Arjun</td><td>140000</td></tr>
+            <tr><td>Engineering</td><td>Maya</td><td>140000</td></tr>
+            <tr><td>Engineering</td><td>Dev</td><td>95000</td></tr>
+            <tr><td>Sales</td><td>Ravi</td><td>130000</td></tr>
+            <tr><td>Sales</td><td>Sana</td><td>120000</td></tr>
+            <tr><td>HR</td><td>Lena</td><td>70000</td></tr>
+          </tbody>
+        </table>
+        <p>Note Dev appears: with DENSE_RANK, 95000 is the <em>3rd distinct salary</em> in Engineering
+        (180 → 140 → 95), so "top 3 salaries" includes 4 people. The LeetCode version of this question explicitly wants
+        DENSE_RANK semantics; if the interviewer wants "at most 3 people", switch to ROW_NUMBER. Ask.</p>
+        <p><strong>Common wrong answers:</strong> filtering the window function in the same SELECT's WHERE (illegal —
+        windows evaluate after WHERE; you must nest); <code>GROUP BY dept ... LIMIT 3</code>, which limits the total result
+        to 3 rows, not 3 per group.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>6. Customers who have never placed an order (and the NULL trap hiding inside).</summary>
+      <div class="answer">
+<pre><code><span class="com">-- Preferred: NOT EXISTS</span>
+SELECT FROM customers c
+WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.customer_id =;
+
+<span class="com">-- Equivalent: LEFT JOIN ... IS NULL</span>
+SELECT FROM customers c
+LEFT JOIN orders o ON o.customer_id =
+WHERE IS NULL;
+<span class="com">-- Both → Soylent</span>
+</code></pre>
+        <p><strong>Common wrong answers:</strong> <code>WHERE id NOT IN (SELECT customer_id FROM orders)</code> —
+        works on this table (customer_id is NOT NULL) but is a habit that detonates the moment the column is nullable
+        (see the NULL section: one NULL → zero rows, no error). Say why you avoid it.
+        Also: <code>LEFT JOIN ... WHERE o.status IS NULL</code> on a <em>nullable</em> right column is unsafe — always
+        IS-NULL-test the right table's PK or join key, which can only be NULL from a failed match.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>7. Find users with a streak of 3+ consecutive login days (gaps-and-islands).</summary>
+      <div class="answer">
+<pre><code><span class="com">-- Setup for this one problem:</span>
+CREATE TABLE logins (user_id int, login_date date);
+INSERT INTO logins VALUES
+  (1,'2025-03-01'),(1,'2025-03-02'),(1,'2025-03-03'),(1,'2025-03-05'),
+  (2,'2025-03-02'),(2,'2025-03-04'),(1,'2025-03-02');  <span class="com">-- note a duplicate login</span>
+
+WITH days AS (
+  SELECT DISTINCT user_id, login_date FROM logins        <span class="com">-- dedupe multiple logins per day!</span>
+),
+grouped AS (
+  SELECT user_id, login_date,
+         login_date - ROW_NUMBER() OVER (PARTITION BY user_id
+                                         ORDER BY login_date)::int AS grp
+  FROM days
+)
+SELECT user_id,
+       MIN(login_date) AS streak_start,
+       MAX(login_date) AS streak_end,
+       COUNT(*)        AS streak_len
+FROM grouped
+GROUP BY user_id, grp
+HAVING COUNT(*) &gt;= 3;
+<span class="com">-- → user 1: 2025-03-01 .. 2025-03-03, len 3</span>
+</code></pre>
+        <p><strong>The trick:</strong> for consecutive dates, <code>date − row_number</code> is <em>constant</em>
+        (03-01−1 = 03-02−2 = 03-03−3 = Feb 28); the moment a day is skipped, the difference jumps to a new constant.
+        That constant (<code>grp</code>) identifies each "island", and a GROUP BY over it measures streaks.
+        The alternative spelling uses <code>LAG</code>: flag rows where <code>login_date - LAG(login_date) &gt; 1</code>
+        as streak-starts, then a running SUM of flags builds the same group id.</p>
+        <p><strong>Common wrong answers:</strong> forgetting the DISTINCT — duplicate same-day logins shift ROW_NUMBER
+        and break every streak after them; and trying nested self-joins (<code>t1.date =</code>) —
+        it detects exactly-3 windows but doesn't generalize and explodes combinatorially.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>8. Month-over-month revenue growth in % (paid orders only).</summary>
+      <div class="answer">
+<pre><code>WITH monthly AS (
+  SELECT date_trunc('month', created_at)::date AS month,
+         SUM(amount) AS revenue
+  FROM orders
+  WHERE status = 'paid'
+  GROUP BY 1
+)
+SELECT month, revenue,
+       ROUND(
+         100.0 * (revenue - LAG(revenue) OVER (ORDER BY month))
+               / NULLIF(LAG(revenue) OVER (ORDER BY month), 0)
+       , 1) AS growth_pct
+FROM monthly
+ORDER BY month;
+</code></pre>
+        <table>
+          <thead><tr><th>month</th><th>revenue</th><th>growth_pct</th></tr></thead>
+          <tbody>
+            <tr><td>2025-01-01</td><td>370.00</td><td>NULL</td></tr>
+            <tr><td>2025-02-01</td><td>1025.00</td><td>177.0</td></tr>
+            <tr><td>2025-03-01</td><td>520.00</td><td>-49.3</td></tr>
+          </tbody>
+        </table>
+        <p>Structure: aggregate to one row per month first (CTE), <em>then</em> LAG across months. The
+        <code>NULLIF(..., 0)</code> guards against a zero-revenue month; <code>100.0</code> (not <code>100</code>)
+        avoids any integer-division surprise if the amounts were integers.</p>
+        <p><strong>Common wrong answers:</strong> applying LAG directly to the orders table (compares <em>orders</em>,
+        not months — you must aggregate first); grouping by <code>EXTRACT(month FROM ...)</code> alone, which merges
+        Jan 2025 with Jan 2026 the moment data spans years — group by <code>date_trunc('month', ...)</code>.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>9. Customers who placed orders in BOTH January and February 2025.</summary>
+      <div class="answer">
+<pre><code><span class="com">-- Way 1: GROUP BY + HAVING over distinct months (scales to "all N months")</span>
+SELECT customer_id
+FROM orders
+WHERE created_at &gt;= DATE '2025-01-01' AND created_at &lt; DATE '2025-03-01'
+GROUP BY customer_id
+HAVING COUNT(DISTINCT date_trunc('month', created_at)) = 2;
+<span class="com">-- → 1 (Acme), 2 (Globex)</span>
+
+<span class="com">-- Way 2: INTERSECT (reads like the requirement)</span>
+SELECT customer_id FROM orders
+WHERE created_at &gt;= '2025-01-01' AND created_at &lt; '2025-02-01'
+INTERSECT
+SELECT customer_id FROM orders
+WHERE created_at &gt;= '2025-02-01' AND created_at &lt; '2025-03-01';
+
+<span class="com">-- Way 3: two EXISTS (best when it's a filter on the customers table)</span>
+SELECT FROM customers c
+WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id =
+              AND o.created_at &gt;= '2025-01-01' AND o.created_at &lt; '2025-02-01')
+  AND EXISTS (SELECT 1 FROM orders o WHERE o.customer_id =
+              AND o.created_at &gt;= '2025-02-01' AND o.created_at &lt; '2025-03-01');
+</code></pre>
+        <p><strong>Common wrong answer (the classic):</strong>
+        <code>WHERE month = 'Jan' AND month = 'Feb'</code> — always empty; a single row has one month, AND applies
+        per-row. "Both" across <em>rows</em> requires grouping (HAVING over distinct months), set intersection, or two
+        correlated existence checks. This misread is precisely what the question screens for.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>10. Running total of order amounts per customer, ordered by date.</summary>
+      <div class="answer">
+<pre><code>SELECT customer_id, created_at, id AS order_id, amount,
+       SUM(amount) OVER (
+         PARTITION BY customer_id
+         ORDER BY created_at, id
+         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+       ) AS running_total
+FROM orders
+ORDER BY customer_id, created_at, id;
+</code></pre>
+        <p>For Acme (customer 1): 250.00 → 370.00 → 460.00 → 780.00. PARTITION restarts the sum per customer;
+        ORDER BY inside OVER makes it cumulative; <code>id</code> breaks same-day ties deterministically.
+        The frame clause is technically the default behavior here spelled with ROWS — writing it shows you know the
+        RANGE-default subtlety (ties in the ORDER BY key would otherwise be summed together).</p>
+        <p><strong>Common wrong answers:</strong> plain <code>GROUP BY customer_id</code> with SUM — gives the final
+        total only, losing the per-order progression; putting the ORDER BY only at statement level (outside OVER) —
+        that orders the <em>display</em>, not the accumulation, so you get the full total on every row.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>11. Median salary (and per-department median).</summary>
+      <div class="answer">
+<pre><code>SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY salary) AS median
+FROM employees;
+<span class="com">-- 8 salaries: 70,70,95,120,130,140,140,180 → (120+130)/2 = 125000</span>
+
+SELECT dept_id,
+       PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY salary) AS median
+FROM employees
+GROUP BY dept_id;
+<span class="com">-- dept 1 → 140000, dept 2 → 125000, dept 3 → 70000, NULL → 70000</span>
+</code></pre>
+        <p><code>PERCENTILE_CONT</code> is an <em>ordered-set aggregate</em> — the <code>WITHIN GROUP (ORDER BY ...)</code>
+        clause supplies the ordering the percentile is computed over. <code>_CONT</code> interpolates between the two middle
+        values on even counts; <code>PERCENTILE_DISC(0.5)</code> returns an actual value from the data (here 120000).</p>
+        <p><strong>Common wrong answers:</strong> <code>AVG</code> (that's the mean — the interviewer chose "median"
+        deliberately); hand-rolling with ROW_NUMBER and COUNT to pick middle rows — legal but 10 lines of fiddly
+        off-by-one risk, and it signals you don't know Postgres has percentiles built in.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>12. Pivot: one row per month with paid / pending / cancelled order counts as columns.</summary>
+      <div class="answer">
+<pre><code>SELECT date_trunc('month', created_at)::date AS month,
+       COUNT(*) FILTER (WHERE status = 'paid')      AS paid,
+       COUNT(*) FILTER (WHERE status = 'pending')   AS pending,
+       COUNT(*) FILTER (WHERE status = 'cancelled') AS cancelled,
+       COUNT(*)                                     AS total
+FROM orders
+GROUP BY 1
+ORDER BY 1;
+</code></pre>
+        <table>
+          <thead><tr><th>month</th><th>paid</th><th>pending</th><th>cancelled</th><th>total</th></tr></thead>
+          <tbody>
+            <tr><td>2025-01-01</td><td>2</td><td>1</td><td>0</td><td>3</td></tr>
+            <tr><td>2025-02-01</td><td>3</td><td>0</td><td>1</td><td>4</td></tr>
+            <tr><td>2025-03-01</td><td>2</td><td>1</td><td>0</td><td>3</td></tr>
+          </tbody>
+        </table>
+        <p>SQL has no first-class dynamic pivot; the interview answer is <strong>conditional aggregation</strong> — one
+        aggregate per desired column. Portable spelling: <code>SUM(CASE WHEN status='paid' THEN 1 ELSE 0 END)</code>;
+        <code>FILTER</code> is the cleaner Postgres form. Swap COUNT for <code>SUM(amount) FILTER (...)</code> to pivot
+        revenue instead of counts.</p>
+        <p><strong>Common wrong answers:</strong> <code>GROUP BY month, status</code> — correct data, wrong <em>shape</em>
+        (long format: one row per month+status, not columns); reaching for the <code>crosstab()</code> extension —
+        fine to name-drop, but requires <code>tablefunc</code> and fixed output columns, overkill live.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>13. Each employee's salary rank within their department, and the % of dept payroll they represent.</summary>
+      <div class="answer">
+<pre><code>SELECT name, dept_id, salary,
+       DENSE_RANK() OVER (PARTITION BY dept_id ORDER BY salary DESC)     AS dept_rank,
+       ROUND(100.0 * salary / SUM(salary) OVER (PARTITION BY dept_id), 1) AS pct_of_payroll
+FROM employees
+ORDER BY dept_id, salary DESC;
+<span class="com">-- Engineering: Priya 1 / 32.4%, Arjun 2 / 25.2%, Maya 2 / 25.2%, Dev 3 / 17.1%</span>
+</code></pre>
+        <p>Two windows over the same partition, no self-joins, rows preserved. This is the "show me you actually use window
+        functions" composite — rank + share-of-total in one pass.</p>
+        <p><strong>Common wrong answer:</strong> computing dept totals in a GROUP BY subquery and joining back. It works,
+        but it's the pre-window-function idiom; produce the window version and mention the join-back as the legacy shape.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>14. For each customer show their first and most recent order amount in one row.</summary>
+      <div class="answer">
+<pre><code><span class="com">-- Way 1: FIRST_VALUE / LAST_VALUE (mind the frame!) + DISTINCT</span>
+SELECT DISTINCT customer_id,
+       FIRST_VALUE(amount) OVER w AS first_amount,
+       LAST_VALUE(amount)  OVER w AS latest_amount
+FROM orders
+WINDOW w AS (PARTITION BY customer_id ORDER BY created_at, id
+             ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING);
+
+<span class="com">-- Way 2 (often cleaner): two DISTINCT ON queries joined, or conditional agg:</span>
+SELECT customer_id,
+       (array_agg(amount ORDER BY created_at, id))[1]                    AS first_amount,
+       (array_agg(amount ORDER BY created_at DESC, id DESC))[1]          AS latest_amount
+FROM orders
+GROUP BY customer_id;
+<span class="com">-- customer 1 → first 250.00, latest 320.00</span>
+</code></pre>
+        <p><strong>The trap this question exists for:</strong> <code>LAST_VALUE</code> with the default frame
+        (<code>... AND CURRENT ROW</code>) returns the <em>current</em> row's value — the frame ends at the row being
+        computed, so "last" is "so far". You must extend the frame to <code>UNBOUNDED FOLLOWING</code>. The named
+        <code>WINDOW w</code> clause avoids repeating the definition. The <code>array_agg(...)[1]</code> trick is a handy
+        Postgres idiom for "first value by some order" inside a plain GROUP BY.</p>
+      </div>
+    </details>
+
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="qa">Interview Q&amp;A</h2>
+
+    <details class="qa">
+      <summary>Q1: What's the logical order of evaluation of a SELECT statement, and why does it matter?</summary>
+      <div class="answer">
+        <p><code>FROM/JOIN → WHERE → GROUP BY → HAVING → SELECT (expressions, window functions) → DISTINCT → ORDER BY →
+        LIMIT/OFFSET</code>. It explains most SQL "why can't I" questions: WHERE can't use aggregates (not computed yet)
+        or SELECT aliases (SELECT runs later); HAVING can use aggregates (post-GROUP BY); ORDER BY <em>can</em> use aliases
+        (it runs after SELECT); window functions can't be filtered in the same query level (they're part of SELECT).
+        Note it's the <em>logical</em> order — the planner physically reorders freely as long as results match.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Q2: WHERE vs HAVING — when is each evaluated and which is cheaper?</summary>
+      <div class="answer">
+        <p>WHERE filters individual rows before grouping; HAVING filters groups after aggregation. WHERE is preferred
+        whenever the condition doesn't involve an aggregate: it shrinks the data before the (expensive) grouping and can
+        use indexes. HAVING exists precisely for conditions on aggregate results (<code>HAVING COUNT(*) &gt; 1</code>).
+        A row-level condition placed in HAVING is at best wasted work, at worst an error.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Q3: GROUP BY vs PARTITION BY — what's the fundamental difference?</summary>
+      <div class="answer">
+        <p>GROUP BY <em>collapses</em>: one output row per group, and you lose row-level detail. PARTITION BY (in a window
+        function) <em>annotates</em>: every input row survives, carrying a value computed over its partition. Use GROUP BY
+        when the answer is per-group ("average salary per dept"); use a window when the answer is per-row with group
+        context ("each employee vs their dept average", ranks, running totals). Windows also allow ordering and frames
+        within the partition, which GROUP BY has no concept of.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Q4: Why can a WHERE clause silently turn a LEFT JOIN into an INNER JOIN?</summary>
+      <div class="answer">
+        <p>The LEFT JOIN NULL-pads right-side columns for unmatched left rows. Any ordinary WHERE predicate on a
+        right-table column then evaluates to UNKNOWN for those rows (<code>NULL &gt;= x</code> is UNKNOWN) and WHERE
+        discards them — exactly the rows the LEFT JOIN existed to preserve. Fix: move right-table conditions into the
+        <code>ON</code> clause (filter match candidates before padding), or make the predicate NULL-tolerant
+        (<code>... OR right_col IS NULL</code>). One exception is legitimate in WHERE: <code>right_pk IS NULL</code> —
+        that's the anti-join pattern, which deliberately keeps only unmatched rows.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Q5: Explain the NOT IN + NULL problem and your default alternative.</summary>
+      <div class="answer">
+        <p><code>x NOT IN (a, b, NULL)</code> expands to <code>x&lt;&gt;a AND x&lt;&gt;b AND x&lt;&gt;NULL</code>; the last
+        term is UNKNOWN, so the whole conjunction is at best UNKNOWN, and WHERE drops it — one NULL in the subquery result
+        makes NOT IN return zero rows, with no error. Default alternative: <code>NOT EXISTS</code> with a correlated
+        predicate — it asks "is there a matching row?" rather than comparing values, so NULLs can't poison it, and
+        Postgres plans it as an efficient anti-join.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Q6: COUNT(*) vs COUNT(column) vs COUNT(DISTINCT column)?</summary>
+      <div class="answer">
+        <p><code>COUNT(*)</code> counts rows. <code>COUNT(col)</code> counts rows where col IS NOT NULL.
+        <code>COUNT(DISTINCT col)</code> counts distinct non-NULL values. Practical corollary: on a LEFT JOIN,
+        <code>COUNT(right.pk)</code> yields 0 for unmatched left rows while <code>COUNT(*)</code> yields 1 — the classic
+        off-by-one in "count children per parent" reports. Performance-wise <code>COUNT(*)</code> is not slower in
+        Postgres (it doesn't fetch "all columns"; it just counts tuples).</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Q7: ROW_NUMBER vs RANK vs DENSE_RANK — and which for "top N per group"?</summary>
+      <div class="answer">
+        <p>On ties: ROW_NUMBER numbers arbitrarily but uniquely (1,2,3,4); RANK shares then skips (1,2,2,4); DENSE_RANK
+        shares without gaps (1,2,2,3). For top-N-per-group: ROW_NUMBER when you want <em>exactly N rows</em> per group
+        (add a unique tiebreaker for determinism); DENSE_RANK when you want <em>everyone within the top N values</em>
+        (ties included, possibly more than N rows). The senior move is asking the interviewer which tie behavior they
+        want before choosing.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Q8: What is a correlated subquery, and what's the performance concern?</summary>
+      <div class="answer">
+        <p>A subquery that references the outer query's columns, making it logically dependent on — and re-evaluated
+        for — each outer row. Concern: if the planner can't decorrelate it, you get nested-loop behavior, O(N×M) without
+        a supporting index. EXISTS/IN correlations are routinely flattened into semi-joins (fine); correlated
+        <em>aggregate</em> subqueries ("salary &gt; dept average") often aren't — rewrite those as window functions or a
+        pre-aggregated CTE joined back. Verify with <code>EXPLAIN</code>: a <code>SubPlan</code> node executed per-row is
+        the red flag.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Q9: CTE vs subquery vs view — how do you choose, and what changed in PG12?</summary>
+      <div class="answer">
+        <p>Functionally interchangeable for a single query; choose for readability — CTEs read top-down like pipeline
+        steps and can be referenced multiple times; a view is a persisted, shared query. Pre-PG12, CTEs were optimization
+        fences (always materialized, no predicate pushdown) — old advice to avoid them for performance dates from then.
+        Since PG12, non-recursive, single-referenced, side-effect-free CTEs are inlined by default; <code>MATERIALIZED</code>
+        forces the old compute-once behavior (useful when referenced multiple times or to pin a plan),
+        <code>NOT MATERIALIZED</code> forces inlining.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Q10: How does INSERT ... ON CONFLICT work, and what does it require?</summary>
+      <div class="answer">
+        <p>It attempts the insert; if a unique violation occurs on the specified conflict target, it runs the alternative
+        action atomically — <code>DO NOTHING</code> or <code>DO UPDATE</code>, where <code>EXCLUDED</code> exposes the
+        proposed row and the table name/alias the existing one. Requirements: the target must match a unique index/constraint
+        (or constraint name via <code>ON CONFLICT ON CONSTRAINT ...</code>); DO UPDATE requires an explicit target.
+        It's race-free under concurrency, unlike SELECT-then-INSERT, which needs retry loops. Since PG15 there's also
+        standard <code>MERGE</code> for multi-branch logic, but ON CONFLICT remains the idiomatic upsert.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Q11: What does RETURNING give you, and where have you seen it matter in an app stack?</summary>
+      <div class="answer">
+        <p>Any INSERT/UPDATE/DELETE can return the affected rows' columns — generated ids, defaults, computed values —
+        in the same statement, eliminating a second round-trip and a race window. App-stack relevance: ORMs retrieve
+        IDENTITY-generated keys this way; "claim a job" queues use
+        <code>UPDATE ... SET claimed_by=? WHERE id = (SELECT ... FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING *</code>;
+        soft-delete endpoints return the deleted entity from the DELETE itself.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Q12: UNION vs UNION ALL — semantics and cost?</summary>
+      <div class="answer">
+        <p>UNION ALL concatenates results; UNION additionally removes duplicate <em>rows</em> (across and within branches),
+        which costs a hash or sort over the entire combined set and blocks streaming. Default to UNION ALL and opt into
+        UNION only when duplicates are possible <em>and</em> unwanted. Bonus nuance: UNION's dedup treats NULLs as equal
+        (IS NOT DISTINCT FROM semantics), unlike <code>=</code>.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Q13: How do NULLs behave in ORDER BY, GROUP BY, DISTINCT, and unique indexes in Postgres?</summary>
+      <div class="answer">
+        <p>ORDER BY: NULLs sort as largest — last in ASC, <em>first</em> in DESC; override with
+        <code>NULLS FIRST/LAST</code>. GROUP BY / DISTINCT / PARTITION BY: NULLs are treated as equal, forming one
+        group. Unique indexes: NULLs are treated as <em>distinct</em>, so many rows with NULL in a unique column are
+        allowed by default (PG15+ can change this with <code>UNIQUE NULLS NOT DISTINCT</code>). The inconsistency —
+        equal for grouping, distinct for uniqueness — is a favorite trivia follow-up.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Q14: EXISTS vs IN vs JOIN for "customers that have orders" — trade-offs?</summary>
+      <div class="answer">
+        <p>All express a semi-join. <code>JOIN + DISTINCT</code> is the trap: the join first multiplies customer rows by
+        their order count, then dedups — wasted work and a bug if you forget DISTINCT. <code>EXISTS</code> states the
+        intent exactly ("at least one match"), stops probing at the first hit, and its negation is NULL-safe.
+        <code>IN</code> reads well for single-column membership and plans equivalently in Postgres, but <code>NOT IN</code>
+        inherits the NULL trap. Preference order for the positive case: EXISTS ≈ IN &gt; JOIN+DISTINCT; for the negative:
+        NOT EXISTS, full stop.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Q15: What is ctid, and when is it legitimately useful?</summary>
+      <div class="answer">
+        <p><code>ctid</code> is a system column giving the tuple's physical address (page, offset) in the heap. It uniquely
+        identifies a row <em>right now</em>, but changes on any UPDATE (MVCC writes a new tuple version) and on VACUUM
+        FULL/CLUSTER — never store or expose it. Legitimate uses: deduplicating a table that lacks any unique key
+        (<code>DELETE ... USING ... WHERE a.ctid &gt; b.ctid</code>), and low-level debugging (finding which page a row
+        lives on, spotting HOT-update behavior). Mentioning why it's unstable (MVCC) is the senior half of the answer.</p>
+      </div>
+    </details>
+
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="exercises">Hands-on exercises</h2>
+
+    <h3>Practice setup: Postgres in one command</h3>
+<pre><code><span class="com"># Throwaway Postgres 16 in Docker</span>
+docker run --name sql-practice -e POSTGRES_PASSWORD=secret -p 5432:5432 -d postgres:16
+
+<span class="com"># Open psql inside it</span>
+docker exec -it sql-practice psql -U postgres
+
+<span class="com"># Done for the day? Container keeps your data until you remove it:</span>
+docker stop sql-practice        <span class="com"># later: docker start sql-practice</span>
+docker rm -f sql-practice       <span class="com"># nuke everything</span>
+</code></pre>
+    <p>psql survival kit — learn these five, they make you look at home in a terminal DB session:</p>
+    <table>
+      <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr><td><code>\dt</code> / <code>\d employees</code></td><td>list tables / describe one (columns, indexes, FKs)</td></tr>
+        <tr><td><code>\x</code></td><td>toggle expanded (vertical) output — lifesaver for wide rows</td></tr>
+        <tr><td><code>\timing</code></td><td>show execution time per query</td></tr>
+        <tr><td><code>\e</code></td><td>edit the current query in $EDITOR (multi-line comfort)</td></tr>
+        <tr><td><code>\i schema.sql</code></td><td>run a file — paste the sample schema from the top into one</td></tr>
+      </tbody>
+    </table>
+    <div class="note">
+      <p>Drill routine: load the sample schema, then re-do every classic problem above <em>from the summary only</em>,
+      no peeking. When a query errors, read the Postgres error message fully before fixing — error-message literacy is
+      half of live-coding composure. Finish with <code>EXPLAIN</code> on your top-N-per-group query and find the
+      WindowAgg node, just to start connecting SQL to plans (next chapters go deeper).</p>
+    </div>
+
+    <h3>Extra exercises (solutions hidden — write yours first)</h3>
+
+    <details class="qa">
+      <summary>E1. For each country, the number of customers and their total <em>paid</em> revenue — countries with
+      customers but no paid orders must still show 0.</summary>
+      <div class="answer">
+<pre><code>SELECT,
+       COUNT(DISTINCT                    AS customers,
+       COALESCE(SUM(o.amount), 0)             AS paid_revenue
+FROM customers c
+LEFT JOIN orders o
+       ON o.customer_id =
+      AND o.status = 'paid'          <span class="com">-- right-table filter in ON, not WHERE!</span>
+GROUP BY
+ORDER BY paid_revenue DESC;
+<span class="com">-- US 3 / 1340.00 (Acme 690 + Initech 650 + Soylent 0), DE 1 / 500.00, UK 1 / 75.00</span>
+</code></pre>
+        <p>Tests the ON-vs-WHERE rule plus COUNT(DISTINCT) — a customer with 3 paid orders must count once.
+        <code>WHERE o.status='paid'</code> would drop Soylent from the US count entirely.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>E2. Each order with the gap in days since that customer's previous order.</summary>
+      <div class="answer">
+<pre><code>SELECT customer_id, id, created_at,
+       created_at - LAG(created_at) OVER (
+         PARTITION BY customer_id ORDER BY created_at, id
+       ) AS days_since_prev
+FROM orders
+ORDER BY customer_id, created_at;
+<span class="com">-- Acme: NULL, 15, 21, 36. (date - date is an integer in Postgres.)</span>
+</code></pre>
+        <p>First order per customer has no predecessor → NULL, which is correct (not 0). If asked for average gap per
+        customer, wrap this in a CTE and <code>AVG(days_since_prev)</code> — the NULL first rows are skipped by AVG,
+        which is exactly right.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>E3. Management chain above Dev, top-down (Priya &gt; Arjun &gt; Dev).</summary>
+      <div class="answer">
+<pre><code>WITH RECURSIVE chain AS (
+  SELECT id, name, manager_id, 0 AS steps_up
+  FROM employees WHERE name = 'Dev'
+  UNION ALL
+  SELECT,, m.manager_id, c.steps_up + 1
+  FROM employees m
+  JOIN chain c ON = c.manager_id       <span class="com">-- walk UP: parent of the previous row</span>
+)
+SELECT name FROM chain ORDER BY steps_up DESC;
+<span class="com">-- Priya, Arjun, Dev</span>
+</code></pre>
+        <p>Same recursive machinery as the org chart, direction reversed: seed at the leaf, join each round to its
+        manager. <code>ORDER BY steps_up DESC</code> flips bottom-up traversal into a top-down display.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>E4. Weekly paid revenue for Jan–Mar 2025 with zero-weeks included, plus a 0/1 flag for weeks above 300.</summary>
+      <div class="answer">
+<pre><code>SELECT gs.week::date AS week_start,
+       COALESCE(SUM(o.amount), 0) AS revenue,
+       CASE WHEN COALESCE(SUM(o.amount), 0) &gt; 300 THEN 1 ELSE 0 END AS good_week
+FROM generate_series(date_trunc('week', DATE '2025-01-01'),
+                     DATE '2025-03-31', INTERVAL '1 week') AS gs(week)
+LEFT JOIN orders o
+       ON o.created_at &gt;= gs.week
+      AND o.created_at &lt;  gs.week + INTERVAL '1 week'
+      AND o.status = 'paid'
+GROUP BY gs.week
+ORDER BY gs.week;
+</code></pre>
+        <p>Combines four tools from this page: <code>generate_series</code> for the calendar spine,
+        <code>date_trunc('week', ...)</code> to align the series to Mondays, the ON-clause filter to keep empty weeks,
+        and CASE for the flag. Most weeks in the range show 0 — which is the point: order data alone could never
+        produce those rows.</p>
+      </div>
+    </details>
+
+    <div class="senior">
+      <p>Last habit to build before the interview: for every query you write, say the answer's <em>grain</em> out loud
+      first — "one row per customer", "one row per month". Grain determines whether you need GROUP BY, a window, or
+      neither, and stating it up front is the clearest fluency signal you can send in the first ten seconds.</p>
+    </div>
+  </section>
+
+  <nav class="page-nav">
+    <a href="10-spring-microservices.html">← Prev: Microservices</a>
+    <a href="12-postgres-schema-design.html">Next: Schema Design →</a>
+  </nav>
+</main>
+</body>
+</html>

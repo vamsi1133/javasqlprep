@@ -1,0 +1,1045 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>15 — Operations &amp; Advanced Postgres | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <div class="breadcrumb"><a href="index.html">← Course Home</a></div>
+    <h1>15 — Operations &amp; Advanced Postgres</h1>
+    <p>VACUUM, pooling, replication, partitioning, JSONB, full-text search — the "can you actually run this in production?" chapter</p>
+  </div>
+</header>
+<main class="container">
+
+<p>
+Everything up to now — schema design, indexing, transactions, MVCC — is about writing correct, fast queries.
+This tutorial is about the other half of the job: <strong>keeping Postgres healthy and knowing when to reach
+for its advanced features</strong>. Interviewers use these topics to separate "I've used Postgres through an ORM"
+from "I understand the system I'm building on." You don't need DBA-level depth. You need to explain
+<em>why</em> VACUUM exists (it's the bill for MVCC), why you can't just crank <code>max_connections</code> to 5000,
+what replication lag does to your application logic, and — the classic — why you'd pick Postgres JSONB
+over MongoDB. Most of this page is T2: aim for confident, honest, trade-off-aware answers rather than
+encyclopedic detail.
+</p>
+
+<div class="toc">
+  <strong>On this page</strong>
+  <ol>
+    <li><a href="#vacuum">VACUUM, autovacuum &amp; bloat</a></li>
+    <li><a href="#pooling">Connection pooling: HikariCP &amp; PgBouncer</a></li>
+    <li><a href="#replication">Replication, read replicas &amp; the lag problem</a></li>
+    <li><a href="#partitioning">Table partitioning</a></li>
+    <li><a href="#backups">Backups, PITR &amp; sharding awareness</a></li>
+    <li><a href="#jsonb">JSONB in depth (and "why not MongoDB?")</a></li>
+    <li><a href="#fts">Full-text search</a></li>
+    <li><a href="#matviews">Materialized views</a></li>
+    <li><a href="#triggers">Triggers, functions &amp; LISTEN/NOTIFY</a></li>
+    <li><a href="#qa">Interview Q&amp;A</a></li>
+    <li><a href="#exercises">Hands-on exercises</a></li>
+  </ol>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="vacuum">VACUUM, autovacuum &amp; bloat <span class="tier tier-2">T2</span></h2>
+
+<h3>Why VACUUM exists: the bill for MVCC</h3>
+<p>
+Recall from tutorial 14: Postgres implements MVCC by <em>never updating rows in place</em>. An
+<code>UPDATE</code> writes a new row version and marks the old one as expired; a <code>DELETE</code> just
+marks the row as expired. Old versions must stick around as long as some transaction might still need to
+see them. Once no transaction can see a dead row version, it's garbage — but Postgres doesn't clean it up
+inline during normal query execution. That deferred cleanup job is <strong>VACUUM</strong>.
+</p>
+<p>So a table that receives heavy updates is constantly generating dead tuples. Without vacuuming:</p>
+<ul>
+  <li>The table file grows even though the logical row count is stable — this is <strong>bloat</strong>.</li>
+  <li>Sequential scans read pages full of dead rows; everything gets slower for the same data.</li>
+  <li>Indexes bloat too, since each new row version usually needs new index entries.</li>
+</ul>
+
+<h3>What VACUUM actually does</h3>
+<p>Plain <code>VACUUM</code> (the kind autovacuum runs) does three important things:</p>
+<table>
+  <thead><tr><th>Action</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><strong>Reclaims dead tuples for reuse</strong></td>
+      <td>Marks the space inside pages as free so future INSERTs/UPDATEs can reuse it.
+      Note: it usually does <em>not</em> shrink the file on disk (it can only truncate empty pages at the very end).</td>
+    </tr>
+    <tr>
+      <td><strong>Updates the visibility map</strong></td>
+      <td>Marks pages where <em>all</em> tuples are visible to every transaction. This is what makes
+      <strong>index-only scans</strong> possible — the planner can skip fetching the heap page. A badly
+      vacuumed table quietly kills your index-only scans.</td>
+    </tr>
+    <tr>
+      <td><strong>Freezes old transaction IDs</strong></td>
+      <td>Replaces very old xids on rows with a special "frozen" marker so the 32-bit transaction ID
+      counter can safely wrap around (see below).</td>
+    </tr>
+  </tbody>
+</table>
+
+<pre><code>-- Manual vacuum of one table (non-blocking for reads/writes)
+VACUUM (VERBOSE, ANALYZE) orders;
+
+-- ANALYZE alone refreshes planner statistics (row counts, value distributions)
+ANALYZE orders;</code></pre>
+
+<h3>VACUUM vs VACUUM FULL</h3>
+<pre><code>-- Rewrites the entire table into a new file, returns space to the OS.
+-- Takes an ACCESS EXCLUSIVE lock: blocks ALL reads and writes for the duration.
+VACUUM FULL orders;   -- rarely the right answer in production</code></pre>
+<table>
+  <thead><tr><th></th><th>VACUUM</th><th>VACUUM FULL</th></tr></thead>
+  <tbody>
+    <tr><td>Locking</td><td>Runs alongside normal traffic</td><td>Exclusive lock — table is offline</td></tr>
+    <tr><td>Disk space</td><td>Marks space reusable inside the file</td><td>Rewrites table, returns space to OS</td></tr>
+    <tr><td>When</td><td>Continuously, via autovacuum</td><td>Rare recovery from severe bloat, in a maintenance window (or use <code>pg_repack</code> for an online rewrite)</td></tr>
+  </tbody>
+</table>
+
+<div class="pitfall">
+<p>"The table is bloated, just run VACUUM FULL" is a classic junior mistake in prod. It takes an exclusive
+lock — on a big table that's an outage. The senior answer: fix the <em>cause</em> (autovacuum tuning,
+long-running transactions), let regular VACUUM contain it, and if you truly must reclaim disk, use
+<code>pg_repack</code> or schedule VACUUM FULL in a window.</p>
+</div>
+
+<h3>Autovacuum and the scale-factor problem</h3>
+<p>
+Autovacuum is a background daemon that vacuums tables when their dead-tuple count crosses a threshold.
+The default trigger is roughly:
+</p>
+<pre><code>dead_tuples &gt; autovacuum_vacuum_threshold          -- default 50
+             + autovacuum_vacuum_scale_factor      -- default 0.2 (20%!)
+               * reltuples (estimated live rows)</code></pre>
+<p>
+The percentage is the problem on big tables. 20% of a 500-million-row table is <strong>100 million dead
+rows</strong> before autovacuum even wakes up — and then it has an enormous job to do. Common fix: lower
+the scale factor per table so vacuum runs earlier and does smaller increments:
+</p>
+<pre><code>ALTER TABLE orders SET (
+  autovacuum_vacuum_scale_factor = 0.01,   -- vacuum at ~1% dead
+  autovacuum_analyze_scale_factor = 0.005
+);</code></pre>
+
+<h3>What happens when vacuum falls behind</h3>
+<ul>
+  <li><strong>Bloat compounds</strong>: table and index files grow, cache hit rates drop, scans slow down.</li>
+  <li><strong>Index-only scans degrade</strong>: the visibility map goes stale, so "index-only" scans start
+      hitting the heap anyway — a query that was fast quietly becomes slow with no plan change.</li>
+  <li><strong>Planner stats go stale</strong> (if ANALYZE also lags): bad row estimates → bad plans.</li>
+  <li><strong>Transaction ID wraparound</strong> — the scary-sounding one, explained calmly below.</li>
+</ul>
+
+<h3>XID wraparound, without the panic</h3>
+<p>
+Postgres transaction IDs are 32-bit counters used to decide row visibility ("was this row created before or
+after my snapshot?"). Because the counter wraps, a row whose xid is more than ~2 billion transactions old would
+become ambiguous. VACUUM prevents this by <strong>freezing</strong> old rows — marking them "visible to
+everyone forever" so their original xid no longer matters. If freezing falls extremely far behind, Postgres
+gets increasingly loud: warnings in logs, then aggressive anti-wraparound autovacuums you can't cancel, and
+in the true worst case it stops accepting new transactions until a vacuum completes. In practice, you get
+weeks of warnings first. The interview takeaway: <em>know it exists, know VACUUM freezing is the fix, and
+know the usual root cause is autovacuum being starved or blocked — not some random cosmic event.</em>
+</p>
+
+<h3>Monitoring bloat and dead tuples</h3>
+<pre><code>SELECT relname,
+       n_live_tup,
+       n_dead_tup,
+       round(100.0 * n_dead_tup / NULLIF(n_live_tup + n_dead_tup, 0), 1) AS dead_pct,
+       last_autovacuum,
+       last_autoanalyze
+FROM pg_stat_user_tables
+ORDER BY n_dead_tup DESC
+LIMIT 10;</code></pre>
+
+<h3>The #1 vacuum blocker: long-running transactions</h3>
+<p>
+VACUUM can only remove dead rows that <strong>no transaction could still see</strong>. One forgotten
+<code>idle in transaction</code> session — a connection that ran <code>BEGIN</code> and went to lunch —
+pins the "oldest visible" horizon for the <em>entire database</em>. Autovacuum runs, but reclaims nothing.
+Bloat grows everywhere while your monitoring says "vacuum is running fine."
+</p>
+<pre><code>-- Find long-running / idle-in-transaction sessions
+SELECT pid, state, now() - xact_start AS xact_age, left(query, 60) AS query
+FROM pg_stat_activity
+WHERE xact_start IS NOT NULL
+ORDER BY xact_start
+LIMIT 10;
+
+-- Guardrail: kill transactions idle too long
+ALTER SYSTEM SET idle_in_transaction_session_timeout = '5min';</code></pre>
+
+<div class="senior">
+<p>Interview-ready summary: "VACUUM is the garbage collector MVCC requires. Plain VACUUM reclaims dead
+tuples for reuse, maintains the visibility map (which index-only scans depend on), and freezes old xids to
+prevent wraparound. VACUUM FULL rewrites the table under an exclusive lock — almost never in prod. On big
+tables I lower the per-table scale factor so autovacuum runs early and often, and the first thing I check
+when bloat grows despite vacuuming is long-running or idle-in-transaction sessions holding back the
+cleanup horizon."</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="pooling">Connection pooling: HikariCP &amp; PgBouncer <span class="tier tier-2">T2</span></h2>
+
+<h3>Why Postgres connections are expensive</h3>
+<p>
+Coming from Node, this is a mindset shift. Postgres forks a <strong>dedicated OS process per
+connection</strong> — not a thread, not an async task. Each backend process carries several megabytes of
+memory, and per-connection <code>work_mem</code> can multiply that during sorts/hashes. Beyond memory,
+more backends means more contention on shared locks and buffers, and more processes for the scheduler to
+juggle. A Postgres server is happiest with a <em>few dozen to a few hundred</em> active connections — not
+thousands.
+</p>
+
+<h3>App-side pooling: HikariCP sizing recap</h3>
+<p>
+In Spring Boot, HikariCP is the default pool. The counterintuitive truth (well-documented by the HikariCP
+project): <strong>a small pool with a queue outperforms a big pool</strong>. Requests waiting briefly in
+the pool's queue finish sooner overall than requests all hammering the database at once, because the DB
+isn't drowning in context switches and lock contention.
+</p>
+<pre><code># A useful starting-point formula (from the HikariCP wiki):
+#   pool_size ≈ (cpu_cores * 2) + effective_spindle_count
+# For a typical cloud Postgres with SSD: cores*2 + a small constant.
+# An 8-core DB server → pool of ~16-20 TOTAL across all app instances.
+
+# application.yml
+spring:
+  datasource:
+    hikari:
+      maximum-pool-size: 10        # per app instance — keep TOTAL in mind
+      minimum-idle: 10
+      connection-timeout: 3000     # fail fast instead of piling up
+      max-lifetime: 1800000        # recycle before infra kills idle conns</code></pre>
+<div class="pitfall">
+<p>The total that matters is <code>pool_size × number_of_app_instances</code>. Ten Kubernetes pods with
+<code>maximum-pool-size: 50</code> is 500 potential connections. Teams "fix" the resulting errors by raising
+<code>max_connections</code> on the server — which makes the database <em>slower</em> (more memory pressure,
+more contention) while hiding the real problem. Right fix: shrink app pools and/or add PgBouncer.</p>
+</div>
+
+<h3>PgBouncer: pooling in front of the database</h3>
+<p>
+When many app instances (or serverless functions) need Postgres, put <strong>PgBouncer</strong> — a
+lightweight connection proxy — in front. Thousands of client connections on one side, a small pool of real
+Postgres connections on the other.
+</p>
+<table>
+  <thead><tr><th>Mode</th><th>How it maps clients → server conns</th><th>Trade-off</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><strong>Session</strong></td>
+      <td>One server connection per client for the whole session</td>
+      <td>Fully transparent, but pools poorly — barely better than no bouncer for idle-heavy apps</td>
+    </tr>
+    <tr>
+      <td><strong>Transaction</strong> (the usual choice)</td>
+      <td>Server connection borrowed only for the duration of each transaction</td>
+      <td>Excellent multiplexing, but <em>no session state</em> between transactions</td>
+    </tr>
+    <tr>
+      <td>Statement</td>
+      <td>Per statement</td>
+      <td>Most aggressive; breaks multi-statement transactions — niche</td>
+    </tr>
+  </tbody>
+</table>
+<p><strong>Transaction-mode caveats</strong> you should be able to name:</p>
+<ul>
+  <li>No session-level state: <code>SET</code> (non-local), session advisory locks, temp tables,
+      <code>LISTEN</code> — all unreliable, because your next transaction may run on a different server connection.</li>
+  <li>Server-side <strong>prepared statements</strong> historically broke (prepared on connection A, executed
+      on connection B). Modern PgBouncer (1.21+) can track protocol-level prepared statements; otherwise JDBC
+      drivers are configured to avoid server-side prepares, at a small performance cost.</li>
+</ul>
+<pre><code>; pgbouncer.ini (sketch)
+[databases]
+appdb = host=10.0.0.5 port=5432 dbname=appdb
+
+[pgbouncer]
+pool_mode = transaction
+default_pool_size = 20        ; real PG connections per db/user pair
+max_client_conn = 2000        ; clients pgbouncer will accept</code></pre>
+<div class="senior">
+<p>Layered answer: "HikariCP pools within one JVM; PgBouncer pools across the whole fleet. I size Hikari
+small — roughly cores×2 on the DB, divided across instances — and if instance count is large or elastic,
+I add PgBouncer in transaction mode, being careful about session state and prepared-statement settings.
+Raising <code>max_connections</code> is the anti-pattern: each connection is a whole process, so more
+connections past the sweet spot means lower throughput, not higher."</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="replication">Replication, read replicas &amp; the lag problem <span class="tier tier-2">T2</span></h2>
+
+<h3>Streaming replication in one paragraph</h3>
+<p>
+Every change Postgres makes is first written to the <strong>WAL</strong> (write-ahead log) — the same log
+that powers crash recovery. <strong>Streaming replication</strong> ships that WAL, in real time, from the
+primary to one or more replicas, which replay it continuously. Replicas are byte-identical copies, open for
+<strong>read-only</strong> queries (hot standby). All writes go to the primary.
+</p>
+<pre><code>-- On a replica, confirm role and lag:
+SELECT pg_is_in_recovery();                        -- true on a replica
+SELECT now() - pg_last_xact_replay_timestamp() AS replay_lag;
+
+-- On the primary, per-replica view:
+SELECT client_addr, state, sync_state,
+       pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) AS byte_lag
+FROM pg_stat_replication;</code></pre>
+
+<h3>Synchronous vs asynchronous</h3>
+<table>
+  <thead><tr><th></th><th>Async (default)</th><th>Sync</th></tr></thead>
+  <tbody>
+    <tr><td>Commit returns when…</td><td>WAL is durable on the <em>primary</em></td><td>…and at least one sync replica has confirmed it</td></tr>
+    <tr><td>Data loss on primary failure</td><td>Possible: last few ms/seconds of commits (RPO &gt; 0)</td><td>None for confirmed commits (RPO ≈ 0)</td></tr>
+    <tr><td>Cost</td><td>None on the write path</td><td>Every commit pays a network round-trip; a slow/dead sync replica can stall writes</td></tr>
+  </tbody>
+</table>
+<p>
+Most systems run async and accept a tiny RPO. Sync replication is for "losing one committed row is
+unacceptable" domains (payments ledgers), often with <code>synchronous_commit</code> tuned per-transaction
+so only the critical writes pay the latency.
+</p>
+
+<h3>Read replicas — and the application problem they create</h3>
+<p>
+Replicas scale <em>reads</em>: dashboards, reports, search, feed rendering. But async replication means a
+replica is always slightly behind — usually milliseconds, occasionally seconds (vacuum storms, big
+transactions, network blips). That gap creates the classic <strong>read-your-own-writes</strong> bug:
+</p>
+<div class="pitfall">
+<p>User saves their new profile photo → <code>UPDATE</code> hits the primary → app redirects to the profile
+page → that read is routed to a replica that hasn't replayed the update yet → user sees their <em>old</em>
+photo and files a bug ("save is broken!"). Nothing is broken — you served a stale read after a write.</p>
+</div>
+<p><strong>Mitigations</strong> (know at least three):</p>
+<ol>
+  <li><strong>Read-from-primary-after-write</strong>: after a user writes, route that user's reads to the
+      primary for a short window (e.g., a "wrote recently" flag with a TTL in the session/cache). Simple and common.</li>
+  <li><strong>Sticky sessions / pinning</strong>: pin a session to the primary for the rest of the request
+      (or a few seconds after any write within it).</li>
+  <li><strong>Lag-aware routing</strong>: only route to replicas whose measured lag is under a threshold;
+      eject laggy replicas from the read pool.</li>
+  <li><strong>LSN tokens (causal consistency)</strong>: capture the primary's WAL position after the write;
+      a replica may serve the read only once it has replayed past that LSN. Most precise, most plumbing.</li>
+  <li><strong>Design tolerance</strong>: for feeds/analytics, just accept staleness — cheapest of all.</li>
+</ol>
+<p>
+In Spring, the routing itself is typically an <code>AbstractRoutingDataSource</code> keyed off
+<code>@Transactional(readOnly = true)</code>, or a JDBC-level splitter. Awareness of the pattern is enough:
+read-only transactions → replica datasource, everything else → primary, plus one of the mitigations above
+for read-your-own-writes.
+</p>
+<pre><code>// Awareness-level sketch: route by transaction read-only flag
+public class ReadWriteRoutingDataSource extends AbstractRoutingDataSource {
+    @Override
+    protected Object determineCurrentLookupKey() {
+        return TransactionSynchronizationManager.isCurrentTransactionReadOnly()
+                ? "replica" : "primary";
+    }
+}</code></pre>
+
+<h3>Failover</h3>
+<p>
+When the primary dies, a replica must be <strong>promoted</strong> to primary and traffic re-pointed. Doing
+this safely by hand is stressful (split-brain risk: two nodes both believing they're primary). Production
+setups use an orchestrator — <strong>Patroni</strong> is the de facto standard (uses etcd/Consul for leader
+election, handles promotion and fencing) — or the cloud provider's managed HA (RDS Multi-AZ, Cloud SQL HA).
+Awareness level: know the term, know why automated fencing matters, don't hand-roll it.
+</p>
+
+<h3>Logical replication vs streaming</h3>
+<table>
+  <thead><tr><th></th><th>Streaming (physical)</th><th>Logical</th></tr></thead>
+  <tbody>
+    <tr><td>Replicates</td><td>WAL bytes — the entire cluster, exactly</td><td>Row changes on <em>selected tables</em> (publish/subscribe)</td></tr>
+    <tr><td>Versions</td><td>Same major version required</td><td>Cross-version — the standard tool for near-zero-downtime major upgrades</td></tr>
+    <tr><td>Target writable?</td><td>No — replica is read-only</td><td>Yes — subscriber is a normal DB with its own data</td></tr>
+    <tr><td>Use cases</td><td>HA, read scaling, PITR base</td><td>Selective sync, upgrades, feeding other systems (CDC)</td></tr>
+  </tbody>
+</table>
+<pre><code>-- Logical replication: publisher side
+CREATE PUBLICATION orders_pub FOR TABLE orders, order_items;
+
+-- Subscriber side (another cluster)
+CREATE SUBSCRIPTION orders_sub
+  CONNECTION 'host=primary dbname=appdb user=repl'
+  PUBLICATION orders_pub;</code></pre>
+<p>
+The same logical-decoding machinery powers <strong>CDC (change data capture)</strong> tools like
+<strong>Debezium</strong>, which stream row changes into Kafka. That's the production-grade companion to the
+<strong>outbox pattern</strong> from the transactions tutorial: write the event to an outbox table in the same
+transaction as the business change, and let Debezium tail the WAL and publish it — no dual-write problem,
+no polling.
+</p>
+
+<!-- ============================================================ -->
+<h2 id="partitioning">Table partitioning <span class="tier tier-2">T2</span></h2>
+
+<h3>What and why</h3>
+<p>
+Declarative partitioning splits one logical table into physical child tables by a key — <strong>range</strong>
+(dates), <strong>list</strong> (region, tenant), or <strong>hash</strong> (even spread). Queries still target
+the parent; Postgres routes rows and prunes partitions automatically.
+</p>
+<p>The honest reasons to partition (in order of real-world value):</p>
+<ol>
+  <li><strong>Instant data retention</strong>: <code>DROP TABLE orders_2024_01</code> removes a month in
+      milliseconds. The alternative — <code>DELETE FROM orders WHERE created_at &lt; ...</code> on a huge
+      table — grinds for hours and generates a mountain of dead tuples for VACUUM.</li>
+  <li><strong>Manageable maintenance</strong>: VACUUM, ANALYZE, and reindex work per-partition — small,
+      predictable jobs instead of one monster.</li>
+  <li><strong>Partition pruning</strong>: queries filtered on the partition key scan only relevant partitions,
+      with smaller per-partition indexes.</li>
+</ol>
+
+<pre><code>-- Range partitioning: orders by month
+CREATE TABLE orders (
+  id          bigint GENERATED ALWAYS AS IDENTITY,
+  customer_id bigint NOT NULL,
+  status      text   NOT NULL,
+  total_cents bigint NOT NULL,
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (id, created_at)          -- must include the partition key!
+) PARTITION BY RANGE (created_at);
+
+CREATE TABLE orders_2026_06 PARTITION OF orders
+  FOR VALUES FROM ('2026-06-01') TO ('2026-07-01');
+CREATE TABLE orders_2026_07 PARTITION OF orders
+  FOR VALUES FROM ('2026-07-01') TO ('2026-08-01');
+
+-- Catch-all for rows outside any declared range (use with care)
+CREATE TABLE orders_default PARTITION OF orders DEFAULT;
+
+-- Indexes on the parent cascade to all partitions
+CREATE INDEX ON orders (customer_id, created_at DESC);</code></pre>
+
+<h3>Seeing pruning in EXPLAIN</h3>
+<pre><code>EXPLAIN (COSTS OFF)
+SELECT * FROM orders
+WHERE created_at &gt;= '2026-07-01' AND created_at &lt; '2026-07-05';
+
+--  Seq Scan on orders_2026_07 orders          &lt;-- ONLY this partition
+--    Filter: created_at &gt;= ... AND created_at &lt; ...
+--
+-- Without a partition-key predicate, you'd see an Append node
+-- scanning every partition — pruning only helps queries that
+-- actually filter on the key.</code></pre>
+
+<h3>When NOT to partition</h3>
+<ul>
+  <li><strong>Small/medium tables</strong>. Under ~100M rows / tens of GB, good indexing usually wins.
+      Partitioning adds planning overhead and operational complexity for nothing.</li>
+  <li><strong>No natural key in your WHERE clauses</strong>. If queries don't filter on the candidate
+      partition key, there's no pruning — every query fans out to all partitions and gets <em>slower</em>.</li>
+  <li><strong>As a performance hail-mary</strong>. Partitioning is primarily a <em>data lifecycle and
+      maintenance</em> tool; it's not a substitute for a missing index.</li>
+</ul>
+
+<h3>Pitfalls to name in an interview</h3>
+<div class="pitfall">
+<p><strong>Unique constraints must include the partition key.</strong> Postgres can't enforce global
+uniqueness across partitions, so <code>PRIMARY KEY (id)</code> alone is rejected — you need
+<code>(id, created_at)</code>. Consequence: no plain unique email column on a partitioned users table, and
+foreign keys <em>referencing</em> the partitioned table need that composite key too. This is why "partition
+everything" is not free.</p>
+</div>
+<div class="note">
+<p>Other gotchas: (1) a <strong>default partition</strong> catches stray rows but then blocks creating new
+partitions whose range overlaps rows already sitting in the default — many teams skip it and instead
+auto-create future partitions with a scheduled job or <code>pg_partman</code>. (2) You can't
+<code>UPDATE</code> a row's partition key in a way that violates its partition without Postgres physically
+moving the row (a delete+insert under the hood). (3) Too many partitions (thousands) inflates planning time.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="backups">Backups, PITR &amp; sharding awareness <span class="tier tier-3">T3</span></h2>
+
+<h3>Two backup families</h3>
+<table>
+  <thead><tr><th></th><th>pg_dump / pg_restore (logical)</th><th>pg_basebackup + WAL archiving (physical)</th></tr></thead>
+  <tbody>
+    <tr><td>What it captures</td><td>SQL/archive of schema + data at one instant</td><td>Byte-level copy of the cluster + continuous WAL stream</td></tr>
+    <tr><td>Restore granularity</td><td>Whole dump (can pick tables); restores to dump time only</td><td><strong>PITR</strong>: replay WAL to any moment — "restore to 14:02, right before the bad migration"</td></tr>
+    <tr><td>Speed at scale</td><td>Slow for big DBs (rebuilds indexes on restore)</td><td>Fast base copy; restore = copy + WAL replay</td></tr>
+    <tr><td>Cross-version?</td><td>Yes — also the migration/export tool</td><td>Same major version</td></tr>
+    <tr><td>Typical role</td><td>Small DBs, per-table exports, dev seeding</td><td>Production DR (usually via pgBackRest/WAL-G, or managed-cloud automated backups)</td></tr>
+  </tbody>
+</table>
+<pre><code># Logical: custom-format dump, parallel restore
+pg_dump -Fc -f appdb.dump appdb
+pg_restore -d appdb_restored -j 4 appdb.dump
+
+# Physical: base backup (WAL archiving configured separately via archive_command
+# or a tool like pgBackRest / WAL-G)
+pg_basebackup -D /backups/base -X stream -P</code></pre>
+<p>
+Vocabulary worth using precisely: <strong>RPO</strong> (recovery point objective — how much data you can
+afford to lose; WAL archiving gets this near zero) and <strong>RTO</strong> (recovery time objective — how
+long until you're back; dominated by restore + replay time). And the old ops wisdom that always lands well:
+<em>an untested backup is a hope, not a backup</em> — restore drills are part of the backup strategy.
+</p>
+
+<h3>Sharding: the honest awareness answer</h3>
+<p>
+Sharding = splitting data across multiple independent Postgres clusters (by tenant, user-id hash, etc.).
+Options: <strong>app-level sharding</strong> (application picks the shard; simple concept, but cross-shard
+queries, transactions, and rebalancing become your problem) or <strong>Citus</strong> (Postgres extension
+that distributes tables across worker nodes behind a coordinator).
+</p>
+<div class="senior">
+<p>The senior take interviewers want: "One well-tuned Postgres with read replicas goes further than most
+people think — a single beefy instance handles multiple TB and tens of thousands of QPS with good schema,
+indexes, and caching. Sharding costs you cross-shard joins, global transactions, and painful rebalancing,
+so I'd exhaust vertical scaling, replicas, caching, and partitioning first, and treat sharding as a
+system-design conversation with real numbers, not a default." Then defer detail to the system-design round.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="jsonb">JSONB in depth — and "why not MongoDB?" <span class="tier tier-2">T2</span></h2>
+
+<h3>json vs jsonb</h3>
+<table>
+  <thead><tr><th></th><th>json</th><th>jsonb</th></tr></thead>
+  <tbody>
+    <tr><td>Storage</td><td>Exact input text</td><td>Parsed binary: no duplicate keys, no key order, whitespace normalized</td></tr>
+    <tr><td>Read/query speed</td><td>Re-parses on every access</td><td>Fast field access, rich operators</td></tr>
+    <tr><td>Indexable (GIN)</td><td>No</td><td><strong>Yes</strong></td></tr>
+    <tr><td>Use</td><td>Only if you must preserve exact original text (e.g., signed payloads)</td><td>Everything else — the default</td></tr>
+  </tbody>
+</table>
+
+<h3>Operators you must know cold</h3>
+<pre><code>CREATE TABLE events (
+  id      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  type    text NOT NULL,
+  payload jsonb NOT NULL,
+  at      timestamptz NOT NULL DEFAULT now()
+);
+
+INSERT INTO events (type, payload) VALUES
+('order.placed', '{"orderId": 42, "customer": {"id": 7, "tier": "gold"},
+                   "items": [{"sku": "A1", "qty": 2}], "tags": ["promo"]}');
+
+-- -&gt;  returns jsonb          -&gt;&gt;  returns text  (THE classic gotcha)
+SELECT payload -&gt; 'customer'            FROM events;  -- {"id": 7, "tier": "gold"}  (jsonb)
+SELECT payload -&gt;&gt; 'type'               FROM events;  -- text or NULL
+SELECT payload -&gt; 'customer' -&gt;&gt; 'tier' FROM events;  -- 'gold' as text
+
+-- #&gt;&gt; : extract by path, as text
+SELECT payload #&gt;&gt; '{customer,tier}' FROM events;     -- 'gold'
+
+-- @&gt; : containment — "does the left side contain this shape?"
+SELECT * FROM events WHERE payload @&gt; '{"customer": {"tier": "gold"}}';
+
+-- ?  : does this top-level key exist?
+SELECT * FROM events WHERE payload ? 'tags';
+
+-- Beware type mixing: payload -&gt; 'orderId' is jsonb 42, not integer 42
+SELECT * FROM events WHERE (payload -&gt;&gt; 'orderId')::bigint = 42;</code></pre>
+<div class="pitfall">
+<p><code>-&gt;</code> vs <code>-&gt;&gt;</code> trips everyone: <code>-&gt;</code> yields
+<strong>jsonb</strong> (chainable, compares as JSON), <code>-&gt;&gt;</code> yields <strong>text</strong>
+(comparable to strings, castable to numbers). <code>payload -&gt; 'tier' = 'gold'</code> fails or misbehaves;
+you want <code>payload -&gt;&gt; 'tier' = 'gold'</code>.</p>
+</div>
+
+<h3>Updating JSONB</h3>
+<pre><code>-- jsonb_set(target, path, new_value, create_missing)
+UPDATE events
+SET payload = jsonb_set(payload, '{customer,tier}', '"platinum"')
+WHERE id = 1;
+
+-- Merge / add keys with ||
+UPDATE events SET payload = payload || '{"reviewed": true}' WHERE id = 1;
+
+-- Remove a key
+UPDATE events SET payload = payload - 'tags' WHERE id = 1;</code></pre>
+<div class="note">
+<p>Remember MVCC: every JSONB "field update" rewrites the <em>whole row</em> (and large payloads live in
+TOAST storage, compressed out-of-line). Hot, frequently-updated fields belong in real columns; JSONB suits
+mostly-read documents.</p>
+</div>
+
+<h3>Indexing JSONB</h3>
+<pre><code>-- GIN with default jsonb_ops: supports @&gt;, ?, ?|, ?&amp;
+CREATE INDEX idx_events_payload ON events USING gin (payload);
+
+-- jsonb_path_ops: smaller/faster index, but ONLY supports @&gt; containment
+CREATE INDEX idx_events_payload_path ON events USING gin (payload jsonb_path_ops);
+
+-- Best of all for a known hot field: a plain B-tree expression index
+CREATE INDEX idx_events_customer_tier ON events ((payload -&gt; 'customer' -&gt;&gt; 'tier'));
+
+-- This now uses the B-tree — ordinary equality, ordinary speed:
+SELECT * FROM events WHERE payload -&gt; 'customer' -&gt;&gt; 'tier' = 'gold';</code></pre>
+<p>
+Rule of thumb: <em>ad-hoc shape queries</em> → GIN (<code>jsonb_path_ops</code> if you only ever use
+<code>@&gt;</code>); <em>known field you filter on constantly</em> → expression B-tree index, which is smaller
+and supports ranges/sorting. You can even add constraints on extracted fields
+(<code>CHECK ((payload -&gt;&gt; 'orderId') IS NOT NULL)</code>) — schema-on-write where it matters.
+</p>
+
+<h3>When JSONB is right vs wrong</h3>
+<table>
+  <thead><tr><th>Right tool</th><th>Wrong tool</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Sparse/variable attributes (product specs differing per category)</td>
+      <td>Core relational data you join, aggregate, and constrain (orders, users, money)</td>
+    </tr>
+    <tr>
+      <td>External payloads you receive and mostly store (webhooks, API responses)</td>
+      <td>Fields you filter/sort on in every query (promote them to columns)</td>
+    </tr>
+    <tr>
+      <td>Event/audit data with evolving shapes</td>
+      <td>Anything needing FKs, uniqueness, or NOT NULL on inner fields</td>
+    </tr>
+    <tr>
+      <td>User-defined/custom fields per tenant</td>
+      <td>Frequently-updated hot fields (whole-row rewrite each time)</td>
+    </tr>
+  </tbody>
+</table>
+<p>
+The tax you pay is <strong>schema-on-read</strong>: nothing stops a producer writing
+<code>"customerId"</code> one day and <code>"customer_id"</code> the next; typos become silent NULLs at read
+time; every consumer re-implements validation. Columns push that enforcement to write time, where errors are
+loud and immediate. A good hybrid: real columns for identity/joins/hot filters, one <code>jsonb</code>
+column for the long tail.
+</p>
+
+<h3>The model answer: "Why Postgres JSONB and not MongoDB?"</h3>
+<div class="senior">
+<p>"Most systems have a relational core — users, orders, payments — that needs joins, foreign keys, unique
+constraints, and multi-row ACID transactions. Postgres gives me all of that natively, and JSONB gives me
+document-style flexibility <em>inside the same database</em> for the parts that are genuinely
+schema-variable, with GIN indexes making those queries fast. Choosing Mongo means either giving up or
+hand-rolling relational guarantees for the core data (application-level joins, weaker constraint
+enforcement — Mongo has multi-document transactions now, but they're bolted onto a document model rather
+than the foundation), and it means a second system to operate, back up, secure, and hire for. One
+well-understood Postgres with JSONB covers roughly 90% of 'we need a document store' cases.
+Where Mongo genuinely fits: the data really is document-shaped end-to-end with minimal cross-entity
+relationships, you want its horizontal scale-out sharding as a first-class built-in, or the team already
+runs it well. It's a legitimate tool — my default is just to exhaust the one-database option first, because
+operational simplicity compounds."</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="fts">Full-text search <span class="tier tier-3">T3</span></h2>
+
+<h3>Why not just ILIKE?</h3>
+<pre><code>SELECT * FROM articles WHERE body ILIKE '%postgres%';</code></pre>
+<p>
+A leading-wildcard <code>ILIKE</code> can't use a B-tree index — it's a sequential scan of every row, every
+time. It also has zero language awareness: no stemming ("running" won't match "run"), no ranking, no
+multi-word logic. Full-text search (FTS) fixes all of this inside Postgres.
+</p>
+
+<h3>tsvector + tsquery</h3>
+<pre><code>-- to_tsvector: normalize text into stemmed lexemes with positions
+SELECT to_tsvector('english', 'The quick brown foxes are jumping');
+-- 'brown':3 'fox':4 'jump':6 'quick':2     (stop words dropped, words stemmed)
+
+-- to_tsquery / plainto_tsquery / websearch_to_tsquery build the query side
+SELECT websearch_to_tsquery('english', '"connection pool" -bouncer');
+-- websearch_to_tsquery is friendliest for raw user input:
+-- quotes = phrase, - = NOT, OR supported, and it never throws on messy input
+
+-- The match operator
+SELECT to_tsvector('english', 'jumping foxes') @@ plainto_tsquery('english', 'fox jump');
+-- true</code></pre>
+
+<h3>Production pattern: generated column + GIN + ranking</h3>
+<pre><code>ALTER TABLE articles
+  ADD COLUMN search tsvector
+  GENERATED ALWAYS AS (
+    setweight(to_tsvector('english', coalesce(title, '')), 'A') ||
+    setweight(to_tsvector('english', coalesce(body,  '')), 'B')
+  ) STORED;
+
+CREATE INDEX idx_articles_search ON articles USING gin (search);
+
+SELECT id, title,
+       ts_rank(search, query) AS rank
+FROM articles,
+     websearch_to_tsquery('english', 'postgres replication lag') AS query
+WHERE search @@ query
+ORDER BY rank DESC
+LIMIT 20;</code></pre>
+<p>
+The generated column keeps the vector in sync automatically (no trigger needed on modern Postgres),
+<code>setweight</code> makes title matches outrank body matches, and the GIN index makes matching fast even
+on millions of rows.
+</p>
+
+<h3>When to graduate to Elasticsearch/OpenSearch</h3>
+<p>
+Postgres FTS comfortably covers "search our articles/products/tickets" for most apps. Reach for a dedicated
+search engine when you need: typo tolerance and sophisticated fuzzy relevance, faceted navigation at scale,
+search-specific analyzers per language at depth, or search QPS high enough that you want it off the primary
+database. The cost is a second system plus an indexing pipeline that is <em>eventually consistent</em> with
+your source of truth — the same class of sync problem as any cache.
+</p>
+<div class="note">
+<p>Related tool: the <code>pg_trgm</code> extension indexes trigrams so that
+<code>ILIKE '%foo%'</code> and fuzzy similarity queries can use a GIN index. FTS is for word/language search;
+pg_trgm is for substring and typo-ish matching (names, SKUs). They're complementary — know both exist.</p>
+</div>
+<pre><code>CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE INDEX idx_users_name_trgm ON users USING gin (name gin_trgm_ops);
+-- Now this can use the index:
+SELECT * FROM users WHERE name ILIKE '%rodrig%';</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="matviews">Materialized views <span class="tier tier-3">T3</span></h2>
+<p>
+A regular <code>VIEW</code> is a saved query — it runs fresh every time, always current, costs full query
+price. A <strong>materialized view</strong> runs the query once and <em>stores the result</em> like a table:
+reads are instant, but the data is frozen until you refresh it.
+</p>
+<pre><code>CREATE MATERIALIZED VIEW daily_revenue AS
+SELECT date_trunc('day', created_at) AS day,
+       count(*)          AS orders,
+       sum(total_cents)  AS revenue_cents
+FROM orders
+WHERE status = 'COMPLETED'
+GROUP BY 1;
+
+-- You can index it like a table
+CREATE UNIQUE INDEX idx_daily_revenue_day ON daily_revenue (day);
+
+-- Plain refresh: recomputes, but LOCKS the view against reads while doing so
+REFRESH MATERIALIZED VIEW daily_revenue;
+
+-- CONCURRENTLY: readers keep working during the refresh.
+-- Requirement: the matview must have a UNIQUE index (it diffs old vs new).
+REFRESH MATERIALIZED VIEW CONCURRENTLY daily_revenue;</code></pre>
+<table>
+  <thead><tr><th></th><th>View</th><th>Materialized view</th></tr></thead>
+  <tbody>
+    <tr><td>Freshness</td><td>Always current</td><td>Stale until refreshed</td></tr>
+    <tr><td>Read cost</td><td>Full underlying query</td><td>Table read (indexable)</td></tr>
+    <tr><td>Write cost</td><td>None</td><td>Periodic refresh recomputes the whole query</td></tr>
+  </tbody>
+</table>
+<p>
+Classic use case: dashboards and aggregation endpoints. A revenue rollup over 100M orders might take 30
+seconds live; as a matview refreshed every 10 minutes by a scheduled job, the API reads it in single-digit
+milliseconds and "up to 10 minutes stale" is an easy business sell. It's the same trade as caching —
+freshness for speed — but the "cache" lives in the database, is queryable with SQL, and refreshes atomically.
+Postgres has no built-in incremental refresh, so a refresh recomputes everything; if the base query itself
+becomes too slow to recompute, you graduate to incremental summary tables maintained by the application or
+triggers.
+</p>
+
+<!-- ============================================================ -->
+<h2 id="triggers">Triggers, functions &amp; LISTEN/NOTIFY <span class="tier tier-3">T3</span></h2>
+
+<h3>The canonical example: auto-touch updated_at</h3>
+<pre><code>CREATE OR REPLACE FUNCTION touch_updated_at()
+RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  NEW.updated_at := now();
+  RETURN NEW;              -- BEFORE triggers return the (possibly modified) row
+END;
+$$;
+
+CREATE TRIGGER trg_orders_touch
+BEFORE UPDATE ON orders
+FOR EACH ROW
+EXECUTE FUNCTION touch_updated_at();</code></pre>
+<p>
+Anatomy: a <strong>function</strong> holds the logic; a <strong>trigger</strong> binds it to table events
+(<code>BEFORE/AFTER</code> × <code>INSERT/UPDATE/DELETE</code> × <code>ROW/STATEMENT</code>). Inside a row
+trigger, <code>NEW</code> and <code>OLD</code> are the incoming and previous row versions. An audit-log
+trigger is the same shape with an <code>AFTER</code> timing and an <code>INSERT INTO audit_log ...</code> body.
+</p>
+
+<h3>The "business logic in the database?" debate</h3>
+<div class="senior">
+<p>The balanced senior answer: "Data <em>integrity</em> logic belongs in the database — constraints, FKs,
+CHECKs, and mechanical triggers like updated_at or audit trails, because they must hold no matter which code
+path writes. Domain logic — pricing rules, workflow transitions, notifications — belongs in the application:
+it needs unit tests, code review, debuggers, version control, and visibility, and trigger-based domain logic
+becomes invisible action-at-a-distance that surprises every future developer ('why did this row change? I
+only updated that one'). Triggers also can't easily be mocked and fire on <em>every</em> write, including
+migrations and bulk fixes. So: DB enforces what must always be true; app decides what should happen."</p>
+</div>
+
+<h3>LISTEN/NOTIFY: lightweight pub-sub</h3>
+<pre><code>-- Session A subscribes:
+LISTEN cache_invalidation;
+
+-- Session B (often from a trigger) publishes:
+NOTIFY cache_invalidation, 'products:42';
+-- or inside SQL/functions:
+SELECT pg_notify('cache_invalidation', 'products:42');</code></pre>
+<p>
+Every listening connection gets the payload — no polling. Great fits: cache invalidation across app
+instances, "wake up the worker, there's a new job row" (poll the table on notify, so nothing is lost),
+lightweight live-update pushes.
+</p>
+<div class="pitfall">
+<p>LISTEN/NOTIFY is <strong>not a message queue</strong>. Delivery is at-most-once to <em>currently
+connected</em> listeners — if your app was restarting, the notification is gone. There's no persistence, no
+replay, no acknowledgment, payloads are small (8KB), and it needs a real dedicated connection (awkward
+behind transaction-mode PgBouncer). Use it as a doorbell, keep the truth in a table; for durable messaging
+use a real queue/outbox+CDC.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="qa">Interview Q&amp;A</h2>
+
+<details class="qa"><summary>Why does Postgres need VACUUM at all?</summary>
+<div class="answer"><p>It's the cost of MVCC. Updates and deletes never remove data in place — they create
+new row versions and mark old ones expired, so readers never block writers. Once no transaction can see an
+old version it's dead weight. VACUUM reclaims that space for reuse, updates the visibility map (which
+index-only scans depend on), and freezes old transaction IDs to prevent xid wraparound. No VACUUM →
+unbounded bloat and, eventually, forced anti-wraparound shutdown.</p></div></details>
+
+<details class="qa"><summary>VACUUM vs VACUUM FULL — when would you use each?</summary>
+<div class="answer"><p>Plain VACUUM runs alongside normal traffic and marks dead-tuple space reusable within
+the file; it's what autovacuum runs continuously and it's almost always sufficient. VACUUM FULL rewrites the
+whole table into a compact new file and returns disk to the OS — but under an ACCESS EXCLUSIVE lock that
+blocks all reads and writes, so on a production table it's effectively an outage. I'd only use it to recover
+from severe historical bloat in a maintenance window, and I'd prefer pg_repack, which achieves the rewrite
+online. The real fix is preventing the bloat: tune autovacuum and eliminate long-running transactions.</p></div></details>
+
+<details class="qa"><summary>Autovacuum is running but a table keeps bloating. What do you check?</summary>
+<div class="answer"><p>First, long-running or idle-in-transaction sessions in <code>pg_stat_activity</code> —
+VACUUM can only remove tuples invisible to <em>all</em> transactions, so one stale transaction pins the
+cleanup horizon for everything (fix the app; set <code>idle_in_transaction_session_timeout</code> as a
+guardrail). Also stale replication slots for dead consumers, which hold the horizon the same way. Second,
+whether autovacuum simply can't keep up: on huge tables the default 20% scale factor means it triggers far
+too late — lower <code>autovacuum_vacuum_scale_factor</code> per-table, and consider raising autovacuum's
+cost limits so it works faster. <code>pg_stat_user_tables</code> (n_dead_tup, last_autovacuum) tells the story.</p></div></details>
+
+<details class="qa"><summary>What is transaction ID wraparound and should I be scared of it?</summary>
+<div class="answer"><p>Postgres xids are 32-bit and wrap, so row visibility for very old rows would become
+ambiguous after ~2 billion transactions. VACUUM prevents this by freezing old rows — marking them permanently
+visible so their xid no longer matters. If freezing falls billions of transactions behind, Postgres escalates:
+log warnings, then aggressive anti-wraparound vacuums, and in the extreme it refuses new transactions until
+vacuum catches up. Scared? No — respectful. You get abundant warning, and the root cause is always the same
+family: autovacuum starved, disabled, or blocked by something holding the xid horizon. Monitor
+<code>age(datfrozenxid)</code> and it's a non-event.</p></div></details>
+
+<details class="qa"><summary>Why are Postgres connections expensive, and what's the right pool size?</summary>
+<div class="answer"><p>Each connection is a forked OS process with megabytes of overhead, plus per-connection
+work_mem during queries — so connections cost memory, context switches, and lock contention, not just a
+socket. Throughput peaks at a surprisingly small number of active connections; the HikariCP guidance is
+roughly cores×2 plus effective disks for the <em>total across all app instances</em>. A small pool with
+requests queueing briefly beats a huge pool hammering the DB — same total work, far less thrashing. If the
+app fleet is large or elastic, multiplex through PgBouncer rather than raising max_connections.</p></div></details>
+
+<details class="qa"><summary>What does PgBouncer do, and what breaks in transaction pooling mode?</summary>
+<div class="answer"><p>PgBouncer is a lightweight proxy that accepts thousands of client connections and
+funnels them through a small pool of real Postgres connections. Transaction mode — the mode that actually
+multiplexes well — hands a server connection to a client only for the duration of each transaction. The
+catch: anything that assumes a persistent session breaks, because consecutive transactions may run on
+different server connections — session-level SET, temp tables, session advisory locks, LISTEN, and
+classically server-side prepared statements (prepared on one connection, executed on another). Mitigations:
+newer PgBouncer versions track protocol-level prepared statements; otherwise configure the JDBC driver to
+avoid server-side prepares, and keep session-state tricks out of the app.</p></div></details>
+
+<details class="qa"><summary>Explain streaming replication and the sync vs async trade-off.</summary>
+<div class="answer"><p>Every change goes through the WAL; streaming replication ships that WAL continuously
+to replicas, which replay it and serve read-only queries. Async (the default): commits return once durable on
+the primary — zero added write latency, but a primary failure can lose the last moments of commits (small
+RPO). Sync: the commit also waits for a sync replica to confirm — RPO of zero for confirmed commits, but
+every commit pays a network round trip and a sick sync replica can stall all writes. Most systems run async;
+sync is for data where losing one committed transaction is unacceptable, sometimes applied per-transaction
+via synchronous_commit so only critical writes pay.</p></div></details>
+
+<details class="qa"><summary>A user updates their profile, then immediately sees old data. What happened and how do you fix it?</summary>
+<div class="answer"><p>Classic read-your-own-writes violation from replication lag: the write hit the
+primary, the follow-up read was routed to an async replica that hadn't replayed it yet. Fixes, cheapest
+first: route that user's reads to the primary for a short window after any write (a TTL flag per user/session);
+pin the session to the primary after a write; lag-aware routing that ejects replicas beyond a lag threshold;
+or, most precisely, capture the primary's WAL LSN after the write and only let replicas serve that user once
+they've replayed past it. And for genuinely staleness-tolerant reads (feeds, analytics), just accept the lag.
+In Spring the split is typically an AbstractRoutingDataSource keyed on @Transactional(readOnly=true), with
+one of these mitigations layered on top.</p></div></details>
+
+<details class="qa"><summary>What's the difference between streaming and logical replication?</summary>
+<div class="answer"><p>Streaming is physical: it ships WAL bytes, replicating the whole cluster exactly —
+same major version, read-only replicas; it's the HA and read-scaling mechanism. Logical decodes the WAL into
+row-change events for selected tables via publications/subscriptions — the subscriber is a normal writable
+database and can be a different major version, which makes it the standard tool for near-zero-downtime
+upgrades and selective data distribution. The same logical decoding powers CDC tools like Debezium, which
+stream changes into Kafka — the production-grade transport for the outbox pattern.</p></div></details>
+
+<details class="qa"><summary>When would you partition a table, and when would you refuse to?</summary>
+<div class="answer"><p>I partition when the table is genuinely large (hundreds of millions of rows) AND
+there's a natural key that appears in queries and drives data lifecycle — typically time. The killer feature
+is retention: dropping an old month's partition is instant, versus a massive DELETE that runs for hours and
+floods VACUUM with dead tuples; secondary wins are per-partition maintenance and partition pruning. I'd
+refuse when the table is modest (indexes are enough), or when queries don't filter on any candidate key —
+then every query fans out to all partitions and gets slower, and you've paid the complexity tax (composite
+unique constraints, partition management automation) for negative return. Partitioning is a lifecycle tool,
+not a substitute for indexing.</p></div></details>
+
+<details class="qa"><summary>Why can't a partitioned table have a simple PRIMARY KEY (id)?</summary>
+<div class="answer"><p>Each partition maintains its own indexes; Postgres has no global cross-partition
+index, so it can't enforce uniqueness of a column that doesn't include the partition key — two partitions
+could otherwise each hold id=42. Hence every unique constraint and primary key must include the partition
+key, e.g. PRIMARY KEY (id, created_at). Knock-on effects: no plain unique email column on a partitioned
+table, and foreign keys referencing it need the composite key. It's one of the main hidden costs of
+partitioning and a reason not to partition casually.</p></div></details>
+
+<details class="qa"><summary>pg_dump vs pg_basebackup with WAL archiving — how do you choose?</summary>
+<div class="answer"><p>pg_dump is logical: a portable snapshot of schema and data, great for smaller
+databases, per-table exports, dev seeding, and cross-version migration — but restore rebuilds indexes
+(slow at scale) and you can only recover to dump time. Physical backup (pg_basebackup or pgBackRest/WAL-G)
+plus continuous WAL archiving gives point-in-time recovery: restore the base copy and replay WAL to any
+moment — 'to 14:02, right before the bad deploy dropped the table.' Production DR means physical + WAL
+(near-zero RPO; RTO governed by restore/replay time), often with pg_dump alongside for portability. And a
+backup is only real once you've drilled restoring it.</p></div></details>
+
+<details class="qa"><summary>Why choose Postgres with JSONB over MongoDB? (Give the full answer.)</summary>
+<div class="answer"><p>Most systems have a relational core — users, orders, payments — needing joins, foreign
+keys, unique constraints, and multi-row ACID transactions, which Postgres provides natively. JSONB then adds
+document flexibility inside the same database: binary storage, containment and path operators, GIN indexes
+for ad-hoc shape queries, expression B-tree indexes for hot fields. Choosing Mongo instead means recreating
+relational guarantees at the application layer for the core data (its transactions exist but are bolted onto
+a document model), plus a second system to operate, back up, monitor, secure, and hire for. One
+well-understood Postgres covers most 'we need a document store' cases: the sparse/variable data goes in a
+JSONB column next to real columns. Mongo genuinely fits when the data is document-shaped end-to-end with
+few cross-entity relationships, when built-in scale-out sharding is a hard requirement, or when the team
+already operates it well. My default is exhausting the one-database option first — operational simplicity
+compounds.</p></div></details>
+
+<details class="qa"><summary>What's the difference between -&gt; and -&gt;&gt; in JSONB, and why does it matter?</summary>
+<div class="answer"><p><code>-&gt;</code> returns <strong>jsonb</strong>; <code>-&gt;&gt;</code> returns
+<strong>text</strong>. It matters for every comparison: <code>payload -&gt; 'tier' = 'gold'</code> compares
+jsonb against a string and fails or surprises, while <code>payload -&gt;&gt; 'tier' = 'gold'</code> works.
+For numbers you extract text and cast: <code>(payload -&gt;&gt; 'qty')::int</code>. Practical pattern: chain
+<code>-&gt;</code> to navigate objects, end with <code>-&gt;&gt;</code> (or <code>#&gt;&gt;</code> with a
+path) to extract the final scalar. It also matters for indexing — an expression index must match the exact
+expression, operators included, that the query uses.</p></div></details>
+
+<details class="qa"><summary>How do you index JSONB queries efficiently?</summary>
+<div class="answer"><p>Two tools. For ad-hoc shape queries — 'find rows containing this sub-document' —
+a GIN index: default jsonb_ops supports containment (@&gt;) and key-existence (?); jsonb_path_ops is smaller
+and faster but only supports @&gt;. For a specific field you filter on constantly, a B-tree expression index
+on the extracted text — e.g. on <code>((payload -&gt; 'customer' -&gt;&gt; 'tier'))</code> — is smaller, faster,
+and supports range queries and ordering, which GIN can't. If a field earns an expression index it's usually
+also a candidate to be promoted to a real column. GIN indexes are costlier to update than B-trees, so on
+write-heavy tables index deliberately rather than slapping GIN on every jsonb column.</p></div></details>
+
+<details class="qa"><summary>Why is Postgres full-text search better than ILIKE, and when would you move to Elasticsearch?</summary>
+<div class="answer"><p>A leading-wildcard ILIKE is an unindexable sequential scan with zero language
+awareness. FTS normalizes text into stemmed lexemes (tsvector), matches structured queries (tsquery, with
+websearch_to_tsquery safely parsing raw user input), ranks with ts_rank, and — the key part — is served by a
+GIN index, so it stays fast at millions of rows. Production shape: a stored generated tsvector column with
+setweight for title-vs-body, plus a GIN index. I'd graduate to Elasticsearch when I need serious typo
+tolerance and relevance tuning, faceted search at scale, or enough search traffic that it should be off the
+primary — accepting the cost of a second system and an eventually-consistent indexing pipeline. For
+substring/fuzzy matching on names or SKUs, pg_trgm with a trigram GIN index accelerates ILIKE itself —
+different tool, complementary.</p></div></details>
+
+<details class="qa"><summary>Materialized view vs regular view vs cache — how do you frame the trade?</summary>
+<div class="answer"><p>A view is a saved query: always fresh, full price on every read. A materialized view
+stores the result: table-speed indexed reads, but stale until refreshed — and REFRESH CONCURRENTLY (which
+requires a unique index on the matview) lets you refresh without blocking readers. It's caching with the
+same fundamental trade — freshness for speed — but living in the database: queryable with SQL, joinable,
+atomically swapped on refresh, no serialization layer. Perfect for dashboards where 'revenue as of 10 minutes
+ago' is fine. Limits: no built-in incremental refresh, so each refresh recomputes everything; when that gets
+too heavy, move to incrementally-maintained summary tables.</p></div></details>
+
+<details class="qa"><summary>Should business logic live in database triggers?</summary>
+<div class="answer"><p>Split it by kind. Integrity and mechanical concerns — constraints, foreign keys,
+updated_at touching, audit trails — yes, in the database, because they must hold regardless of which code
+path writes. Domain logic — pricing, workflow, notifications — no: it needs tests, code review, debugging,
+and visibility, and trigger-hosted logic becomes invisible action-at-a-distance ('why did this row change?'),
+fires on every write including migrations and bulk fixes, and is hard to mock. My rule: the database
+enforces what must always be true; the application decides what should happen. When I do use a trigger,
+it's small, mechanical, and documented next to the schema migrations.</p></div></details>
+
+<details class="qa"><summary>What is LISTEN/NOTIFY good for, and why isn't it a message queue?</summary>
+<div class="answer"><p>It's built-in lightweight pub-sub: sessions LISTEN on a channel, NOTIFY pushes a small
+payload to all current listeners — no polling, no extra infrastructure. Good uses: cache invalidation across
+app instances, waking a worker when a job row is inserted. Why it's not a queue: delivery is at-most-once to
+currently-connected listeners only — a restarting consumer misses everything; no persistence, replay, or
+acks; small payloads; and it needs a dedicated real connection, which fights transaction-mode PgBouncer.
+The safe pattern is 'doorbell, not mailbox': the durable truth lives in a table (or an outbox consumed via
+CDC), NOTIFY just says 'check now.'</p></div></details>
+
+<details class="qa"><summary>Your dashboard queries are slowing the primary. Walk through your options.</summary>
+<div class="answer"><p>In escalating order. First, optimize: EXPLAIN the queries, fix indexes — often that's
+it. Second, precompute: materialized views refreshed on a schedule turn 30-second aggregations into
+millisecond reads, and dashboards tolerate staleness by nature. Third, offload: route read-only/reporting
+traffic to a streaming replica — lag is irrelevant for dashboards, though heavy analytics queries on a
+replica can conflict with WAL replay (know hot_standby_feedback exists, and its vacuum-horizon cost on the
+primary). Fourth, if analytics needs genuinely diverge — huge scans, columnar workloads — replicate into a
+proper warehouse via logical replication/CDC. I'd stop at the earliest step that meets the need.</p></div></details>
+
+<!-- ============================================================ -->
+<h2 id="exercises">Hands-on exercises</h2>
+
+<div class="exercise">
+<p><strong>1. Watch bloat happen, then fix it.</strong>
+In a scratch database, create a table and fill it:
+<code>CREATE TABLE bloaty (id int PRIMARY KEY, val text); INSERT INTO bloaty SELECT g, repeat('x', 100) FROM generate_series(1, 200000) g;</code>
+Note its size with <code>SELECT pg_size_pretty(pg_relation_size('bloaty'));</code>. Now update every row
+three times (<code>UPDATE bloaty SET val = val || 'y';</code> ×3) and check size and
+<code>n_dead_tup</code> in <code>pg_stat_user_tables</code>. Run <code>VACUUM VERBOSE bloaty;</code> — does
+the file shrink? (Mostly no — space is reclaimed for reuse.) Update all rows again and confirm the size stays
+flat this time. Finally, open a second session, run <code>BEGIN; SELECT 1;</code> and leave it idle, generate
+more dead tuples, and observe that VACUUM now reports tuples "not yet removable." Commit the idle transaction
+and vacuum again.</p>
+</div>
+
+<div class="exercise">
+<p><strong>2. Partitioning and pruning.</strong>
+Create the partitioned <code>orders</code> table from this page with three monthly partitions and insert a
+few thousand rows spread across months (use <code>generate_series</code> with random timestamps). Run
+<code>EXPLAIN SELECT count(*) FROM orders WHERE created_at &gt;= '2026-07-01' AND created_at &lt; '2026-07-08';</code>
+and confirm only one partition is scanned. Then run a query filtered only on <code>customer_id</code> and
+observe the Append over all partitions. Finish by "expiring" the oldest month with
+<code>DROP TABLE orders_2026_05;</code> and time it against a <code>DELETE</code> of equivalent rows on an
+unpartitioned copy.</p>
+</div>
+
+<div class="exercise">
+<p><strong>3. JSONB operators and indexing.</strong>
+Create the <code>events</code> table from this page and insert ~100k rows with varying payloads (mix tiers,
+random orderIds). Write queries using <code>-&gt;&gt;</code>, <code>#&gt;&gt;</code>, <code>@&gt;</code>, and
+<code>?</code>. EXPLAIN ANALYZE the containment query <code>payload @&gt; '{"customer": {"tier": "gold"}}'</code>
+before and after adding a GIN index (try both <code>jsonb_ops</code> and <code>jsonb_path_ops</code> and
+compare index sizes with <code>pg_size_pretty(pg_relation_size(...))</code>). Then add the expression B-tree
+index on the extracted tier and compare the plan for the equality query. Bonus: try
+<code>WHERE payload -&gt; 'customer' -&gt;&gt; 'tier' = 'gold' ORDER BY id LIMIT 10</code> with each index.</p>
+</div>
+
+<div class="exercise">
+<p><strong>4. Full-text search end to end.</strong>
+Create an <code>articles(id, title, body)</code> table and load a few hundred rows (paste paragraphs, or
+generate filler with distinctive keywords sprinkled in). Add the stored generated <code>tsvector</code> column
+with <code>setweight</code> (title = A, body = B) and a GIN index. Query with
+<code>websearch_to_tsquery</code>, order by <code>ts_rank</code>, and verify that a keyword appearing in a
+title outranks the same keyword in a body. Compare EXPLAIN output against <code>ILIKE '%keyword%'</code>.
+Bonus: install <code>pg_trgm</code>, add a trigram index on <code>title</code>, and confirm
+<code>ILIKE '%ostgre%'</code> switches from a sequential scan to an index scan.</p>
+</div>
+
+<nav class="page-nav">
+  <a href="14-postgres-transactions-mvcc.html">← Prev: Transactions &amp; MVCC</a>
+  <a href="16-capstone-project.html">Next: Capstone Project →</a>
+</nav>
+</main>
+</body>
+</html>

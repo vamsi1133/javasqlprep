@@ -1,0 +1,810 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>10 — Microservices &amp; Ecosystem | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header"><div class="container"><div class="breadcrumb"><a href="index.html">← Course Home</a></div><h1>10 — Microservices &amp; Ecosystem</h1><p>Architecture trade-offs, resilience patterns, Kafka, sagas &amp; the outbox — the distributed-systems layer of a senior Java interview</p></div></header>
+<main class="container">
+
+<p>At 7 years of experience, interviewers stop asking "what is a microservice?" and start asking <strong>"when would you <em>not</em> use one?"</strong> Even teams running a monolith ask these questions, because they test whether you understand distributed systems: partial failure, consistency trade-offs, and operational cost. You've spent years <em>consuming</em> these APIs from React — you already know what a flaky backend feels like from the browser. This page gives you the other side: why that spinner hung, why the retry made it worse, and what a senior engineer does about it. It's also the on-ramp to system-design rounds: every pattern here (circuit breakers, sagas, outbox, consumer groups) is a building block you'll be expected to reach for by name.</p>
+
+<div class="toc"><strong>On this page</strong><ol>
+<li><a href="#monolith-vs-microservices">Monolith vs Microservices — arguing both ways</a></li>
+<li><a href="#communication">Inter-service communication: sync vs async</a></li>
+<li><a href="#resilience">Resilience patterns with Resilience4j</a></li>
+<li><a href="#gateway">API Gateway, service discovery, central config</a></li>
+<li><a href="#kafka">Kafka fundamentals</a></li>
+<li><a href="#distributed-data">Distributed data: sagas, outbox, idempotency</a></li>
+<li><a href="#eventual-consistency">Eventual consistency &amp; the frontend</a></li>
+<li><a href="#observability">Observability, containers &amp; 12-factor</a></li>
+<li><a href="#vocab">Vocabulary drill</a></li>
+<li><a href="#qa">Interview Q&amp;A</a></li>
+<li><a href="#exercises">Hands-on exercises</a></li>
+</ol></div>
+
+<!-- ============================================================ -->
+<h2 id="monolith-vs-microservices">Monolith vs Microservices — arguing both ways <span class="tier tier-1">T1</span></h2>
+
+<p>The single biggest signal you can send in this topic is <strong>refusing to treat microservices as "the modern default."</strong> A senior answer weighs both architectures against a specific team and product, and knows that most systems should start as a well-structured monolith.</p>
+
+<h3>What microservices actually buy you</h3>
+<table>
+<thead><tr><th>Benefit</th><th>What it really means</th><th>When it matters</th></tr></thead>
+<tbody>
+<tr><td><strong>Independent deployability</strong></td><td>Team A ships the payments service Friday afternoon without coordinating with Team B's checkout release. Deploys become small and low-risk.</td><td>Many teams sharing one release train; deploy contention is the #1 practical driver.</td></tr>
+<tr><td><strong>Independent scaling</strong></td><td>The image-resizing service runs 40 pods; the admin service runs 2. You scale (and pay for) only the hot path.</td><td>Wildly asymmetric load profiles (e.g., search vs. account settings).</td></tr>
+<tr><td><strong>Team autonomy</strong></td><td>Each team owns its service end-to-end: code, schema, deploy, on-call. Fewer cross-team merge conflicts and meetings.</td><td>Org grows past ~3–4 teams touching the same codebase.</td></tr>
+<tr><td><strong>Fault isolation</strong></td><td>A memory leak in recommendations OOM-kills that service, not the checkout flow. Smaller <em>blast radius</em> — if you also add resilience patterns (see below).</td><td>Parts of the system have very different availability requirements.</td></tr>
+<tr><td><strong>Tech freedom</strong></td><td>The ML team uses Python; the core uses Java 21. Upgrade Spring Boot one service at a time.</td><td>Genuinely different workloads. Often overrated — polyglot sprawl is its own cost.</td></tr>
+</tbody>
+</table>
+
+<h3>What microservices cost you</h3>
+<table>
+<thead><tr><th>Cost</th><th>Concrete pain</th></tr></thead>
+<tbody>
+<tr><td><strong>Distributed-system complexity</strong></td><td>Every in-process method call becomes a network call that can fail, be slow, or succeed <em>without you knowing</em> (response lost). You now design for partial failure everywhere.</td></tr>
+<tr><td><strong>Network failure modes</strong></td><td>Timeouts, retries, retry storms, cascading failures, thundering herds. A monolith has none of these between its modules.</td></tr>
+<tr><td><strong>Data consistency</strong></td><td>No cross-service ACID transactions. You trade <code>@Transactional</code> for sagas, outboxes, and eventual consistency — a huge jump in design effort.</td></tr>
+<tr><td><strong>Observability burden</strong></td><td>A single user request now spans 6 services. Without correlation IDs, distributed tracing, and centralized logs, debugging is archaeology.</td></tr>
+<tr><td><strong>Operational overhead</strong></td><td>N services = N CI pipelines, N dashboards, N on-call surfaces, N sets of secrets, contract versioning between them, local-dev environments that need half the company running in Docker.</td></tr>
+<tr><td><strong>Latency</strong></td><td>An in-process call is ~nanoseconds; a service hop is ~1–10&nbsp;ms plus serialization. Chatty designs (10 hops per request) get slow fast.</td></tr>
+</tbody>
+</table>
+
+<div class="pitfall"><p><strong>The distributed monolith.</strong> The worst outcome: services split along the wrong boundaries so every feature change touches three repos, services call each other synchronously in deep chains, and they must be deployed together anyway. You pay all the microservice costs and get none of the benefits. Interviewers love hearing you name this failure mode — it shows you've seen (or can foresee) real damage.</p></div>
+
+<h3>The modular monolith: the sane default</h3>
+<p>A <strong>modular monolith</strong> is one deployable with strictly enforced internal module boundaries: each module has a public API (Java interfaces / a facade package), private internals, and ideally its own schema or table namespace. Spring Modulith and ArchUnit tests can enforce the boundaries at build time.</p>
+
+<pre><code>Modular monolith (one JVM, one deploy)          Microservices (N deploys)
+┌───────────────────────────────────┐        ┌─────────┐  ┌─────────┐
+│  orders/   payments/  inventory/  │        │ orders  │─▶│payments │
+│  ├─api     ├─api      ├─api       │  vs    └────┬────┘  └─────────┘
+│  └─internal└─internal └─internal  │             │ HTTP/Kafka
+│        one database (schemas)     │        ┌────▼────┐   3 DBs, 3 pipelines,
+└───────────────────────────────────┘        │inventory│   3 on-call rotations
+  in-process calls, ACID txns                └─────────┘
+</code></pre>
+
+<p>The killer argument: <strong>module boundaries are cheap to change; service boundaries are expensive to change.</strong> Early in a product's life you don't yet know the right boundaries (they follow the domain, which is still being discovered). Get them wrong inside a monolith → refactor. Get them wrong across services → data migrations, API version dances, cross-team coordination. So: find the seams in a monolith first, extract services later <em>along proven seams</em>.</p>
+
+<h3>"When would you split?" — a decision framework</h3>
+<ol>
+<li><strong>Team size / cognitive load.</strong> Roughly: one codebase per 2–4 teams max. If 8 teams queue behind one release train and step on each other's code, split along team ownership lines. (Amazon's "two-pizza team owns a service" heuristic.)</li>
+<li><strong>Deploy contention.</strong> If releases are blocked because unrelated changes share a pipeline, and trunk is red half the time because of someone else's module — that's the most concrete trigger.</li>
+<li><strong>Independent scaling need.</strong> One workload needs 50× the resources of the rest (e.g., a PDF-rendering path), or needs different hardware (GPU).</li>
+<li><strong>Divergent non-functionals.</strong> One part needs 99.99% availability and another is a batch back-office tool; one part must be PCI-scoped and you want the audit boundary small.</li>
+<li><strong>A genuinely separate bounded context</strong> with a narrow, stable interface — the DDD test. If the candidate service would need to join the monolith's tables, it's not a real boundary yet.</li>
+</ol>
+<p>If none of these pressures exist, the split is résumé-driven architecture. Say that (politely) in an interview.</p>
+
+<h3>Conway's law</h3>
+<p><em>"Organizations design systems that mirror their own communication structure."</em> Practical reading: your architecture will end up matching your org chart whether you like it or not, so do the <strong>inverse Conway maneuver</strong> — shape teams around the service boundaries you want. Splitting a system across teams that must constantly coordinate just moves the coupling from code review to meetings. When an interviewer asks "how do you decide service boundaries?", mentioning team ownership and Conway's law alongside bounded contexts is a strong senior signal.</p>
+
+<div class="senior"><p>A crisp 30-second answer: "I default to a modular monolith with enforced boundaries. I extract a service when there's a concrete forcing function — deploy contention across teams, an asymmetric scaling need, or an isolation/compliance requirement — and I extract along a boundary the monolith has already proven, using strangler-fig style incremental extraction rather than a big-bang rewrite. Microservices are an organizational scaling tool more than a technical one."</p></div>
+
+<!-- ============================================================ -->
+<h2 id="communication">Inter-service communication: sync vs async <span class="tier tier-2">T2</span></h2>
+
+<p>Two fundamental styles, and the choice shapes everything downstream — failure modes, consistency, and debuggability.</p>
+
+<h3>Synchronous request/response (REST, gRPC)</h3>
+<pre><code>Order Service ──HTTP GET /users/42──▶ User Service
+      ◀────────── 200 {…} ───────────
+(caller blocks; both must be up at the same moment = temporal coupling)
+</code></pre>
+<ul>
+<li><strong>Pros:</strong> simple mental model, immediate answer, easy to debug (one request, one response), fits naturally when the caller <em>needs</em> the result to proceed (price check before charging).</li>
+<li><strong>Cons:</strong> <strong>temporal coupling</strong> — both services must be healthy simultaneously. Latencies add up across chains. Worst of all: <strong>cascading failure</strong> — if User Service hangs, Order Service's threads pile up waiting, its own callers pile up waiting on it, and one slow leaf takes down the tree.</li>
+</ul>
+
+<h3>Asynchronous messaging (Kafka, RabbitMQ, SQS)</h3>
+<pre><code>Order Service ──publish OrderPlaced──▶ [ broker ] ──▶ Inventory Service
+                                                  └──▶ Email Service
+(producer doesn't know or care who consumes; consumers can be down and catch up later)
+</code></pre>
+<ul>
+<li><strong>Pros:</strong> temporal <em>de</em>coupling (broker buffers while a consumer is down or slow), natural load-leveling, fan-out to new consumers without touching the producer, resilience by default.</li>
+<li><strong>Cons:</strong> eventual consistency (the caller gets "accepted", not "done"), harder to reason about ("who consumes this event?"), duplicate delivery to design for, and operating a broker is real work.</li>
+</ul>
+
+<table>
+<thead><tr><th></th><th>Sync REST/gRPC</th><th>Async messaging</th></tr></thead>
+<tbody>
+<tr><td>Coupling</td><td>Temporal + location</td><td>Only to the message contract</td></tr>
+<tr><td>Failure mode</td><td>Cascading failures, timeouts</td><td>Growing consumer lag, duplicates</td></tr>
+<tr><td>Consistency</td><td>Read-your-call immediately</td><td>Eventual</td></tr>
+<tr><td>Best for</td><td>Queries; commands needing an immediate answer</td><td>Notifications, workflows, integration events, load spikes</td></tr>
+</tbody>
+</table>
+
+<div class="senior"><p>Rule of thumb worth saying out loud: <strong>queries tend to be sync, state-change notifications tend to be async.</strong> "Get me the user's profile" → REST. "An order was placed, whoever cares should react" → event. And prefer <em>shallow</em> sync call graphs: if A→B→C→D synchronously, the availability of the whole chain is the product of each hop's availability (0.99⁴ ≈ 0.96) and the latency is the sum.</p></div>
+
+<h3>OpenFeign: declarative REST clients</h3>
+<p>Spring Cloud OpenFeign turns an interface into an HTTP client — it will feel like a typed <code>fetch</code> wrapper generated from an interface:</p>
+
+<pre><code><span class="ann">@FeignClient</span>(name = <span class="str">"user-service"</span>, url = <span class="str">"${clients.user-service.url}"</span>)
+<span class="kw">public interface</span> <span class="typ">UserClient</span> {
+
+    <span class="ann">@GetMapping</span>(<span class="str">"/api/users/{id}"</span>)
+    <span class="typ">UserDto</span> getUser(<span class="ann">@PathVariable</span>(<span class="str">"id"</span>) <span class="kw">long</span> id);
+}
+
+<span class="com">// usage — Spring generates the implementation</span>
+<span class="ann">@Service</span>
+<span class="kw">public class</span> <span class="typ">OrderService</span> {
+    <span class="kw">private final</span> <span class="typ">UserClient</span> userClient;
+
+    <span class="kw">public</span> <span class="typ">OrderDetails</span> enrich(<span class="typ">Order</span> order) {
+        <span class="typ">UserDto</span> user = userClient.getUser(order.userId()); <span class="com">// looks local, is a network call!</span>
+        <span class="kw">return new</span> <span class="typ">OrderDetails</span>(order, user);
+    }
+}
+</code></pre>
+
+<pre><code><span class="com"># application.yml — NEVER ship a client without explicit timeouts</span>
+spring:
+  cloud:
+    openfeign:
+      client:
+        config:
+          user-service:
+            connectTimeout: <span class="num">1000</span>    <span class="com"># ms to establish the TCP connection</span>
+            readTimeout: <span class="num">2000</span>       <span class="com"># ms to wait for the response</span>
+</code></pre>
+
+<div class="pitfall"><p><strong>Timeouts are non-negotiable on every remote call.</strong> Default timeouts are often infinite or absurdly long (e.g., 60s+). One hung downstream with no timeout = your worker threads exhaust = <em>your</em> service is now down too, for all endpoints, even ones that never touch that dependency. Pick timeouts from the callee's p99 latency plus headroom (e.g., p99 is 300&nbsp;ms → timeout 1s), not from vibes. Connect timeout short (~1s), read timeout based on the operation. This is the single most common real-world resilience miss.</p></div>
+
+<div class="note"><p>Feign's elegance is also its danger: the call <em>looks</em> like a local method. Treat every Feign interface as a shouted reminder that failure, latency, and retries all apply. That's why the next section exists.</p></div>
+
+<!-- ============================================================ -->
+<h2 id="resilience">Resilience patterns with Resilience4j <span class="tier tier-2">T2</span></h2>
+
+<p>Resilience4j is the standard library for these patterns in Spring (Hystrix is dead/maintenance-mode — mention that if asked). Each pattern answers a specific failure question.</p>
+
+<h3>Circuit breaker — fail fast, let downstream recover</h3>
+<p><strong>Problem:</strong> a dependency is down. Every call still burns a thread for the full timeout, and your callers pile up. Worse, your traffic keeps hammering the struggling dependency so it can never recover.</p>
+<p><strong>Solution:</strong> track the failure rate. Past a threshold, "open the circuit": reject calls <em>instantly</em> (fail fast) for a cool-down period, then probe cautiously.</p>
+
+<pre><code>            failure rate ≥ threshold
+   ┌────────┐  (over sliding window)   ┌────────┐
+   │ CLOSED │ ────────────────────────▶│  OPEN  │  all calls fail fast with
+   │ normal │                          │        │  CallNotPermittedException
+   └────────┘◀───────┐                 └───┬────┘
+        ▲            │                     │ waitDurationInOpenState elapses
+        │   probes   │                     ▼
+        │   succeed  │                ┌───────────┐
+        └────────────┴────────────────│ HALF_OPEN │ lets N trial calls through
+                       probes fail ──▶│  probing  │ (permittedNumberOfCalls
+                       (back to OPEN) └───────────┘  InHalfOpenState)
+</code></pre>
+
+<ul>
+<li><strong>CLOSED:</strong> normal operation; outcomes recorded in a sliding window (count-based, e.g., last 100 calls, or time-based).</li>
+<li><strong>OPEN:</strong> failure rate (or <em>slow-call</em> rate!) crossed the threshold. Calls are rejected immediately — no thread burned, no load on the sick dependency. This is the point: <strong>fail fast for you, breathing room for them.</strong></li>
+<li><strong>HALF_OPEN:</strong> after the wait duration, a handful of real calls are let through as probes. All good → CLOSED. Failures → back to OPEN.</li>
+</ul>
+
+<pre><code><span class="com"># application.yml</span>
+resilience4j:
+  circuitbreaker:
+    instances:
+      userService:
+        slidingWindowType: COUNT_BASED
+        slidingWindowSize: <span class="num">20</span>              <span class="com"># evaluate over last 20 calls</span>
+        minimumNumberOfCalls: <span class="num">10</span>            <span class="com"># don't judge on tiny samples</span>
+        failureRateThreshold: <span class="num">50</span>            <span class="com"># % failures to trip</span>
+        slowCallDurationThreshold: 2s       <span class="com"># a "slow" call counts against you too</span>
+        slowCallRateThreshold: <span class="num">80</span>
+        waitDurationInOpenState: 10s
+        permittedNumberOfCallsInHalfOpenState: <span class="num">3</span>
+</code></pre>
+
+<pre><code><span class="ann">@CircuitBreaker</span>(name = <span class="str">"userService"</span>, fallbackMethod = <span class="str">"getUserFallback"</span>)
+<span class="kw">public</span> <span class="typ">UserDto</span> getUser(<span class="kw">long</span> id) {
+    <span class="kw">return</span> userClient.getUser(id);
+}
+
+<span class="com">// same signature + trailing exception parameter</span>
+<span class="kw">private</span> <span class="typ">UserDto</span> getUserFallback(<span class="kw">long</span> id, <span class="typ">Throwable</span> t) {
+    log.warn(<span class="str">"user-service unavailable, serving placeholder for {}"</span>, id, t);
+    <span class="kw">return</span> <span class="typ">UserDto</span>.anonymous(id);   <span class="com">// degraded but useful: cached copy, default, or partial page</span>
+}
+</code></pre>
+
+<div class="senior"><p>A good fallback is a <em>product decision</em>, not just a try/catch: show cached recommendations, a default shipping estimate, or hide the widget — like an error boundary in React that renders something useful instead of a white screen. If there's no sensible degraded answer (e.g., payment authorization), the right fallback is a fast, clear error — never a fake success.</p></div>
+
+<h3>Retry — exponential backoff + jitter, idempotent only</h3>
+<p><strong>Problem:</strong> transient blips (connection reset, brief 503, leader election). <strong>Solution:</strong> try again — carefully.</p>
+<pre><code>resilience4j:
+  retry:
+    instances:
+      userService:
+        maxAttempts: <span class="num">3</span>
+        waitDuration: 200ms
+        enableExponentialBackoff: <span class="kw">true</span>
+        exponentialBackoffMultiplier: <span class="num">2</span>       <span class="com"># 200ms → 400ms → 800ms</span>
+        enableRandomizedWait: <span class="kw">true</span>            <span class="com"># jitter — see pitfall</span>
+        retryExceptions:
+          - java.io.IOException
+          - feign.RetryableException
+        ignoreExceptions:
+          - com.example.BusinessException     <span class="com"># a 400/422 will never succeed on retry</span>
+</code></pre>
+<ul>
+<li><strong>Only retry transient failures</strong>: timeouts, 502/503/504, connection errors. Never a 400/401/404/422 — the request is wrong, not unlucky.</li>
+<li><strong>Only retry idempotent operations.</strong> Retrying <code>GET</code> is safe. Retrying <code>POST /payments</code> after a timeout may <strong>charge the customer twice</strong> — the timeout doesn't tell you whether the first attempt succeeded. Make writes idempotent first (idempotency keys, later section), then retry.</li>
+<li><strong>Jitter matters:</strong> if 5,000 clients fail at the same instant and all retry exactly 200&nbsp;ms later, you've synchronized a <em>retry storm</em> — a self-inflicted DDoS wave hitting a recovering service (thundering herd). Randomizing the wait spreads the wave.</li>
+</ul>
+<div class="pitfall"><p><strong>Retry amplification across layers.</strong> If the gateway retries 3×, the service retries 3×, and the client retries 3×, one user click becomes 27 requests to the struggling dependency. Retry near the edge <em>or</em> deep in the stack — not at every layer. Circuit breakers cap the damage.</p></div>
+
+<h3>Timeout — TimeLimiter</h3>
+<pre><code>resilience4j:
+  timelimiter:
+    instances:
+      userService:
+        timeoutDuration: 2s
+        cancelRunningFuture: <span class="kw">true</span>
+
+<span class="com">// TimeLimiter needs an async return type</span>
+<span class="ann">@TimeLimiter</span>(name = <span class="str">"userService"</span>)
+<span class="kw">public</span> <span class="typ">CompletableFuture</span>&lt;<span class="typ">UserDto</span>&gt; getUserAsync(<span class="kw">long</span> id) {
+    <span class="kw">return</span> <span class="typ">CompletableFuture</span>.supplyAsync(() -&gt; userClient.getUser(id));
+}
+</code></pre>
+<p>In practice most timeouts live on the HTTP client itself (Feign/WebClient config, shown earlier) — <code>TimeLimiter</code> adds an overall budget on top, useful when a single logical operation makes several calls.</p>
+
+<h3>Bulkhead — isolate so one slow dependency can't drown everything</h3>
+<p>Named after ship compartments: one flooded compartment shouldn't sink the ship. Without it, a slow recommendations API can consume <em>all</em> of Tomcat's worker threads, taking down checkout too — even though checkout never calls recommendations.</p>
+<pre><code>Without bulkhead:                      With bulkhead:
+[ 200 shared threads ]                 [ checkout: 150 ] [ recs: 25 ] [ other: 25 ]
+slow recs call eats all 200            recs pool saturates → recs calls rejected fast,
+→ WHOLE service unresponsive           checkout unaffected
+</code></pre>
+<pre><code>resilience4j:
+  bulkhead:                    <span class="com"># semaphore-based: caps concurrent calls</span>
+    instances:
+      recommendations:
+        maxConcurrentCalls: <span class="num">25</span>
+        maxWaitDuration: 0     <span class="com"># don't queue — reject immediately</span>
+  thread-pool-bulkhead:        <span class="com"># dedicated pool: full isolation for async calls</span>
+    instances:
+      recommendations:
+        coreThreadPoolSize: <span class="num">10</span>
+        maxThreadPoolSize: <span class="num">25</span>
+        queueCapacity: <span class="num">50</span>
+</code></pre>
+
+<h3>Rate limiter — protect yourself and others</h3>
+<pre><code>resilience4j:
+  ratelimiter:
+    instances:
+      partnerApi:
+        limitForPeriod: <span class="num">50</span>          <span class="com"># 50 calls…</span>
+        limitRefreshPeriod: 1s      <span class="com"># …per second</span>
+        timeoutDuration: 100ms      <span class="com"># wait up to 100ms for a permit, else fail</span>
+</code></pre>
+<p>Use it outbound to honor a partner's quota, or inbound (usually at the gateway) to protect yourself from abusive or buggy clients.</p>
+
+<h3>Combining patterns — order matters</h3>
+<p>Stack the annotations and Resilience4j applies them in a fixed default order (outermost first):</p>
+<pre><code>Retry ( CircuitBreaker ( RateLimiter ( TimeLimiter ( Bulkhead ( yourCall ) ) ) ) )
+</code></pre>
+<pre><code><span class="ann">@Retry</span>(name = <span class="str">"userService"</span>)
+<span class="ann">@CircuitBreaker</span>(name = <span class="str">"userService"</span>, fallbackMethod = <span class="str">"fallback"</span>)
+<span class="ann">@TimeLimiter</span>(name = <span class="str">"userService"</span>)
+<span class="ann">@Bulkhead</span>(name = <span class="str">"userService"</span>)
+<span class="kw">public</span> <span class="typ">CompletableFuture</span>&lt;<span class="typ">UserDto</span>&gt; getUser(<span class="kw">long</span> id) { … }
+</code></pre>
+<p>Why this order is sensible: the <strong>timeout</strong> bounds each individual attempt; each timed-out attempt is a <em>failure recorded by the circuit breaker</em>; the <strong>retry</strong>, outermost, decides whether to attempt again — and if the breaker has opened meanwhile, the retry hits <code>CallNotPermittedException</code> instantly instead of burning another timeout. If you put retry <em>inside</em> the breaker, one logical call could register as three failures and trip the breaker prematurely — a subtlety worth mentioning in an interview.</p>
+
+<div class="note"><p>Frontend analogy that lands well: a circuit breaker is like your React app noticing the API is down and switching the whole widget to a cached/offline state instead of firing a failing <code>fetch</code> on every render tick.</p></div>
+
+<!-- ============================================================ -->
+<h2 id="gateway">API Gateway, service discovery, central config <span class="tier tier-2">T2</span></h2>
+
+<h3>API Gateway — the single front door</h3>
+<pre><code>                        ┌──────────────────────┐
+  Browser/Mobile ─────▶ │      API GATEWAY     │────▶ order-service
+  (one origin,          │ • routing            │────▶ user-service
+   one TLS cert,        │ • authN (JWT check)  │────▶ catalog-service
+   one auth story)      │ • rate limiting      │
+                        │ • CORS termination   │
+                        └──────────────────────┘
+</code></pre>
+<p>Responsibilities you should rattle off: <strong>routing</strong> (path/host → service), <strong>authentication</strong> (validate the JWT once at the edge; services then trust the gateway or re-verify a lightweight internal token), <strong>rate limiting</strong>, <strong>CORS termination</strong> (one place sets the headers — as a frontend dev you know the pain of per-service CORS drift), plus TLS termination, request logging, and sometimes response aggregation (BFF pattern). Spring Cloud Gateway config:</p>
+
+<pre><code><span class="com"># Spring Cloud Gateway</span>
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: orders
+          uri: lb://order-service          <span class="com"># lb:// = resolve via service discovery</span>
+          predicates:
+            - Path=/api/orders/**
+          filters:
+            - StripPrefix=1
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: <span class="num">100</span>
+                redis-rate-limiter.burstCapacity: <span class="num">200</span>
+        - id: users
+          uri: lb://user-service
+          predicates:
+            - Path=/api/users/**
+</code></pre>
+
+<div class="pitfall"><p>Don't let the gateway grow business logic. Once it starts transforming payloads and enforcing domain rules, it becomes a shared bottleneck every team must change — a mini distributed monolith at the front door. Cross-cutting concerns only.</p></div>
+
+<h3>Service discovery</h3>
+<p>Instances come and go (autoscaling, deploys, crashes), so hardcoded hosts don't work. Two flavors:</p>
+<ul>
+<li><strong>Client-side (Eureka):</strong> services register with a registry and heartbeat; callers fetch the instance list and load-balance client-side (Spring Cloud LoadBalancer). Classic Netflix stack.</li>
+<li><strong>Platform-provided (Kubernetes DNS):</strong> in K8s, a <em>Service</em> object gives a stable DNS name (<code>http://user-service</code>) with built-in load balancing across healthy pods. <strong>This is why Eureka is fading</strong> — the platform does discovery. Say this: "on Kubernetes I'd just use Service DNS; Eureka matters mostly on VMs or non-K8s setups."</li>
+</ul>
+
+<h3>Centralized configuration</h3>
+<p>Awareness level: config shouldn't be baked into the jar (12-factor). Options: <strong>Spring Cloud Config Server</strong> (config in a Git repo, served to services, refreshable via <code>@RefreshScope</code> + actuator), or on K8s, <strong>ConfigMaps/Secrets</strong> mounted as env vars or files. Secrets belong in a secret manager (Vault, AWS Secrets Manager), never in Git plaintext.</p>
+
+<!-- ============================================================ -->
+<h2 id="kafka">Kafka fundamentals <span class="tier tier-2">T2</span></h2>
+
+<h3>Log, not queue — the mental model</h3>
+<p>A traditional queue (RabbitMQ classic queues) <em>removes</em> a message once consumed. Kafka is a <strong>distributed, append-only, durable log</strong>: messages are written to the end, retained for a configured time (e.g., 7 days) <em>regardless of consumption</em>, and each consumer just remembers its own position (<strong>offset</strong>). Consequences:</p>
+<ul>
+<li>Multiple independent consumer groups read the same data without copies (fan-out for free).</li>
+<li>You can <strong>replay</strong>: reset offsets and reprocess history (rebuild a projection, backfill a new service, recover from a consumer bug).</li>
+<li>Consuming is cheap sequential reads; Kafka sustains enormous throughput.</li>
+</ul>
+
+<h3>Topics, partitions, ordering</h3>
+<pre><code>topic: orders (3 partitions)
+partition 0: [m0][m3][m6]…   ← strictly ordered WITHIN the partition
+partition 1: [m1][m4][m7]…
+partition 2: [m2][m5][m8]…
+
+producer:  partition = hash(key) % numPartitions
+           key = orderId  →  all events for one order land in ONE partition, in order
+           key = null     →  round-robin/sticky, no ordering guarantee at all
+</code></pre>
+<ul>
+<li>A topic is split into <strong>partitions</strong> — the unit of parallelism <em>and</em> the unit of ordering. <strong>Kafka guarantees ordering only within a single partition, never across the topic.</strong></li>
+<li>The <strong>message key</strong> decides the partition. Choosing the key is a design decision: key by <code>orderId</code> and all events for an order are totally ordered; key by <code>userId</code> and one hyperactive user (or a null-key celebrity account keyed by <code>userId</code>) can create a <strong>hot partition</strong> that lags while its siblings idle.</li>
+<li>Partition count is your max consumer parallelism, and it's painful to change (repartitioning breaks key→partition mapping), so size it with headroom.</li>
+</ul>
+
+<h3>Consumer groups</h3>
+<pre><code>topic orders (3 partitions)      consumer group "inventory-svc"
+   p0 ──────────────────────────▶ consumer A
+   p1 ──────────────────────────▶ consumer B
+   p2 ──────────────────────────▶ consumer B      (a partition has exactly ONE
+                                                   consumer within a group)
+4th consumer in this group? → sits IDLE. consumers ≤ partitions for useful scaling.
+
+group "email-svc" reads the SAME topic independently with its own offsets.
+</code></pre>
+<p>Each partition is assigned to exactly one consumer <em>within a group</em>; different groups are fully independent. To scale processing, add consumers up to the partition count.</p>
+
+<h3>Offsets &amp; commit strategies — where duplicates come from</h3>
+<ul>
+<li><strong>Auto-commit</strong> (<code>enable.auto.commit=true</code>): offsets committed on a timer (default every 5s), decoupled from whether <em>your processing</em> succeeded. Crash after commit but before processing → <strong>message lost</strong>. Crash after processing but before commit → <strong>reprocessed</strong>. Fine for metrics; wrong for money.</li>
+<li><strong>Manual commit</strong> (Spring Kafka <code>AckMode.MANUAL</code> / <code>RECORD</code>): process, <em>then</em> acknowledge. Crash before the ack → the record is redelivered → <strong>at-least-once</strong>: you never lose a message, but you <em>will</em> see duplicates.</li>
+</ul>
+<div class="pitfall"><p><strong>At-least-once is the practical default, therefore consumer idempotency is mandatory, not optional.</strong> Design every consumer to survive seeing the same event twice: check a processed-event-ID table before acting, use DB upserts/unique constraints, or make the operation naturally idempotent ("set status = SHIPPED" is safe to repeat; "balance += 10" is not). Interviewers probe this constantly.</p></div>
+
+<h3>Producer side: acks and idempotence</h3>
+<table>
+<thead><tr><th><code>acks</code></th><th>Meaning</th><th>Trade-off</th></tr></thead>
+<tbody>
+<tr><td><code>0</code></td><td>Fire and forget — don't wait for the broker</td><td>Fastest; silent loss on any failure. Metrics/telemetry only.</td></tr>
+<tr><td><code>1</code></td><td>Leader wrote it</td><td>Lost if the leader dies before replication.</td></tr>
+<tr><td><code>all</code></td><td>All in-sync replicas have it (pair with <code>min.insync.replicas=2</code>)</td><td>Durable; slightly higher latency. The default for anything that matters.</td></tr>
+</tbody>
+</table>
+<p><strong>Idempotent producer</strong> (<code>enable.idempotence=true</code>, on by default in modern clients): the broker deduplicates producer <em>retries</em> using a producer ID + sequence number, so a retried send can't create a duplicate <em>in the log</em>. Note the scope: it fixes producer-retry duplicates only — it does nothing about your consumer processing a message twice.</p>
+
+<h3>Exactly-once semantics — the honest answer</h3>
+<p>Kafka offers <strong>transactions</strong>: a consumer-transform-produce pipeline can commit consumed offsets and produced messages atomically, with downstream consumers reading <code>isolation.level=read_committed</code>. That is real exactly-once — <strong>but only within Kafka</strong> (topic → app → topic, e.g., Kafka Streams). The moment a side effect leaves Kafka — writing Postgres, calling Stripe, sending an email — <strong>no broker setting can make it exactly-once</strong>. There's no distributed transaction spanning Kafka and your DB. The engineering answer is: <em>at-least-once delivery + idempotent effects = effectively-once outcomes</em>. Saying exactly that sentence in an interview is worth more than reciting transaction configs.</p>
+
+<h3>Rebalancing</h3>
+<p>When a consumer joins/leaves/crashes (or is <em>presumed</em> crashed because it didn't poll within <code>max.poll.interval.ms</code>), the group <strong>rebalances</strong>: partitions are reassigned. During a classic (eager) rebalance all consumers stop — a processing pause. Modern clients use the <strong>cooperative sticky assignor</strong> which moves only the partitions that must move. Classic incident: a slow consumer takes too long processing a batch → coordinator evicts it → rebalance → its records get redelivered elsewhere → more load → more slowness. Fixes: smaller <code>max.poll.records</code>, faster processing, or move heavy work off the poll thread.</p>
+
+<h3>Dead-letter queue (DLQ)</h3>
+<p>A poison message (bad payload, bug in the handler) will fail forever; endless retries block the partition behind it (head-of-line blocking). Pattern: retry a few times, then publish the failing record to <code>orders.DLT</code> with error metadata, commit, move on. Alert on DLQ depth; build a redrive path for after the fix.</p>
+
+<pre><code><span class="com">// Spring Kafka: listener + retry-then-DLQ error handling</span>
+<span class="ann">@Component</span>
+<span class="kw">public class</span> <span class="typ">OrderEventsListener</span> {
+
+    <span class="ann">@KafkaListener</span>(topics = <span class="str">"orders"</span>, groupId = <span class="str">"inventory-svc"</span>)
+    <span class="kw">public void</span> onOrderPlaced(<span class="typ">ConsumerRecord</span>&lt;<span class="typ">String</span>, <span class="typ">OrderPlaced</span>&gt; record,
+                              <span class="typ">Acknowledgment</span> ack) {
+        <span class="typ">OrderPlaced</span> event = record.value();
+        <span class="kw">if</span> (processedEvents.alreadyHandled(event.eventId())) { <span class="com">// idempotency guard</span>
+            ack.acknowledge();
+            <span class="kw">return</span>;
+        }
+        inventoryService.reserve(event.orderId(), event.lines());
+        processedEvents.markHandled(event.eventId());   <span class="com">// same DB tx as reserve()</span>
+        ack.acknowledge();                              <span class="com">// manual commit AFTER success</span>
+    }
+}
+
+<span class="ann">@Bean</span>
+<span class="typ">DefaultErrorHandler</span> errorHandler(<span class="typ">KafkaTemplate</span>&lt;<span class="typ">Object</span>, <span class="typ">Object</span>&gt; template) {
+    <span class="kw">var</span> recoverer = <span class="kw">new</span> <span class="typ">DeadLetterPublishingRecoverer</span>(template); <span class="com">// → orders.DLT</span>
+    <span class="kw">return new</span> <span class="typ">DefaultErrorHandler</span>(recoverer,
+            <span class="kw">new</span> <span class="typ">ExponentialBackOff</span>(<span class="num">500L</span>, <span class="num">2.0</span>));  <span class="com">// retry with backoff, then DLQ</span>
+}
+</code></pre>
+
+<h3>Kafka vs RabbitMQ — decision table</h3>
+<table>
+<thead><tr><th>Dimension</th><th>Kafka</th><th>RabbitMQ</th></tr></thead>
+<tbody>
+<tr><td>Model</td><td>Durable replicated log; consumers track offsets</td><td>Smart broker, queues; messages removed on ack</td></tr>
+<tr><td>Throughput</td><td>Very high (millions/s); built for firehoses</td><td>Good (tens of thousands/s typical); per-message features cost</td></tr>
+<tr><td>Replay</td><td>Yes — reset offsets, reprocess history</td><td>No (consumed = gone; streams plugin narrows this)</td></tr>
+<tr><td>Routing</td><td>Basic (topic + key)</td><td>Rich: exchanges, routing keys, headers, priorities, per-message TTL</td></tr>
+<tr><td>Ordering</td><td>Per-partition, controlled by key</td><td>Per-queue FIFO, but competing consumers break it</td></tr>
+<tr><td>Consumer scaling</td><td>Consumer groups, bounded by partitions</td><td>Just add consumers to a queue</td></tr>
+<tr><td>Sweet spot</td><td>Event streaming, event sourcing, high-volume pipelines, multiple independent readers</td><td>Task/work queues, RPC-ish messaging, complex routing, lower ops footprint</td></tr>
+</tbody>
+</table>
+<div class="senior"><p>One-liner: "Kafka when the data is a <em>stream of facts</em> multiple systems care about (and replay matters); RabbitMQ when it's <em>jobs to be done once</em> with rich routing. And I wouldn't introduce Kafka for one queue's worth of traffic — it's an operational commitment."</p></div>
+
+<!-- ============================================================ -->
+<h2 id="distributed-data">Distributed data: sagas, outbox, idempotency <span class="tier tier-2">T2</span></h2>
+
+<h3>Database-per-service and its consequence</h3>
+<p>Each service owns its database exclusively; nobody else touches its tables. This is what makes services independently deployable (schema changes don't ripple) and independently scalable. The price is brutal and you must own it out loud:</p>
+<ul>
+<li><strong>No cross-service joins.</strong> "Orders with customer names" now means API composition (call both, join in memory), data duplication (orders keeps a copy of the customer name, updated via events), or a CQRS read model fed by events.</li>
+<li><strong>No cross-service ACID transactions.</strong> You cannot atomically debit the wallet in one service and reserve stock in another.</li>
+</ul>
+
+<h3>Why not 2PC (two-phase commit)?</h3>
+<p>2PC gives distributed atomicity via a coordinator (prepare → all vote → commit). It's avoided in microservices because it's a <strong>blocking protocol</strong>: while a participant is "prepared," it holds locks waiting for the coordinator's verdict. If the coordinator dies at the wrong moment, participants sit locked, <em>in doubt</em>, potentially for a long time. Availability of the whole transaction is the <em>product</em> of every participant's availability, latency is the sum, and it needs XA support everywhere (Kafka and most modern stores don't play). It optimizes consistency by sacrificing exactly the availability and autonomy microservices exist to provide. Hence: sagas.</p>
+
+<h3>SAGA pattern — in depth</h3>
+<p>A saga replaces one distributed ACID transaction with a <strong>sequence of local transactions</strong>, each committed in one service. If step N fails, you don't roll back (can't — earlier steps already committed); you execute <strong>compensating transactions</strong> that semantically undo the completed steps (refund the payment, release the reservation). Consistency is eventual; there's a window where the system is mid-saga.</p>
+
+<h4>Choreography — event chain, no boss</h4>
+<pre><code>Order Service          Payment Service         Inventory Service
+     │ save order(PENDING)     │                       │
+     ├── OrderPlaced ─────────▶│ charge card           │
+     │                         ├── PaymentCompleted ──▶│ reserve stock
+     │                         │                       ├── StockReserved ──▶ Order → CONFIRMED
+     │                         │                       │
+     │                 FAILURE PATH (out of stock):    │
+     │                         │◀── StockRejected ─────┤
+     │                         │ refund (compensate)   │
+     │◀── PaymentRefunded ─────┤                       │
+     │ order → CANCELLED (compensate)                  │
+</code></pre>
+<p><strong>Pros:</strong> no central component, services stay loosely coupled, each service only knows "which events do I react to." <strong>Cons:</strong> the workflow exists <em>nowhere</em> — it's an emergent property of event subscriptions. With 6+ steps, answering "what's the flow when payment succeeds but inventory times out?" requires archaeology across repos. Cyclic event dependencies can sneak in. Hard to see, hard to test end-to-end.</p>
+
+<h4>Orchestration — a central coordinator</h4>
+<pre><code>            ┌──────────────────────────────┐
+            │     Order Saga Orchestrator  │  (a state machine per order)
+            └──┬───────────┬───────────┬───┘
+   1. ChargePayment   2. ReserveStock   on step-2 failure:
+       │  ▲                │  ▲          3. RefundPayment (compensation)
+       ▼  │ reply          ▼  │ reply    4. CancelOrder
+   Payment Svc         Inventory Svc     (commands via queues or REST)
+</code></pre>
+<pre><code><span class="com">// sketch of an orchestrator's state machine (conceptual)</span>
+<span class="kw">switch</span> (saga.state()) {
+    <span class="kw">case</span> STARTED          -&gt; send(<span class="kw">new</span> <span class="typ">ChargePayment</span>(orderId, amount));
+    <span class="kw">case</span> PAYMENT_DONE     -&gt; send(<span class="kw">new</span> <span class="typ">ReserveStock</span>(orderId, lines));
+    <span class="kw">case</span> STOCK_RESERVED   -&gt; complete(orderId);                      <span class="com">// happy end</span>
+    <span class="kw">case</span> STOCK_REJECTED   -&gt; send(<span class="kw">new</span> <span class="typ">RefundPayment</span>(orderId));       <span class="com">// compensate</span>
+    <span class="kw">case</span> PAYMENT_REFUNDED -&gt; cancel(orderId);                        <span class="com">// compensate</span>
+}
+</code></pre>
+<p><strong>Pros:</strong> the workflow is explicit, in one place — readable, testable, easy to add timeouts/monitoring ("all sagas stuck &gt; 1h" is a query). <strong>Cons:</strong> the orchestrator couples to every participant's API, and can drift toward a god-service if business logic leaks into it (it should sequence, not decide domain rules). Tools: Temporal, Camunda, Axon, or a hand-rolled state table.</p>
+
+<table>
+<thead><tr><th></th><th>Choreography</th><th>Orchestration</th></tr></thead>
+<tbody>
+<tr><td>Coupling</td><td>Low (events only)</td><td>Orchestrator knows all participants</td></tr>
+<tr><td>Visibility of flow</td><td>Poor — spread across services</td><td>Excellent — one state machine</td></tr>
+<tr><td>Good for</td><td>2–3 steps, simple flows</td><td>4+ steps, branching, timeouts, SLAs</td></tr>
+</tbody>
+</table>
+
+<div class="pitfall"><p>Compensations are <em>semantic</em> undo, not rollback — and some actions can't be fully undone (the email was sent; the money left via a card network with fees). Design steps so risky/irreversible ones happen <em>last</em> ("pivot transaction"), and accept that compensation itself can fail, which needs retries + alerting + occasionally a human.</p></div>
+
+<h3>Outbox pattern — the interview classic</h3>
+<p><strong>The question:</strong> "Your service saves an order to Postgres <em>and</em> publishes <code>OrderPlaced</code> to Kafka. How do you keep them consistent?" The naive code has a fatal window either way:</p>
+<pre><code><span class="com">// BROKEN — pick your failure:</span>
+orderRepository.save(order);          <span class="com">// tx commits…</span>
+kafkaTemplate.send(<span class="str">"orders"</span>, event); <span class="com">// …then app crashes here → DB updated, event NEVER sent</span>
+
+<span class="com">// swap the order? send first, then save → crash → event sent for an order that DOESN'T EXIST</span>
+<span class="com">// send inside @Transactional? Kafka doesn't join the DB transaction — same problem, hidden.</span>
+</code></pre>
+<p><strong>The fix:</strong> write the event <em>into the same database, in the same local transaction</em>, and let a separate process deliver it.</p>
+<pre><code>┌──────────────── one ACID transaction ────────────────┐
+│  INSERT INTO orders (…)                              │
+│  INSERT INTO outbox (id, aggregate_id, type, payload)│   ← atomic: both or neither
+└──────────────────────────────────────────────────────┘
+            │
+            ▼  afterwards, asynchronously
+   ┌─────────────────┐         ┌────────┐
+   │  Relay          │ ──────▶ │ Kafka  │   two delivery options:
+   └─────────────────┘         └────────┘
+   (a) polling publisher: SELECT unsent rows → publish → mark sent
+   (b) CDC (Debezium): tails the Postgres WAL, streams outbox inserts
+       to Kafka with no polling and low latency
+</code></pre>
+<pre><code><span class="ann">@Transactional</span>
+<span class="kw">public void</span> placeOrder(<span class="typ">PlaceOrderCommand</span> cmd) {
+    <span class="typ">Order</span> order = orderRepository.save(<span class="typ">Order</span>.from(cmd));
+    outboxRepository.save(<span class="typ">OutboxEvent</span>.of(          <span class="com">// SAME transaction → atomic</span>
+        <span class="str">"OrderPlaced"</span>, order.getId(), toJson(order)));
+}   <span class="com">// relay/Debezium publishes later; if publish fails it retries → at-least-once</span>
+</code></pre>
+<p>Delivery becomes <strong>at-least-once</strong> (the relay may crash after publishing but before marking sent) — which is fine, because your consumers are idempotent. Right? That's the closing line interviewers want.</p>
+
+<h3>Idempotency keys — for consumers and APIs</h3>
+<ul>
+<li><strong>Consumers:</strong> every event carries a unique <code>eventId</code>; the consumer records handled IDs in a <code>processed_events</code> table <em>in the same transaction</em> as its business write. A duplicate hits the unique constraint → skip. (This is what the <code>@KafkaListener</code> example above does.)</li>
+<li><strong>APIs:</strong> for non-idempotent operations (<code>POST /payments</code>), the client generates an <code>Idempotency-Key</code> header (UUID) per logical operation; the server stores key → response and replays the stored response on retry. Exactly Stripe's model — your React app retrying a failed checkout <code>fetch</code> can't double-charge.</li>
+</ul>
+<pre><code>POST /payments
+Idempotency-Key: 7f3a…c9            ← same key on retry
+{ "orderId": 42, "amount": 99.00 }
+
+server: INSERT INTO idempotency (key, response) — unique constraint on key
+        duplicate key? → return stored response, do NOT charge again
+</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="eventual-consistency">Eventual consistency &amp; the frontend <span class="tier tier-2">T2</span></h2>
+
+<p>This is where your React years become an interview asset. Eventual consistency isn't just a backend property — it leaks into UX, and a senior full-stack engineer designs both sides together.</p>
+
+<h3>What to tell the frontend</h3>
+<ul>
+<li><strong>Return 202-style semantics honestly.</strong> When an operation kicks off a saga, respond <code>202 Accepted</code> with a status URL or resource in <code>PENDING</code> state — not a fake <code>200 "done"</code>. The contract says "we've durably recorded your intent," which (thanks to the outbox) is exactly true.</li>
+<li><strong>Optimistic UI:</strong> you've done this with React Query / SWR mutations — update the cache immediately, reconcile on settle. Same idea: show the order as "Placing…" instantly, upgrade to "Confirmed" when the saga completes (poll the status endpoint, or push via WebSocket/SSE), and <em>roll back the UI with an explanation</em> if the saga compensates ("Payment declined — order cancelled").</li>
+<li><strong>Design explicit pending states.</strong> <code>PENDING → CONFIRMED | CANCELLED</code> should be a first-class status in the API and the UI, not something the frontend infers from timeouts. Amazon does this: "Thanks for your order" is not "your card was charged" — that email comes later.</li>
+</ul>
+<pre><code>React side (you know this pattern)          Backend reality
+─────────────────────────────────          ───────────────
+onMutate: show "Placing order…"      ←──   202 + { status: "PENDING" }
+poll /orders/42 or subscribe SSE     ←──   saga running: payment → inventory
+render "Confirmed ✓"                 ←──   { status: "CONFIRMED" }
+or render "Cancelled: out of stock"  ←──   { status: "CANCELLED", reason: … }  (compensated)
+</code></pre>
+
+<h3>Read-your-own-writes</h3>
+<p>Classic bug: user submits an edit, the write goes to service A, the next page load reads from a lagging replica or an event-fed read model in service B — and their change "disappears." Users forgive <em>other people's</em> data being seconds stale; they do not forgive their <em>own</em> write vanishing. Mitigations, cheapest first:</p>
+<ol>
+<li><strong>Return the written state in the write response</strong> and seed the client cache from it (React Query's <code>setQueryData</code> after mutation) — often you never need the immediate re-read at all.</li>
+<li><strong>Pin the reader:</strong> for N seconds after a user's write, route their reads to the primary / the owning service (session stickiness or a "recently wrote" flag).</li>
+<li><strong>Version-aware reads:</strong> the write returns a version/offset; the read waits until the replica or read model has caught up to at least that version.</li>
+</ol>
+<div class="senior"><p>Strong framing for interviews: "Consistency is a per-use-case budget, not a global switch. The user's own writes need read-your-writes; the product catalog can be minutes stale; inventory counts on a listing page can be approximate as long as checkout re-validates. I push for the weakest consistency each screen can tolerate, because that's what buys availability and latency."</p></div>
+
+<!-- ============================================================ -->
+<h2 id="observability">Observability, containers &amp; 12-factor <span class="tier tier-3">T3</span></h2>
+
+<h3>The three pillars</h3>
+<p><strong>1. Structured logs + correlation IDs.</strong> Logs must be JSON (machine-parseable, shipped to a central store — ELK/Loki/Datadog), and every log line from one user request across all services must share a <strong>correlation/trace ID</strong>. In Spring, Micrometer Tracing puts the current trace ID into SLF4J's <strong>MDC</strong> (a thread-local map of contextual key-values) so the log pattern can include it automatically:</p>
+<pre><code><span class="com">// MDC = Mapped Diagnostic Context (thread-local); tracing libs populate it for you</span>
+<span class="com">// logback pattern:</span>  %d %-5level [%X{traceId},%X{spanId}] %logger - %msg%n
+
+2026-07-02 10:14:02 INFO  [6f2a91cc4b0e, 91cc] OrderController - placing order 42
+2026-07-02 10:14:02 INFO  [6f2a91cc4b0e, 22a7] PaymentClient   - charging card   ← same traceId,
+                                                                                    different service!
+</code></pre>
+<p><strong>2. Metrics — Micrometer → Prometheus.</strong> Micrometer is "SLF4J for metrics": a facade the app writes to; Prometheus scrapes <code>/actuator/prometheus</code>; Grafana visualizes; Alertmanager pages. For request-serving services, know the <strong>RED</strong> triad by name: <strong>R</strong>ate (req/s), <strong>E</strong>rrors (error %), <strong>D</strong>uration (latency, and always percentiles — p95/p99 — never averages, because averages hide the pain your slowest users feel).</p>
+<pre><code><span class="kw">private final</span> <span class="typ">MeterRegistry</span> registry;
+
+<span class="typ">Timer</span>.builder(<span class="str">"orders.place"</span>)
+     .publishPercentiles(<span class="num">0.95</span>, <span class="num">0.99</span>)
+     .register(registry)
+     .record(() -&gt; orderService.place(cmd));
+
+registry.counter(<span class="str">"orders.placed"</span>, <span class="str">"channel"</span>, <span class="str">"web"</span>).increment();
+</code></pre>
+<p><strong>3. Distributed tracing.</strong> A <strong>trace</strong> is one request's journey; each unit of work (an HTTP hop, a DB query, a Kafka publish) is a <strong>span</strong> with a parent, forming a tree with timings. Context propagates between services via the <strong>W3C <code>traceparent</code></strong> HTTP header (<code>00-{trace-id}-{parent-span-id}-{flags}</code>) — Micrometer Tracing injects/extracts it automatically. Backends: Zipkin, Jaeger, Tempo; OpenTelemetry is the vendor-neutral standard. Tracing answers the question logs can't: <em>"the request took 3s — where did the time go?"</em> (Answer, visually: 2.4s inside inventory's DB span.)</p>
+<pre><code>trace 6f2a91cc4b0e  — GET /api/orders/42     total 3.0s
+├── gateway                        12ms
+├── order-service                 2.9s
+│   ├── SELECT orders              8ms
+│   ├── HTTP → payment-service    310ms
+│   └── HTTP → inventory-service  2.4s   ◀ found it
+│       └── SELECT stock … (missing index) 2.3s
+</code></pre>
+
+<h3>Health, readiness, liveness</h3>
+<table>
+<thead><tr><th>Probe</th><th>Question</th><th>K8s reaction if failing</th></tr></thead>
+<tbody>
+<tr><td>Liveness (<code>/actuator/health/liveness</code>)</td><td>"Is the process wedged beyond recovery?" (deadlock, broken state)</td><td><strong>Restart</strong> the container</td></tr>
+<tr><td>Readiness (<code>/actuator/health/readiness</code>)</td><td>"Can it serve traffic <em>right now</em>?" (still warming up, dependency down)</td><td><strong>Remove from load balancing</strong> — no restart</td></tr>
+</tbody>
+</table>
+<div class="pitfall"><p>Do <strong>not</strong> wire external dependencies (DB, Kafka) into the <em>liveness</em> probe. If the database blips, every pod's liveness fails, K8s restart-loops your entire healthy fleet, and a 30-second DB hiccup becomes a full outage. Dependencies belong in <em>readiness</em> only — pods step out of rotation and step back in when the DB returns.</p></div>
+
+<h3>Docker for Java — layered jars</h3>
+<p>Docker images are stacked layers; a layer rebuilds (and re-uploads) only if its contents changed. A naive fat-jar image puts your 5-line code change and 80&nbsp;MB of unchanged dependencies in <em>one</em> layer — every build ships 80&nbsp;MB. Spring Boot's layered-jar mode splits the jar so dependencies (rarely change) sit below your classes (change every commit):</p>
+<pre><code><span class="com"># multi-stage Dockerfile with Spring Boot layertools</span>
+FROM eclipse-temurin:21-jre AS builder
+WORKDIR /app
+COPY target/app.jar app.jar
+RUN java -Djarmode=tools -jar app.jar extract --layers --destination extracted
+
+FROM eclipse-temurin:21-jre
+WORKDIR /app                                     <span class="com"># least → most volatile:</span>
+COPY --from=builder /app/extracted/dependencies/          ./   <span class="com"># cached across builds</span>
+COPY --from=builder /app/extracted/spring-boot-loader/    ./
+COPY --from=builder /app/extracted/snapshot-dependencies/ ./
+COPY --from=builder /app/extracted/application/           ./   <span class="com"># only this rebuilds</span>
+ENTRYPOINT ["java", "-jar", "app.jar"]
+</code></pre>
+<p>Also mention: run as a non-root user; modern JVMs are container-aware (heap sized from cgroup limits — set <code>-XX:MaxRAMPercentage</code>, don't hardcode <code>-Xmx</code> blindly).</p>
+
+<h3>Kubernetes vocabulary (awareness level)</h3>
+<table>
+<thead><tr><th>Term</th><th>One-liner</th></tr></thead>
+<tbody>
+<tr><td>Pod</td><td>Smallest deployable unit — one or more containers sharing network/storage.</td></tr>
+<tr><td>Deployment</td><td>Desired state for N replica pods + rolling updates ("run 3 of image v1.4").</td></tr>
+<tr><td>Service</td><td>Stable virtual IP/DNS name load-balancing across matching healthy pods — built-in service discovery.</td></tr>
+<tr><td>Ingress</td><td>HTTP(S) entry point routing external traffic to Services (host/path rules, TLS).</td></tr>
+<tr><td>HPA</td><td>Horizontal Pod Autoscaler — scales replica count on CPU/memory/custom metrics.</td></tr>
+<tr><td>ConfigMap / Secret</td><td>Externalized config / sensitive values, injected as env vars or files.</td></tr>
+</tbody>
+</table>
+
+<h3>12-factor highlights (the ones interviews touch)</h3>
+<ul>
+<li><strong>Config in the environment</strong> — same image promoted dev → staging → prod; only env vars differ.</li>
+<li><strong>Stateless processes</strong> — no sticky in-memory sessions; state lives in Postgres/Redis so any pod can serve any request and horizontal scaling is trivial.</li>
+<li><strong>Logs as event streams</strong> — write JSON to stdout; the platform ships it. No log files in containers.</li>
+<li><strong>Disposability</strong> — fast startup, graceful shutdown (finish in-flight requests on SIGTERM: <code>server.shutdown=graceful</code>), because K8s kills and reschedules pods routinely.</li>
+<li><strong>Dev/prod parity</strong> — containers exist largely to make "works on my machine" mean something.</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="vocab">Vocabulary drill <span class="tier tier-2">T2</span></h2>
+<p>System-design rounds are partly a vocabulary test — using these precisely signals fluency.</p>
+<table>
+<thead><tr><th>Term</th><th>Senior one-sentence definition</th></tr></thead>
+<tbody>
+<tr><td><strong>Blast radius</strong></td><td>The scope of what breaks when a component fails — good architecture (bulkheads, cells, service boundaries) shrinks it.</td></tr>
+<tr><td><strong>Backpressure</strong></td><td>A consumer's ability to signal "slow down" upstream instead of being overwhelmed — bounded queues, reactive demand, or 429s; without it, buffers grow until something dies.</td></tr>
+<tr><td><strong>Fan-out</strong></td><td>One event or request triggering many downstream calls/consumers — cheap in pub/sub, dangerous in sync chains where it multiplies latency and failure probability.</td></tr>
+<tr><td><strong>Hot partition</strong></td><td>One partition/shard receiving disproportionate traffic due to key skew (celebrity user, null keys), lagging while its siblings idle — fix the key, not the cluster size.</td></tr>
+<tr><td><strong>Thundering herd</strong></td><td>Many clients acting simultaneously (cache expiry, synchronized retries, restart storms) and crushing a resource — mitigated by jitter, request coalescing, and staggered TTLs.</td></tr>
+<tr><td><strong>Split brain</strong></td><td>A partitioned cluster where two halves each believe they're authoritative and both accept writes — prevented by quorum: only a majority side may act.</td></tr>
+<tr><td><strong>Cascading failure</strong></td><td>One component's failure exhausting its callers' resources (threads, connections), propagating outage upstream — the exact scenario timeouts, breakers, and bulkheads exist to stop.</td></tr>
+<tr><td><strong>Temporal coupling</strong></td><td>A dependency requiring both parties to be available at the same moment (sync calls); messaging removes it.</td></tr>
+<tr><td><strong>Idempotency</strong></td><td>Performing an operation N times has the same effect as once — the property that makes retries and at-least-once delivery safe.</td></tr>
+<tr><td><strong>Consumer lag</strong></td><td>How far a Kafka consumer group's committed offsets trail the log's head — the primary "are we keeping up?" health metric for async pipelines.</td></tr>
+<tr><td><strong>Head-of-line blocking</strong></td><td>One stuck item (poison message, slow request) blocking everything queued behind it — the reason DLQs exist.</td></tr>
+<tr><td><strong>Quorum</strong></td><td>Requiring a majority of nodes to agree before an action counts, so no two disjoint groups can both proceed.</td></tr>
+<tr><td><strong>Graceful degradation</strong></td><td>Serving a reduced but useful experience when a dependency fails (cached data, hidden widget) instead of a hard error.</td></tr>
+<tr><td><strong>Strangler fig</strong></td><td>Incrementally routing functionality out of a legacy system behind a facade until the old system can be retired — the safe alternative to big-bang rewrites.</td></tr>
+<tr><td><strong>CDC (change data capture)</strong></td><td>Streaming a database's transaction log (e.g., Debezium on the Postgres WAL) as events — the low-latency way to implement the outbox relay.</td></tr>
+<tr><td><strong>Canary release</strong></td><td>Routing a small slice of real traffic to the new version and watching metrics before rolling out to everyone.</td></tr>
+<tr><td><strong>Blue-green deployment</strong></td><td>Two full environments; flip traffic from old to new atomically, keep the old one warm for instant rollback.</td></tr>
+<tr><td><strong>Sidecar</strong></td><td>A helper container deployed alongside the app container in the same pod (proxy, log shipper) — the pattern service meshes like Istio are built on.</td></tr>
+</tbody>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="qa">Interview Q&amp;A</h2>
+
+<details class="qa"><summary>When would you choose a monolith over microservices?</summary><div class="answer"><p>Almost always at the start. A modular monolith gives fast iteration, ACID transactions, trivial debugging, and one pipeline — while domain boundaries are still being discovered. I'd choose microservices only under concrete pressure: multiple teams blocked by deploy contention, a component needing independent scaling, or isolation/compliance boundaries. Microservices trade development simplicity for organizational scalability; if you don't have the organizational problem, you're paying the distributed-systems tax for nothing.</p></div></details>
+
+<details class="qa"><summary>What is a "distributed monolith" and how does it happen?</summary><div class="answer"><p>Services that are physically separate but logically coupled: every feature touches several of them, they call each other in deep synchronous chains, share databases or fragile contracts, and must be released together. You get all microservice costs (network failures, ops overhead, tracing pain) with none of the benefits (independent deploy/scale). It happens when systems are split by technical layer or by org-chart accident instead of along bounded contexts, or when teams split before boundaries were proven in the monolith.</p></div></details>
+
+<details class="qa"><summary>Explain Conway's law and its practical implication for architecture.</summary><div class="answer"><p>Systems mirror the communication structure of the organizations that build them. Practically: service boundaries that don't match team boundaries generate constant cross-team coordination, and the architecture will erode toward the org chart anyway. The inverse Conway maneuver applies it deliberately — restructure teams to match the architecture you want, giving each team end-to-end ownership of its services.</p></div></details>
+
+<details class="qa"><summary>How do you decide where service boundaries go?</summary><div class="answer"><p>Along bounded contexts from the domain: a service should own a cohesive set of data and behavior with a narrow, stable interface. Litmus tests: can it be described without mentioning another service's internals? Would it need to join another service's tables (bad sign)? Does one team fully own it? Do most changes stay within one boundary? I'd validate boundaries as modules inside a monolith first — module boundaries are cheap to move, service boundaries are not.</p></div></details>
+
+<details class="qa"><summary>Sync REST vs async messaging — how do you choose?</summary><div class="answer"><p>Queries and commands that need an immediate answer are sync (get user profile, validate a coupon at checkout). State-change notifications and workflows tolerant of delay are async (order placed → email, analytics, inventory). Sync is simpler but temporally couples services and creates cascading-failure risk in deep chains; async decouples availability and levels load, at the cost of eventual consistency and duplicate handling. I keep sync call graphs shallow and push cross-service side effects to events.</p></div></details>
+
+<details class="qa"><summary>Why are timeouts on every remote call non-negotiable?</summary><div class="answer"><p>Without a timeout, a hung dependency holds your worker thread indefinitely; under load the pool exhausts and your whole service stops responding — including endpoints unrelated to that dependency — and the failure cascades to your callers. Defaults are often effectively infinite. I set connect timeouts ~1s and read timeouts from the callee's p99 plus headroom, and pair them with a circuit breaker so persistent slowness turns into fast failure.</p></div></details>
+
+<details class="qa"><summary>Walk me through circuit breaker states.</summary><div class="answer"><p>CLOSED: calls flow normally; outcomes recorded in a sliding window. When the failure rate (or slow-call rate) over a minimum number of calls crosses the threshold, it transitions to OPEN: calls are rejected instantly with CallNotPermittedException — fail fast for the caller, breathing room for the sick downstream. After a wait duration it goes HALF_OPEN: a limited number of trial calls pass through; if they succeed the breaker closes, if they fail it reopens. Key configs: sliding window size, minimumNumberOfCalls (avoid judging tiny samples), failureRateThreshold, waitDurationInOpenState.</p></div></details>
+
+<details class="qa"><summary>Why does a circuit breaker help the failing service, not just the caller?</summary><div class="answer"><p>A struggling service usually needs reduced load to recover — it's saturated on CPU, connections, or GC. If every caller keeps retrying at full rate, it never gets that window; breakers collectively shed load. That's also why retries without breakers are dangerous: they <em>increase</em> load exactly when the target can least handle it.</p></div></details>
+
+<details class="qa"><summary>When is retrying a request actively harmful?</summary><div class="answer"><p>Three cases. Non-idempotent operations: retrying a timed-out payment POST may execute it twice, since a timeout doesn't reveal whether the first attempt succeeded — fix with idempotency keys first. Non-transient errors: a 400/422 will fail identically every time; retrying wastes capacity. Overload: if the downstream is saturated, synchronized retries create a retry storm that deepens the outage — hence exponential backoff with jitter, retry budgets, and retrying at one layer only, capped by a circuit breaker.</p></div></details>
+
+<details class="qa"><summary>What is the bulkhead pattern and what incident does it prevent?</summary><div class="answer"><p>Partitioning resources (threads, connections, concurrency permits) per dependency so one slow dependency can't consume everything. Classic incident: a slow third-party recommendations API gradually occupies all 200 Tomcat worker threads because each request waits on it; now checkout — which never touches recommendations — is down too. With a 25-permit bulkhead around that client, the 26th concurrent call fails fast (or gets a fallback) and the rest of the service keeps working. Semaphore bulkheads cap concurrency in-thread; thread-pool bulkheads give full isolation for async calls.</p></div></details>
+
+<details class="qa"><summary>In what order should retry, circuit breaker, and timeout compose, and why?</summary><div class="answer"><p>Timeout innermost (bounds each attempt), circuit breaker around that (each timed-out attempt is recorded as a failure), retry outermost (decides whether to attempt again; if the breaker opened mid-sequence, the retry fails instantly instead of burning another full timeout). Resilience4j's default matches this: Retry(CircuitBreaker(RateLimiter(TimeLimiter(Bulkhead(call))))). Putting retry inside the breaker makes one logical call count as multiple failures, tripping the breaker prematurely.</p></div></details>
+
+<details class="qa"><summary>What belongs in an API gateway — and what doesn't?</summary><div class="answer"><p>Cross-cutting edge concerns: routing, TLS termination, authentication (validate the JWT once), rate limiting, CORS, request logging, sometimes response aggregation for specific frontends (BFF). What doesn't: business logic and payload transformation tied to domain rules — that turns the gateway into a shared bottleneck every team must modify, coupling all services through it. The gateway should be boring and thin.</p></div></details>
+
+<details class="qa"><summary>Why is ordering in Kafka only guaranteed per partition, and how do you exploit that?</summary><div class="answer"><p>A topic's partitions are independent logs consumed in parallel by different consumers — there's no global sequence across them by design; that independence is where the throughput comes from. Order exists only within one partition. You exploit it via the message key: hash(key) picks the partition, so keying by orderId puts all events for one order in one partition, in order. The trade-offs: key skew creates hot partitions, and repartitioning changes key→partition mapping, so choose keys and partition counts deliberately.</p></div></details>
+
+<details class="qa"><summary>You have 12 partitions and add a 13th consumer to the group. What happens?</summary><div class="answer"><p>It sits idle. Within a consumer group, each partition is assigned to at most one consumer, so useful parallelism is capped at the partition count. The 13th instance is only a warm standby that takes over on a rebalance. If I need more parallelism I need more partitions (planned ahead — resizing breaks key ordering assumptions) or faster per-record processing.</p></div></details>
+
+<details class="qa"><summary>Compare Kafka's acks=0, 1, and all.</summary><div class="answer"><p>acks=0: producer doesn't wait — fastest, silently loses data on any broker issue; only for disposable telemetry. acks=1: leader acknowledged, but data is lost if the leader dies before followers replicate. acks=all with min.insync.replicas=2: acknowledged only when the in-sync replica set has it — survives a broker loss; the default choice for business data, at modest latency cost. I'd also enable the idempotent producer so broker-side retries can't duplicate records in the log.</p></div></details>
+
+<details class="qa"><summary>Is exactly-once delivery possible? Be precise.</summary><div class="answer"><p>Within Kafka, yes: transactions atomically commit consumed offsets plus produced records, and read_committed consumers see only committed data — real exactly-once for Kafka-to-Kafka pipelines (Kafka Streams uses this). Across system boundaries, no: there's no atomic commit spanning Kafka and your database or a payment provider. The honest engineering answer is at-least-once delivery plus idempotent processing, which yields exactly-once <em>effects</em>. Any claim of universal exactly-once delivery should make you suspicious.</p></div></details>
+
+<details class="qa"><summary>What causes a Kafka consumer rebalance, and why can rebalances cascade?</summary><div class="answer"><p>Membership changes: a consumer joins, leaves, crashes, or is evicted because it didn't poll within max.poll.interval.ms or missed heartbeats. During eager rebalances consumption pauses group-wide (cooperative sticky assignment reduces this to only the moved partitions). The cascade: a consumer processing a slow batch gets evicted → rebalance → its partitions and unacked records shift to survivors → they slow down too → more evictions. Fixes: lower max.poll.records, keep the poll loop fast, move heavy work off the polling thread.</p></div></details>
+
+<details class="qa"><summary>What's a dead-letter queue and when does a message go there?</summary><div class="answer"><p>A side topic for messages that keep failing — a poison message (malformed payload, handler bug) would otherwise be retried forever, blocking every record behind it in the partition (head-of-line blocking). Pattern: bounded retries with backoff, then publish to orders.DLT with error metadata, commit the offset, continue. Operationally: alert on DLQ depth, and have a redrive process to replay messages after deploying the fix.</p></div></details>
+
+<details class="qa"><summary>Why is 2PC avoided in microservice architectures?</summary><div class="answer"><p>It's a blocking protocol: after voting "prepared," participants hold locks awaiting the coordinator's decision; if the coordinator fails at that moment they're stuck in-doubt, holding locks. The transaction's availability is the product of all participants' availability, latency is additive, and it requires XA support that Kafka and most modern datastores don't offer. It sacrifices availability and autonomy — the two things microservices exist to maximize. Sagas invert the trade: local commits plus compensations, accepting eventual consistency.</p></div></details>
+
+<details class="qa"><summary>Explain the saga pattern with a concrete failure scenario.</summary><div class="answer"><p>Order placement: (1) order service saves order PENDING, (2) payment service charges the card, (3) inventory reserves stock. Each step is a local transaction. If step 3 fails — out of stock — we can't roll back the committed payment, so we compensate: refund the payment, then cancel the order. Choreography does this via events (PaymentCompleted → StockRejected → PaymentRefunded), simple but the flow is invisible; orchestration uses a central state machine issuing commands, explicit and monitorable but coupled to all participants. I'd choreograph short flows and orchestrate anything with 4+ steps or timeout/SLA requirements. Also: sequence irreversible steps last, and remember compensations themselves can fail and need retries plus alerting.</p></div></details>
+
+<details class="qa"><summary>How do you atomically update the database AND publish an event? (The outbox question.)</summary><div class="answer"><p>You can't do it directly — Kafka doesn't participate in the DB transaction, so save-then-publish loses events on a crash between the two, and publish-then-save emits events for state that never committed. The outbox pattern fixes it: in the same ACID transaction as the business write, insert the event into an outbox table — atomic by construction. A separate relay delivers it: either a poller that selects unsent rows and publishes, or Debezium CDC tailing the WAL for low latency. Delivery becomes at-least-once (relay can crash after publish, before marking sent), which is fine because consumers are idempotent via event-ID dedup.</p></div></details>
+
+<details class="qa"><summary>How do idempotency keys work for a payment API?</summary><div class="answer"><p>The client generates a unique key (UUID) per logical operation and sends it as an Idempotency-Key header, reusing the same key on retries. The server inserts the key into a table with a unique constraint alongside the operation; a retry hits the constraint, and the server returns the stored response instead of re-executing. This makes a non-idempotent POST safely retryable end-to-end — a timed-out checkout retry can't double-charge. Stripe's API is the canonical example. Keys need a TTL/cleanup policy and should be scoped per operation type.</p></div></details>
+
+<details class="qa"><summary>The UI shows stale data right after the user's own update. What's happening and how do you fix it?</summary><div class="answer"><p>A read-your-own-writes violation: the write hit the primary/owning service, but the follow-up read hit a lagging replica or an event-fed read model that hasn't caught up. Fixes in order of cheapness: return the full written state in the write response and seed the client cache from it (often eliminates the re-read); pin that user's reads to the primary for a short window after a write; or use version-aware reads where the write returns a version and reads wait for the replica to reach it. Users tolerate others' data being stale, never their own write vanishing — so I budget consistency per use case.</p></div></details>
+
+<details class="qa"><summary>What are the three pillars of observability and what does each answer?</summary><div class="answer"><p>Logs — discrete events with context: "what exactly happened?"; structured JSON, centralized, joined across services by trace/correlation ID (via MDC). Metrics — cheap numeric aggregates over time: "is the system healthy, and is it trending worse?"; Micrometer → Prometheus, RED (rate/errors/duration) per endpoint, always percentiles not averages. Traces — the tree of timed spans one request produces across services: "where did the latency go / which hop failed?"; propagated via the W3C traceparent header, visualized in Jaeger/Tempo/Zipkin. They compose: an alert fires on metrics, the trace localizes the slow hop, the logs on that trace ID explain why.</p></div></details>
+
+<details class="qa"><summary>Difference between liveness and readiness probes — and the classic mistake?</summary><div class="answer"><p>Liveness asks "is this process irrecoverably broken?" — failure triggers a container restart. Readiness asks "can it serve traffic right now?" — failure just removes the pod from load balancing. The classic mistake is checking the database in the liveness probe: a brief DB outage then fails liveness on every pod, Kubernetes restart-loops the whole healthy fleet, and a small blip becomes a self-inflicted total outage. External dependencies belong in readiness only.</p></div></details>
+
+<details class="qa"><summary>Why layered jars for Java Docker images?</summary><div class="answer"><p>Image layers are cached and only rebuilt/re-pushed when their content changes. A fat jar puts ~80MB of rarely-changing dependencies and your constantly-changing classes in one layer, so every commit rebuilds and ships everything. Spring Boot's layertools extracts the jar into layers ordered by volatility — dependencies, loader, snapshot deps, application — so a typical build only rebuilds the tiny application layer: faster CI, faster pulls, less registry storage.</p></div></details>
+
+<!-- ============================================================ -->
+<h2 id="exercises">Hands-on exercises</h2>
+
+<div class="exercise">
+<h3>Exercise 1 — Argue the split (design review)</h3>
+<p>Your company runs a Spring Boot monolith: orders, payments, catalog, notifications. 5 backend teams, ~40 engineers. Symptoms: releases happen weekly because QA must regression-test everything; the catalog search feature needs 10× the compute of everything else during sales; a notifications bug once OOM-killed the whole app during Black Friday. The CTO says "let's do microservices." Write your recommendation: what would you extract (if anything), in what order, and what would you explicitly NOT split? Name the prerequisites you'd demand before any extraction.</p>
+<details><summary>Model answer</summary><div class="answer">
+<p><strong>Diagnosis first:</strong> three real forcing functions exist — deploy contention (weekly train, 5 teams), asymmetric scaling (catalog search), and blast radius (notifications OOM took down checkout). That justifies <em>targeted extraction</em>, not a full decomposition.</p>
+<p><strong>Order of extraction:</strong> (1) <strong>Notifications</strong> first — it's naturally async (consume OrderPlaced-style events), has no synchronous callers, minimal data coupling, and it caused the worst incident; lowest risk, immediate blast-radius win. (2) <strong>Catalog search</strong> second — read-heavy, scales independently, can be fed by CDC/events from the catalog data with eventual consistency being acceptable for search results. (3) <strong>Payments</strong> only if PCI scope reduction or team ownership demands it — it's the scariest to move because of transactional coupling with orders.</p>
+<p><strong>Explicitly not split:</strong> orders + core checkout stays in the (now modular) monolith — it's the transactional heart; splitting it forces sagas immediately for little gain. Also don't split by layer (no "backend-for-entities service").</p>
+<p><strong>Prerequisites before any extraction:</strong> module boundaries enforced inside the monolith first (prove the seam); CI/CD able to deploy services independently; observability baseline (centralized structured logs, tracing with traceparent propagation, RED dashboards); an event backbone (Kafka) with outbox in the monolith so extracted services can subscribe; on-call/ownership model agreed per team (Conway alignment). <strong>Method:</strong> strangler fig — route traffic gradually, keep the old path until parity is proven.</p>
+</div></details>
+</div>
+
+<div class="exercise">
+<h3>Exercise 2 — Design the order saga</h3>
+<p>Design order placement across order-service, payment-service, and inventory-service. Requirements: no order may be confirmed without successful payment AND stock reservation; a customer must never be charged for an unconfirmed order for more than a few minutes; the flow must be observable ("show me all stuck orders"). Choose choreography or orchestration and justify; enumerate every failure point and its handling; specify the events/commands and compensations.</p>
+<details><summary>Model answer</summary><div class="answer">
+<p><strong>Choice: orchestration.</strong> Three-plus steps, a hard business rule about compensation timing ("never charged more than a few minutes"), and an explicit observability requirement — a central saga state machine gives me a queryable table of every saga's state (<code>SELECT * FROM sagas WHERE state != 'DONE' AND updated_at &lt; now() - interval '5 min'</code> = "stuck orders" for free). Choreography would scatter that state across three services.</p>
+<p><strong>Happy path:</strong> order-service saves order PENDING + saga row (same tx, outbox for the first command) → orchestrator sends <code>ChargePayment</code> → payment-service replies <code>PaymentCompleted</code> → orchestrator sends <code>ReserveStock</code> → inventory replies <code>StockReserved</code> → orchestrator marks order CONFIRMED. Ordering choice: reserve stock <em>could</em> go first (releasing a reservation is a gentler compensation than refunding money) — either is defensible; charging last means the irreversible-ish step is the pivot.</p>
+<p><strong>Failure points:</strong> (a) payment declined → saga → order CANCELLED(payment_declined), no compensation needed. (b) stock unavailable → send <code>RefundPayment</code>, await <code>PaymentRefunded</code>, order CANCELLED(out_of_stock). (c) payment-service <em>times out</em> — ambiguous! Don't blindly retry charge; query payment status by idempotency key, or retry <code>ChargePayment</code> safely <em>because it carries an idempotency key</em>. (d) refund fails → retry with backoff; after N attempts, park saga in COMPENSATION_FAILED and page a human — money movement gets an operator, not silent retries forever. (e) orchestrator crashes mid-saga → state is in the DB; on restart a recovery poller resumes any saga not in a terminal state. (f) duplicate replies (at-least-once messaging) → saga state machine ignores replies that don't match the current state; participants dedupe commands by command ID.</p>
+<p><strong>The "few minutes" rule:</strong> a timeout watchdog — any saga in PAYMENT_DONE longer than T triggers automatic compensation (refund) rather than waiting indefinitely for inventory.</p>
+<p><strong>Transport:</strong> commands/replies over Kafka (per-saga key = orderId for ordering), all writes via outbox, all consumers idempotent.</p>
+</div></details>
+</div>
+
+<div class="exercise">
+<h3>Exercise 3 — Make this endpoint survive a flaky dependency</h3>
+<p>Given: <code>GET /api/products/{id}</code> composes core product data (own DB) with live pricing from pricing-service (recent p99: 180&nbsp;ms; had two 20-minute outages last month) and recommendations from recs-service (p99: 900&nbsp;ms, frequently slow). Currently both are plain Feign calls with defaults, and product pages hang when either misbehaves. Specify the full resilience config (timeouts, breakers, bulkheads, retries, fallbacks) per dependency, with numbers and reasoning.</p>
+<details><summary>Model answer</summary><div class="answer">
+<p><strong>Pricing (critical-ish, fast, occasionally down):</strong> connect timeout 500&nbsp;ms, read timeout 600&nbsp;ms (p99 180&nbsp;ms × ~3 headroom). Retry: 2 attempts total, 100&nbsp;ms backoff with jitter, on IO/timeout only — the call is a GET (idempotent) and fast enough that one retry fits the budget. Circuit breaker: count-based window 20, minimumNumberOfCalls 10, failureRateThreshold 50%, slowCallDurationThreshold 500&nbsp;ms, waitDurationInOpenState 15&nbsp;s — during those 20-minute outages the breaker stays open and probes every 15&nbsp;s instead of hammering. Fallback: last-known price from a short-TTL cache with a "price may have changed, confirmed at checkout" flag; if no cached price, show the product without a price and disable buy-now (product decision — never show a guessed price). Bulkhead: 30 concurrent permits.</p>
+<p><strong>Recommendations (optional, slow):</strong> this is decoration, so budget it tightly: read timeout 400&nbsp;ms — deliberately <em>below</em> its p99; we'd rather drop recs on slow tail requests than delay the page. No retries (optional data, retrying a slow service adds load for marginal value). Breaker: slowCallRateThreshold 80% at slowCallDurationThreshold 300&nbsp;ms so <em>chronic slowness</em> opens it, not just errors. Bulkhead: small — 10 permits — so recs can never eat the thread pool (this was the original hang). Fallback: empty list / hide the carousel; the frontend already renders fine without it (like a failed non-critical widget behind an error boundary).</p>
+<p><strong>Composition:</strong> fetch pricing and recs in parallel (CompletableFuture), overall endpoint budget ~800&nbsp;ms. Emit metrics per dependency (breaker state, fallback rate) and alert on fallback rate &gt; 5% — resilience without observability just hides outages.</p>
+</div></details>
+</div>
+
+<div class="exercise">
+<h3>Exercise 4 — Kafka topic design for order events</h3>
+<p>Design the Kafka setup for order events consumed by inventory-service (must process each order's events in order, ~500 events/s peak), analytics (can lag, wants full history for 30 days), and a future fraud service. Specify: topic(s), partition count, message key, producer settings, consumer group layout, commit strategy, and how you handle a poison message. Then answer: what breaks if someone publishes with a null key "for performance"?</p>
+<details><summary>Model answer</summary><div class="answer">
+<p><strong>Topic:</strong> one topic <code>orders.events</code> (all lifecycle events: placed, paid, shipped…) — per-order ordering across event types requires them in one topic/partition. Retention 30 days (analytics requirement). <strong>Partitions:</strong> 12 — 500/s is modest, but partitions are hard to add without breaking key mapping, so provision several times current peak; 12 gives good divisor options for consumer counts. <strong>Key:</strong> <code>orderId</code> — guarantees all events for one order hit one partition in order; cardinality is high and uniform, so no hot-partition risk (keying by customerId would risk skew from big B2B customers).</p>
+<p><strong>Producer:</strong> <code>acks=all</code>, <code>min.insync.replicas=2</code>, idempotence enabled, and events written via the <strong>outbox pattern</strong> from order-service (never dual-write). Each event carries a unique <code>eventId</code>.</p>
+<p><strong>Consumers:</strong> three independent groups — <code>inventory-svc</code>, <code>analytics</code>, <code>fraud-svc</code> (added later with zero producer changes; it can even replay 30 days of history by starting from earliest — the log model's payoff). Inventory: up to 12 instances, manual ack after processing, idempotency via <code>processed_events(event_id)</code> unique insert in the same DB tx as the stock mutation — at-least-once delivery, exactly-once effect. Analytics: auto-commit is acceptable (tolerates loss/dupes in aggregates) or batch commits for throughput.</p>
+<p><strong>Poison messages:</strong> DefaultErrorHandler with ExponentialBackOff (e.g., 5 attempts) then DeadLetterPublishingRecoverer → <code>orders.events.DLT</code>; alert on DLT depth; redrive tool replays after a fix. This prevents head-of-line blocking of the partition.</p>
+<p><strong>Null key:</strong> events for the same order round-robin across partitions, so inventory can process "shipped" before "paid" — ordering silently breaks, likely as rare, unreproducible state-machine bugs under load. Also, per-order replay/compaction options die. The "performance" gain is negligible here; the correctness loss is severe. This is exactly why key choice is a design review item, not a config detail.</p>
+</div></details>
+</div>
+
+<nav class="page-nav"><a href="09-spring-aop-testing.html">← Prev: AOP &amp; Testing</a><a href="11-postgres-sql-fluency.html">Next: SQL Fluency →</a></nav>
+</main></body></html>

@@ -1,0 +1,1180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>13 — Indexing &amp; Query Performance | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header"><div class="container"><div class="breadcrumb"><a href="index.html">← Course Home</a></div><h1>13 — Indexing &amp; Query Performance</h1><p>B-tree mechanics, EXPLAIN ANALYZE fluency, and the slow-query diagnosis story every senior interview wants to hear</p></div></header>
+<main class="container">
+
+<section>
+  <h2 id="why">Why interviewers ask this</h2>
+  <p>
+    Every senior full-stack interview eventually arrives at some version of: <em>"A page in production got slow.
+    The team says it's the database. Walk me through what you do."</em> This is not trivia — it's a probe for whether
+    you have a <strong>diagnosis-first mindset</strong> (measure, hypothesize, verify) or whether you'll cargo-cult
+    "add an index" and hope. Indexing is the highest-yield database topic because it connects everything:
+    data structures (B-trees), the query planner, statistics, write amplification, and app-level behavior like N+1
+    queries and pagination.
+  </p>
+  <p>
+    As a frontend developer you already have the right instincts from performance work: you'd never "optimize" a React
+    app without the Profiler flamegraph. <code>EXPLAIN ANALYZE</code> is the database's flamegraph. This page teaches
+    you to read it fluently, predict what the planner will do, and — critically — tell the
+    <strong>"we had a slow query"</strong> story with real numbers. That story is a guaranteed interview moment;
+    by the end of this page you'll have a complete, realistic one you can rehearse.
+  </p>
+  <div class="note">
+    <p>Everything here is PostgreSQL-specific where it matters (heap tables, visibility map, HOT updates), but the
+    B-tree mechanics and plan-reading skills transfer to MySQL, SQL Server, and Oracle almost unchanged. If the
+    interviewer uses MySQL, say so and note the one big difference: InnoDB clusters the table on the primary key;
+    Postgres heaps are unordered and every index — including the PK — points at heap tuples.</p>
+  </div>
+</section>
+
+<div class="toc">
+  <strong>On this page</strong>
+  <ol>
+    <li><a href="#btree">B-tree mechanics: how an index actually works</a></li>
+    <li><a href="#cant-use">What CAN'T use a B-tree index (the trap list)</a></li>
+    <li><a href="#composite">Composite index design: column order, ORDER BY, covering indexes</a></li>
+    <li><a href="#explain">EXPLAIN / EXPLAIN ANALYZE deep-dive</a></li>
+    <li><a href="#ignored">Why the planner ignores your index</a></li>
+    <li><a href="#hurt">When indexes HURT: writes, HOT updates, bloat</a></li>
+    <li><a href="#specialized">Specialized indexes: partial, expression, GIN, GiST, BRIN, hash</a></li>
+    <li><a href="#runbook">The slow-query diagnosis runbook (your interview story)</a></li>
+    <li><a href="#app-level">App-level interplay: N+1, SELECT *, pagination, COUNT(*), pools</a></li>
+    <li><a href="#qa">Interview Q&amp;A</a></li>
+    <li><a href="#exercises">Hands-on exercises</a></li>
+  </ol>
+</div>
+
+<!-- ============================================================ -->
+<section>
+<h2 id="btree">B-tree mechanics: how an index actually works <span class="tier tier-1">T1</span></h2>
+
+<p>
+  A B-tree index is a <strong>balanced, sorted, block-oriented tree</strong>. Postgres stores it in 8&nbsp;KB pages,
+  exactly like the table (the "heap"). There are three kinds of pages:
+</p>
+<ul>
+  <li><strong>Root page</strong> — one page; the entry point. Holds sorted separator keys and child-page pointers.</li>
+  <li><strong>Internal pages</strong> — more separator keys and pointers, fanning out. With ~8&nbsp;KB pages, a single page can hold hundreds of entries, so the fan-out is enormous.</li>
+  <li><strong>Leaf pages</strong> — sorted <em>(key, ctid)</em> pairs, where the <code>ctid</code> is the physical address of the row in the heap: <code>(block_number, item_offset)</code>. Leaf pages are linked left-to-right (and right-to-left) into a doubly-linked list, which is what makes range scans and <code>ORDER BY</code> traversal cheap.</li>
+</ul>
+
+<pre><code>                          ROOT
+                 +-----------------------+
+                 |  k &lt; 400 | k &lt; 800 | * |
+                 +----+---------+------+--+
+                      |         |      |
+        +-------------+         |      +-------------+
+        v                       v                    v
+   INTERNAL                INTERNAL              INTERNAL
+ +------------+         +------------+        +------------+
+ | 100|200|300|         | 500|600|700|        | 900 | 1000 |
+ +--+--+--+--++         +--+---+---+-+        +---+----+---+
+    |  |  |  |              |   |   |             |    |
+    v  v  v  v              v   v   v             v    v
+ LEAF PAGES (sorted key -&gt; ctid pairs, doubly linked):
+
+ [ 1..99 ] &lt;-&gt; [100..199] &lt;-&gt; [200..299] &lt;-&gt; ... &lt;-&gt; [1000..]
+   |  |            |  |
+   v  v            v  v
+  ctid(7,3)      ctid(812,14)     ...each entry points into the HEAP
+                                  (the actual table pages, unordered)</code></pre>
+
+<h3>Why lookups are O(log n)</h3>
+<p>
+  Each step down the tree eliminates all but one child's worth of keys. Because fan-out is in the hundreds,
+  the tree stays <em>very</em> shallow: a 1-million-row index on a <code>bigint</code> is typically 3 levels;
+  a billion rows is 4–5. So an equality lookup touches a handful of pages regardless of table size — that's the
+  O(log n), and in practice "log" with base ~300, not base 2.
+</p>
+
+<h3>Equality vs. range traversal</h3>
+<ul>
+  <li><strong>Equality</strong> (<code>WHERE id = 4242</code>): binary-search the root, descend to an internal page, descend to the leaf, binary-search inside the leaf, emit matching <em>(key, ctid)</em> entries.</li>
+  <li><strong>Range</strong> (<code>WHERE created_at BETWEEN x AND y</code>): descend once to the leaf containing the <em>lower</em> bound, then walk the leaf-page linked list rightward until the upper bound. One descent + a sequential leaf walk. This is also how an index satisfies <code>ORDER BY created_at</code> without sorting.</li>
+</ul>
+
+<h3>The heap hop: why an index scan isn't free</h3>
+<p>
+  The index gives you a <code>ctid</code>, not the row. Postgres must then fetch the heap page and read the tuple
+  (to get the other columns <em>and</em> to check row visibility under MVCC — the index alone doesn't know whether a
+  tuple is visible to your transaction). If you fetch 5,000 rows via an index and those rows are scattered across
+  5,000 different heap pages, that's 5,000 random page reads. On a cold cache with spinning disks this is
+  catastrophic; even on SSDs it's real work. This is exactly why the planner will sometimes <em>refuse</em> your
+  index: past a certain selectivity, reading the whole table sequentially is cheaper than millions of random hops.
+</p>
+
+<div class="senior">
+  <p>The word to drop in interviews is <strong>correlation</strong>. <code>pg_stats.correlation</code> tells the
+  planner how well the physical heap order matches the index order. An index on <code>created_at</code> for an
+  append-only table has correlation ≈ 1.0 — range scans hit consecutive heap pages, so the planner prices index
+  scans cheaply. An index on <code>email</code> has correlation ≈ 0 — every fetch is a random hop. Same index type,
+  wildly different real cost. Mentioning correlation signals you understand cost, not just structure.</p>
+</div>
+
+<h3>Write cost: every index is a tax</h3>
+<p>
+  On <code>INSERT</code>, Postgres must add an entry to <em>every</em> index on the table — descend each tree, insert
+  into the correct leaf, and split the leaf page if it's full (splits ripple upward occasionally). On
+  <code>UPDATE</code>, Postgres writes a whole new row version (MVCC), so by default every index needs a new entry
+  pointing at the new version — even indexes on columns you didn't change (the HOT optimization can avoid this;
+  see <a href="#hurt">When indexes hurt</a>). <code>DELETE</code> doesn't remove index entries immediately; vacuum
+  cleans them later, which is where index bloat comes from.
+</p>
+
+<pre><code>-- See sizes: an index is a real object competing for cache
+SELECT relname, pg_size_pretty(pg_relation_size(oid))
+FROM pg_class
+WHERE relname LIKE 'orders%'
+ORDER BY pg_relation_size(oid) DESC;
+
+    relname             | pg_size_pretty
+------------------------+----------------
+ orders                 | 730 MB
+ orders_pkey            | 214 MB
+ idx_orders_customer_id | 214 MB
+ idx_orders_created_at  | 214 MB</code></pre>
+
+<div class="pitfall">
+  <p>"Indexes make reads faster" is the junior framing. The senior framing: <em>an index is a copy of part of your
+  table, maintained synchronously on every write, that lets you trade write throughput and storage for read latency.</em>
+  Every index must earn its keep.</p>
+</div>
+</section>
+
+<!-- ============================================================ -->
+<section>
+<h2 id="cant-use">What CAN'T use a B-tree index — the trap list <span class="tier tier-1">T1</span></h2>
+
+<p>
+  Interviewers love these because each one looks like it "should" use the index. The unifying principle: a B-tree can
+  only help when the predicate can be turned into <strong>"seek to a point in sorted order, then scan
+  contiguously"</strong>. Anything that breaks sorted-order seekability breaks the index.
+</p>
+
+<h3>1. Leading-wildcard LIKE</h3>
+<pre><code>-- CAN use a B-tree (prefix = a contiguous sorted range):
+SELECT * FROM users WHERE email LIKE 'ana%';
+
+-- CANNOT (matching suffixes are scattered all over sorted order):
+SELECT * FROM users WHERE email LIKE '%@gmail.com';</code></pre>
+<pre><code>EXPLAIN ANALYZE SELECT * FROM users WHERE email LIKE '%@gmail.com';
+
+ Seq Scan on users  (cost=0.00..24346.00 rows=312400 width=72)
+                    (actual time=0.014..214.882 rows=309911 loops=1)
+   Filter: (email ~~ '%@gmail.com'::text)
+   Rows Removed by Filter: 690089
+ Planning Time: 0.101 ms
+ Execution Time: 231.507 ms</code></pre>
+<div class="note">
+  <p>Two footnotes worth knowing: (a) for <code>'ana%'</code> to use the index in a non-C locale you need an
+  operator class like <code>text_pattern_ops</code>, or a C-collation column; (b) genuine substring search is a job
+  for a trigram GIN index (<code>pg_trgm</code>), which <em>can</em> serve <code>LIKE '%foo%'</code>. Saying
+  "leading wildcard → seq scan, unless we add a trigram GIN index" is a strong answer.</p>
+</div>
+
+<h3>2. Functions on the indexed column</h3>
+<pre><code>-- Index on users(email). This does NOT use it:
+SELECT * FROM users WHERE lower(email) = 'ana@example.com';
+-- The index stores 'Ana@Example.com'; lower(email) values aren't in the tree.
+
+-- Fix: an expression index — the tree stores the *result* of the expression:
+CREATE INDEX idx_users_email_lower ON users (lower(email));</code></pre>
+<pre><code>EXPLAIN ANALYZE SELECT * FROM users WHERE lower(email) = 'ana@example.com';
+
+ Index Scan using idx_users_email_lower on users
+     (cost=0.42..8.44 rows=1 width=72)
+     (actual time=0.043..0.045 rows=1 loops=1)
+   Index Cond: (lower(email) = 'ana@example.com'::text)
+ Planning Time: 0.144 ms
+ Execution Time: 0.061 ms</code></pre>
+<p>
+  The same trap wears many costumes: <code>date(created_at) = '2026-07-01'</code> (rewrite as a half-open range:
+  <code>created_at &gt;= '2026-07-01' AND created_at &lt; '2026-07-02'</code>), <code>total + tax &gt; 100</code>,
+  <code>substring(sku, 1, 3) = 'ABC'</code>. Either rewrite the predicate to leave the column "bare", or index the expression.
+</p>
+
+<h3>3. Type mismatches and implicit casts</h3>
+<pre><code>-- column: user_id bigint, index on user_id.
+-- A JDBC/ORM layer binds the parameter as text:
+SELECT * FROM events WHERE user_id = '12345'::text;   -- forces user_id::text = ...
+-- Postgres casts the COLUMN to match, wrapping it in a function -&gt; no index.</code></pre>
+<p>
+  In Postgres, comparing <code>bigint</code> to an integer-family literal is fine (cross-type operators exist), but
+  comparisons that force a cast <em>of the column</em> — text vs numeric, <code>varchar</code> id column compared to
+  an integer parameter, timestamp vs timestamptz in some setups — degrade to a seq scan silently. This is a classic
+  ORM bug: the query looks identical in the log; only the bound parameter type differs. When a query is fast in
+  <code>psql</code> but slow from the app, suspect parameter types.
+</p>
+
+<h3>4. Negations and inequality (a selectivity problem, not a structural one)</h3>
+<pre><code>SELECT * FROM orders WHERE status &lt;&gt; 'completed';
+SELECT * FROM orders WHERE status NOT IN ('completed', 'cancelled');</code></pre>
+<p>
+  Structurally a B-tree <em>could</em> serve <code>&lt;&gt;</code> as two ranges, but the planner usually estimates
+  it matches most of the table, so a seq scan wins. The senior move: if you only care about a small set of "live"
+  statuses, flip the predicate to a positive <code>IN ('pending','processing')</code>, or use a
+  <strong>partial index</strong> (<code>WHERE status NOT IN (...)</code>) that materializes exactly the interesting rows.
+</p>
+
+<h3>5. OR conditions — and when bitmap OR saves you</h3>
+<pre><code>-- OR across two different columns can't be one B-tree traversal.
+SELECT * FROM users WHERE email = $1 OR phone = $2;
+
+-- If BOTH columns are individually indexed, the planner can do a BitmapOr:
+EXPLAIN ANALYZE SELECT * FROM users WHERE email = 'a@x.com' OR phone = '555-0142';
+
+ Bitmap Heap Scan on users  (cost=8.87..16.55 rows=2 width=72)
+                            (actual time=0.052..0.056 rows=2 loops=1)
+   Recheck Cond: ((email = 'a@x.com'::text) OR (phone = '555-0142'::text))
+   Heap Blocks: exact=2
+   -&gt;  BitmapOr  (cost=8.87..8.87 rows=2 width=0) (actual time=0.044..0.045 rows=0 loops=1)
+         -&gt;  Bitmap Index Scan on idx_users_email  (cost=0.00..4.43 rows=1 width=0)
+               Index Cond: (email = 'a@x.com'::text)
+         -&gt;  Bitmap Index Scan on idx_users_phone  (cost=0.00..4.43 rows=1 width=0)
+               Index Cond: (phone = '555-0142'::text)</code></pre>
+<p>
+  If either side of the OR has no index, the whole thing degrades to a seq scan. A common rewrite when bitmap OR
+  isn't available is <code>UNION ALL</code> of two indexed queries (dedupe if needed).
+</p>
+
+<h3>6. The leading-column rule for composite indexes</h3>
+<pre><code>CREATE INDEX idx_orders_cust_status ON orders (customer_id, status);
+
+-- USES the index (leading column constrained):
+WHERE customer_id = 42
+WHERE customer_id = 42 AND status = 'pending'
+
+-- CANNOT SEEK (leading column unconstrained):
+WHERE status = 'pending'</code></pre>
+<p>
+  The index is sorted by <code>customer_id</code> first, then <code>status</code> within each customer. Rows with
+  <code>status = 'pending'</code> are sprinkled throughout — there is no single contiguous region to seek to. Think
+  of a phone book sorted by (last_name, first_name): finding everyone named "Maria" requires reading the whole book.
+</p>
+<div class="pitfall">
+  <p>Nuance for bonus points: Postgres <em>can</em> still choose the composite index for a
+  <code>status</code>-only query as a full <em>index scan with a filter</em> (reading every leaf page) — occasionally
+  cheaper than a seq scan because the index is narrower than the table — and it can consider a "skip scan"-style plan
+  in very recent versions when the leading column has few distinct values. But it cannot <em>seek</em>. Say
+  "can't seek on a non-leading column" rather than "can't use the index at all".</p>
+</div>
+
+<table>
+  <thead><tr><th>Predicate</th><th>B-tree seekable?</th><th>Fix</th></tr></thead>
+  <tbody>
+    <tr><td><code>email LIKE 'ana%'</code></td><td>Yes (prefix range)</td><td>— (mind collation/opclass)</td></tr>
+    <tr><td><code>email LIKE '%gmail%'</code></td><td>No</td><td>pg_trgm GIN index</td></tr>
+    <tr><td><code>lower(email) = $1</code></td><td>No (plain index)</td><td>Expression index on <code>lower(email)</code>, or citext</td></tr>
+    <tr><td><code>date(created_at) = $1</code></td><td>No</td><td>Rewrite as half-open range on bare column</td></tr>
+    <tr><td><code>varchar_id = 123</code> (int param)</td><td>No (column gets cast)</td><td>Fix parameter type at app layer</td></tr>
+    <tr><td><code>status &lt;&gt; 'done'</code></td><td>Rarely useful</td><td>Positive IN-list, or partial index</td></tr>
+    <tr><td><code>a = $1 OR b = $2</code></td><td>Not as one traversal</td><td>Index both → BitmapOr; or UNION ALL</td></tr>
+    <tr><td><code>WHERE b = $1</code> on index <code>(a, b)</code></td><td>No seek</td><td>Separate index on <code>b</code>, or reorder</td></tr>
+  </tbody>
+</table>
+</section>
+
+<!-- ============================================================ -->
+<section>
+<h2 id="composite">Composite index design: column order, ORDER BY, covering indexes <span class="tier tier-1">T1</span></h2>
+
+<h3>Column-order strategy</h3>
+<p>The working rule, in priority order:</p>
+<ol>
+  <li><strong>Equality columns first, then the range/sort column.</strong> Once you hit a range condition in the key, everything after it can only be filtered, not sought. <code>WHERE customer_id = $1 AND created_at &gt; $2</code> wants <code>(customer_id, created_at)</code> — all of customer 42's rows are contiguous, and within them, sorted by time. The reverse order <code>(created_at, customer_id)</code> would scan <em>every</em> customer's recent rows and filter.</li>
+  <li><strong>Among equality columns, lead with the one that's most useful standing alone</strong> — because the leading column doubles as a single-column index (leftmost-prefix rule). If some queries filter only on <code>customer_id</code> and none filter only on <code>status</code>, lead with <code>customer_id</code>.</li>
+  <li><strong>Selectivity is a tiebreaker, not the headline.</strong> "Most selective first" is the folklore answer; the sharper answer is that for pure multi-equality lookups the order barely changes the traversal cost — order matters mostly for (a) which prefixes are useful to other queries and (b) keeping range columns last. Saying that nuance out loud is a senior signal.</li>
+</ol>
+
+<pre><code>-- The canonical shape:
+CREATE INDEX idx_orders_cust_created
+    ON orders (customer_id, created_at);          -- equality, then range/sort
+
+-- Serves all of these with a single seek + contiguous walk:
+WHERE customer_id = $1
+WHERE customer_id = $1 AND created_at &gt;= $2
+WHERE customer_id = $1 ORDER BY created_at DESC LIMIT 20</code></pre>
+
+<h3>Covering the ORDER BY: killing the Sort node</h3>
+<p>
+  Because leaf pages are sorted and linked, an index whose order matches the <code>ORDER BY</code> lets Postgres
+  stream rows already sorted — no Sort node, and crucially, <strong>LIMIT can stop early</strong>. This turns
+  "sort 50,000 rows to return 20" into "read 20 index entries."
+</p>
+<pre><code>-- WITHOUT a matching index: fetch all, sort, take 20
+EXPLAIN ANALYZE
+SELECT * FROM orders WHERE customer_id = 4242
+ORDER BY created_at DESC LIMIT 20;
+
+ Limit  (cost=9483.11..9483.16 rows=20 width=41)
+        (actual time=18.343..18.348 rows=20 loops=1)
+   -&gt;  Sort  (cost=9483.11..9495.53 rows=4967 width=41)
+             (actual time=18.341..18.344 rows=20 loops=1)
+         Sort Key: created_at DESC
+         Sort Method: top-N heapsort  Memory: 27kB
+         -&gt;  Bitmap Heap Scan on orders  (cost=58.92..9350.94 rows=4967 width=41)
+                                          (actual time=1.204..16.902 rows=5121 loops=1)
+               Recheck Cond: (customer_id = 4242)
+               Heap Blocks: exact=4893
+               -&gt;  Bitmap Index Scan on idx_orders_customer  (cost=0.00..57.68 rows=4967 width=0)
+                     Index Cond: (customer_id = 4242)
+ Execution Time: 18.412 ms
+
+-- WITH (customer_id, created_at): stream in order, stop after 20
+ Limit  (cost=0.43..24.15 rows=20 width=41)
+        (actual time=0.038..0.164 rows=20 loops=1)
+   -&gt;  Index Scan Backward using idx_orders_cust_created on orders
+           (cost=0.43..5891.40 rows=4967 width=41)
+           (actual time=0.036..0.158 rows=20 loops=1)
+         Index Cond: (customer_id = 4242)
+ Execution Time: 0.189 ms</code></pre>
+<div class="note">
+  <p><code>Index Scan Backward</code> = walking the leaf chain right-to-left to serve <code>DESC</code>; a plain
+  ascending index handles it. You only need <code>(customer_id, created_at DESC)</code> explicitly when
+  <em>mixing</em> directions, e.g. <code>ORDER BY a ASC, b DESC</code>.</p>
+</div>
+
+<h3>Covering indexes and INCLUDE</h3>
+<pre><code>-- Query: SELECT status, total FROM orders WHERE customer_id = $1;
+CREATE INDEX idx_orders_cust_covering
+    ON orders (customer_id) INCLUDE (status, total);</code></pre>
+<p>
+  <code>INCLUDE</code> columns are stored as payload in leaf pages only — they're not part of the sort key, don't
+  bloat internal pages, and can be types with no B-tree ordering. If the index carries every column the query needs,
+  Postgres can answer from the index alone: an <strong>Index Only Scan</strong>, skipping the heap hop entirely.
+  You can also get a covering effect by simply putting the column in the key (<code>(customer_id, status, total)</code>);
+  <code>INCLUDE</code> is the cleaner statement of intent and works with unique indexes
+  (<code>UNIQUE (email) INCLUDE (name)</code> stays unique on email alone).
+</p>
+
+<h3>Index-only scans and the visibility map catch</h3>
+<pre><code> Index Only Scan using idx_orders_cust_covering on orders
+     (cost=0.42..134.81 rows=4967 width=14)
+     (actual time=0.029..1.611 rows=5121 loops=1)
+   Index Cond: (customer_id = 4242)
+   Heap Fetches: 0                      &lt;-- the number that matters
+ Execution Time: 2.011 ms</code></pre>
+<p>
+  Here's the MVCC catch: index entries carry no visibility information, so an "index only" scan must still verify
+  each tuple is visible. Postgres keeps a <strong>visibility map</strong> — one bit per heap page saying
+  "every tuple on this page is visible to all transactions." If the bit is set, no heap visit needed. The bit is set
+  by <strong>VACUUM</strong> and cleared by any write to the page. Consequence: on a heavily updated table,
+  <code>Heap Fetches</code> climbs and your "index only" scan quietly degrades into a regular index scan until
+  vacuum catches up. If you see <code>Heap Fetches: 48,213</code>, the fix is often <code>VACUUM</code> (or more
+  aggressive autovacuum), not a new index.
+</p>
+<div class="senior">
+  <p>Interview-ready summary: "Index-only scans are a contract between the index (has the columns) and the
+  visibility map (proves the pages are all-visible). Both must hold. I check <code>Heap Fetches</code> in the plan;
+  a big number means vacuum isn't keeping up, and that's a vacuum-tuning problem wearing an indexing costume."</p>
+</div>
+
+<div class="pitfall">
+  <p>Don't create one mega-index per query. Indexes on <code>(a)</code>, <code>(a,b)</code>, and
+  <code>(a,b,c)</code> together are almost always waste — <code>(a,b,c)</code> serves the other two's seeks via the
+  leftmost-prefix rule. Audit for redundant prefixes before adding; drop the narrow ones.</p>
+</div>
+
+<h3>NULLs and indexes — three facts interviewers check</h3>
+<ul>
+  <li><strong>B-trees DO index NULLs</strong> (a common myth says otherwise — that's Oracle's single-column behavior,
+    not Postgres). <code>WHERE col IS NULL</code> can use an index; NULLs sort last by default
+    (<code>NULLS LAST</code> for ASC).</li>
+  <li><strong>Unique indexes allow multiple NULLs</strong> by default, because <code>NULL = NULL</code> is unknown,
+    not true. Postgres 15+ gives you <code>UNIQUE NULLS NOT DISTINCT</code> to change that; before 15, use a partial
+    unique index or a coalescing expression index.</li>
+  <li>If a nullable column is <em>mostly</em> NULL and you only query the non-NULL rows, a
+    <strong>partial index <code>WHERE col IS NOT NULL</code></strong> can be a fraction of the size.</li>
+</ul>
+<pre><code>-- "at most one default address per user", where is_default is nullable:
+CREATE UNIQUE INDEX one_default_addr
+    ON addresses (user_id)
+    WHERE is_default;        -- boolean partial: NULL and false rows excluded</code></pre>
+</section>
+
+<!-- ============================================================ -->
+<section>
+<h2 id="explain">EXPLAIN / EXPLAIN ANALYZE deep-dive <span class="tier tier-1">T1</span></h2>
+
+<p>
+  <code>EXPLAIN</code> shows the plan the optimizer <em>chose</em> with cost estimates. <code>EXPLAIN ANALYZE</code>
+  actually <strong>runs the query</strong> and adds real timings and row counts. Always add <code>BUFFERS</code>:
+</p>
+<pre><code>EXPLAIN (ANALYZE, BUFFERS) SELECT ...;
+-- Careful: ANALYZE really executes. Wrap DML in a transaction:
+BEGIN; EXPLAIN ANALYZE UPDATE ...; ROLLBACK;</code></pre>
+
+<h3>Read the tree bottom-up, inside-out</h3>
+<p>
+  Indentation = child nodes. Leaves (scans) execute first and feed rows upward into joins, sorts, and aggregates.
+  Your eyes should go: deepest node first, then follow rows up. When hunting a problem, find the node where
+  <strong>actual time explodes</strong> or where <strong>estimated rows and actual rows diverge wildly</strong>.
+</p>
+
+<h3>Cost numbers decoded</h3>
+<pre><code>Seq Scan on orders  (cost=0.00..20834.00 rows=4967 width=41)
+                     ^^^^^^^^^^^^^^^^^^  ^^^^^^^^^  ^^^^^^^^
+                     startup..total cost  est. rows  avg row bytes</code></pre>
+<ul>
+  <li><strong>Cost units are abstract</strong>, anchored to <code>seq_page_cost = 1.0</code> ("cost of reading one page sequentially"). <code>random_page_cost</code> defaults to 4.0; <code>cpu_tuple_cost</code> 0.01. Costs are for <em>comparing plans</em>, not predicting milliseconds.</li>
+  <li><strong>Startup cost</strong> = cost before the first row can be emitted. A Sort has high startup (must consume all input first); an Index Scan has near-zero. This is why <code>LIMIT</code> favors low-startup plans.</li>
+  <li><strong>rows</strong> is the planner's <em>estimate</em> from statistics. Comparing it against ANALYZE's actual rows is the single highest-value diagnostic act.</li>
+</ul>
+
+<h3>Rows estimate vs actual — the root of most bad plans</h3>
+<pre><code>-&gt;  Index Scan using idx_ev_type on events
+        (cost=0.43..8.45 rows=1 width=64)
+        (actual time=0.055..912.331 rows=184220 loops=1)
+                                    ^^^^^^^^^^^
+    Planner expected 1 row; got 184,220.</code></pre>
+<p>
+  A 5-orders-of-magnitude misestimate like this makes the planner pick strategies that only work for tiny inputs
+  (typically a Nested Loop), which then run 184,220 times. Causes: stale stats (<code>ANALYZE</code> the table),
+  correlated columns (planner multiplies independent selectivities — fix with
+  <code>CREATE STATISTICS ... (dependencies)</code>), skewed data beyond the MCV list
+  (<code>ALTER TABLE ... ALTER COLUMN ... SET STATISTICS 1000</code>), or non-immutable expressions the planner can't see through.
+</p>
+
+<h3>loops — per-loop actuals multiply!</h3>
+<pre><code>-&gt;  Index Scan using orders_pkey on orders
+        (cost=0.43..8.45 rows=1 width=41)
+        (actual time=0.021..0.022 rows=1 loops=48213)</code></pre>
+<p>
+  <code>actual time</code> and <code>rows</code> are <strong>per loop</strong>. Total row count = 1 × 48,213; total
+  time ≈ 0.022&nbsp;ms × 48,213 ≈ 1.06&nbsp;s. A node that looks innocent ("0.022 ms!") can be your entire runtime.
+  Always multiply by loops. This is also what an app-level N+1 looks like when it happens <em>inside</em> one query
+  via a nested loop join.
+</p>
+
+<h3>BUFFERS — cache visibility</h3>
+<pre><code>   Buffers: shared hit=2112 read=85342</code></pre>
+<p>
+  <code>hit</code> = pages found in shared_buffers (RAM); <code>read</code> = pages fetched from the OS/disk.
+  85k reads × 8&nbsp;KB ≈ 667&nbsp;MB of I/O for one query — that's your smoking gun for "why is it slow only
+  sometimes" (cold cache) and for spotting queries that churn the cache for everyone else. A query can be
+  "fast in staging, slow in prod" purely because of hit ratios.
+</p>
+
+<h3>Scan node types</h3>
+<table>
+  <thead><tr><th>Node</th><th>What it does</th><th>When it's the right choice</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Seq Scan</strong></td><td>Read every heap page in order</td><td>Small tables; predicates matching a large fraction of rows (sequential I/O beats millions of random hops); no usable index. A seq scan is often <em>correct</em> — say this in interviews.</td></tr>
+    <tr><td><strong>Index Scan</strong></td><td>Traverse B-tree, hop to heap per row, preserves index order</td><td>High selectivity (few rows), or when index order serves ORDER BY/LIMIT</td></tr>
+    <tr><td><strong>Index Only Scan</strong></td><td>Answer from index + visibility map, no heap (ideally)</td><td>Query columns ⊆ index columns and table is well-vacuumed</td></tr>
+    <tr><td><strong>Bitmap Index Scan + Bitmap Heap Scan</strong></td><td>Collect all matching ctids into a bitmap, sort by page, then visit each heap page once in physical order</td><td>Medium selectivity — too many rows for per-row random hops, too few for a full seq scan. Also enables combining indexes (BitmapAnd/BitmapOr).</td></tr>
+  </tbody>
+</table>
+<div class="note">
+  <p><strong>Recheck Cond</strong> on a Bitmap Heap Scan: if the bitmap has too many entries for
+  <code>work_mem</code>, it degrades from exact ctids to <em>lossy</em> whole-page bits
+  (<code>Heap Blocks: exact=2140 lossy=31882</code>), and every tuple on those pages must be rechecked against the
+  condition. Lots of lossy blocks → raise <code>work_mem</code> or make the predicate more selective.</p>
+</div>
+
+<h3>Join strategies</h3>
+<pre><code>-- NESTED LOOP: for each outer row, probe the inner side.
+ Nested Loop  (cost=0.43..112.30 rows=12 width=105)
+              (actual time=0.031..0.214 rows=12 loops=1)
+   -&gt;  Index Scan using idx_orders_cust_created on orders o
+           (cost=0.43..14.85 rows=12 width=41) (actual ... rows=12 loops=1)
+         Index Cond: (customer_id = 4242)
+   -&gt;  Index Scan using order_items_order_id_idx on order_items i
+           (cost=0.43..7.90 rows=2 width=64) (actual ... rows=2 loops=12)
+         Index Cond: (order_id = o.id)</code></pre>
+<p>
+  <strong>Nested Loop</strong> is great when the outer side is small and the inner side has an index (12 cheap
+  probes above). It's <em>catastrophic</em> when the outer side is unexpectedly large or the inner side has no index
+  — a misestimated outer of 200k rows × an inner seq scan is the classic multi-minute query. Check
+  <code>loops=</code> on the inner node.
+</p>
+<pre><code>-- HASH JOIN: build a hash table from one side, probe with the other.
+ Hash Join  (cost=3542.00..27890.42 rows=98230 width=105)
+            (actual time=31.442..204.116 rows=99871 loops=1)
+   Hash Cond: (o.customer_id = c.id)
+   -&gt;  Seq Scan on orders o  (cost=0.00..20834.00 rows=1000000 width=41)
+   -&gt;  Hash  (cost=2292.00..2292.00 rows=100000 width=72)
+             (actual time=30.871..30.872 rows=100000 loops=1)
+         Buckets: 131072  Batches: 1  Memory Usage: 11265kB
+         -&gt;  Seq Scan on customers c  (cost=0.00..2292.00 rows=100000 width=72)</code></pre>
+<p>
+  <strong>Hash Join</strong>: equality joins over big row sets. The build side must fit in <code>work_mem</code>
+  or it spills (<code>Batches: 8</code> = 8 passes over temp files). The planner builds on the smaller side.
+</p>
+<pre><code>-- MERGE JOIN: both inputs sorted on the join key; zipper them together.
+ Merge Join  (cost=0.85..61240.90 rows=1000000 width=105)
+   Merge Cond: (o.customer_id = c.id)
+   -&gt;  Index Scan using idx_orders_customer on orders o   (pre-sorted, free)
+   -&gt;  Index Scan using customers_pkey on customers c</code></pre>
+<p>
+  <strong>Merge Join</strong> shines when both sides arrive pre-sorted (via indexes) — huge joins with no memory
+  pressure. If a side needs an explicit Sort first, the sort cost usually hands the win back to Hash Join.
+</p>
+
+<h3>Sort, incremental sort, and work_mem spills</h3>
+<pre><code> Sort  (cost=131824.29..134324.29 rows=1000000 width=41)
+       (actual time=812.406..1094.221 rows=1000000 loops=1)
+   Sort Key: created_at DESC
+   Sort Method: external merge  Disk: 48720kB     &lt;-- spilled to temp files
+   Buffers: shared hit=12448, temp read=6090 written=6103</code></pre>
+<p>
+  <code>quicksort Memory: ...kB</code> = fit in <code>work_mem</code>, fine. <code>external merge Disk:</code> =
+  didn't fit; Postgres wrote sorted runs to disk and merged them. Fixes, in order of preference: make an index serve
+  the ordering (best — no sort at all), sort fewer rows/columns, or raise <code>work_mem</code>
+  (session-level for the reporting query, not globally — it's per sort node per connection, so a global bump can
+  blow out memory under load). <strong>Incremental Sort</strong> appears when input is already sorted by a prefix of
+  the sort key (index on <code>(a)</code>, query orders by <code>a, b</code>): it sorts small per-group batches —
+  low memory, low startup cost.
+</p>
+
+<h3>Plan red flags — the 60-second triage table</h3>
+<p>When a plan lands in front of you (or on a whiteboard), scan for these in order:</p>
+<table>
+  <thead><tr><th>Red flag in the plan</th><th>What it means</th><th>First move</th></tr></thead>
+  <tbody>
+    <tr><td>estimated <code>rows</code> vs actual off by 100x+</td><td>Planner is flying blind; every choice above this node is suspect</td><td><code>ANALYZE</code>; extended statistics for correlated columns</td></tr>
+    <tr><td>huge <code>Rows Removed by Filter</code></td><td>Reading far more than you keep — predicate not served by the access path</td><td>Index matching the filter (or accept: low selectivity)</td></tr>
+    <tr><td>inner node with <code>loops=</code> in the thousands</td><td>Nested loop executing the inner side per outer row; multiply per-loop time by loops</td><td>Check outer-side estimate; index the inner join key</td></tr>
+    <tr><td><code>Sort Method: external merge Disk</code></td><td>work_mem spill — slowest sort path</td><td>Index the ORDER BY; session-level work_mem</td></tr>
+    <tr><td><code>Heap Blocks: ... lossy=...</code></td><td>Bitmap overflowed work_mem; per-tuple rechecks</td><td>work_mem, or tighter predicate</td></tr>
+    <tr><td><code>Heap Fetches:</code> large on Index Only Scan</td><td>Visibility map stale — writes outpacing vacuum</td><td>VACUUM / autovacuum tuning</td></tr>
+    <tr><td><code>Buffers: read</code> ≫ <code>hit</code></td><td>Cold-cache I/O; explains "slow sometimes" and cache churn</td><td>Reduce pages touched; check index/query shape</td></tr>
+    <tr><td><code>Hash ... Batches:</code> &gt; 1</td><td>Hash join build side spilled to disk</td><td>work_mem; or reduce build-side rows</td></tr>
+    <tr><td>Sort/Hash directly above a Seq Scan of a huge table</td><td>The whole table is the input — is that necessary?</td><td>Push predicates down; pre-aggregate; index</td></tr>
+  </tbody>
+</table>
+</section>
+
+<!-- ============================================================ -->
+<section>
+<h2 id="ignored">Why the planner ignores your index <span class="tier tier-1">T1</span></h2>
+
+<p>"I added the index and it still does a seq scan" — the checklist, roughly in order of likelihood:</p>
+
+<ol>
+  <li><strong>Stale statistics.</strong> The planner prices plans using stats from the last <code>ANALYZE</code>. After bulk loads or big deletes, estimates can be fiction. First move, always: <code>ANALYZE tablename;</code> and re-explain. (Autovacuum usually handles this, but it lags after mass changes.)</li>
+  <li><strong>Low selectivity — the seq scan is CORRECT.</strong> If the predicate matches ~30–50%+ of rows, per-row index random I/O costs more than one sequential pass. The planner is doing its job. Rough mental model: index scans win below a few percent of the table; bitmap scans hold the middle; seq scans win the rest. Don't fight it; fix the query shape (or accept it).</li>
+  <li><strong>Small table.</strong> A 50-page table is cheaper to read whole than to traverse a tree for. Indexes on tiny lookup tables exist for constraints, not speed.</li>
+  <li><strong>Cost settings lying about your hardware.</strong> Default <code>random_page_cost = 4.0</code> models spinning disks. On SSD/NVMe (and cloud storage), random reads are nearly as cheap as sequential; common practice is 1.1. Left at 4.0, the planner over-penalizes index scans and clings to seq scans and hash joins. Also check <code>effective_cache_size</code> (should reflect total RAM available for caching — it makes index scans look cheaper by modeling cache hits).</li>
+  <li><strong>Wrapped column / expression mismatch.</strong> Anything from the <a href="#cant-use">trap list</a>: function on the column, implicit cast, collation mismatch.</li>
+  <li><strong>Wrong column order</strong> in a composite index — the leading-column rule again.</li>
+  <li><strong>The index can't produce what the query needs</strong> — e.g., ordering direction mismatch with mixed ASC/DESC, or a partial index whose WHERE clause doesn't provably cover the query's predicate.</li>
+</ol>
+
+<h3>Verifying: the enable_seqscan trick (diagnosis ONLY)</h3>
+<pre><code>SET enable_seqscan = off;   -- session-local; makes seq scans astronomically expensive
+EXPLAIN ANALYZE SELECT ... ;
+RESET enable_seqscan;</code></pre>
+<p>Two outcomes, both informative:</p>
+<ul>
+  <li>Planner <em>still</em> seq-scans → the index is <strong>unusable</strong> for this query (wrapped column, wrong order, cast). Structural problem.</li>
+  <li>Planner uses the index and it's <em>slower</em> (or barely faster) → the cost model was <strong>right</strong>; selectivity is the issue.</li>
+  <li>Planner uses the index and it's <em>much faster</em> → costing problem: stale stats, <code>random_page_cost</code>, correlation. Fix the inputs to the cost model.</li>
+</ul>
+<div class="pitfall">
+  <p>Never ship <code>enable_seqscan = off</code> (or friends) to production, and say so explicitly in the interview:
+  "these are diagnostic scalpels, not tuning knobs." Interviewers actively probe whether you know these settings are
+  global sledgehammers.</p>
+</div>
+
+<h3>Selectivity rules of thumb</h3>
+<table>
+  <thead><tr><th>Predicate matches roughly…</th><th>Plan you should expect</th><th>Is that a problem?</th></tr></thead>
+  <tbody>
+    <tr><td>&lt; ~1–2% of rows</td><td>Index Scan (or Index Only Scan)</td><td>No — the ideal case</td></tr>
+    <tr><td>~2–20% of rows</td><td>Bitmap Index + Bitmap Heap Scan</td><td>No — batched heap access is the right trade</td></tr>
+    <tr><td>&gt; ~20–30% of rows</td><td>Seq Scan (often parallel)</td><td>No — sequential I/O wins; don't force the index</td></tr>
+    <tr><td>Tiny table (a few pages)</td><td>Seq Scan regardless</td><td>No — tree traversal costs more than reading it all</td></tr>
+  </tbody>
+</table>
+<p>
+  The thresholds shift with correlation, row width, and <code>random_page_cost</code> — treat them as intuition,
+  not law. A well-correlated index (e.g. timestamp on append-only data) stays profitable far past these percentages;
+  a zero-correlation index gives up earlier. On big scans you'll also see <code>Gather</code> /
+  <code>Parallel Seq Scan</code> nodes — remember that per-worker actual rows are reported per loop
+  (<code>loops=3</code> means leader + 2 workers), another place where the multiply-by-loops habit pays off.
+</p>
+</section>
+
+<!-- ============================================================ -->
+<section>
+<h2 id="hurt">When indexes HURT: write amplification, HOT updates, bloat <span class="tier tier-1">T1</span></h2>
+
+<h3>Write amplification</h3>
+<p>
+  Every <code>INSERT</code> writes the heap tuple <em>plus one entry per index</em> — each a tree descent, a leaf
+  insert, possible page splits, and WAL for all of it. A table with 9 indexes does ~10x the write work of an
+  unindexed one. On an ingest-heavy table, that's the difference between keeping up and falling behind. Bulk-load
+  pattern: drop (or create after) indexes, load, then <code>CREATE INDEX</code> — building an index in one pass is
+  far cheaper than a million incremental inserts.
+</p>
+
+<h3>HOT updates — and how one index defeats them</h3>
+<p>
+  An <code>UPDATE</code> in Postgres writes a whole new row version. Normally every index needs a new entry pointing
+  at it. The <strong>HOT (Heap-Only Tuple)</strong> optimization skips all index writes when two conditions hold:
+  (1) <strong>no indexed column changed</strong>, and (2) the new version fits <strong>on the same heap page</strong>
+  (helped by a <code>fillfactor</code> below 100 leaving room). The old version just points to the new one within the page;
+  indexes keep pointing at the chain head.
+</p>
+<div class="pitfall">
+  <p>The trap: someone adds an index on <code>last_seen_at</code> or <code>updated_at</code> — a column touched by
+  nearly every UPDATE. Condition (1) now fails for <em>every</em> update, so <em>every</em> index on the table gets
+  written on every update, not just the new one. One "harmless" index can multiply the write load of the whole
+  table and inflate bloat everywhere. Check impact with <code>pg_stat_user_tables.n_tup_hot_upd</code> vs
+  <code>n_tup_upd</code> before and after — a collapsing HOT ratio is the tell.</p>
+</div>
+
+<h3>Bloat</h3>
+<p>
+  Dead tuples (from UPDATE/DELETE) leave dead index entries too. Vacuum reclaims space <em>within</em> pages, but
+  B-tree pages that became sparse don't merge back gracefully — indexes ratchet up in size under churny workloads.
+  Symptoms: index physically larger than expected, degraded cache hit ratio, slower scans. Fix:
+  <code>REINDEX INDEX CONCURRENTLY idx_name;</code> (production-safe rebuild, Postgres 12+). Monitor with
+  <code>pgstattuple</code>/<code>pgstatindex</code> (<code>avg_leaf_density</code> well under ~70% on a stable-size
+  index suggests a rebuild).
+</p>
+
+<h3>Finding indexes that don't earn their keep</h3>
+<pre><code>SELECT s.schemaname, s.relname AS table, s.indexrelname AS index,
+       s.idx_scan AS scans,
+       pg_size_pretty(pg_relation_size(s.indexrelid)) AS size
+FROM pg_stat_user_indexes s
+JOIN pg_index i ON i.indexrelid = s.indexrelid
+WHERE s.idx_scan = 0
+  AND NOT i.indisunique          -- unique indexes enforce constraints; keep them
+ORDER BY pg_relation_size(s.indexrelid) DESC;
+
+ schemaname |  table  |          index           | scans |  size
+------------+---------+--------------------------+-------+--------
+ public     | orders  | idx_orders_updated_at    |     0 | 214 MB
+ public     | events  | idx_events_meta_gin      |     0 | 1287 MB</code></pre>
+<h3>Production index operations: CONCURRENTLY or downtime</h3>
+<p>
+  A plain <code>CREATE INDEX</code> takes a lock that <strong>blocks all writes</strong> to the table for the entire
+  build — minutes to hours on a big table. In production, always:
+</p>
+<pre><code>CREATE INDEX CONCURRENTLY idx_orders_cust_created
+    ON orders (customer_id, created_at);
+
+DROP INDEX CONCURRENTLY idx_orders_old;
+REINDEX INDEX CONCURRENTLY idx_orders_bloated;   -- PG 12+</code></pre>
+<p>Know the fine print — this is exactly where interviewers poke:</p>
+<ul>
+  <li><code>CONCURRENTLY</code> can't run inside a transaction block — it manages its own (so it doesn't mix with
+    transactional migration tools; Flyway needs the migration marked non-transactional).</li>
+  <li>It does <strong>two table scans plus waits</strong> for concurrent transactions, so it's slower and needs care
+    on very busy tables (long-running transactions stall it).</li>
+  <li>If it fails or is cancelled midway, it leaves an <strong>INVALID index</strong> behind — still maintained on
+    writes (pure cost, never used for reads). Find and drop them:
+    <code>SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid;</code></li>
+  <li>Pair migrations with <code>lock_timeout</code> (e.g. <code>SET lock_timeout = '3s'</code>) so any DDL that does
+    need a lock fails fast instead of queueing behind a long query while blocking everyone <em>behind it</em>.</li>
+</ul>
+
+<div class="senior">
+  <p>Caveats before you drop: stats reset on <code>pg_stat_reset()</code> and (pre-PG16) on failover to a replica —
+  make sure the observation window is long enough to include monthly/quarterly jobs; check replicas too (their index
+  usage is tracked separately). Safe path: note the definition, <code>DROP INDEX CONCURRENTLY</code>, and be ready to
+  recreate. The symptom of over-indexing at the system level: write latency creeping up, autovacuum permanently busy,
+  and indexes collectively larger than the table.</p>
+</div>
+</section>
+
+<!-- ============================================================ -->
+<section>
+<h2 id="specialized">Specialized indexes: partial, expression, GIN, GiST, BRIN, hash <span class="tier tier-2">T2</span></h2>
+
+<h3>Partial indexes — index only the rows you query</h3>
+<pre><code>-- 98% of orders are 'completed'; the app only ever queries live ones.
+CREATE INDEX idx_orders_live
+    ON orders (customer_id, created_at)
+    WHERE status IN ('pending', 'processing');</code></pre>
+<p>
+  The index contains only matching rows: ~2% of the size, hotter in cache, cheaper to maintain (writes to completed
+  orders never touch it). The planner uses it only when the query's WHERE clause <em>provably implies</em> the index's
+  predicate — write the same condition (or a stricter one) in the query. Killer bonus use:
+  <strong>conditional uniqueness</strong>, which a plain unique constraint can't express:
+</p>
+<pre><code>-- "one active subscription per user" — cancelled ones don't count
+CREATE UNIQUE INDEX one_active_sub_per_user
+    ON subscriptions (user_id)
+    WHERE status = 'active';
+
+-- soft-delete-safe unique emails
+CREATE UNIQUE INDEX users_email_unique
+    ON users (lower(email))
+    WHERE deleted_at IS NULL;</code></pre>
+
+<h3>Expression indexes</h3>
+<pre><code>CREATE INDEX idx_users_email_lower ON users (lower(email));
+-- Query must use the SAME expression to match:
+SELECT * FROM users WHERE lower(email) = lower($1);</code></pre>
+<p>The tree stores computed results. The expression must be immutable. Combines with partial (see above). Run <code>ANALYZE</code> after creating one — expression indexes get their own statistics.</p>
+
+<h3>GIN — inverted index for "contains" questions</h3>
+<pre><code>CREATE INDEX idx_events_payload ON events USING gin (payload jsonb_path_ops);
+
+EXPLAIN ANALYZE
+SELECT * FROM events WHERE payload @&gt; '{"type": "checkout", "plan": "pro"}';
+
+ Bitmap Heap Scan on events  (cost=52.31..3418.24 rows=890 width=412)
+                             (actual time=0.911..4.822 rows=1042 loops=1)
+   Recheck Cond: (payload @&gt; '{"type": "checkout", "plan": "pro"}'::jsonb)
+   Heap Blocks: exact=987
+   -&gt;  Bitmap Index Scan on idx_events_payload  (cost=0.00..52.09 rows=890 width=0)
+         Index Cond: (payload @&gt; '{"type": "checkout", "plan": "pro"}'::jsonb)
+ Execution Time: 5.201 ms</code></pre>
+<p>
+  GIN maps each element/key/lexeme → list of rows containing it — perfect for JSONB containment (<code>@&gt;</code>),
+  array overlap (<code>&amp;&amp;</code>), full-text search (<code>tsvector @@ tsquery</code>), and (with
+  <code>pg_trgm</code>) <code>LIKE '%foo%'</code>. Costs: notably slower writes than B-tree (many entries per row;
+  mitigated by <code>fastupdate</code> pending lists, which trade read latency spikes), large size, and no ordering —
+  GIN can't serve <code>ORDER BY</code>. <code>jsonb_path_ops</code> is smaller/faster but only supports <code>@&gt;</code>.
+</p>
+<div class="pitfall">
+  <p>A B-tree on a <code>jsonb</code> column is nearly useless (it indexes whole-document comparison). Either GIN
+  the column, or B-tree an extracted expression: <code>CREATE INDEX ON events ((payload-&gt;&gt;'type'));</code> —
+  the right choice when you always query that one key with equality and want ordering/statistics.</p>
+</div>
+
+<h3>GiST — overlaps, nearest-neighbor, exclusion constraints</h3>
+<pre><code>-- Prevent double-booking a room: no two reservations may overlap.
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+ALTER TABLE reservations ADD CONSTRAINT no_overlap
+    EXCLUDE USING gist (room_id WITH =, during WITH &amp;&amp;);</code></pre>
+<p>
+  GiST is a generalized tree for data with "containment/overlap" rather than total order: ranges, geometry
+  (PostGIS), and k-nearest-neighbor (<code>ORDER BY location &lt;-&gt; point</code>). The exclusion-constraint
+  example is a spectacular interview answer for booking systems — it's a uniqueness constraint over <em>overlap</em>,
+  enforced at the database level, race-free.
+</p>
+
+<h3>BRIN — tiny index for huge, naturally-ordered tables</h3>
+<pre><code>CREATE INDEX idx_metrics_time_brin ON metrics USING brin (recorded_at);
+
+-- 2 TB append-only time-series table:
+--   B-tree on recorded_at:  ~45 GB
+--   BRIN on recorded_at:    ~2 MB</code></pre>
+<p>
+  BRIN stores only the min/max of the column per <em>block range</em> (default 128 pages). A time filter skips
+  every block range whose min/max can't match. It only works when physical order correlates with the column —
+  append-only time-series is the canonical case. Wrong tool for scattered data (correlation ≈ 0 → it skips nothing).
+  Trade: much coarser than B-tree (always a lossy bitmap scan with rechecks), but the maintenance and memory cost
+  is near zero.
+</p>
+
+<h3>Hash indexes</h3>
+<p>
+  Equality only — no ranges, no ordering, no multi-column. WAL-logged and crash-safe since Postgres 10, so they're
+  legitimate now, and can beat B-trees slightly for equality on very long keys (URLs). But a B-tree handles equality
+  fine and does everything else too, so the honest interview answer is: "rarely; B-tree is the default for a reason.
+  For long text keys I'd sooner B-tree a hash expression like <code>(digest(url,'sha256'))</code> and get uniqueness support."
+</p>
+
+<table>
+  <thead><tr><th>Index</th><th>Best for</th><th>Watch out</th></tr></thead>
+  <tbody>
+    <tr><td>B-tree</td><td>Equality, ranges, ORDER BY, uniqueness — the default</td><td>The trap list above</td></tr>
+    <tr><td>Partial</td><td>Hot subset of rows; conditional uniqueness</td><td>Query must imply the predicate</td></tr>
+    <tr><td>Expression</td><td>Queries on lower(col), date_trunc, extracted JSON keys</td><td>Expression must match exactly; immutable only</td></tr>
+    <tr><td>GIN</td><td>JSONB @&gt;, arrays, full-text, trigram LIKE</td><td>Slow writes, big, no ordering</td></tr>
+    <tr><td>GiST</td><td>Ranges/geometry overlap, KNN, exclusion constraints</td><td>Lossy; generally slower than B-tree for scalars</td></tr>
+    <tr><td>BRIN</td><td>Huge append-only tables, physically ordered column</td><td>Useless without physical correlation</td></tr>
+    <tr><td>Hash</td><td>Equality on very long keys</td><td>Equality only; rarely worth it</td></tr>
+  </tbody>
+</table>
+</section>
+
+<!-- ============================================================ -->
+<section>
+<h2 id="runbook">The slow-query diagnosis runbook — your interview story <span class="tier tier-2">T2</span></h2>
+
+<p>
+  When the interviewer says "production got slow," do NOT jump to "add an index." Walk the runbook. The structure
+  itself — <em>symptom → locate → measure → hypothesize → fix → verify</em> — is what they're grading.
+</p>
+
+<h3>Step 1 — Locate the query: pg_stat_statements</h3>
+<pre><code>-- (requires the extension; normalizes queries and aggregates stats)
+SELECT round(total_exec_time::numeric, 0) AS total_ms,
+       calls,
+       round(mean_exec_time::numeric, 1) AS mean_ms,
+       rows,
+       left(query, 80) AS query
+FROM pg_stat_statements
+ORDER BY total_exec_time DESC
+LIMIT 5;
+
+ total_ms | calls  | mean_ms |  rows  | query
+----------+--------+---------+--------+------------------------------------------
+ 18744210 |   7412 |  2529.0 | 148240 | SELECT * FROM orders WHERE customer_id = $1 AND status = $2 ORDER BY created_a
+  2231904 | 991042 |     2.3 | 991042 | SELECT * FROM order_items WHERE order_id = $1
+   401220 |     44 |  9118.6 |     44 | SELECT count(*) FROM events WHERE ...</code></pre>
+<p>
+  Sort by <strong>total_exec_time</strong>, not mean — a 2&nbsp;ms query called a million times (row 2: hello, N+1)
+  can out-damage a 9-second report. Row 1 is our target: 2.5&nbsp;s mean, 7,412 calls. Also worth glancing at:
+  <code>shared_blks_read</code> (I/O hog?) and <code>rows/calls</code> (fetching too much?).
+</p>
+<div class="note">
+  <p>Complementary tooling to name-drop: <code>log_min_duration_statement = 500</code> logs every statement over
+  500&nbsp;ms; the <code>auto_explain</code> module (<code>auto_explain.log_min_duration</code>,
+  <code>log_analyze</code>, <code>log_buffers</code>) logs the <em>actual plan</em> of slow production executions —
+  invaluable when a query is only slow for certain parameters and you can't reproduce it by hand.</p>
+</div>
+
+<h3>Step 2 — Measure: EXPLAIN (ANALYZE, BUFFERS) with real parameters</h3>
+<pre><code>EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM orders
+WHERE customer_id = 4242 AND status = 'pending'
+ORDER BY created_at DESC
+LIMIT 20;
+
+ Limit  (cost=193067.87..193067.92 rows=20 width=41)
+        (actual time=2489.211..2489.217 rows=20 loops=1)
+   Buffers: shared hit=2112 read=85342
+   -&gt;  Sort  (cost=193067.87..193068.99 rows=449 width=41)
+             (actual time=2489.209..2489.212 rows=20 loops=1)
+         Sort Key: created_at DESC
+         Sort Method: top-N heapsort  Memory: 27kB
+         Buffers: shared hit=2112 read=85342
+         -&gt;  Seq Scan on orders  (cost=0.00..193055.60 rows=449 width=41)
+                                 (actual time=1.822..2487.010 rows=1893 loops=1)
+               Filter: ((customer_id = 4242) AND (status = 'pending'::text))
+               Rows Removed by Filter: 9998107
+               Buffers: shared hit=2112 read=85342
+ Planning Time: 0.213 ms
+ Execution Time: 2489.304 ms</code></pre>
+<p>Read it like a senior, out loud:</p>
+<ul>
+  <li>Seq scan over 10M rows; <code>Rows Removed by Filter: 9,998,107</code> — we read the entire table to keep 1,893 rows.</li>
+  <li><code>Buffers: read=85342</code> ≈ 667&nbsp;MB of I/O per execution, 7,412 times — this query alone is thrashing the cache.</li>
+  <li>The Sort itself is cheap (top-N heapsort, 27&nbsp;kB) — the cost is entirely the scan. Don't "fix the sort."</li>
+</ul>
+
+<h3>Step 3 — Hypothesize (differential diagnosis, not a guess)</h3>
+<ul>
+  <li><strong>Misestimate?</strong> Estimated 449 vs actual 1,893 — off ~4x, not the disease here. (If it were 1 vs 100k, fix stats <em>first</em>.)</li>
+  <li><strong>Missing index?</strong> <code>\d orders</code> shows only the PK. Yes — no index can serve (customer_id, status, created_at).</li>
+  <li><strong>N+1 from the app?</strong> pg_stat_statements row 2 says we <em>also</em> have one (order_items, 991k calls) — separate ticket, app-layer fix.</li>
+  <li><strong>Lock waits?</strong> Would show as fast plans but slow wall-clock; check <code>pg_locks</code>/<code>pg_stat_activity.wait_event</code>. Not the case here — the time is inside the scan.</li>
+</ul>
+
+<h3>Step 4 — Fix: a composite partial index matching the query shape</h3>
+<pre><code>-- Equality columns → key prefix; sort column next; hot status subset → partial.
+-- CONCURRENTLY: builds without blocking writes (can't run inside a transaction).
+CREATE INDEX CONCURRENTLY idx_orders_cust_created_pending
+    ON orders (customer_id, created_at DESC)
+    WHERE status = 'pending';
+
+ANALYZE orders;</code></pre>
+
+<h3>Step 5 — Verify with numbers</h3>
+<pre><code>EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM orders
+WHERE customer_id = 4242 AND status = 'pending'
+ORDER BY created_at DESC
+LIMIT 20;
+
+ Limit  (cost=0.43..25.91 rows=20 width=41)
+        (actual time=0.049..0.203 rows=20 loops=1)
+   Buffers: shared hit=25
+   -&gt;  Index Scan using idx_orders_cust_created_pending on orders
+           (cost=0.43..2287.15 rows=1795 width=41)
+           (actual time=0.047..0.196 rows=20 loops=1)
+         Index Cond: (customer_id = 4242)
+ Planning Time: 0.301 ms
+ Execution Time: 0.241 ms</code></pre>
+<p>
+  <strong>2,489&nbsp;ms → 0.24&nbsp;ms (~10,000x); 85,342 buffer reads → 25 buffer hits.</strong> Note what the plan
+  shows: no Sort node (the index provides the order, so LIMIT stops after 20 entries), no status filter (the partial
+  index's predicate absorbs it), and the whole thing runs from cache. Then close the loop: watch
+  <code>pg_stat_statements</code> mean_exec_time over the next day, and check the write-side cost you just added
+  (this table takes ~50 inserts/s; one extra partial index covering ~2% of rows is a cheap tax — state that
+  trade-off out loud).
+</p>
+
+<div class="senior">
+  <p>The rehearsable 30-second version: "We had a p99 alert on the orders page. <code>pg_stat_statements</code>
+  pointed at one query — 2.5&nbsp;s mean, top total time. <code>EXPLAIN (ANALYZE, BUFFERS)</code> showed a seq scan
+  over 10M rows discarding 99.98% of them, 667&nbsp;MB of I/O per call. Estimates were sane, so it wasn't stats — it
+  was genuinely missing an index. I added a composite partial index — customer_id then created_at, partial on the
+  pending status — built CONCURRENTLY. Query went to sub-millisecond, buffers from 85k reads to 25 hits, and the
+  Sort node disappeared because the index serves the ORDER BY. Then I verified the HOT-update ratio and insert
+  latency didn't regress, and set auto_explain thresholds so the next one pages us with a plan attached."</p>
+</div>
+</section>
+
+<!-- ============================================================ -->
+<section>
+<h2 id="app-level">App-level interplay: N+1, SELECT *, pagination, COUNT(*), pools <span class="tier tier-2">T2</span></h2>
+
+<h3>N+1 — the database is innocent</h3>
+<pre><code>-- What pg_stat_statements shows:
+--   calls=991042  mean=2.3ms   SELECT * FROM order_items WHERE order_id = $1
+-- Each call is FAST. The workload is the problem: 1 query for orders,
+-- then 1 per order for items. Latency = N × (round trip + 2.3ms).</code></pre>
+<p>
+  Indexing can't fix N+1 — every individual query already uses an index. Fix at the app layer: a JOIN, a batched
+  <code>WHERE order_id = ANY($1)</code>, or in JPA a <code>JOIN FETCH</code> / <code>@EntityGraph</code>
+  (see tutorial 07). The interview tell that it's N+1 and not a slow query: huge <code>calls</code>, tiny
+  <code>mean_exec_time</code>, page latency scaling with result-set size. Your frontend analogy lands well here:
+  it's a waterfall of sequential fetches instead of one batched request.
+</p>
+
+<h3>SELECT * — three separate costs</h3>
+<ul>
+  <li><strong>Defeats index-only scans</strong>: the moment you ask for a column not in the index, every row needs a heap fetch.</li>
+  <li><strong>Network and serialization</strong>: dragging a 2&nbsp;KB <code>jsonb</code> or text blob across the wire for a list view that shows three fields — multiplied by rows × requests. (Wide values live in TOAST storage, fetched and decompressed only when actually selected — <code>SELECT *</code> forces that work too.)</li>
+  <li><strong>Fragility</strong>: plans and ORM mappings silently change when columns are added.</li>
+</ul>
+
+<h3>Deep pagination: LIMIT/OFFSET is O(offset)</h3>
+<pre><code>EXPLAIN ANALYZE SELECT id, title, created_at FROM posts
+ORDER BY created_at DESC LIMIT 20 OFFSET 200000;
+
+ Limit  (cost=6841.32..6841.99 rows=20 width=52)
+        (actual time=312.441..312.688 rows=20 loops=1)
+   -&gt;  Index Scan Backward using idx_posts_created on posts
+           (cost=0.43..68413.20 rows=2000000 width=52)
+           (actual time=0.038..305.912 rows=200020 loops=1)
+ Execution Time: 312.821 ms</code></pre>
+<p>
+  Postgres must produce and <em>discard</em> 200,000 rows to return 20 — <code>rows=200020</code> on the scan says it
+  plainly. Page 10,000 is 10,000x the work of page 1, and rows shift between pages under concurrent writes.
+  The fix is <strong>keyset (cursor) pagination</strong>: remember where the last page ended and seek there:
+</p>
+<pre><code>-- Cursor = (created_at, id) of the last row of the previous page.
+-- id breaks ties so pagination is total-ordered and stable.
+SELECT id, title, created_at FROM posts
+WHERE (created_at, id) &lt; ($1, $2)          -- row-value comparison: one index seek
+ORDER BY created_at DESC, id DESC
+LIMIT 20;
+
+-- Needs: CREATE INDEX ON posts (created_at DESC, id DESC);
+
+ Limit  (cost=0.43..7.28 rows=20 width=52)
+        (actual time=0.041..0.152 rows=20 loops=1)
+   -&gt;  Index Scan using idx_posts_created_id on posts
+           (cost=0.43..684530.11 rows=1998112 width=52)
+           (actual time=0.039..0.146 rows=20 loops=1)
+         Index Cond: (ROW(created_at, id) &lt; ROW('2026-06-30 08:14:02+00', 1837421))
+ Execution Time: 0.178 ms</code></pre>
+<p>
+  Every page costs the same as page 1. The API returns an opaque cursor instead of a page number — the trade-off is
+  no "jump to page 47" (usually fine: infinite scroll, feeds, exports). This exact rewrite — with the composite
+  row-value comparison — is a fantastic whiteboard answer.
+</p>
+
+<h3>COUNT(*) on big tables</h3>
+<p>
+  <code>COUNT(*)</code> must visit rows to check MVCC visibility — no shortcut exists; on a 100M-row table it's a
+  multi-second parallel scan (an index-only scan helps but still touches every entry). Alternatives, by use case:
+</p>
+<pre><code>-- UI badge / dashboard: planner's estimate is instant and usually plenty
+SELECT reltuples::bigint AS approx_rows
+FROM pg_class WHERE relname = 'events';       -- accurate to last ANALYZE
+
+-- "10,000+ results" UX: count with a cap
+SELECT count(*) FROM (
+  SELECT 1 FROM events WHERE tenant_id = $1 LIMIT 10001
+) t;
+
+-- Exact + fast + frequent: maintain a counter (trigger or app-side, accept the write cost)</code></pre>
+
+<h3>"The DB is slow" that isn't: connection pool exhaustion</h3>
+<p>
+  Symptom: p99 explodes, dashboards blame the database — but <code>pg_stat_statements</code> shows normal
+  <code>mean_exec_time</code> and the DB is idle. The time is spent in the <em>app</em>, queued waiting for a
+  connection from HikariCP (default pool: 10). Common causes: a pool sized too small for a traffic spike, one slow
+  endpoint (or that N+1) holding connections 10x longer than normal, or transactions held open across HTTP calls.
+  Diagnose with pool metrics (Hikari's <code>pending</code>/<code>awaiting</code> gauges, connection acquisition
+  time) and <code>pg_stat_activity</code> (lots of <code>idle in transaction</code> = app holding transactions open).
+  Fix the hog first; more connections is often the wrong fix — Postgres degrades past a few hundred backends, which
+  is why PgBouncer exists.
+</p>
+
+<h3>Guardrails: statement timeout</h3>
+<pre><code>-- Per role/app: fail fast instead of letting a runaway query pile up
+ALTER ROLE app_user SET statement_timeout = '5s';
+ALTER ROLE app_user SET idle_in_transaction_session_timeout = '30s';
+-- Reporting jobs get their own role with a bigger budget.
+ALTER ROLE reporting SET statement_timeout = '5min';</code></pre>
+<p>
+  A missing index plus no timeout = one bad deploy saturates I/O, every other query slows, pools exhaust, the whole
+  site is down. With a 5&nbsp;s timeout the blast radius is one failing endpoint and a clean error in the logs.
+  Timeouts convert "mystery outage" into "specific query to fix" — mention them as the systemic guardrail at the end
+  of your slow-query story.
+</p>
+</section>
+
+<!-- ============================================================ -->
+<section>
+<h2 id="qa">Interview Q&amp;A</h2>
+
+<details class="qa"><summary>Walk me through what happens inside Postgres when you run <code>WHERE email = 'x'</code> with a B-tree index on email.</summary>
+<div class="answer"><p>The planner first decides an index scan is worth it based on statistics. Execution: binary-search the root page for the key, descend through internal pages to the leaf (2–4 page reads even for huge tables since fan-out is in the hundreds), binary-search within the leaf for matching (key, ctid) entries. Each ctid is a physical heap address — fetch that heap page, read the tuple, and check MVCC visibility, since the index doesn't know if the row version is visible to my snapshot. So the real cost is tree descent plus one heap hop per matching row — which is why index scans win at high selectivity and lose when they'd trigger millions of random heap reads.</p></div></details>
+
+<details class="qa"><summary>Why is a B-tree lookup O(log n), and why is that even faster than it sounds?</summary>
+<div class="answer"><p>Each level of the tree partitions keys by sorted separator values, so a descent eliminates all but one child per step — that's the log. But because Postgres pages are 8&nbsp;KB and hold hundreds of keys, the branching factor is ~several hundred, not 2: a million rows is a 3-level tree, a billion is 4–5. In practice "O(log n)" means "a handful of page reads regardless of table size," and the upper levels are almost always cached.</p></div></details>
+
+<details class="qa"><summary>You have an index on <code>(customer_id, status)</code>. Which queries can use it to seek?</summary>
+<div class="answer"><p><code>WHERE customer_id = $1</code> and <code>WHERE customer_id = $1 AND status = $2</code> can seek — the index is sorted by customer_id first, so both define a contiguous leaf range. <code>WHERE status = $1</code> alone cannot seek: matching entries are scattered across every customer's section. The planner might still walk the whole index with a filter if that beats a heap seq scan, but there's no seek. If status-only queries matter, I'd add a separate index on status — probably partial, since status columns are usually low-cardinality with a hot subset.</p></div></details>
+
+<details class="qa"><summary>How do you order columns in a composite index?</summary>
+<div class="answer"><p>Equality-filtered columns first, then the range or sort column last — once the key hits a range condition, later columns can't be sought. Among the equality columns, I lead with whichever is useful standing alone, since the leading column doubles as a single-column index. Selectivity ordering is a tiebreaker, not the main rule — for pure multi-equality lookups, order barely changes traversal cost; it mostly determines which other queries can reuse prefixes. So for <code>WHERE customer_id = ? AND status = ? ORDER BY created_at DESC</code>: (customer_id, status, created_at), or make status a partial-index predicate instead of a key column.</p></div></details>
+
+<details class="qa"><summary>What's an index-only scan and when does it unexpectedly hit the heap anyway?</summary>
+<div class="answer"><p>If the index contains every column the query reads (key columns or INCLUDE payload), Postgres can answer from the index without heap fetches. But index entries carry no MVCC visibility info, so it consults the visibility map — a bitmap of "all tuples on this heap page are visible to everyone." Pages recently written have that bit cleared, forcing a heap fetch to check visibility. After heavy writes, <code>Heap Fetches</code> in the plan climbs and the scan silently degrades to a normal index scan until VACUUM re-marks pages all-visible. So a slow "index only" scan is often a vacuum problem, not an index problem.</p></div></details>
+
+<details class="qa"><summary>Why doesn't <code>LIKE '%gmail.com'</code> use a B-tree index, while <code>LIKE 'ana%'</code> can?</summary>
+<div class="answer"><p>A B-tree serves predicates that map to a contiguous range in sorted order. A prefix defines such a range — everything from 'ana' up to 'anb' is adjacent in the tree (given a suitable collation or text_pattern_ops opclass). A suffix match has no relationship to sort order; matching values are scattered everywhere, so the only B-tree option is scanning everything. For genuine substring search I'd use a trigram GIN index from pg_trgm, which decomposes strings into 3-grams and can serve <code>%foo%</code> patterns.</p></div></details>
+
+<details class="qa"><summary>Your query is fast in psql but slow from the Java app. Same SQL. What do you check?</summary>
+<div class="answer"><p>First hypothesis: parameter type mismatch — the JDBC driver binding a String against a numeric/uuid column (or vice versa) forces a cast on the column and kills the index; psql with a literal doesn't. I'd capture the actual production plan with auto_explain to compare. Other candidates: the app fetching far more rows (missing LIMIT), a generic prepared-statement plan gone bad after repeated executions (custom vs generic plans), N+1 so no single query is slow but the workload is, connection pool wait time being blamed on the query, or different session settings (work_mem, search_path). The unifying move: measure the app's execution specifically, don't assume psql reproduces it.</p></div></details>
+
+<details class="qa"><summary>Explain a Bitmap Heap Scan and why the planner picks it over a plain Index Scan.</summary>
+<div class="answer"><p>It's the middle ground for medium selectivity. A plain index scan does one random heap hop per row in index order — great for a few rows, terrible for 100k. A bitmap scan first collects all matching ctids from the index into an in-memory bitmap, sorts by physical page, then visits each heap page exactly once, sequentially. It trades index ordering (so ORDER BY needs a Sort afterward) for vastly better I/O patterns, and enables BitmapAnd/BitmapOr to combine multiple indexes. The Recheck Cond exists because if the bitmap exceeds work_mem it degrades to lossy per-page bits, and every tuple on those pages must be rechecked against the predicate — lots of lossy blocks in the plan is a hint to raise work_mem.</p></div></details>
+
+<details class="qa"><summary>When is a Nested Loop join the best plan, and when is it a disaster?</summary>
+<div class="answer"><p>Best when the outer side is small and the inner side has an index on the join key: k cheap index probes, near-zero startup cost — ideal for "this customer's 12 orders and their items," and the only join that can exploit LIMIT well. Disaster when the outer side is much larger than estimated (planner thought 5 rows, actual 200k) or the inner side has no index, turning it into 200k inner scans. In plans I check <code>loops=</code> on the inner node and multiply per-loop time by loops — that product is often the whole runtime. Root cause is usually a row misestimate, so the fix is stats/extended statistics before anything else.</p></div></details>
+
+<details class="qa"><summary>What do the two cost numbers in EXPLAIN mean, and what unit are they in?</summary>
+<div class="answer"><p><code>cost=startup..total</code>: startup is the estimated cost before emitting the first row (a Sort must consume all input first, so high startup; an index scan is near zero), total is for producing all rows. Units are abstract, anchored to seq_page_cost = 1.0 — one sequential page read — with random_page_cost, cpu_tuple_cost etc. as multiples. They're for comparing candidate plans, not predicting milliseconds. The startup/total split matters for LIMIT: it charges roughly startup plus a prorated fraction of total, which is why LIMIT favors streaming plans over sort-everything plans.</p></div></details>
+
+<details class="qa"><summary>EXPLAIN ANALYZE shows <code>rows=1</code> estimated but <code>rows=180000</code> actual. What happens next?</summary>
+<div class="answer"><p>That misestimate is the root cause of almost any bad plan built on top of it — the planner will have chosen strategies that only work for one row, like a nested loop that now executes 180k inner probes. Diagnosis order: run <code>ANALYZE</code> on the table (stale stats after a bulk load is the most common cause); if it persists, look for correlated predicates — the planner multiplies column selectivities as if independent, so <code>city = 'SF' AND state = 'CA'</code> is underestimated; fix with <code>CREATE STATISTICS (dependencies) ON city, state FROM t</code>. For skewed columns, raise the statistics target so the MCV list captures the hot values. If it's an expression, add an expression index or extended statistics so it gets stats at all.</p></div></details>
+
+<details class="qa"><summary>What does <code>Buffers: shared hit=200 read=90000</code> tell you?</summary>
+<div class="answer"><p>The query touched ~90,200 8&nbsp;KB pages and only 200 came from shared_buffers — the rest were read from the OS or disk: ~700&nbsp;MB of I/O for one execution. That explains "slow sometimes": with a warm cache it's fast, cold it's awful, and it also evicts everyone else's pages, so this one query degrades unrelated queries. The fix is reducing pages touched — better index, tighter predicate, fewer columns — not just more RAM. I always run EXPLAIN with the BUFFERS option for exactly this; timings tell you it's slow, buffers tell you why.</p></div></details>
+
+<details class="qa"><summary>What does "Sort Method: external merge Disk: 48720kB" mean and how do you fix it?</summary>
+<div class="answer"><p>The sort didn't fit in work_mem, so Postgres wrote sorted runs to temp files on disk and merge them — the slowest sort path. Fixes in order of preference: eliminate the sort entirely with an index matching the ORDER BY (best — also lets LIMIT stop early); sort less data (project fewer columns, filter earlier); or raise work_mem for that session or role — not globally, because work_mem is per sort/hash node per query, so a global increase can multiply into memory exhaustion under concurrency. I'd also check whether an Incremental Sort is available if an index already provides a prefix of the sort key.</p></div></details>
+
+<details class="qa"><summary>You added an index but EXPLAIN still shows a Seq Scan. Give your checklist.</summary>
+<div class="answer"><p>(1) ANALYZE the table — stale stats after bulk changes is the #1 cause. (2) Check selectivity: if the predicate matches 30%+ of rows, the seq scan is correct and I should say so, not fight it. (3) Small table — seq scan is optimal. (4) Is the column wrapped — function, cast, collation mismatch — making the index structurally unusable? (5) Composite index with the wrong leading column. (6) Cost settings: random_page_cost=4 on NVMe over-penalizes index scans; ~1.1 is realistic. To distinguish structural from costing issues, I'll <code>SET enable_seqscan = off</code> in a session as a diagnostic only: if it still seq-scans, the index is unusable for this query; if it uses the index and is much faster, the cost model inputs are wrong; if it uses it and it's slower, the planner was right all along.</p></div></details>
+
+<details class="qa"><summary>Why might adding an index on <code>updated_at</code> slow down the whole table's writes disproportionately?</summary>
+<div class="answer"><p>Because it defeats HOT updates. Normally an UPDATE that doesn't change any indexed column and fits on the same heap page skips all index maintenance — the new tuple version is reached via an in-page chain. <code>updated_at</code> changes on virtually every UPDATE, so with it indexed, condition one fails for every update: now every index on the table gets a new entry per update, not just this one. Write amplification across all indexes, more WAL, faster bloat. I'd check pg_stat_user_tables' n_tup_hot_upd/n_tup_upd ratio before and after — if the HOT ratio collapses, that index needs a very good justification, or the query it serves should be rethought (e.g., BRIN if it's for time-range maintenance jobs).</p></div></details>
+
+<details class="qa"><summary>How do you find indexes you should drop, and what are the gotchas?</summary>
+<div class="answer"><p>Query pg_stat_user_indexes for idx_scan = 0 (or near-zero relative to table writes), excluding unique/constraint-backing indexes which exist for correctness, and sort by size to prioritize. Gotchas: the stats window must be long enough to cover periodic jobs — a month-end report's index looks unused for 29 days; counters reset on pg_stat_reset and, before PG16, on replica promotion; and replicas track usage separately, so check them if reads are offloaded. Also look for redundant prefixes — (a) alongside (a,b) — where the wider index makes the narrow one droppable. Process: record the definition, DROP INDEX CONCURRENTLY, monitor, ready to recreate.</p></div></details>
+
+<details class="qa"><summary>What's a partial index and what's the killer use case beyond size?</summary>
+<div class="answer"><p>An index with a WHERE clause — it only contains rows matching the predicate. Benefits: a fraction of the size (hot subset stays cached), cheaper writes (rows outside the predicate never touch it), and the planner uses it when the query provably implies the predicate. The killer feature is conditional uniqueness, which a plain constraint can't express: <code>CREATE UNIQUE INDEX ... ON subscriptions (user_id) WHERE status = 'active'</code> enforces "one active subscription per user" at the database level, race-free — while allowing unlimited cancelled rows. Same trick makes unique emails coexist with soft deletes: unique on lower(email) WHERE deleted_at IS NULL.</p></div></details>
+
+<details class="qa"><summary>When would you reach for GIN vs a B-tree expression index on a JSONB column?</summary>
+<div class="answer"><p>Depends on query shape. If queries are arbitrary containment — "documents containing {plan: pro}" on varied keys — GIN (often jsonb_path_ops for @&gt;-only workloads: smaller, faster) is built for it. If the app always queries one specific key with equality or ranges — <code>payload-&gt;&gt;'type'</code> — a B-tree expression index on that extraction is smaller, cheaper to maintain, supports ordering, and gets real per-value statistics. GIN's costs: significantly slower writes (many index entries per row), large size, no ORDER BY support. And honestly, a key queried that way constantly is a candidate for promotion to a real column — schema design beats index heroics.</p></div></details>
+
+<details class="qa"><summary>What is BRIN and when is it the right answer?</summary>
+<div class="answer"><p>Block Range INdex: instead of indexing rows, it stores the min/max of a column per block range (default 128 pages, ~1 MB). A range predicate skips block ranges that can't match. On a 2&nbsp;TB append-only time-series table, a BRIN on the timestamp can be a couple of MB where a B-tree would be tens of GB — trivial to cache and nearly free to maintain. The requirement: physical row order must correlate with the column, which append-only insertion gives naturally. On scattered data it prunes nothing. It's coarser than a B-tree — always a lossy bitmap scan with rechecks — so it suits "scan last week of metrics" analytics, not single-row point lookups.</p></div></details>
+
+<details class="qa"><summary>Tell me about a slow query you fixed. (The guaranteed question — model story.)</summary>
+<div class="answer"><p>Structure it symptom → locate → measure → fix → verify: "p99 latency alert on the orders page. pg_stat_statements, sorted by total_exec_time, pointed at one query: 2.5&nbsp;s mean over 7k calls. EXPLAIN (ANALYZE, BUFFERS) with production parameters showed a seq scan over 10M rows with 'Rows Removed by Filter: 9.99M' and 85k buffer reads — 667&nbsp;MB of I/O per execution. Row estimates were sane so it wasn't statistics; the table simply had no index matching the shape: customer_id equality + status equality + ORDER BY created_at DESC LIMIT 20. I created a composite partial index — (customer_id, created_at DESC) WHERE status = 'pending' — with CREATE INDEX CONCURRENTLY to avoid blocking writes. Result: 0.24&nbsp;ms, 25 buffer hits, and the Sort node vanished because the index feeds LIMIT pre-sorted. Verified the HOT-update ratio and insert latency didn't regress, and added auto_explain + statement_timeout so the next incident comes with a plan attached and a bounded blast radius." Numbers + trade-off awareness + guardrails is what makes it senior.</p></div></details>
+
+<details class="qa"><summary>Why is OFFSET 500000 slow, and what's the fix?</summary>
+<div class="answer"><p>OFFSET doesn't skip — Postgres must generate and discard all 500k preceding rows in order before returning yours; the plan shows rows=500020 on the scan feeding a LIMIT of 20. Cost grows linearly with page depth, and concurrent inserts shift rows between pages. Fix: keyset pagination — return a cursor of the last row's sort key, e.g. (created_at, id) with id as tiebreaker, and fetch the next page with <code>WHERE (created_at, id) &lt; ($1, $2) ORDER BY created_at DESC, id DESC LIMIT 20</code> backed by an index on (created_at DESC, id DESC). Row-value comparison compiles to a single index seek, so every page costs the same as page one. Trade-off: no random page jumps — fine for feeds and infinite scroll, which is most real UX anyway.</p></div></details>
+
+<details class="qa"><summary>Why is COUNT(*) slow on a 100M-row table and what do you do about it?</summary>
+<div class="answer"><p>MVCC: row visibility is per-snapshot, so Postgres can't keep one true counter — COUNT(*) must visit tuples (or index entries plus visibility checks) to decide what your transaction can see. Parallel workers and index-only scans help but it's still O(rows). Alternatives by requirement: approximate is usually fine for UI — <code>pg_class.reltuples</code> is instant and accurate to the last ANALYZE; for search UX, cap it: count a subquery with LIMIT 10001 and display "10,000+"; for exact-and-frequent, maintain a counter table via trigger or app logic and accept the write cost and contention. The senior move is asking what the count is <em>for</em> before choosing.</p></div></details>
+
+<details class="qa"><summary>The team says "the database is slow" but pg_stat_statements shows normal query times. What's going on?</summary>
+<div class="answer"><p>Classic connection-pool exhaustion masquerading as DB slowness. Requests queue in the app waiting for a connection (HikariCP defaults to 10); the wall-clock time is spent waiting, not querying, so DB-side metrics look healthy. I'd check pool metrics — connection acquisition time, pending threads — and pg_stat_activity for symptoms like many 'idle in transaction' sessions (app holding transactions across external calls). Root causes: one slow endpoint or an N+1 hogging connections, transactions spanning HTTP calls, or genuine undersizing. Fix the hog first — just raising pool size often makes it worse, since Postgres itself degrades with too many backends; that's what PgBouncer is for. Also lock waits: fast plans + slow wall-clock inside the DB shows up as wait_event of type Lock, which is a different diagnosis branch.</p></div></details>
+
+<details class="qa"><summary>What guardrails do you set so one bad query can't take down production?</summary>
+<div class="answer"><p>Per-role <code>statement_timeout</code> (e.g. 5s for the web app role, minutes for reporting roles) so a runaway query fails fast instead of saturating I/O and cascading into pool exhaustion; <code>idle_in_transaction_session_timeout</code> so abandoned transactions can't hold locks and block vacuum; <code>lock_timeout</code> for migrations so an ALTER TABLE queues briefly instead of blocking all traffic behind its lock request; log_min_duration_statement + auto_explain (with ANALYZE and BUFFERS) so slow production executions arrive with plans attached; and pg_stat_statements as the always-on profiler. On the app side: pool metrics with alerts, and CREATE INDEX CONCURRENTLY as a hard rule for production migrations since plain CREATE INDEX blocks writes for the duration.</p></div></details>
+
+<details class="qa"><summary>What's the difference between EXPLAIN and EXPLAIN ANALYZE, and what's the risk with the latter?</summary>
+<div class="answer"><p>EXPLAIN plans without executing — estimates only. EXPLAIN ANALYZE actually runs the query and reports per-node actual times, row counts, loops, and (with BUFFERS) I/O. The risk: it really executes — an EXPLAIN ANALYZE on an UPDATE/DELETE modifies data, so wrap it in BEGIN ... ROLLBACK. Also worth knowing: per-node timing instrumentation adds overhead (heavy on some systems), the numbers reflect current cache state so a second run can look very different, and for parameterized queries you should test with realistic, skewed values — the plan for the hottest customer can differ from the plan for an average one. When I can't reproduce prod behavior, auto_explain captures the plan of the actual slow execution.</p></div></details>
+
+<details class="qa"><summary>How does an index satisfy ORDER BY ... LIMIT without sorting, and why is that a big deal?</summary>
+<div class="answer"><p>B-tree leaf pages are sorted and doubly linked, so an Index Scan emits rows already in index order — ascending or, walking the chain backward, descending. If that order matches the ORDER BY, the planner drops the Sort node entirely. The big deal is the interaction with LIMIT: a Sort must consume its entire input before emitting anything (high startup cost), so ORDER BY + LIMIT 20 over 5M matching rows sorts 5M rows to return 20. An index scan streams: it reads exactly ~20 entries and stops. That's the difference between 2 seconds and 0.2&nbsp;ms, and it's why my composite indexes for list endpoints almost always end with the sort column — equality keys first, sort key last.</p></div></details>
+
+</section>
+
+<!-- ============================================================ -->
+<section>
+<h2 id="exercises">Hands-on exercises</h2>
+
+<div class="exercise">
+  <h3>Exercise 1 — The 1M-row lab: watch plans change as you add indexes</h3>
+  <p>Build a realistic table and observe every major plan shape. Run each EXPLAIN before and after each index.</p>
+  <pre><code>CREATE TABLE orders (
+  id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  customer_id bigint      NOT NULL,
+  status      text        NOT NULL,
+  total       numeric(12,2) NOT NULL,
+  created_at  timestamptz NOT NULL
+);
+
+INSERT INTO orders (customer_id, status, total, created_at)
+SELECT (random() * 99999)::bigint + 1,
+       (ARRAY['completed','completed','completed','completed',
+              'pending','processing','cancelled'])[1 + (random()*6)::int],
+       (random() * 500)::numeric(12,2),
+       now() - (random() * interval '730 days')
+FROM generate_series(1, 1000000);
+
+ANALYZE orders;</code></pre>
+  <ol>
+    <li><code>EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM orders WHERE customer_id = 42;</code> — note the Seq Scan, Rows Removed by Filter, and buffer reads.</li>
+    <li><code>CREATE INDEX idx_orders_customer ON orders (customer_id);</code> then re-run. Did you get Index Scan or Bitmap Heap Scan? Explain why (about 10 rows per customer — what if it were 10,000?).</li>
+    <li>Run the ORDER BY query: <code>... WHERE customer_id = 42 ORDER BY created_at DESC LIMIT 5;</code> — find the Sort node. Create <code>idx_orders_cust_created ON orders (customer_id, created_at)</code>, re-run, and confirm the Sort node disappears (look for Index Scan Backward).</li>
+    <li>Query <code>WHERE status = 'pending'</code> — why does it seq-scan even though you could index status? Check the fraction of matching rows. Then try <code>WHERE status = 'cancelled'</code> after creating an index on status — compare.</li>
+    <li>Record index sizes with <code>\di+</code> as you go, and time <code>INSERT ... SELECT ... generate_series(1, 100000)</code> with 0, 1, and 3 indexes present. Write down the write-cost ratio you observe.</li>
+  </ol>
+</div>
+
+<div class="exercise">
+  <h3>Exercise 2 — Break the index, then fix it</h3>
+  <p>Using the lab table plus a <code>users(email text)</code> table (generate 500k emails like <code>'user' || n || '@example.com'</code>, some mixed-case), demonstrate each trap and its fix, capturing plans for both:</p>
+  <ol>
+    <li><code>WHERE lower(email) = ...</code> vs an expression index on <code>lower(email)</code>.</li>
+    <li><code>WHERE date(created_at) = current_date - 1</code> vs the half-open range rewrite (<code>&gt;= ... AND &lt; ...</code>).</li>
+    <li><code>WHERE email LIKE '%@example.com'</code> — confirm the seq scan; then install <code>pg_trgm</code>, add a GIN trigram index, and test <code>LIKE '%er42%'</code>.</li>
+    <li>On the composite <code>(customer_id, created_at)</code> index: query by <code>created_at</code> alone and confirm no seek happens. Explain in one sentence why, using the phone-book analogy.</li>
+  </ol>
+</div>
+
+<div class="exercise">
+  <h3>Exercise 3 — Rehearse the runbook end-to-end</h3>
+  <p>Scale the lab table to 5–10M rows. Enable <code>pg_stat_statements</code> (add to <code>shared_preload_libraries</code>, restart, <code>CREATE EXTENSION pg_stat_statements;</code>). Then:</p>
+  <ol>
+    <li>Simulate load: run <code>SELECT * FROM orders WHERE customer_id = X AND status = 'pending' ORDER BY created_at DESC LIMIT 20</code> in a loop (psql <code>\watch</code> or a bash loop) for a few hundred iterations with random customer ids.</li>
+    <li>Find it in <code>pg_stat_statements</code> ordered by <code>total_exec_time</code>. Record mean_exec_time and shared_blks_read.</li>
+    <li>Capture <code>EXPLAIN (ANALYZE, BUFFERS)</code>, build the composite partial index <em>with CONCURRENTLY</em>, re-capture, and reset stats (<code>SELECT pg_stat_statements_reset();</code>) to measure the after-state under load.</li>
+    <li>Write the incident narrative in 6 sentences with your real numbers. Say it out loud. This is your interview story — the numbers being yours makes it unshakeable.</li>
+  </ol>
+</div>
+
+<div class="exercise">
+  <h3>Exercise 4 — Keyset vs OFFSET shootout</h3>
+  <p>On a 2M-row <code>posts(id, title, created_at)</code> table with an index on <code>(created_at DESC, id DESC)</code>:</p>
+  <ol>
+    <li>Time <code>ORDER BY created_at DESC LIMIT 20 OFFSET n</code> for n = 0, 10k, 100k, 1M. Plot (or tabulate) latency vs offset — confirm it's linear, and find <code>rows=</code> on the scan node showing the discarded work.</li>
+    <li>Implement keyset pagination with the row-value comparison <code>WHERE (created_at, id) &lt; ($1, $2)</code> and verify page 50,000-equivalent costs the same as page 1 (check Buffers).</li>
+    <li>Bonus: insert 100 rows mid-pagination with each strategy and observe OFFSET skipping/duplicating rows while keyset stays consistent.</li>
+  </ol>
+</div>
+
+<div class="exercise">
+  <h3>Exercise 5 — Index-only scans and the visibility map</h3>
+  <ol>
+    <li>Create <code>idx_orders_cust_total ON orders (customer_id) INCLUDE (total)</code>. Run <code>SELECT customer_id, sum(total) FROM orders WHERE customer_id = 42 GROUP BY 1</code> right after a fresh <code>VACUUM orders;</code> — confirm Index Only Scan with <code>Heap Fetches: 0</code>.</li>
+    <li>Now <code>UPDATE orders SET total = total * 1.0 WHERE customer_id BETWEEN 1 AND 5000;</code> and re-run the query for an affected customer. Watch Heap Fetches jump. Explain why in terms of the visibility map.</li>
+    <li><code>VACUUM orders;</code> and confirm Heap Fetches returns to 0.</li>
+    <li>Finally, check HOT: look at <code>n_tup_hot_upd</code> vs <code>n_tup_upd</code> in <code>pg_stat_user_tables</code> for that update. Then create an index on <code>total</code>, repeat the update, and watch the HOT ratio collapse — you've just reproduced the "innocent index that amplifies every write" pitfall.</li>
+  </ol>
+</div>
+</section>
+
+<nav class="page-nav"><a href="12-postgres-schema-design.html">← Prev: Schema Design</a><a href="14-postgres-transactions-mvcc.html">Next: Transactions &amp; MVCC →</a></nav>
+</main></body></html>

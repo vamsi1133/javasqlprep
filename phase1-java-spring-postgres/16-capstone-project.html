@@ -1,0 +1,1653 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>16 — Capstone: Order-Management API | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <div class="breadcrumb"><a href="index.html">← Course Home</a></div>
+    <h1>16 — Capstone: Order-Management API</h1>
+    <p>One project that exercises every must-know topic from tutorials 1–15 — and becomes your best interview story.</p>
+  </div>
+</header>
+<main class="container">
+
+<h2 id="why-build-this">Why build this</h2>
+<p>
+You have now <em>read</em> about dependency injection, JPA relationship mapping, transaction isolation,
+composite indexes, and JWT filters. Reading is how a senior engineer ramps fast — but interviews reward
+<strong>recall under pressure</strong>, and recall comes from having typed the thing, broken it, and fixed it.
+This capstone converts fifteen tutorials of passive knowledge into one coherent artifact you can
+talk about for forty-five minutes without slides.
+</p>
+<p>Three concrete payoffs:</p>
+<ul>
+  <li><strong>Muscle memory.</strong> You will hand-write an entity mapping, a <code>@Transactional</code> service,
+      a security filter chain, and a Flyway migration. The second time you do any of these (in the interview,
+      or on the job) takes a tenth of the time.</li>
+  <li><strong>A "tell me about something you built" answer.</strong> Instead of describing seven years of React work
+      to a backend-heavy panel, you can say: <em>"I recently built an order-management API in Spring Boot and Postgres —
+      let me walk you through how I handled a concurrent-inventory race and a 300× query speedup."</em>
+      Sections below turn each milestone into a rehearsed story.</li>
+  <li><strong>A place to feel the failure modes.</strong> N+1 queries, oversold stock, sequential-scan pagination —
+      you will deliberately cause each one, observe it in logs and <code>EXPLAIN</code> output, and fix it.
+      Interviewers can instantly tell the difference between someone who read about N+1 and someone who has
+      watched 101 queries scroll past for a single HTTP request.</li>
+</ul>
+<div class="senior">
+As a senior frontend dev you already know how to design APIs from the consumer side — you have been on the
+receiving end of bad pagination and vague 500s for years. Lean into that: this project is your chance to build
+the backend you always wished your React apps were talking to. That "I've consumed hundreds of APIs, here's what
+I made sure mine did differently" framing is a genuinely strong interview angle for a frontend-to-fullstack move.
+</div>
+<p>
+Budget: roughly 12–20 focused hours across a week or two. Every milestone below has a <strong>checkpoint</strong> —
+a command to run and the output you should see — so you always know whether you are on track.
+</p>
+
+<div class="toc">
+  <strong>On this page</strong>
+  <ol>
+    <li><a href="#why-build-this">Why build this</a></li>
+    <li><a href="#project-spec">Project spec</a></li>
+    <li><a href="#milestones">Milestones</a></li>
+    <li><a href="#self-review">Self-review checklist</a></li>
+    <li><a href="#interview-stories">Turning it into interview stories</a></li>
+    <li><a href="#common-mistakes">Common mistakes</a></li>
+  </ol>
+</div>
+
+<h2 id="project-spec">Project spec</h2>
+<p><strong>Product:</strong> a REST API for a small e-commerce back office. Four domain concepts:
+<code>customers</code>, <code>products</code>, <code>orders</code>, <code>order_items</code>.</p>
+
+<h3>Functional requirements</h3>
+<ul>
+  <li><strong>Place an order</strong> — <code>POST /api/orders</code> with a list of product lines.
+      Validates that every product exists and has sufficient stock, decrements inventory,
+      and creates the order with its items — all in <strong>one transaction</strong>. Under concurrent load,
+      stock must never go negative (no overselling).</li>
+  <li><strong>Order lifecycle</strong> — status moves <code>PENDING → PAID → SHIPPED</code>, with
+      <code>CANCELLED</code> reachable from <code>PENDING</code> or <code>PAID</code>. Illegal transitions
+      (e.g. <code>SHIPPED → PENDING</code>) are rejected with a clear error. Enforced in the domain model,
+      backed by a database <code>CHECK</code> constraint.</li>
+  <li><strong>List orders</strong> — <code>GET /api/orders?status=PAID&amp;page=0&amp;size=20</code> with
+      pagination and filtering by status and customer.</li>
+  <li><strong>Order details</strong> — <code>GET /api/orders/{id}</code> with items and product info.</li>
+  <li><strong>Security</strong> — JWT bearer tokens. A <code>CUSTOMER</code> sees and places only their own orders;
+      an <code>ADMIN</code> sees everything and drives status transitions.</li>
+  <li><strong>Auditability</strong> — every row carries <code>created_at</code> / <code>updated_at</code>
+      timestamps (<code>timestamptz</code>).</li>
+</ul>
+
+<h3>Tech stack (fixed — don't bikeshed this)</h3>
+<ul>
+  <li>Java 21, Spring Boot 3.x, Maven</li>
+  <li>PostgreSQL 16 in Docker (docker-compose)</li>
+  <li>Flyway for migrations — <code>ddl-auto</code> stays on <code>validate</code>, always</li>
+  <li>Spring Data JPA / Hibernate, Spring Security (OAuth2 resource server with an HMAC-signed JWT)</li>
+  <li>Testcontainers + JUnit 5 + Mockito + AssertJ for the test pyramid</li>
+</ul>
+
+<div class="note">
+Base package for everything: <code>com.prep.orders</code>. All code below is written against that package and
+against consistent entity names (<code>Customer</code>, <code>Product</code>, <code>Order</code>, <code>OrderItem</code>)
+so the milestones assemble into one runnable project if you type them out in order.
+</div>
+
+<h2 id="milestones">Milestones</h2>
+<p>
+Twelve milestones, strictly ordered — each builds on the previous one and each ends with a checkpoint.
+Resist the urge to skip ahead to security or performance; the boring scaffolding milestones are where
+the muscle memory for "start a Spring project from zero" comes from, and that is exactly what a take-home
+exercise will ask you to do under time pressure.
+</p>
+
+<h3 id="m1">Milestone 1 — Scaffold + Postgres in Docker</h3>
+<p><strong>Goal:</strong> a running Spring Boot app connected to a containerized Postgres, with a deliberate package layout.</p>
+<p>Generate the project at <a href="https://start.spring.io">start.spring.io</a> (or via curl) with these settings:
+Maven, Java 21, Spring Boot 3.x, group <code>com.prep</code>, artifact <code>orders</code>, and dependencies:
+<code>web</code>, <code>data-jpa</code>, <code>postgresql</code>, <code>flyway</code>, <code>validation</code>,
+<code>security</code>, <code>oauth2-resource-server</code>, <code>actuator</code>, <code>testcontainers</code>.</p>
+<pre><code>curl -s https://start.spring.io/starter.zip \
+  -d type=maven-project -d language=java -d javaVersion=21 \
+  -d groupId=com.prep -d artifactId=orders -d name=orders \
+  -d packageName=com.prep.orders \
+  -d dependencies=web,data-jpa,postgresql,flyway,validation,security,oauth2-resource-server,actuator,testcontainers \
+  -o orders.zip &amp;&amp; unzip orders.zip -d orders</code></pre>
+<p><code>docker-compose.yml</code> at the project root:</p>
+<pre><code>services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: orders-db
+    environment:
+      POSTGRES_DB: orders
+      POSTGRES_USER: orders
+      POSTGRES_PASSWORD: orders
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orders -d orders"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:</code></pre>
+<p><code>src/main/resources/application.yml</code>:</p>
+<pre><code>spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/orders
+    username: orders
+    password: orders
+  jpa:
+    hibernate:
+      ddl-auto: validate      <span class="com"># Flyway owns the schema. Never "update".</span>
+    open-in-view: false       <span class="com"># fail fast on lazy-loads outside a transaction</span>
+  flyway:
+    enabled: true
+
+app:
+  jwt:
+    secret: local-dev-only-secret-at-least-32-bytes-long!!</code></pre>
+<p>Lay out packages <strong>by feature</strong>, not by layer:</p>
+<pre><code>com.prep.orders
+├── OrdersApplication.java
+├── common/          <span class="com">// error handling, correlation-id filter</span>
+├── customer/        <span class="com">// Customer, CustomerRepository</span>
+├── product/         <span class="com">// Product, ProductRepository</span>
+├── order/           <span class="com">// Order, OrderItem, OrderStatus, OrderService,
+                     //    OrderRepository, OrderController, dto/</span>
+└── security/        <span class="com">// SecurityConfig, TokenService, AuthController, OrderSecurity</span></code></pre>
+<div class="senior">
+Package-by-feature vs package-by-layer is a real interview question. The senior answer: layer packages
+(<code>controllers/</code>, <code>services/</code>, <code>repositories/</code>) tell you nothing about what the app
+<em>does</em> and force every feature change to touch four packages. Feature packages keep cohesion high,
+let you use package-private visibility as a cheap module boundary, and are the natural seam if you ever
+split into microservices (Tutorial 10).
+</div>
+<div class="note">
+<strong>Checkpoint:</strong> <code>docker compose up -d</code>, then <code>./mvnw spring-boot:run</code>.
+The app starts, Flyway logs "Schema \"public\" is up to date. No migration necessary" (nothing to run yet),
+and <code>curl localhost:8080/actuator/health</code> returns <code>{"status":"UP"}</code>
+(temporarily permit it, or pass <code>-u user:&lt;generated password&gt;</code> — Security locks everything down by default until Milestone 7).
+</div>
+<div class="senior">
+<strong>What you're practicing:</strong> project bootstrap and configuration hygiene —
+Tutorial 5 (Spring Boot auto-configuration, externalized config) and Tutorial 15 (running Postgres as an
+operational dependency). Note <code>open-in-view: false</code>: you'll thank yourself in Milestone 8.
+</div>
+
+<h3 id="m2">Milestone 2 — Flyway V1: the schema</h3>
+<p><strong>Goal:</strong> the full DDL, written by hand, with every design decision defensible.</p>
+<p><code>src/main/resources/db/migration/V1__init_schema.sql</code>:</p>
+<pre><code><span class="com">-- Sequences: INCREMENT BY 50 matches Hibernate's allocationSize (Milestone 3),
+-- so JPA grabs id blocks in one round-trip instead of one nextval per insert.</span>
+CREATE SEQUENCE customer_seq   START WITH 1 INCREMENT BY 50;
+CREATE SEQUENCE product_seq    START WITH 1 INCREMENT BY 50;
+CREATE SEQUENCE order_seq      START WITH 1 INCREMENT BY 50;
+CREATE SEQUENCE order_item_seq START WITH 1 INCREMENT BY 50;
+
+CREATE TABLE customers (
+    id            BIGINT PRIMARY KEY DEFAULT nextval('customer_seq'),
+    email         TEXT        NOT NULL UNIQUE,
+    full_name     TEXT        NOT NULL,
+    password_hash TEXT        NOT NULL,
+    role          TEXT        NOT NULL DEFAULT 'CUSTOMER'
+                  CHECK (role IN ('CUSTOMER', 'ADMIN')),
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE products (
+    id         BIGINT PRIMARY KEY DEFAULT nextval('product_seq'),
+    sku        TEXT           NOT NULL UNIQUE,
+    name       TEXT           NOT NULL,
+    price      NUMERIC(12,2)  NOT NULL CHECK (price &gt;= 0),
+    stock      INTEGER        NOT NULL CHECK (stock &gt;= 0),  <span class="com">-- the oversell backstop</span>
+    created_at TIMESTAMPTZ    NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ    NOT NULL DEFAULT now()
+);
+
+CREATE TABLE orders (
+    id           BIGINT PRIMARY KEY DEFAULT nextval('order_seq'),
+    customer_id  BIGINT         NOT NULL REFERENCES customers(id),
+    status       TEXT           NOT NULL DEFAULT 'PENDING'
+                 CHECK (status IN ('PENDING', 'PAID', 'SHIPPED', 'CANCELLED')),
+    total_amount NUMERIC(12,2)  NOT NULL DEFAULT 0 CHECK (total_amount &gt;= 0),
+    version      BIGINT         NOT NULL DEFAULT 0,   <span class="com">-- optimistic locking (Milestone 3)</span>
+    created_at   TIMESTAMPTZ    NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ    NOT NULL DEFAULT now()
+);
+
+<span class="com">-- Postgres does NOT auto-index FK columns. Without this, every
+-- "orders for customer X" query and every DELETE on customers seq-scans orders.</span>
+CREATE INDEX idx_orders_customer_id ON orders (customer_id);
+
+CREATE TABLE order_items (
+    id         BIGINT PRIMARY KEY DEFAULT nextval('order_item_seq'),
+    order_id   BIGINT        NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+    product_id BIGINT        NOT NULL REFERENCES products(id),
+    quantity   INTEGER       NOT NULL CHECK (quantity &gt; 0),
+    unit_price NUMERIC(12,2) NOT NULL CHECK (unit_price &gt;= 0),
+    UNIQUE (order_id, product_id)   <span class="com">-- also serves as the FK index on order_id</span>
+);
+
+CREATE INDEX idx_order_items_product_id ON order_items (product_id);</code></pre>
+<p>Decisions worth being able to defend out loud — these are straight from Tutorial 12 (schema design):</p>
+<ul>
+  <li><strong><code>NUMERIC(12,2)</code> for money</strong>, never <code>float</code>/<code>double</code> —
+      binary floating point cannot represent 0.10 exactly; totals drift by cents at scale.</li>
+  <li><strong><code>TIMESTAMPTZ</code>, not <code>TIMESTAMP</code></strong> — stores an instant (UTC internally);
+      plain <code>timestamp</code> is a wall-clock reading with no timezone and is a classic data bug.</li>
+  <li><strong><code>CHECK</code> on <code>status</code> and <code>stock &gt;= 0</code></strong> — the database is the
+      last line of defense. Even if a bug slips past the Java state machine, the DB refuses corrupt data.</li>
+  <li><strong><code>unit_price</code> denormalized onto <code>order_items</code></strong> — a deliberate,
+      correct denormalization: the order must record the price <em>at purchase time</em>; joining to
+      <code>products.price</code> would rewrite history whenever the catalog price changes.</li>
+  <li><strong>Explicit FK indexes</strong> — Postgres indexes the referenced side (the PK) automatically, never the
+      referencing side. Note how <code>UNIQUE (order_id, product_id)</code> doubles as the <code>order_id</code>
+      FK index because <code>order_id</code> is its leading column.</li>
+</ul>
+<div class="pitfall">
+Do not add every index you can imagine "while you're here". Each index taxes every write. The composite
+index for the list query is deliberately deferred to Milestone 9, where you will justify it with
+<code>EXPLAIN ANALYZE</code> evidence — that before/after is the whole point.
+</div>
+<div class="note">
+<strong>Checkpoint:</strong> restart the app. Flyway logs
+<code>Migrating schema "public" to version "1 - init schema"</code>. Then
+<code>docker exec -it orders-db psql -U orders -c "\d orders"</code> shows the table with its CHECK constraints.
+</div>
+<div class="senior">
+<strong>What you're practicing:</strong> Tutorial 12 (schema design: types, constraints, normalization
+calls) and Tutorial 7 (why migrations, not <code>ddl-auto</code>, own the schema in any real system).
+</div>
+
+<h3 id="m3">Milestone 3 — JPA entities and relationships, done right</h3>
+<p><strong>Goal:</strong> entities that map the schema cleanly, with every relationship LAZY and the object graph kept consistent by helper methods.</p>
+<p>The status enum owns the legal-transition rules — the state machine lives in the domain, not scattered through services:</p>
+<pre><code><span class="com">// com/prep/orders/order/OrderStatus.java</span>
+package com.prep.orders.order;
+
+import java.util.EnumSet;
+import java.util.Map;
+import java.util.Set;
+
+public enum OrderStatus {
+    PENDING, PAID, SHIPPED, CANCELLED;
+
+    private static final Map&lt;OrderStatus, Set&lt;OrderStatus&gt;&gt; LEGAL = Map.of(
+        PENDING,   EnumSet.of(PAID, CANCELLED),
+        PAID,      EnumSet.of(SHIPPED, CANCELLED),
+        SHIPPED,   EnumSet.noneOf(OrderStatus.class),
+        CANCELLED, EnumSet.noneOf(OrderStatus.class)
+    );
+
+    public boolean canTransitionTo(OrderStatus target) {
+        return LEGAL.get(this).contains(target);
+    }
+}</code></pre>
+<p>The aggregate root:</p>
+<pre><code><span class="com">// com/prep/orders/order/Order.java</span>
+package com.prep.orders.order;
+
+import com.prep.orders.customer.Customer;
+import jakarta.persistence.*;
+import org.hibernate.annotations.CreationTimestamp;
+import org.hibernate.annotations.UpdateTimestamp;
+
+import java.math.BigDecimal;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+
+@Entity
+@Table(name = "orders")   <span class="com">// "order" is a reserved word in SQL — table is plural for a reason</span>
+public class Order {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "order_seq")
+    @SequenceGenerator(name = "order_seq", sequenceName = "order_seq", allocationSize = 50)
+    private Long id;
+
+    @ManyToOne(fetch = FetchType.LAZY, optional = false)
+    @JoinColumn(name = "customer_id", nullable = false)
+    private Customer customer;
+
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false)
+    private OrderStatus status = OrderStatus.PENDING;
+
+    @Column(name = "total_amount", nullable = false)
+    private BigDecimal totalAmount = BigDecimal.ZERO;
+
+    @Version                       <span class="com">// optimistic lock: concurrent status updates collide safely</span>
+    private Long version;
+
+    @OneToMany(mappedBy = "order", cascade = CascadeType.ALL, orphanRemoval = true)
+    private List&lt;OrderItem&gt; items = new ArrayList&lt;&gt;();
+
+    @CreationTimestamp @Column(name = "created_at", updatable = false)
+    private Instant createdAt;
+
+    @UpdateTimestamp @Column(name = "updated_at")
+    private Instant updatedAt;
+
+    protected Order() {}          <span class="com">// JPA needs it; protected keeps callers honest</span>
+
+    public Order(Customer customer) {
+        this.customer = customer;
+    }
+
+    <span class="com">// Helper method: keeps BOTH sides of the bidirectional link in sync.</span>
+    public void addItem(OrderItem item) {
+        items.add(item);
+        item.setOrder(this);
+    }
+
+    public void recalculateTotal() {
+        this.totalAmount = items.stream()
+            .map(i -&gt; i.getUnitPrice().multiply(BigDecimal.valueOf(i.getQuantity())))
+            .reduce(BigDecimal.ZERO, BigDecimal::add);
+    }
+
+    <span class="com">// State machine enforcement lives on the aggregate, not in the controller.</span>
+    public void transitionTo(OrderStatus target) {
+        if (!status.canTransitionTo(target)) {
+            throw new IllegalOrderStateException(id, status, target);
+        }
+        this.status = target;
+    }
+
+    public Long getId() { return id; }
+    public Customer getCustomer() { return customer; }
+    public OrderStatus getStatus() { return status; }
+    public BigDecimal getTotalAmount() { return totalAmount; }
+    public List&lt;OrderItem&gt; getItems() { return items; }
+    public Instant getCreatedAt() { return createdAt; }
+}</code></pre>
+<pre><code><span class="com">// com/prep/orders/order/OrderItem.java</span>
+package com.prep.orders.order;
+
+import com.prep.orders.product.Product;
+import jakarta.persistence.*;
+import java.math.BigDecimal;
+
+@Entity
+@Table(name = "order_items")
+public class OrderItem {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "order_item_seq")
+    @SequenceGenerator(name = "order_item_seq", sequenceName = "order_item_seq", allocationSize = 50)
+    private Long id;
+
+    @ManyToOne(fetch = FetchType.LAZY, optional = false)
+    @JoinColumn(name = "order_id", nullable = false)
+    private Order order;
+
+    @ManyToOne(fetch = FetchType.LAZY, optional = false)
+    @JoinColumn(name = "product_id", nullable = false)
+    private Product product;
+
+    @Column(nullable = false)
+    private int quantity;
+
+    @Column(name = "unit_price", nullable = false)
+    private BigDecimal unitPrice;   <span class="com">// price frozen at purchase time (see Milestone 2)</span>
+
+    protected OrderItem() {}
+
+    public OrderItem(Product product, int quantity, BigDecimal unitPrice) {
+        this.product = product;
+        this.quantity = quantity;
+        this.unitPrice = unitPrice;
+    }
+
+    void setOrder(Order order) { this.order = order; }  <span class="com">// package-private: only Order.addItem calls it</span>
+    public Product getProduct() { return product; }
+    public int getQuantity() { return quantity; }
+    public BigDecimal getUnitPrice() { return unitPrice; }
+}</code></pre>
+<p><code>Customer</code> and <code>Product</code> follow the same pattern (sequence id via
+<code>customer_seq</code> / <code>product_seq</code>, timestamps, no relationships pointing outward —
+keep the graph navigable in one direction where you can). Give <code>Product</code> a convenience constructor
+<code>Product(String sku, String name, BigDecimal price, int stock)</code>; the tests in Milestone 10 use it.</p>
+<div class="pitfall">
+<code>@ManyToOne</code> defaults to <strong>EAGER</strong>. If you forget <code>fetch = FetchType.LAZY</code> on
+<code>OrderItem.product</code> and <code>Order.customer</code>, every order load drags customer and product rows
+along whether you need them or not — and Milestone 8's N+1 hunt gets noisier and harder to reason about.
+Rule: LAZY everywhere, then fetch <em>explicitly</em> per query.
+</div>
+<div class="note">
+<strong>Checkpoint:</strong> restart the app with <code>ddl-auto: validate</code> still on. A clean start means
+Hibernate agrees your mappings match the Flyway schema exactly — column names, types, nullability. A
+<code>SchemaManagementException</code> here is the checkpoint doing its job: fix the mapping, not the DDL.
+</div>
+<div class="senior">
+<strong>What you're practicing:</strong> Tutorial 7 (JPA entity design: LAZY fetching, bidirectional sync helpers,
+<code>@Version</code> optimistic locking) plus Tutorial 2 (enums with behavior, immutability instincts) and
+Tutorial 12 (mapping decisions echoing schema decisions — <code>allocationSize</code> matching
+<code>INCREMENT BY 50</code> is the kind of cross-layer coherence interviewers probe for).
+</div>
+
+<h3 id="m4">Milestone 4 — Repositories, service layer, and the transactional place-order flow</h3>
+<p><strong>Goal:</strong> the core business flow — atomic, race-safe order placement.</p>
+<pre><code><span class="com">// com/prep/orders/product/ProductRepository.java</span>
+package com.prep.orders.product;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+
+public interface ProductRepository extends JpaRepository&lt;Product, Long&gt; {
+
+    <span class="com">/**
+     * Atomic stock decrement. The WHERE clause is the guard: if stock is
+     * insufficient, 0 rows update and we translate that into a business error.
+     * Row-level locking inside UPDATE makes this safe under concurrency.
+     */</span>
+    @Modifying
+    @Query("""
+        UPDATE Product p
+           SET p.stock = p.stock - :qty
+         WHERE p.id = :id AND p.stock &gt;= :qty
+        """)
+    int decrementStock(@Param("id") Long id, @Param("qty") int qty);
+}</code></pre>
+<pre><code><span class="com">// com/prep/orders/order/OrderService.java</span>
+package com.prep.orders.order;
+
+import com.prep.orders.customer.Customer;
+import com.prep.orders.customer.CustomerRepository;
+import com.prep.orders.product.Product;
+import com.prep.orders.product.ProductRepository;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.util.List;
+
+@Service
+public class OrderService {
+
+    private final OrderRepository orderRepository;
+    private final ProductRepository productRepository;
+    private final CustomerRepository customerRepository;
+
+    <span class="com">// Constructor injection — no @Autowired needed on a single constructor.</span>
+    public OrderService(OrderRepository orderRepository,
+                        ProductRepository productRepository,
+                        CustomerRepository customerRepository) {
+        this.orderRepository = orderRepository;
+        this.productRepository = productRepository;
+        this.customerRepository = customerRepository;
+    }
+
+    public record OrderLine(Long productId, int quantity) {}
+
+    @Transactional
+    public Order placeOrder(Long customerId, List&lt;OrderLine&gt; lines) {
+        Customer customer = customerRepository.findById(customerId)
+            .orElseThrow(() -&gt; new NotFoundException("customer", customerId));
+
+        Order order = new Order(customer);
+
+        for (OrderLine line : lines) {
+            Product product = productRepository.findById(line.productId())
+                .orElseThrow(() -&gt; new NotFoundException("product", line.productId()));
+
+            int updated = productRepository.decrementStock(line.productId(), line.quantity());
+            if (updated == 0) {
+                <span class="com">// Throwing from a @Transactional method rolls back EVERYTHING —
+                // including decrements already applied for earlier lines.</span>
+                throw new InsufficientStockException(product.getSku(), line.quantity());
+            }
+            order.addItem(new OrderItem(product, line.quantity(), product.getPrice()));
+        }
+
+        order.recalculateTotal();
+        return orderRepository.save(order);
+    }
+
+    @Transactional
+    public Order changeStatus(Long orderId, OrderStatus target) {
+        Order order = orderRepository.findById(orderId)
+            .orElseThrow(() -&gt; new NotFoundException("order", orderId));
+        order.transitionTo(target);      <span class="com">// dirty checking flushes the change; no save() needed</span>
+        return order;
+    }
+}</code></pre>
+<p><strong>The race, spelled out.</strong> The naive implementation reads stock, checks it in Java, then writes:</p>
+<pre><code><span class="com">// BROKEN — read-check-write race (do not ship this):</span>
+Product p = productRepository.findById(id).orElseThrow();
+if (p.getStock() &lt; qty) throw new InsufficientStockException(...);
+p.setStock(p.getStock() - qty);   <span class="com">// two requests both read stock=1, both pass the check → stock = -1</span></code></pre>
+<p>Two correct fixes — know both, and know why you picked one:</p>
+<ul>
+  <li><strong>Atomic conditional UPDATE (used above).</strong> The check and the write are one statement;
+      Postgres takes a row lock during the UPDATE, so concurrent decrements serialize on the row and the
+      <code>WHERE stock &gt;= :qty</code> guard makes the loser update 0 rows. Simple, no explicit locking, minimal lock hold time.</li>
+  <li><strong>Pessimistic lock: <code>SELECT … FOR UPDATE</code></strong> (in JPA:
+      <code>@Lock(LockModeType.PESSIMISTIC_WRITE)</code> on a repository <code>findById</code> variant). Locks the row
+      first, then you check-and-modify the entity in Java. Choose this when the decision logic is too rich for one
+      SQL statement (tiered pricing, reservations, multi-row invariants). Cost: locks held for the rest of the
+      transaction, and you must think about lock ordering to avoid deadlocks when orders touch multiple products.</li>
+</ul>
+<div class="senior">
+And there is a third layer regardless: the <code>CHECK (stock &gt;= 0)</code> constraint from Milestone 2. Defense
+in depth — the constraint turns any future concurrency bug into a loud constraint violation instead of silent
+oversell. In an interview, walking through naive → atomic UPDATE → FOR UPDATE → DB constraint, with the trade-off
+at each step, is a complete senior answer to "how do you handle concurrent updates?" (Tutorial 14 material.)
+</div>
+<div class="pitfall">
+<code>@Transactional</code> only works through the Spring proxy. A <em>self-invocation</em>
+(<code>this.placeOrder(...)</code> from another method in the same class) bypasses the proxy and runs with
+<strong>no transaction</strong>. Also: it rolls back on unchecked exceptions by default — if you ever throw a
+checked exception and expect rollback, you need <code>rollbackFor</code>. Both are top-five interview questions.
+</div>
+<div class="note">
+<strong>Checkpoint:</strong> no HTTP layer yet, so prove it with a quick <code>@SpringBootTest</code> or a
+<code>CommandLineRunner</code>: seed one product with stock 5, place an order for 3, assert stock is 2 and the
+order row exists with the right <code>total_amount</code>. Then place an order for 99 and verify the whole thing
+rolls back (stock still 2, no orphan order row).
+</div>
+<div class="senior">
+<strong>What you're practicing:</strong> Tutorial 5 (constructor injection, service layering), Tutorial 7
+(repositories, dirty checking, <code>@Modifying</code>), Tutorial 14 (transactions, atomicity, row locking,
+lost-update anatomy).
+</div>
+
+<h3 id="m5">Milestone 5 — REST controllers, DTO records, validation, ProblemDetail</h3>
+<p><strong>Goal:</strong> a clean HTTP boundary — entities never cross it.</p>
+<pre><code><span class="com">// com/prep/orders/order/dto/PlaceOrderRequest.java</span>
+package com.prep.orders.order.dto;
+
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.Min;
+import jakarta.validation.constraints.NotEmpty;
+import jakarta.validation.constraints.NotNull;
+import java.util.List;
+
+public record PlaceOrderRequest(
+        @NotEmpty @Valid List&lt;Line&gt; lines) {
+
+    public record Line(
+            @NotNull Long productId,
+            @Min(1) int quantity) {}
+}</code></pre>
+<pre><code><span class="com">// com/prep/orders/order/dto/OrderResponse.java</span>
+package com.prep.orders.order.dto;
+
+import com.prep.orders.order.Order;
+import java.math.BigDecimal;
+import java.time.Instant;
+import java.util.List;
+
+public record OrderResponse(
+        Long id,
+        String status,
+        BigDecimal totalAmount,
+        Instant createdAt,
+        List&lt;ItemResponse&gt; items) {
+
+    public record ItemResponse(Long productId, String productName, int quantity, BigDecimal unitPrice) {}
+
+    public static OrderResponse from(Order order) {
+        return new OrderResponse(
+            order.getId(),
+            order.getStatus().name(),
+            order.getTotalAmount(),
+            order.getCreatedAt(),
+            order.getItems().stream()
+                .map(i -&gt; new ItemResponse(i.getProduct().getId(), i.getProduct().getName(),
+                                           i.getQuantity(), i.getUnitPrice()))
+                .toList());
+    }
+}</code></pre>
+<pre><code><span class="com">// com/prep/orders/order/OrderController.java</span>
+package com.prep.orders.order;
+
+import com.prep.orders.order.dto.OrderResponse;
+import com.prep.orders.order.dto.PlaceOrderRequest;
+import jakarta.validation.Valid;
+import org.springframework.http.HttpStatus;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api/orders")
+public class OrderController {
+
+    private final OrderService orderService;
+
+    public OrderController(OrderService orderService) {
+        this.orderService = orderService;
+    }
+
+    @PostMapping
+    @ResponseStatus(HttpStatus.CREATED)
+    public OrderResponse place(@Valid @RequestBody PlaceOrderRequest request,
+                               @RequestParam Long customerId) {   <span class="com">// TEMPORARY — replaced by the JWT claim in Milestone 7</span>
+        var lines = request.lines().stream()
+            .map(l -&gt; new OrderService.OrderLine(l.productId(), l.quantity()))
+            .toList();
+        return OrderResponse.from(orderService.placeOrder(customerId, lines));
+    }
+
+    @GetMapping("/{id}")
+    public OrderResponse get(@PathVariable Long id) {
+        return OrderResponse.from(orderService.getOrder(id));
+    }
+
+    @PostMapping("/{id}/status")
+    public OrderResponse changeStatus(@PathVariable Long id, @RequestParam OrderStatus target) {
+        return OrderResponse.from(orderService.changeStatus(id, target));
+    }
+}</code></pre>
+<p>Centralized error handling with RFC 7807 <code>ProblemDetail</code> (built into Spring 6 — no custom error envelope needed):</p>
+<pre><code><span class="com">// com/prep/orders/common/GlobalExceptionHandler.java</span>
+package com.prep.orders.common;
+
+import com.prep.orders.order.IllegalOrderStateException;
+import com.prep.orders.order.InsufficientStockException;
+import com.prep.orders.order.NotFoundException;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ProblemDetail;
+import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    ProblemDetail onValidation(MethodArgumentNotValidException ex) {
+        var pd = ProblemDetail.forStatusAndDetail(HttpStatus.BAD_REQUEST, "Request validation failed");
+        pd.setProperty("errors", ex.getBindingResult().getFieldErrors().stream()
+            .map(fe -&gt; fe.getField() + ": " + fe.getDefaultMessage())
+            .toList());
+        return pd;
+    }
+
+    @ExceptionHandler(NotFoundException.class)
+    ProblemDetail onNotFound(NotFoundException ex) {
+        return ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND, ex.getMessage());
+    }
+
+    @ExceptionHandler(InsufficientStockException.class)
+    ProblemDetail onStock(InsufficientStockException ex) {
+        return ProblemDetail.forStatusAndDetail(HttpStatus.CONFLICT, ex.getMessage());
+    }
+
+    @ExceptionHandler(IllegalOrderStateException.class)
+    ProblemDetail onIllegalTransition(IllegalOrderStateException ex) {
+        return ProblemDetail.forStatusAndDetail(HttpStatus.CONFLICT, ex.getMessage());
+    }
+}</code></pre>
+<p>The three business exceptions are trivial <code>RuntimeException</code> subclasses in their feature packages
+(e.g. <code>InsufficientStockException(String sku, int requested)</code> with a message like
+<code>"Insufficient stock for SKU-123 (requested 5)"</code>).</p>
+<div class="senior">
+Why records for DTOs? Immutable, value-based equality, zero boilerplate — and they make the boundary
+explicit: the API contract can now evolve independently of the persistence model. Returning entities
+from controllers couples your JSON to your table layout, invites lazy-loading serialization crashes,
+and leaks fields (imagine <code>password_hash</code> serializing). This maps directly to what you already
+know from TypeScript: DTOs are your API types; entities are your database types; never
+<code>export</code> the latter.
+</div>
+<div class="note">
+<strong>Checkpoint:</strong> with security still permitting requests (or temporarily <code>permitAll</code> on
+<code>/api/**</code> until Milestone 7): <code>POST /api/orders?customerId=1</code> with
+<code>{"lines":[{"productId":1,"quantity":2}]}</code> returns <code>201</code> and the order JSON. Send
+<code>{"lines":[]}</code> and expect a <code>400</code> ProblemDetail with an <code>errors</code> array. Try an
+illegal transition (<code>POST /api/orders/1/status?target=SHIPPED</code> on a PENDING order) and expect <code>409</code>.
+</div>
+<div class="senior">
+<strong>What you're practicing:</strong> Tutorial 6 (REST design, status codes, validation, ControllerAdvice)
+and Tutorial 2 (records, streams). ProblemDetail specifically is a "have you used Spring 6 features?" signal.
+</div>
+
+<h3 id="m6">Milestone 6 — Pagination, filtering, and a window-function query</h3>
+<p><strong>Goal:</strong> the list endpoint every real API needs, plus one query that proves you know SQL beyond CRUD.</p>
+<p>Filtering with the Specification API (composable, null-safe — better than an explosion of
+<code>findByStatusAndCustomerId...</code> method names):</p>
+<pre><code><span class="com">// com/prep/orders/order/OrderRepository.java</span>
+package com.prep.orders.order;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.JpaSpecificationExecutor;
+import org.springframework.data.jpa.repository.Query;
+
+import java.util.List;
+
+public interface OrderRepository
+        extends JpaRepository&lt;Order, Long&gt;, JpaSpecificationExecutor&lt;Order&gt; {
+
+    boolean existsByIdAndCustomerId(Long orderId, Long customerId);   <span class="com">// Milestone 7 ownership check</span>
+
+    <span class="com">/** Each customer's most recent order — native, using DISTINCT ON (Postgres idiom). */</span>
+    @Query(value = """
+        SELECT o.customer_id   AS "customerId",
+               c.email         AS "email",
+               o.id            AS "orderId",
+               o.status        AS "status",
+               o.total_amount  AS "totalAmount",
+               o.created_at    AS "createdAt"
+          FROM (
+                SELECT DISTINCT ON (customer_id) *
+                  FROM orders
+                 ORDER BY customer_id, created_at DESC
+               ) o
+          JOIN customers c ON c.id = o.customer_id
+        """, nativeQuery = true)
+    List&lt;LatestOrderRow&gt; findLatestOrderPerCustomer();
+}</code></pre>
+<pre><code><span class="com">// com/prep/orders/order/LatestOrderRow.java — interface projection for the native query</span>
+package com.prep.orders.order;
+
+import java.math.BigDecimal;
+import java.time.Instant;
+
+public interface LatestOrderRow {
+    Long getCustomerId();
+    String getEmail();
+    Long getOrderId();
+    String getStatus();
+    BigDecimal getTotalAmount();
+    Instant getCreatedAt();
+}</code></pre>
+<p>The same query with <code>ROW_NUMBER()</code> — the portable form, and the one an interviewer will
+most likely ask you to whiteboard ("latest X per Y" is a classic):</p>
+<pre><code>SELECT customer_id, id, status, total_amount, created_at
+FROM (
+    SELECT o.*,
+           ROW_NUMBER() OVER (PARTITION BY customer_id
+                              ORDER BY created_at DESC) AS rn
+    FROM orders o
+) ranked
+WHERE rn = 1;</code></pre>
+<p>The filtered, paginated list — specification + <code>Pageable</code>:</p>
+<pre><code><span class="com">// com/prep/orders/order/OrderSpecifications.java</span>
+package com.prep.orders.order;
+
+import jakarta.persistence.criteria.Predicate;
+import org.springframework.data.jpa.domain.Specification;
+import java.util.ArrayList;
+
+public final class OrderSpecifications {
+    private OrderSpecifications() {}
+
+    public static Specification&lt;Order&gt; withFilters(OrderStatus status, Long customerId) {
+        return (root, query, cb) -&gt; {
+            var predicates = new ArrayList&lt;Predicate&gt;();
+            if (status != null)     predicates.add(cb.equal(root.get("status"), status));
+            if (customerId != null) predicates.add(cb.equal(root.get("customer").get("id"), customerId));
+            return cb.and(predicates.toArray(new Predicate[0]));
+        };
+    }
+}</code></pre>
+<pre><code><span class="com">// added to OrderController</span>
+@GetMapping
+public Page&lt;OrderSummaryResponse&gt; list(
+        @RequestParam(required = false) OrderStatus status,
+        @RequestParam(required = false) Long customerId,
+        @PageableDefault(size = 20, sort = "createdAt", direction = Sort.Direction.DESC) Pageable pageable) {
+    return orderService.search(status, customerId, pageable);   <span class="com">// service maps Page&lt;Order&gt; → Page&lt;dto&gt;</span>
+}</code></pre>
+<p><code>OrderSummaryResponse</code> is a slim record — <code>id, status, totalAmount, itemCount, createdAt</code> —
+deliberately <em>without</em> the items list. That choice matters enormously in Milestone 8.</p>
+<div class="note">
+<strong>Checkpoint:</strong> <code>GET /api/orders?status=PENDING&amp;page=0&amp;size=5</code> returns a Spring
+<code>Page</code> envelope (<code>content</code>, <code>totalElements</code>, <code>totalPages</code>). Run the
+DISTINCT ON query in <code>psql</code> too and confirm both variants return identical rows.
+</div>
+<div class="senior">
+<strong>What you're practicing:</strong> Tutorial 11 (window functions, DISTINCT ON), Tutorial 6 (pagination
+contracts), Tutorial 7 (Specifications, projections). Bonus talking point: offset pagination degrades as
+<code>OFFSET</code> grows — for deep pagination you would switch to keyset pagination
+(<code>WHERE (created_at, id) &lt; (?, ?) ORDER BY created_at DESC, id DESC LIMIT ?</code>). Say that sentence in
+an interview and watch the interviewer perk up.
+</div>
+
+<h3 id="m7">Milestone 7 — JWT security: login, roles, ownership</h3>
+<p><strong>Goal:</strong> stateless JWT auth using Spring's OAuth2 resource-server support — no hand-rolled filter, no third-party JWT lib.</p>
+<pre><code><span class="com">// com/prep/orders/security/SecurityConfig.java</span>
+package com.prep.orders.security;
+
+import com.nimbusds.jose.jwk.source.ImmutableSecret;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.authentication.AuthenticationManager;
+import org.springframework.security.config.Customizer;
+import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.security.oauth2.jwt.*;
+import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationConverter;
+import org.springframework.security.web.SecurityFilterChain;
+
+import javax.crypto.spec.SecretKeySpec;
+import java.nio.charset.StandardCharsets;
+import java.util.List;
+
+@Configuration
+@EnableWebSecurity
+@EnableMethodSecurity          <span class="com">// enables @PreAuthorize</span>
+public class SecurityConfig {
+
+    @Bean
+    SecurityFilterChain filterChain(HttpSecurity http,
+                                    JwtAuthenticationConverter jwtAuthConverter) throws Exception {
+        http
+            .csrf(csrf -&gt; csrf.disable())          <span class="com">// stateless token API: no session, no CSRF surface</span>
+            .sessionManagement(sm -&gt; sm.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+            .authorizeHttpRequests(auth -&gt; auth
+                .requestMatchers("/api/auth/**", "/actuator/health").permitAll()
+                .anyRequest().authenticated())
+            .oauth2ResourceServer(oauth -&gt; oauth
+                .jwt(jwt -&gt; jwt.jwtAuthenticationConverter(jwtAuthConverter)));
+        return http.build();
+    }
+
+    @Bean
+    JwtDecoder jwtDecoder(@Value("${app.jwt.secret}") String secret) {
+        var key = new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256");
+        return NimbusJwtDecoder.withSecretKey(key).build();
+    }
+
+    @Bean
+    JwtEncoder jwtEncoder(@Value("${app.jwt.secret}") String secret) {
+        var key = new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256");
+        return new NimbusJwtEncoder(new ImmutableSecret&lt;&gt;(key));
+    }
+
+    @Bean
+    JwtAuthenticationConverter jwtAuthenticationConverter() {
+        var converter = new JwtAuthenticationConverter();
+        converter.setJwtGrantedAuthoritiesConverter(jwt -&gt;
+            List.of(new SimpleGrantedAuthority("ROLE_" + jwt.getClaimAsString("role"))));
+        return converter;
+    }
+
+    @Bean
+    PasswordEncoder passwordEncoder() {
+        return new BCryptPasswordEncoder();
+    }
+}</code></pre>
+<pre><code><span class="com">// com/prep/orders/security/TokenService.java</span>
+package com.prep.orders.security;
+
+import com.prep.orders.customer.Customer;
+import org.springframework.security.oauth2.jose.jws.MacAlgorithm;
+import org.springframework.security.oauth2.jwt.*;
+import org.springframework.stereotype.Service;
+
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
+
+@Service
+public class TokenService {
+
+    private final JwtEncoder encoder;
+
+    public TokenService(JwtEncoder encoder) {
+        this.encoder = encoder;
+    }
+
+    public String issue(Customer customer) {
+        Instant now = Instant.now();
+        JwtClaimsSet claims = JwtClaimsSet.builder()
+            .issuer("orders-api")
+            .issuedAt(now)
+            .expiresAt(now.plus(1, ChronoUnit.HOURS))
+            .subject(customer.getEmail())
+            .claim("customerId", customer.getId())
+            .claim("role", customer.getRole())          <span class="com">// "CUSTOMER" or "ADMIN"</span>
+            .build();
+        JwsHeader header = JwsHeader.with(MacAlgorithm.HS256).build();
+        return encoder.encode(JwtEncoderParameters.from(header, claims)).getTokenValue();
+    }
+}</code></pre>
+<pre><code><span class="com">// com/prep/orders/security/AuthController.java</span>
+package com.prep.orders.security;
+
+import com.prep.orders.customer.CustomerRepository;
+import jakarta.validation.constraints.NotBlank;
+import org.springframework.http.HttpStatus;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.server.ResponseStatusException;
+
+@RestController
+@RequestMapping("/api/auth")
+public class AuthController {
+
+    private final CustomerRepository customers;
+    private final PasswordEncoder passwordEncoder;
+    private final TokenService tokenService;
+
+    public AuthController(CustomerRepository customers,
+                          PasswordEncoder passwordEncoder,
+                          TokenService tokenService) {
+        this.customers = customers;
+        this.passwordEncoder = passwordEncoder;
+        this.tokenService = tokenService;
+    }
+
+    public record LoginRequest(@NotBlank String email, @NotBlank String password) {}
+    public record TokenResponse(String accessToken) {}
+
+    @PostMapping("/login")
+    public TokenResponse login(@RequestBody LoginRequest request) {
+        var customer = customers.findByEmail(request.email())
+            .filter(c -&gt; passwordEncoder.matches(request.password(), c.getPasswordHash()))
+            .orElseThrow(() -&gt; new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Bad credentials"));
+        return new TokenResponse(tokenService.issue(customer));
+    }
+}</code></pre>
+<p>Ownership check as a named bean, referenced from SpEL:</p>
+<pre><code><span class="com">// com/prep/orders/security/OrderSecurity.java</span>
+package com.prep.orders.security;
+
+import com.prep.orders.order.OrderRepository;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.oauth2.jwt.Jwt;
+import org.springframework.stereotype.Component;
+
+@Component("orderSecurity")
+public class OrderSecurity {
+
+    private final OrderRepository orders;
+
+    public OrderSecurity(OrderRepository orders) {
+        this.orders = orders;
+    }
+
+    public boolean isOwner(Long orderId, Authentication auth) {
+        if (!(auth.getPrincipal() instanceof Jwt jwt)) return false;   <span class="com">// pattern matching (Java 16+)</span>
+        Long customerId = jwt.getClaim("customerId");
+        return customerId != null &amp;&amp; orders.existsByIdAndCustomerId(orderId, customerId);
+    }
+}</code></pre>
+<p>Now update <code>OrderController</code>: the customer id comes from the token, not a query param,
+and access rules go on the methods:</p>
+<pre><code>@PostMapping
+@ResponseStatus(HttpStatus.CREATED)
+@PreAuthorize("hasRole('CUSTOMER')")
+public OrderResponse place(@Valid @RequestBody PlaceOrderRequest request,
+                           @AuthenticationPrincipal Jwt jwt) {
+    Long customerId = jwt.getClaim("customerId");
+    ...
+}
+
+@GetMapping("/{id}")
+@PreAuthorize("hasRole('ADMIN') or @orderSecurity.isOwner(#id, authentication)")
+public OrderResponse get(@PathVariable Long id) { ... }
+
+@PostMapping("/{id}/status")
+@PreAuthorize("hasRole('ADMIN')")
+public OrderResponse changeStatus(...) { ... }</code></pre>
+<p>For the list endpoint: an admin may pass any <code>customerId</code> filter; a customer's filter is
+forcibly overwritten with their own id in the service — never trust the query string for authorization data.</p>
+<div class="pitfall">
+<code>hasRole('ADMIN')</code> checks for the authority <code>ROLE_ADMIN</code> — the <code>ROLE_</code> prefix is
+added for you. If your authorities converter emits <code>"ADMIN"</code> without the prefix, <code>hasRole</code>
+silently never matches and every request 403s. If you don't want prefixes, use
+<code>hasAuthority('ADMIN')</code> consistently instead. This mismatch is probably the single most common
+Spring Security debugging session in existence.
+</div>
+<div class="note">
+<strong>Checkpoint:</strong> seed one CUSTOMER and one ADMIN (a <code>V2__seed_users.sql</code> Flyway migration
+with BCrypt hashes is fine for dev). Then: login as customer → place an order → fetch it (200). Fetch an order
+belonging to someone else → 403. Same fetch as admin → 200. No token at all → 401.
+Notice 401 vs 403 — authentication vs authorization — and be ready to say why each happens.
+</div>
+<div class="senior">
+<strong>What you're practicing:</strong> Tutorial 8 (Security filter chain, stateless JWT, method security)
+and Tutorial 6 (auth endpoints). Using Spring's own <code>JwtEncoder</code>/<code>JwtDecoder</code> instead of
+wiring <code>jjwt</code> plus a custom <code>OncePerRequestFilter</code> is itself a talking point: less custom
+security code is better security code.
+</div>
+
+<h3 id="m8">Milestone 8 — The N+1 hunt</h3>
+<p><strong>Goal:</strong> deliberately cause the most famous ORM performance bug, observe it with your own eyes, fix it three ways, and measure.</p>
+<p><strong>Step 1 — make it visible.</strong> In <code>application.yml</code> (dev only):</p>
+<pre><code>spring:
+  jpa:
+    properties:
+      hibernate:
+        generate_statistics: true   <span class="com"># logs a per-session summary incl. JDBC statement count</span>
+
+logging:
+  level:
+    org.hibernate.SQL: DEBUG
+    org.hibernate.stat: DEBUG</code></pre>
+<p><strong>Step 2 — trigger it.</strong> Temporarily change the list endpoint to return the full
+<code>OrderResponse</code> (with items) instead of <code>OrderSummaryResponse</code>, seed ~50 orders with
+2–3 items each, and hit <code>GET /api/orders?size=50</code>. Watch the log:</p>
+<pre><code>select o1_0.id, o1_0.customer_id, ... from orders o1_0 ...      <span class="com">-- 1 query for the page</span>
+select oi1_0.order_id, oi1_0.id, ... where oi1_0.order_id=?     <span class="com">-- × 50 (items per order)</span>
+select p1_0.id, p1_0.name, ...        where p1_0.id=?           <span class="com">-- × ~120 (product per item)</span>
+
+... 171 JDBC statements executed for one HTTP request.</code></pre>
+<p>This happens because every relationship is LAZY (correctly!) and the DTO mapper walks
+<code>order.getItems()</code> then <code>item.getProduct()</code> per row — each first touch fires its own SELECT.</p>
+<div class="note">
+Because you set <code>open-in-view: false</code> in Milestone 1, this lazy walking only works while the
+transaction is open — do the DTO mapping inside the <code>@Transactional</code> service method. If you had left
+open-in-view on, the lazy loads would silently run during JSON serialization, outside the service, holding a
+connection through the whole response write — the default that hides the problem instead of surfacing it.
+</div>
+<p><strong>Step 3 — fix it.</strong> Three techniques, in order of preference for this case:</p>
+<ul>
+  <li><strong>Right-size the payload (best here):</strong> the list endpoint should return
+      <code>OrderSummaryResponse</code> without items at all — you already built that in Milestone 6.
+      Most N+1s die when you stop over-fetching. 1 query.</li>
+  <li><strong>Fetch join for the detail endpoint,</strong> where you genuinely need the graph:
+<pre><code>@Query("""
+    SELECT o FROM Order o
+      JOIN FETCH o.items i
+      JOIN FETCH i.product
+     WHERE o.id = :id
+    """)
+Optional&lt;Order&gt; findByIdWithItems(@Param("id") Long id);</code></pre>
+      One query, one order, whole graph. Equivalent declarative form:
+      <code>@EntityGraph(attributePaths = {"items", "items.product"})</code> on a repository method.</li>
+  <li><strong>Batch fetching as a safety net:</strong>
+      <code>spring.jpa.properties.hibernate.default_batch_fetch_size: 25</code> turns N single-row selects into
+      ⌈N/25⌉ <code>IN (...)</code> selects app-wide. Good insurance; not a substitute for thinking.</li>
+</ul>
+<div class="pitfall">
+Do <strong>not</strong> combine a collection fetch join with <code>Pageable</code>. Hibernate cannot apply SQL
+<code>LIMIT</code> to a query whose row count is multiplied by the joined collection, so it fetches
+<em>every matching row</em> and paginates in memory — look for the
+<code>HHH90003004: firstResult/maxResults specified with collection fetch; applying in memory</code> warning.
+That "fix" can be slower than the N+1 it replaced. For paginated lists: summary DTOs, or a two-step
+select-ids-then-fetch-graph pattern.
+</div>
+<div class="note">
+<strong>Checkpoint:</strong> Hibernate statistics for the list request show the JDBC statement count dropping
+from 171 to <strong>1</strong> (summary DTO), and the detail request from 3+ to <strong>1</strong> (fetch join).
+Write those two numbers down — they are the spine of your performance interview story.
+</div>
+<div class="senior">
+<strong>What you're practicing:</strong> Tutorial 7 (fetching strategies — this is the single most-asked JPA
+interview topic) and Tutorial 13 (thinking in queries-per-request as a first-class metric). The senior framing:
+N+1 is not a Hibernate bug, it is the default consequence of lazy loading meeting per-row navigation —
+and the fix is always "decide the fetch plan per use case."
+</div>
+
+<h3 id="m9">Milestone 9 — EXPLAIN ANALYZE at 100k rows</h3>
+<p><strong>Goal:</strong> generate realistic volume, watch a query go slow, read the plan, add the right index, and quantify the win.</p>
+<p><strong>Step 1 — seed 100k orders.</strong> Run this in <code>psql</code> (it is dev seeding, not a Flyway
+migration — keep it in <code>scripts/seed_100k.sql</code>):</p>
+<pre><code><span class="com">-- 5,000 customers (ids come from customer_seq, so they are spaced by 50 — that's fine)</span>
+INSERT INTO customers (email, full_name, password_hash)
+SELECT 'user' || i || '@example.test', 'User ' || i, '$2a$10$notarealhashnotarealhashnotareal'
+FROM generate_series(1, 5000) AS i;
+
+<span class="com">-- 200 products</span>
+INSERT INTO products (sku, name, price, stock)
+SELECT 'SKU-' || i, 'Product ' || i, round((random() * 200 + 1)::numeric, 2), 10000
+FROM generate_series(1, 200) AS i;
+
+<span class="com">-- 100,000 orders with random customer, status, and a created_at spread over a year</span>
+WITH cust AS (SELECT array_agg(id) AS ids FROM customers)
+INSERT INTO orders (customer_id, status, total_amount, created_at)
+SELECT ids[1 + floor(random() * array_length(ids, 1))::int],
+       (ARRAY['PENDING','PAID','SHIPPED','CANCELLED'])[1 + floor(random() * 4)::int],
+       round((random() * 500)::numeric, 2),
+       now() - (random() * interval '365 days')
+FROM cust, generate_series(1, 100000);
+
+ANALYZE customers; ANALYZE products; ANALYZE orders;   <span class="com">-- refresh planner statistics</span></code></pre>
+<p><strong>Step 2 — run the query your list endpoint generates</strong> ("recent PENDING orders, newest first"):</p>
+<pre><code>EXPLAIN (ANALYZE, BUFFERS)
+SELECT id, customer_id, total_amount, created_at
+FROM orders
+WHERE status = 'PENDING'
+ORDER BY created_at DESC
+LIMIT 20;</code></pre>
+<p>Expected shape <em>before</em> the index (numbers will vary):</p>
+<pre><code>Limit  (cost=4712.61..4712.66 rows=20 ...) (actual time=38.941..38.947 ...)
+  -&gt;  Sort  (cost=4712.61..4775.11 rows=25000 ...) (actual time=38.939..38.941 ...)
+        Sort Key: created_at DESC
+        Sort Method: top-N heapsort  Memory: 26kB
+        -&gt;  Seq Scan on orders  (cost=0.00..4047.00 rows=25000 ...)
+              Filter: (status = 'PENDING'::text)
+              Rows Removed by Filter: 74812
+Execution Time: 39.2 ms</code></pre>
+<p>Read it bottom-up: a <strong>sequential scan of all 100k rows</strong>, throwing away ~75k, then sorting the
+survivors just to keep 20. <strong>Step 3 — add the composite index as a real migration</strong>,
+<code>V3__idx_orders_status_created.sql</code>:</p>
+<pre><code>CREATE INDEX idx_orders_status_created
+    ON orders (status, created_at DESC);</code></pre>
+<p>Re-run the same <code>EXPLAIN ANALYZE</code>:</p>
+<pre><code>Limit  (cost=0.42..2.89 rows=20 ...) (actual time=0.061..0.113 ...)
+  -&gt;  Index Scan using idx_orders_status_created on orders
+        Index Cond: (status = 'PENDING'::text)
+Execution Time: 0.14 ms</code></pre>
+<p>No sort node at all — the index returns rows already ordered by <code>created_at DESC</code> within the
+<code>status</code> prefix, so Postgres walks the first 20 entries and stops. <strong>~39&nbsp;ms → ~0.14&nbsp;ms,
+roughly 280×.</strong> Your numbers will differ; what matters is that you have real ones.</p>
+<p>Things to try while you're here (10 minutes each, all Tutorial 13 material):</p>
+<ul>
+  <li>Column order matters: an index on <code>(created_at, status)</code> does <em>not</em> serve this query well —
+      equality columns first, then the range/sort column.</li>
+  <li><code>EXPLAIN</code> the Milestone 6 filter with <code>customer_id</code>: watch it use
+      <code>idx_orders_customer_id</code> from V1.</li>
+  <li>Check index sizes: <code>SELECT indexrelname, pg_size_pretty(pg_relation_size(indexrelid)) FROM pg_stat_user_indexes WHERE relname = 'orders';</code>
+      — indexes are not free; that is the argument for adding them on evidence, not superstition.</li>
+</ul>
+<div class="senior">
+Production footnote that interviewers love: on a live table you would use
+<code>CREATE INDEX CONCURRENTLY</code> to avoid blocking writes — but it cannot run inside a transaction, so with
+Flyway you must mark that migration non-transactional (Flyway's <code>executeInTransaction=false</code> script
+config). Knowing that wrinkle is a very cheap way to sound like you have operated Postgres, not just queried it
+(Tutorial 15).
+</div>
+<div class="note">
+<strong>Checkpoint:</strong> both plans saved into <code>docs/explain-before-after.txt</code> in the repo.
+You will paste from it when writing the README and quoting numbers in interviews.
+</div>
+
+<h3 id="m10">Milestone 10 — Tests: the pyramid, plus the race test</h3>
+<p><strong>Goal:</strong> unit tests for logic, slice tests for the web layer, Testcontainers for the truth — including proof that overselling is impossible.</p>
+<p><strong>Service unit test (Mockito — fast, no Spring):</strong></p>
+<pre><code><span class="com">// src/test/java/com/prep/orders/order/OrderServiceTest.java</span>
+package com.prep.orders.order;
+
+import com.prep.orders.customer.CustomerRepository;
+import com.prep.orders.product.Product;
+import com.prep.orders.product.ProductRepository;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+import java.math.BigDecimal;
+import java.util.List;
+import java.util.Optional;
+
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.*;
+
+@ExtendWith(MockitoExtension.class)
+class OrderServiceTest {
+
+    @Mock OrderRepository orderRepository;
+    @Mock ProductRepository productRepository;
+    @Mock CustomerRepository customerRepository;
+    @InjectMocks OrderService orderService;
+
+    @Test
+    void rejectsOrderWhenStockGuardFails() {
+        var customer = TestData.customer(1L);
+        var product  = new Product("SKU-1", "Widget", new BigDecimal("9.99"), 3);
+        when(customerRepository.findById(1L)).thenReturn(Optional.of(customer));
+        when(productRepository.findById(10L)).thenReturn(Optional.of(product));
+        when(productRepository.decrementStock(10L, 5)).thenReturn(0);   <span class="com">// guard says no</span>
+
+        assertThatThrownBy(() -&gt;
+                orderService.placeOrder(1L, List.of(new OrderService.OrderLine(10L, 5))))
+            .isInstanceOf(InsufficientStockException.class);
+
+        verify(orderRepository, never()).save(any());   <span class="com">// no half-created order</span>
+    }
+
+    @Test
+    void illegalTransitionIsRejected() {
+        var order = TestData.shippedOrder(7L);
+        when(orderRepository.findById(7L)).thenReturn(Optional.of(order));
+
+        assertThatThrownBy(() -&gt; orderService.changeStatus(7L, OrderStatus.PENDING))
+            .isInstanceOf(IllegalOrderStateException.class);
+    }
+}</code></pre>
+<p><strong>Web slice test (<code>@WebMvcTest</code> — controller + validation + advice, no DB):</strong></p>
+<pre><code><span class="com">// src/test/java/com/prep/orders/order/OrderControllerTest.java</span>
+package com.prep.orders.order;
+
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
+import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
+import org.springframework.http.MediaType;
+import org.springframework.test.context.bean.override.mockito.MockitoBean;
+import org.springframework.test.web.servlet.MockMvc;
+
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
+
+@WebMvcTest(OrderController.class)
+@AutoConfigureMockMvc(addFilters = false)   <span class="com">// security filters off: this slice tests validation, not auth</span>
+class OrderControllerTest {
+
+    @Autowired MockMvc mvc;
+    @MockitoBean OrderService orderService;   <span class="com">// @MockBean is deprecated since Boot 3.4</span>
+
+    @Test
+    void emptyLinesReturns400ProblemDetail() throws Exception {
+        mvc.perform(post("/api/orders")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("""
+                    {"lines": []}
+                    """))
+            .andExpect(status().isBadRequest())
+            .andExpect(jsonPath("$.detail").value("Request validation failed"))
+            .andExpect(jsonPath("$.errors").isArray());
+    }
+
+    @Test
+    void zeroQuantityReturns400() throws Exception {
+        mvc.perform(post("/api/orders")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("""
+                    {"lines": [{"productId": 1, "quantity": 0}]}
+                    """))
+            .andExpect(status().isBadRequest());
+    }
+}</code></pre>
+<p><strong>The integration test that earns the interview story — real Postgres via Testcontainers,
+two threads racing for the last unit of stock:</strong></p>
+<pre><code><span class="com">// src/test/java/com/prep/orders/order/PlaceOrderIntegrationTest.java</span>
+package com.prep.orders.order;
+
+import com.prep.orders.customer.Customer;
+import com.prep.orders.customer.CustomerRepository;
+import com.prep.orders.product.Product;
+import com.prep.orders.product.ProductRepository;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
+import org.testcontainers.containers.PostgreSQLContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+
+import java.math.BigDecimal;
+import java.util.List;
+import java.util.concurrent.*;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+@SpringBootTest
+@Testcontainers
+class PlaceOrderIntegrationTest {
+
+    @Container
+    @ServiceConnection   <span class="com">// Boot 3.1+: wires datasource props from the container automatically</span>
+    static PostgreSQLContainer&lt;?&gt; postgres = new PostgreSQLContainer&lt;&gt;("postgres:16-alpine");
+
+    @Autowired OrderService orderService;
+    @Autowired ProductRepository productRepository;
+    @Autowired CustomerRepository customerRepository;
+
+    @Test
+    void placeOrderDecrementsStockAndComputesTotal() {
+        var customer = customerRepository.save(Customer.of("it@test.dev", "IT User", "x"));
+        var product  = productRepository.save(new Product("SKU-IT", "Widget", new BigDecimal("10.00"), 5));
+
+        var order = orderService.placeOrder(customer.getId(),
+                List.of(new OrderService.OrderLine(product.getId(), 3)));
+
+        assertThat(order.getTotalAmount()).isEqualByComparingTo("30.00");
+        assertThat(productRepository.findById(product.getId()).orElseThrow().getStock()).isEqualTo(2);
+    }
+
+    @Test
+    void concurrentOrdersForLastUnitDoNotOversell() throws Exception {
+        var customer = customerRepository.save(Customer.of("race@test.dev", "Racer", "x"));
+        var product  = productRepository.save(new Product("SKU-RACE", "Last unit", new BigDecimal("9.99"), 1));
+
+        var startGate = new CountDownLatch(1);
+        Callable&lt;String&gt; attempt = () -&gt; {
+            startGate.await();               <span class="com">// both threads released at the same instant</span>
+            try {
+                orderService.placeOrder(customer.getId(),
+                        List.of(new OrderService.OrderLine(product.getId(), 1)));
+                return "OK";
+            } catch (InsufficientStockException e) {
+                return "REJECTED";
+            }
+        };
+
+        try (var pool = Executors.newFixedThreadPool(2)) {
+            Future&lt;String&gt; first  = pool.submit(attempt);
+            Future&lt;String&gt; second = pool.submit(attempt);
+            startGate.countDown();
+
+            assertThat(List.of(first.get(), second.get()))
+                .containsExactlyInAnyOrder("OK", "REJECTED");   <span class="com">// exactly ONE wins</span>
+        }
+
+        assertThat(productRepository.findById(product.getId()).orElseThrow().getStock())
+            .isZero();                                          <span class="com">// never -1</span>
+    }
+}</code></pre>
+<div class="pitfall">
+Do <em>not</em> put <code>@Transactional</code> on the race test class. Test-level transactions would wrap each
+test in a rolled-back transaction on the <em>test</em> thread — but the two worker threads open their own
+transactions anyway, and test-managed rollback semantics around multi-threaded code are a reliable source of
+confusing flakes. Let this test commit for real and assert on real committed state; clean up with
+<code>@AfterEach</code> deletes or unique SKUs per test.
+</div>
+<div class="note">
+<strong>Checkpoint:</strong> <code>./mvnw verify</code> — everything green. Temporarily revert
+<code>decrementStock</code> to the naive read-check-write version and run the race test ten times: it should
+fail at least once (stock −1 or two OKs). Put the fix back. Now you have <em>seen</em> the race, not just read about it.
+</div>
+<div class="senior">
+<strong>What you're practicing:</strong> Tutorial 9 (test pyramid, Mockito, slices, Testcontainers) and
+Tutorial 14 (proving isolation behavior empirically). The layered strategy is itself the interview answer:
+fast unit tests for business rules, slice tests for the HTTP contract, a handful of full-stack tests against
+real Postgres for things only a real database can verify — locking, constraints, SQL dialect.
+</div>
+
+<h3 id="m11">Milestone 11 — Polish: Actuator, correlation IDs, README</h3>
+<p><strong>Goal:</strong> the last 10% that makes the project look operated, not just written.</p>
+<p>Actuator exposure (<code>application.yml</code>):</p>
+<pre><code>management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info, metrics
+  endpoint:
+    health:
+      show-details: when_authorized</code></pre>
+<p>Correlation-ID filter — every log line for a request shares an ID, and the ID round-trips to the client:</p>
+<pre><code><span class="com">// com/prep/orders/common/CorrelationIdFilter.java</span>
+package com.prep.orders.common;
+
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import org.slf4j.MDC;
+import org.springframework.stereotype.Component;
+import org.springframework.web.filter.OncePerRequestFilter;
+
+import java.io.IOException;
+import java.util.UUID;
+
+@Component
+public class CorrelationIdFilter extends OncePerRequestFilter {
+
+    public static final String HEADER = "X-Correlation-Id";
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request,
+                                    HttpServletResponse response,
+                                    FilterChain chain) throws ServletException, IOException {
+        String id = request.getHeader(HEADER);
+        if (id == null || id.isBlank()) {
+            id = UUID.randomUUID().toString();
+        }
+        MDC.put("correlationId", id);
+        response.setHeader(HEADER, id);
+        try {
+            chain.doFilter(request, response);
+        } finally {
+            MDC.remove("correlationId");   <span class="com">// servlet threads are pooled — always clean the MDC</span>
+        }
+    }
+}</code></pre>
+<pre><code><span class="com"># application.yml — put the id into every log line</span>
+logging:
+  pattern:
+    level: "%5p [cid:%X{correlationId:-}]"</code></pre>
+<p>README sections (an hour, max — recruiters and interviewers <em>will</em> read this):
+what it is, how to run it (<code>docker compose up -d &amp;&amp; ./mvnw spring-boot:run</code>), an API table,
+a curl walkthrough (login → place → pay → ship), and — most importantly — a short
+<strong>"Design decisions"</strong> section: atomic stock decrement vs FOR UPDATE, the N+1 numbers,
+the EXPLAIN before/after, why Flyway + <code>validate</code>. That section is your interview cheat sheet.</p>
+<div class="note">
+<strong>Checkpoint:</strong> <code>curl -i localhost:8080/actuator/health</code> shows <code>UP</code>
+including a <code>db</code> component; any API request logs lines carrying the same <code>cid:</code> value and
+echoes <code>X-Correlation-Id</code> back in the response headers.
+</div>
+<div class="senior">
+<strong>What you're practicing:</strong> Tutorial 10 (observability basics that microservices make mandatory —
+a correlation ID is the single-service seed of distributed tracing) and Tutorial 15 (operability as a feature).
+</div>
+
+<h3 id="m12">Milestone 12 (optional stretch) — Idempotency, caching, outbox</h3>
+<p>Only after 1–11 are solid. Each of these is a strong senior-differentiator topic:</p>
+<ul>
+  <li><strong>Idempotency keys on order placement.</strong> Client sends an <code>Idempotency-Key</code> header;
+      store it in an <code>idempotency_keys</code> table with a <code>UNIQUE</code> constraint and the serialized
+      response. A retry (mobile client, gateway timeout) replays the stored response instead of double-charging.
+      The interesting part: the unique constraint, not application logic, is what makes it race-proof —
+      the same lesson as Milestone 4, and exactly why "how do you make POST safe to retry?" is such a
+      common system-design probe.</li>
+  <li><strong>Redis cache for the product catalog.</strong> <code>spring-boot-starter-data-redis</code> +
+      <code>@EnableCaching</code> + <code>@Cacheable("products")</code> on catalog reads,
+      <code>@CacheEvict</code> on writes. Be ready for the follow-up: what staleness is acceptable, and why
+      you would <em>never</em> cache <code>stock</code> this way (it is the one field where staleness = oversell).</li>
+  <li><strong>Outbox pattern on order-paid.</strong> When an order transitions to PAID, insert an event row into an
+      <code>outbox</code> table <em>in the same transaction</em>; a <code>@Scheduled</code> poller publishes and marks
+      rows sent. This solves the dual-write problem (DB commit + message publish cannot be made atomic) and is
+      the canonical Tutorial 10 microservices answer to "how do services communicate reliably?" — you can build
+      the whole thing here without a broker by logging the "published" event.</li>
+</ul>
+
+<h2 id="self-review">Self-review checklist</h2>
+<p>Walk this list when you finish. Every line maps a course concept to the place in <em>your</em> project that
+proves you can do it — if you can't point at the code, that's the gap to close before interview day.</p>
+<ul>
+  <li>☐ <strong>Core Java (T1–T2):</strong> records for DTOs, an enum with behavior (<code>OrderStatus</code>),
+      streams in <code>recalculateTotal()</code> and DTO mapping, pattern matching in <code>OrderSecurity</code>,
+      text blocks for queries.</li>
+  <li>☐ <strong>Collections &amp; generics (T3):</strong> <code>Map&lt;OrderStatus, Set&lt;OrderStatus&gt;&gt;</code>
+      transition table; <code>EnumSet</code>/<code>Map.of</code> chosen deliberately.</li>
+  <li>☐ <strong>Concurrency &amp; JVM (T4):</strong> the race test's <code>ExecutorService</code> +
+      <code>CountDownLatch</code>; you can explain why the fix lives in the database, not in
+      <code>synchronized</code> (hint: multiple app instances).</li>
+  <li>☐ <strong>Spring DI (T5):</strong> constructor injection everywhere; zero field injection; you can explain
+      what the proxy does to <code>@Transactional</code> self-invocation.</li>
+  <li>☐ <strong>REST (T6):</strong> proper verbs and status codes (201/400/401/403/404/409), pagination envelope,
+      ProblemDetail errors, validation annotations on request records.</li>
+  <li>☐ <strong>JPA (T7):</strong> LAZY on every association, <code>@Version</code>, sequence IDs with matching
+      <code>allocationSize</code>, helper methods syncing both sides, fetch join vs <code>@EntityGraph</code> vs
+      projection — and you triggered and killed an N+1 with before/after numbers.</li>
+  <li>☐ <strong>Security (T8):</strong> stateless JWT resource server, role vs authority prefix rule,
+      <code>@PreAuthorize</code> ownership check, 401 vs 403 story.</li>
+  <li>☐ <strong>Testing/AOP (T9):</strong> unit / slice / integration layers all present; <code>@WebMvcTest</code>
+      proves validation without a DB; Testcontainers proves locking with a real DB.</li>
+  <li>☐ <strong>Microservices thinking (T10):</strong> package-by-feature seams, correlation IDs,
+      (stretch) outbox pattern — you can say what you would extract first and what it would cost.</li>
+  <li>☐ <strong>SQL (T11):</strong> a window function / <code>DISTINCT ON</code> query you wrote by hand and can
+      re-derive on a whiteboard.</li>
+  <li>☐ <strong>Schema design (T12):</strong> NUMERIC money, timestamptz, CHECK constraints, indexed FKs,
+      one defensible denormalization (<code>unit_price</code>).</li>
+  <li>☐ <strong>Indexing (T13):</strong> a composite index you justified with <code>EXPLAIN ANALYZE</code>,
+      correct column order, and real before/after timings in <code>docs/</code>.</li>
+  <li>☐ <strong>Transactions (T14):</strong> atomic UPDATE guard, FOR UPDATE alternative, optimistic
+      <code>@Version</code>, DB CHECK as backstop — four layers you can rank by trade-off.</li>
+  <li>☐ <strong>Postgres ops (T15):</strong> Dockerized Postgres with healthcheck and volume, Flyway-owned schema,
+      <code>ANALYZE</code> after bulk load, the <code>CREATE INDEX CONCURRENTLY</code> caveat.</li>
+</ul>
+
+<h2 id="interview-stories">Turning it into interview stories</h2>
+<p>Behavioral-technical questions reward specifics: numbers, trade-offs, and a decision you personally made.
+Each entry below is a model narrative grounded in this project — rehearse them out loud, in your own words,
+with <em>your</em> measured numbers substituted in.</p>
+
+<details class="qa">
+<summary>"Tell me about a performance problem you found and fixed."</summary>
+<div class="answer">
+<p><strong>Situation:</strong> "In an order-management API I built with Spring Boot and Postgres, the order-list
+endpoint felt fine in dev but I'd enabled Hibernate statement statistics, and one page of 50 orders was issuing
+171 SQL statements — a classic N+1: one query for the page, then a lazy load per order for its items and per
+item for its product."</p>
+<p><strong>Task/Action:</strong> "I fixed it at two levels. For the list view, the real bug was over-fetching —
+the UI only needed summaries, so I switched to a slim DTO projection: one query. For the detail view, where the
+full graph is genuinely needed, I wrote a fetch join. I deliberately did <em>not</em> combine the fetch join
+with pagination, because Hibernate then paginates in memory after fetching everything — that 'fix' is worse
+than the disease."</p>
+<p><strong>Result:</strong> "171 statements down to 1 for the list, 3 down to 1 for the detail. Separately, at
+100k rows the list query was seq-scanning and sorting — EXPLAIN ANALYZE showed ~39ms; a composite index on
+(status, created_at DESC) eliminated the sort entirely and brought it to ~0.14ms. The habit I took away:
+queries-per-request and the query plan are metrics you check <em>before</em> users complain."</p>
+</div>
+</details>
+
+<details class="qa">
+<summary>"How do you handle concurrent updates?"</summary>
+<div class="answer">
+<p>"The sharpest example was inventory: two customers buying the last unit simultaneously. Read-check-write in
+Java is a lost-update race — both threads read stock=1, both pass the check, stock goes to −1. I fixed it with
+an atomic conditional UPDATE: <code>SET stock = stock − ? WHERE id = ? AND stock &gt;= ?</code>, and treated
+zero rows updated as a business rejection. Postgres's row lock inside UPDATE serializes the writers, so exactly
+one wins."</p>
+<p>"I considered <code>SELECT … FOR UPDATE</code> — the right tool when the decision logic is too rich for one
+statement — but it holds the lock for the rest of the transaction and forces you to think about lock ordering
+across products, so I preferred the shorter critical section. I also kept two more layers: a
+<code>CHECK (stock &gt;= 0)</code> constraint as a backstop so any future bug fails loudly instead of overselling,
+and <code>@Version</code> optimistic locking on orders for the low-contention status updates. And crucially, I
+<em>proved</em> it: a Testcontainers test fires two threads through a CountDownLatch at one unit of stock and
+asserts exactly one success and stock ending at zero — when I temporarily reverted to the naive code, that
+test failed, which is exactly what a regression test for a race should do."</p>
+</div>
+</details>
+
+<details class="qa">
+<summary>"Walk me through your API design."</summary>
+<div class="answer">
+<p>"Resource-oriented: <code>/api/orders</code> as the collection, <code>POST</code> to place (201 with the
+created representation), <code>GET /{id}</code> for details, and status transitions modeled as an explicit
+sub-action rather than a raw PATCH of a status field — because transitions have rules (PENDING→PAID→SHIPPED,
+CANCELLED only from PENDING or PAID), and the server enforces the state machine, returning 409 on an illegal
+transition. Errors are RFC 7807 ProblemDetail across the board, so clients get one machine-readable error shape
+with a field-level <code>errors</code> array for validation failures."</p>
+<p>"The boundary is strict: request/response DTOs as Java records, entities never serialized — that keeps the
+API contract decoupled from the schema and prevents leaking fields. Lists are paginated with filtering by
+status and customer; and having spent seven years consuming APIs from React, I designed for the client I used
+to be: predictable envelopes, correlation IDs echoed in headers for support tickets, and a 409-vs-400
+distinction the frontend can actually branch on. Security is a stateless JWT resource server; a customer role
+is scoped to its own orders via a method-security ownership check, and I never trust identifiers from the
+query string for authorization — the customer id comes from the token."</p>
+</div>
+</details>
+
+<details class="qa">
+<summary>"How did you test it?"</summary>
+<div class="answer">
+<p>"As a pyramid, with each layer answering a different question. Business rules — the order state machine,
+the insufficient-stock path — are plain Mockito unit tests, milliseconds each, verifying things like 'no order
+row is saved if any line fails'. The HTTP contract — validation, status codes, the ProblemDetail shape — is
+<code>@WebMvcTest</code> slices with the service mocked, so I test the web layer without booting a database.
+Then the things only a real database can verify — row locking, CHECK constraints, the actual SQL dialect — run
+against real Postgres 16 in Testcontainers, wired with <code>@ServiceConnection</code> so config is automatic."</p>
+<p>"The test I'm proudest of is the concurrency test: two threads released by a latch racing for the last unit
+of stock, asserting exactly one success and no negative inventory. I validated the test itself by reverting the
+fix and watching it fail. The principle: an H2 test would have passed with subtly different locking behavior —
+integration tests should run against the engine you deploy on, and Testcontainers makes that cheap."</p>
+</div>
+</details>
+
+<details class="qa">
+<summary>"Tell me about a transaction design decision you made."</summary>
+<div class="answer">
+<p>"Order placement had to be all-or-nothing across multiple tables: decrement stock for each line, insert the
+order, insert its items. I drew the transaction boundary at the service method with <code>@Transactional</code> —
+not the controller, not the repository — because that method <em>is</em> the business invariant. Any line
+failing throws an unchecked exception, which rolls back everything including stock decrements already applied
+for earlier lines; I verified with a test that a failing second line leaves the first product's stock untouched."</p>
+<p>"Two deliberate choices inside that boundary: default READ COMMITTED isolation was sufficient because the
+one genuine race — stock — is handled by an atomic guarded UPDATE rather than by escalating isolation to
+SERIALIZABLE, which would have meant retry loops for a problem I could solve with one statement. And I kept the
+transaction short: no HTTP calls, no token verification, nothing slow inside it, because a transaction holds a
+connection and its locks for its whole lifetime. I also know the proxy caveat — <code>@Transactional</code> is
+proxy-based, so self-invocation silently skips the transaction; that's a bug class I now check for in review."</p>
+</div>
+</details>
+
+<details class="qa">
+<summary>"Why should we trust a frontend developer with backend work?" (the subtext question)</summary>
+<div class="answer">
+<p>"Fair question — my answer is this project. It's not a tutorial follow-along: it has a concurrency test that
+catches overselling, EXPLAIN-verified indexing with before/after numbers, Flyway-owned schema with CHECK
+constraints, and a documented decision log. Seven years of consuming APIs taught me what good ones feel like
+from the client side; now I've built one end-to-end and can defend every layer of it. The fundamentals
+transferred faster than expected — TypeScript made Java's type system familiar, React's data-fetching pain
+made N+1 instantly intuitive — and where backend is genuinely different, like transactions and locking, I went
+deep enough to prove behavior with tests rather than assume it. I'd rather be judged on that artifact than on
+a keyword list."</p>
+</div>
+</details>
+
+<h2 id="common-mistakes">Common mistakes</h2>
+<p>The classic ways capstone projects go sideways — each one is also a negative signal an experienced
+interviewer will spot in your repo within minutes.</p>
+
+<div class="pitfall">
+<strong>EAGER fetching everywhere</strong> (or worse: leaving the <code>@ManyToOne</code> default). It "fixes"
+LazyInitializationException by loading the world on every query, and it makes fetch behavior invisible and
+unfixable per-use-case. Everything LAZY; choose the fetch plan per query with fetch joins, entity graphs, or
+projections. If you're getting LazyInitializationException, the answer is a wider transaction boundary or a
+DTO — never a fetch-type change.
+</div>
+
+<div class="pitfall">
+<strong>Entities crossing the HTTP boundary.</strong> Returning <code>Order</code> from a controller couples
+your JSON to your schema, risks serializing lazy proxies (Jackson happily triggers N+1 or explodes), and leaks
+fields — today it's <code>version</code>, next refactor it's <code>passwordHash</code>. DTO records in, DTO
+records out, always. Same discipline as never exporting your database row types to your React components.
+</div>
+
+<div class="pitfall">
+<strong><code>ddl-auto: update</code> instead of Flyway.</strong> It cannot rename or drop anything, it drifts
+silently between environments, there is no history and no review, and it advertises "I have never run this in
+production." Migrations are code: versioned, reviewed, immutable once applied — and <code>validate</code> keeps
+Hibernate honest about matching them.
+</div>
+
+<div class="pitfall">
+<strong>Testing only happy paths.</strong> Ten tests that all place a valid order prove almost nothing. The
+tests that carry interview weight are the unhappy ones: insufficient stock rolls back the whole order, illegal
+transitions 409, empty lines 400 with a field-level error, foreign customer's order 403 — and above all the
+concurrency test. One race test outweighs twenty green happy paths.
+</div>
+
+<div class="pitfall">
+<strong>Giant service methods.</strong> When <code>placeOrder</code> grows to 150 lines doing validation,
+pricing, stock, persistence, and notifications, you can no longer name what it does or test paths in isolation.
+Keep domain rules on the domain (<code>Order.transitionTo</code>, <code>Order.recalculateTotal</code>), keep the
+service as orchestration, and let package-by-feature stop the "one OrderService to rule them all" gravity.
+</div>
+
+<div class="pitfall">
+<strong>Skipping the measurement steps.</strong> The N+1 hunt and the EXPLAIN session are the two milestones
+people skip "to save time" — and they are precisely the ones that generate numbers for your stories. A claim
+("I optimized the query") is filler; a measurement ("171 statements to 1; 39ms to 0.14ms") is a hire signal.
+Do not ship this project without <code>docs/explain-before-after.txt</code>.
+</div>
+
+<div class="note">
+Done with all twelve milestones? Push it to GitHub with the README from Milestone 11, pin the repo on your
+profile, and re-read your six stories the night before each interview. Then go back through the course index —
+any checklist line you couldn't point at in your own code tells you exactly which tutorial to revisit.
+</div>
+
+<nav class="page-nav">
+  <a href="15-postgres-ops-advanced.html">← Prev: Ops &amp; Advanced Postgres</a>
+  <a href="index.html">Course Home →</a>
+</nav>
+</main>
+</body>
+</html>

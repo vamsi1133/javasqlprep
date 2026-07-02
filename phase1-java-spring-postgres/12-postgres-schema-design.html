@@ -1,0 +1,841 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>12 — Schema Design | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header"><div class="container"><div class="breadcrumb"><a href="index.html">← Course Home</a></div><h1>12 — Schema Design</h1><p>Designing PostgreSQL schemas at a whiteboard: normalization, keys, types, patterns — and how to narrate your trade-offs like a senior.</p></div></header>
+<main class="container">
+
+<p>Live schema design is one of the most common senior full-stack interview exercises: "design the tables for an e-commerce checkout" or "model a booking system." Interviewers don't grade the final DDL nearly as much as they grade the <em>conversation</em> — do you ask clarifying questions, do you name trade-offs out loud, do you know why you picked a surrogate key or a <code>NUMERIC</code> column, and can you defend a denormalization when pushed? As a frontend developer you already model state shapes and API contracts; schema design is the same discipline with stricter invariants, because the database outlives every frontend rewrite. This page teaches the concepts, then walks two full whiteboard exercises end to end exactly the way you'd narrate them in an interview.</p>
+
+<div class="toc"><strong>On this page</strong>
+<ol>
+<li><a href="#normalization">Normalization through one evolving example</a></li>
+<li><a href="#denormalization">Denormalization as a deliberate choice</a></li>
+<li><a href="#keys-constraints">Keys &amp; constraints</a></li>
+<li><a href="#uuid-vs-bigint">UUID vs BIGINT identity — the deep dive</a></li>
+<li><a href="#data-types">Postgres data types done right</a></li>
+<li><a href="#modeling-patterns">Modeling patterns</a></li>
+<li><a href="#multi-tenancy">Multi-tenancy strategies</a></li>
+<li><a href="#walkthroughs">Live design walkthroughs</a></li>
+<li><a href="#interview-qa">Interview Q&amp;A</a></li>
+<li><a href="#exercises">Hands-on exercises</a></li>
+</ol>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="normalization">Normalization through one evolving example <span class="tier tier-1">T1</span></h2>
+
+<p>Normalization is a sequence of increasingly strict rules that remove <strong>redundancy</strong> — the root cause of update anomalies, insert anomalies, and delete anomalies. Instead of memorizing definitions, walk through one example the way you would at a whiteboard. Start from the "spreadsheet" a small shop might actually keep:</p>
+
+<table>
+<thead><tr><th>order_id</th><th>customer</th><th>customer_email</th><th>products</th><th>prices</th></tr></thead>
+<tbody>
+<tr><td>1001</td><td>Asha Rao</td><td>asha@example.com</td><td>Keyboard, Mouse</td><td>79.00, 25.00</td></tr>
+<tr><td>1002</td><td>Ben Cole</td><td>ben@example.com</td><td>Monitor</td><td>299.00</td></tr>
+<tr><td>1003</td><td>Asha Rao</td><td>asha@example.com</td><td>Mouse</td><td>25.00</td></tr>
+</tbody>
+</table>
+
+<h3>1NF — atomic values, no repeating groups</h3>
+<p><strong>Rule:</strong> every column holds a single atomic value; no comma-separated lists, no <code>product1/product2/product3</code> column families. The <code>products</code> column above violates 1NF — you can't ask "how many mice did we sell?" without string parsing, and you can't index into it.</p>
+<p><strong>Fix:</strong> one row per order line.</p>
+
+<pre><code>-- 1NF: explode the repeating group into rows
+CREATE TABLE order_flat (
+    order_id        bigint      NOT NULL,
+    customer        text        NOT NULL,
+    customer_email  text        NOT NULL,
+    product_name    text        NOT NULL,
+    price           numeric(10,2) NOT NULL,
+    PRIMARY KEY (order_id, product_name)   -- composite key for now
+);</code></pre>
+
+<h3>2NF — no partial dependency on a composite key</h3>
+<p><strong>Rule:</strong> every non-key column must depend on the <em>whole</em> key, not just part of it. Our key is <code>(order_id, product_name)</code>, but <code>customer</code> and <code>customer_email</code> depend only on <code>order_id</code> — a <em>partial dependency</em>. Consequence: Asha's email is duplicated on every line of every order she places. Change it in one row and forget another, and the database now disagrees with itself (an <strong>update anomaly</strong>).</p>
+<p><strong>Fix:</strong> split the order header out from the lines.</p>
+
+<pre><code>-- 2NF: order-level facts move to an orders table
+CREATE TABLE orders_2nf (
+    order_id        bigint PRIMARY KEY,
+    customer        text NOT NULL,
+    customer_email  text NOT NULL
+);
+
+CREATE TABLE order_lines_2nf (
+    order_id        bigint NOT NULL REFERENCES orders_2nf(order_id),
+    product_name    text NOT NULL,
+    price           numeric(10,2) NOT NULL,
+    PRIMARY KEY (order_id, product_name)
+);</code></pre>
+
+<h3>3NF — no transitive dependency</h3>
+<p><strong>Rule:</strong> non-key columns must depend on the key <em>directly</em>, not via another non-key column. In <code>orders_2nf</code>, <code>customer_email</code> depends on <code>customer</code> (the person), which depends on <code>order_id</code> — a <em>transitive</em> dependency. Asha's email is still repeated once per order. Also: if Asha has never ordered, we have nowhere to store her at all (an <strong>insert anomaly</strong>), and deleting her only order deletes her contact info (a <strong>delete anomaly</strong>).</p>
+<p><strong>Fix:</strong> customers become their own entity. Same logic pulls products out of the line table.</p>
+
+<pre><code>-- 3NF: each fact lives in exactly one place
+CREATE TABLE customers (
+    id      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name    text NOT NULL,
+    email   text NOT NULL UNIQUE
+);
+
+CREATE TABLE products (
+    id      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name    text NOT NULL,
+    price   numeric(10,2) NOT NULL CHECK (price &gt;= 0)
+);
+
+CREATE TABLE orders (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    customer_id bigint NOT NULL REFERENCES customers(id),
+    created_at  timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE order_lines (
+    order_id    bigint NOT NULL REFERENCES orders(id),
+    product_id  bigint NOT NULL REFERENCES products(id),
+    quantity    int NOT NULL CHECK (quantity &gt; 0),
+    unit_price  numeric(10,2) NOT NULL,   -- see the note below!
+    PRIMARY KEY (order_id, product_id)
+);</code></pre>
+
+<div class="note"><p><strong>The one-line summaries interviewers love:</strong> "The key (1NF), the whole key (2NF), and nothing but the key (3NF)." <strong>BCNF</strong> is the slightly stricter cousin of 3NF: <em>every</em> determinant (anything that functionally determines another column) must be a candidate key. In practice, if you're in 3NF with single-column surrogate keys, you're almost always in BCNF too — mention it, don't dwell on it.</p></div>
+
+<div class="senior"><p>Notice <code>unit_price</code> in <code>order_lines</code> even though <code>products.price</code> exists. That is <em>not</em> a normalization violation and <em>not</em> denormalization — it's a <strong>different fact</strong>: "the price at the moment of purchase" vs "the current catalog price." Prices change; historical orders must not. Interviewers frequently probe this exact point, and confusing it with denormalization is a classic mid-level mistake. Say it out loud: "I'm capturing temporal state, not caching a lookup."</p></div>
+
+<!-- ============================================================ -->
+<h2 id="denormalization">Denormalization as a deliberate choice <span class="tier tier-1">T1</span></h2>
+
+<p>Normalization optimizes for <strong>write correctness</strong>: one fact, one place, no anomalies. But every fact you split out is a JOIN you pay at read time. Senior engineers denormalize <em>on purpose, with a stated maintenance plan</em> — never by accident. The interview framing: "I'll design normalized first, then denormalize the specific reads that measurement shows are hot."</p>
+
+<h3>When to denormalize</h3>
+<ul>
+<li><strong>Read-heavy aggregates:</strong> "orders count per customer" or "total revenue per product" computed on every page load. Recomputing <code>SUM()</code> over millions of rows per request is wasteful; a maintained <code>order_count</code> column or summary table is not.</li>
+<li><strong>Avoiding hot joins:</strong> a 5-table join on the most-hit endpoint in the system. Copying, say, <code>customer_name</code> onto a reporting table trades storage and consistency risk for latency.</li>
+<li><strong>Feed/list screens</strong> that need one row per item with everything pre-joined (the "read model" in CQRS terms).</li>
+</ul>
+
+<h3>How to keep denormalized data consistent — three options</h3>
+<table>
+<thead><tr><th>Mechanism</th><th>Consistency</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td><strong>Database trigger</strong></td><td>Synchronous, transactional</td><td>Impossible to bypass; correct even for ad-hoc SQL</td><td>Hidden logic; adds write latency; harder to test/version</td></tr>
+<tr><td><strong>Application logic</strong> (same transaction)</td><td>Synchronous if disciplined</td><td>Visible in code review; testable</td><td>Every write path must remember; ad-hoc SQL bypasses it</td></tr>
+<tr><td><strong>Periodic rebuild</strong> (cron / materialized view)</td><td>Eventually consistent</td><td>Simple; zero write-path cost; self-healing</td><td>Stale between refreshes — must be acceptable to the product</td></tr>
+</tbody>
+</table>
+
+<pre><code>-- Option 1: trigger-maintained counter
+ALTER TABLE customers ADD COLUMN order_count int NOT NULL DEFAULT 0;
+
+CREATE OR REPLACE FUNCTION bump_order_count() RETURNS trigger AS $$
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        UPDATE customers SET order_count = order_count + 1 WHERE id = NEW.customer_id;
+    ELSIF TG_OP = 'DELETE' THEN
+        UPDATE customers SET order_count = order_count - 1 WHERE id = OLD.customer_id;
+    END IF;
+    RETURN NULL;
+END $$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_order_count
+AFTER INSERT OR DELETE ON orders
+FOR EACH ROW EXECUTE FUNCTION bump_order_count();
+
+-- Option 3: periodic rebuild via materialized view
+CREATE MATERIALIZED VIEW customer_stats AS
+SELECT c.id, c.name, count(o.id) AS order_count, coalesce(sum(l.unit_price * l.quantity), 0) AS lifetime_value
+FROM customers c
+LEFT JOIN orders o ON o.customer_id = c.id
+LEFT JOIN order_lines l ON l.order_id = o.id
+GROUP BY c.id, c.name;
+
+REFRESH MATERIALIZED VIEW CONCURRENTLY customer_stats;  -- needs a unique index on the MV</code></pre>
+
+<div class="pitfall"><p>Counter columns maintained by triggers become <strong>lock hot-spots</strong>: every order insert for the same customer serializes on that customer's row. For high-write counters, prefer periodic aggregation, or an append-only tally table that's rolled up asynchronously. Say this trade-off out loud in the interview — it's exactly the kind of second-order thinking being graded.</p></div>
+
+<!-- ============================================================ -->
+<h2 id="keys-constraints">Keys &amp; constraints <span class="tier tier-1">T1</span></h2>
+
+<h3>Primary keys: natural vs surrogate</h3>
+<p>A <strong>natural key</strong> is a real-world attribute (email, SSN, ISBN). A <strong>surrogate key</strong> is a meaningless generated identifier. Surrogates usually win, and the canonical argument is: <em>emails change</em>. If <code>email</code> is your PK, changing it means cascading updates through every FK in the system, and every historical reference is rewritten. Natural keys also tend to be wide (bad for index size — every secondary index in Postgres stores the row's heap pointer, but FKs replicate the PK into child tables) and occasionally turn out not to be unique after all (two employees genuinely can share a name; SSNs get recycled and mistyped).</p>
+<p>The senior nuance: use a surrogate PK <em>and</em> declare the natural key <code>UNIQUE</code>. You get stable joins and still enforce the business rule.</p>
+
+<pre><code>CREATE TABLE users (
+    id      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,  -- surrogate: stable forever
+    email   text NOT NULL UNIQUE,                             -- natural key: enforced, but mutable
+    name    text NOT NULL
+);</code></pre>
+
+<h3>Foreign keys: choosing the ON DELETE action</h3>
+<table>
+<thead><tr><th>Action</th><th>Behavior</th><th>Use when…</th></tr></thead>
+<tbody>
+<tr><td><code>RESTRICT</code> / <code>NO ACTION</code> (default)</td><td>Parent delete fails if children exist</td><td>Children are independently valuable: never silently delete orders because a product was removed. <strong>Safe default.</strong></td></tr>
+<tr><td><code>CASCADE</code></td><td>Deleting the parent deletes children</td><td>Children are meaningless without the parent: <code>order_lines</code> when the <code>order</code> goes, tag mappings, session rows.</td></tr>
+<tr><td><code>SET NULL</code></td><td>Child FK becomes NULL</td><td>The relationship is optional and the child survives: tickets keep existing when their assignee's account is deleted.</td></tr>
+</tbody>
+</table>
+
+<pre><code>CREATE TABLE order_lines (
+    order_id   bigint NOT NULL REFERENCES orders(id) ON DELETE CASCADE,   -- lines die with the order
+    product_id bigint NOT NULL REFERENCES products(id) ON DELETE RESTRICT, -- can't drop a purchased product
+    ...
+);
+
+CREATE TABLE tickets (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    assignee_id bigint REFERENCES users(id) ON DELETE SET NULL  -- note: column must be nullable
+);</code></pre>
+
+<div class="pitfall"><p><strong>Postgres does NOT automatically index foreign key columns.</strong> It indexes the <em>referenced</em> side (the PK) but not the <em>referencing</em> column. Without an index on <code>order_lines.order_id</code>, every <code>DELETE FROM orders</code> sequential-scans <code>order_lines</code> to check the constraint, and every "lines for this order" query is slow. Rule of thumb: <strong>index every FK column</strong> unless you have a measured reason not to. This is one of the highest-signal facts you can drop in an interview.</p></div>
+
+<pre><code>CREATE INDEX idx_order_lines_order   ON order_lines (order_id);
+CREATE INDEX idx_order_lines_product ON order_lines (product_id);</code></pre>
+
+<h3>UNIQUE — and the NULL subtlety</h3>
+<p>By default, a <code>UNIQUE</code> constraint allows <strong>multiple NULLs</strong>, because in SQL <code>NULL = NULL</code> is unknown, not true — two NULLs are not considered duplicates. This matters for optional-but-unique columns like <code>external_id</code>. Postgres 15 added an explicit switch:</p>
+
+<pre><code>-- default: many rows may have external_id IS NULL
+ALTER TABLE users ADD CONSTRAINT uq_ext UNIQUE (external_id);
+
+-- PG 15+: treat NULLs as equal, so at most ONE NULL allowed
+ALTER TABLE users ADD CONSTRAINT uq_ext UNIQUE NULLS NOT DISTINCT (external_id);</code></pre>
+
+<h3>CHECK constraints — guard enums and ranges</h3>
+<p>Every column with a bounded domain deserves a CHECK. It costs microseconds on write and prevents entire classes of bad data forever — including bugs from services and scripts that bypass your application layer.</p>
+
+<pre><code>CREATE TABLE orders (
+    id       bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    status   text NOT NULL DEFAULT 'pending'
+             CHECK (status IN ('pending','paid','shipped','delivered','cancelled')),
+    total    numeric(12,2) NOT NULL CHECK (total &gt;= 0),
+    placed_at   timestamptz NOT NULL DEFAULT now(),
+    shipped_at  timestamptz,
+    CHECK (shipped_at IS NULL OR shipped_at &gt;= placed_at)   -- cross-column rule
+);</code></pre>
+
+<h3>NOT NULL by default mindset</h3>
+<p>Treat every column as <code>NOT NULL</code> unless you can articulate what NULL <em>means</em> for it ("not yet shipped", "no assignee"). Nullable-by-default schemas push null-handling into every consumer forever — the SQL equivalent of a TypeScript codebase without <code>strictNullChecks</code>. That analogy lands well in interviews.</p>
+
+<h3>EXCLUSION constraints — the booking superpower</h3>
+<p>UNIQUE says "no two rows with the same value." <strong>EXCLUSION</strong> generalizes it: "no two rows for which <em>these operators</em> all return true." The killer use case is preventing overlapping time ranges — double-booked rooms — enforced by the database itself, race-free, no application locking required:</p>
+
+<pre><code>CREATE EXTENSION IF NOT EXISTS btree_gist;  -- lets GiST index plain equality too
+
+CREATE TABLE reservations (
+    id       bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    room_id  bigint NOT NULL REFERENCES rooms(id),
+    during   tstzrange NOT NULL,
+    EXCLUDE USING gist (room_id WITH =, during WITH &amp;&amp;)  -- same room AND overlapping range: rejected
+);</code></pre>
+
+<p>Two concurrent transactions trying to book the same room for overlapping windows: one commits, the other gets a constraint violation. Compare with the app-level alternative — <code>SELECT ... FOR UPDATE</code> then check then insert — which is more code and easier to get wrong. Knowing this exists is a genuine differentiator; we use it in the booking walkthrough below.</p>
+
+<!-- ============================================================ -->
+<h2 id="uuid-vs-bigint">UUID vs BIGINT identity — the deep dive <span class="tier tier-1">T1</span></h2>
+
+<p>"What do you use for primary keys?" is asked in nearly every schema interview. The strong answer names concrete mechanics on both sides, then picks based on context.</p>
+
+<table>
+<thead><tr><th></th><th><code>bigint</code> IDENTITY / BIGSERIAL</th><th>UUID (v4 random)</th><th>UUIDv7 (time-ordered)</th></tr></thead>
+<tbody>
+<tr><td>Size</td><td>8 bytes</td><td>16 bytes</td><td>16 bytes</td></tr>
+<tr><td>Generation</td><td>DB sequence (central coordination)</td><td>Anywhere — client, app, any shard, offline</td><td>Anywhere</td></tr>
+<tr><td>B-tree insert pattern</td><td>Rightmost page — cache-friendly, dense pages</td><td>Random pages — page splits, fragmentation, poor cache hit rate</td><td>Rightmost-ish — nearly as good as bigint</td></tr>
+<tr><td>Safe to expose in URLs?</td><td>No — sequential IDs are guessable, enable <strong>enumeration attacks</strong> and leak business volume ("order #1,000,001")</td><td>Yes</td><td>Mostly — leaks creation time, rarely a problem</td></tr>
+<tr><td>Sortable by creation?</td><td>Yes (roughly)</td><td>No</td><td>Yes (by design)</td></tr>
+<tr><td>Merging datasets / multi-region</td><td>Collisions — needs offset schemes or ID service</td><td>Trivially safe</td><td>Trivially safe</td></tr>
+</tbody>
+</table>
+
+<p><strong>Why the B-tree point matters:</strong> with sequential bigints, every insert lands on the current rightmost leaf page — one hot page in cache, pages fill completely. With random UUIDv4s, inserts scatter across the whole index: the working set is the <em>entire index</em>, pages split at ~50% fill, the index bloats, and write throughput drops measurably at scale. The 16-byte width also compounds — the PK value is duplicated into every FK column and every index on those FKs.</p>
+
+<p><strong>UUIDv7</strong> (48-bit millisecond timestamp prefix + randomness) is the modern middle ground: globally generatable and non-guessable-enough, but index-friendly because new values sort last. Postgres 18 ships <code>uuidv7()</code> natively; before that, generate in the application (most languages have libraries) or via an extension.</p>
+
+<pre><code>-- bigint identity (the default choice for internal tables)
+CREATE TABLE line_items (
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY
+);
+
+-- UUID PK, DB-generated v4
+CREATE TABLE api_keys (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid()   -- built-in since PG 13
+);
+
+-- Pragmatic hybrid: internal bigint PK + external UUID for the API surface
+CREATE TABLE orders (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,  -- joins, FKs: compact + fast
+    public_id   uuid NOT NULL UNIQUE DEFAULT gen_random_uuid(),   -- what URLs and clients see
+    ...
+);</code></pre>
+
+<div class="senior"><p>The hybrid pattern is a great interview answer because it acknowledges both concerns: "I keep joins on 8-byte sequential keys for index locality, and expose an unguessable UUID at the API boundary. If the team standard is UUIDs everywhere, I push for UUIDv7 to avoid random-write index fragmentation." That sentence demonstrates you understand storage, security, <em>and</em> pragmatism.</p></div>
+
+<!-- ============================================================ -->
+<h2 id="data-types">Postgres data types done right <span class="tier tier-2">T2</span></h2>
+
+<h3>text vs varchar(n)</h3>
+<p>In Postgres they have <strong>identical performance and storage</strong> — <code>varchar(n)</code> is just <code>text</code> with a length check bolted on. Unlike some databases, there is no padding or speed benefit. The idiomatic choice is <code>text</code>, plus a <code>CHECK</code> when a length limit is a genuine business rule — because changing a CHECK later is easier and better-documented than an opaque <code>varchar(255)</code> someone copied from a tutorial.</p>
+
+<pre><code>-- Idiomatic Postgres
+username text NOT NULL CHECK (char_length(username) BETWEEN 3 AND 30)
+
+-- Works, but the 255 is almost always cargo-cult
+username varchar(255)</code></pre>
+
+<h3>Money: NUMERIC, never float</h3>
+<p><code>real</code>/<code>double precision</code> are binary floating point — they cannot represent most decimal fractions exactly, and errors accumulate:</p>
+
+<pre><code>SELECT 0.1::float8 + 0.2::float8;        -- 0.30000000000000004
+SELECT (0.1 + 0.2)::numeric = 0.3;       -- true
+
+-- Sum a million 10-cent charges:
+SELECT sum(x) FROM generate_series(1, 1000000) g, LATERAL (SELECT 0.10::float8 AS x) t;
+-- 100000.00000133288  ← you just invented or lost money
+
+price numeric(12,2) NOT NULL CHECK (price &gt;= 0)   -- exact decimal: correct answer, always</code></pre>
+
+<p><code>NUMERIC(precision, scale)</code> is exact decimal arithmetic. It's slower than float, and nobody cares — correctness wins for money. (Avoid the legacy <code>money</code> type: it's locale-dependent and awkward. For multi-currency, store <code>amount numeric</code> + <code>currency char(3)</code>, or amounts in minor units as <code>bigint</code>.)</p>
+
+<h3>timestamptz vs timestamp — always timestamptz</h3>
+<p>Despite the name, <code>timestamptz</code> does <strong>not store a time zone</strong>. Both types are 8 bytes; <code>timestamptz</code> stores an absolute instant in UTC and converts to/from the session's <code>TimeZone</code> on input/output. Plain <code>timestamp</code> stores a wall-clock reading with no idea which wall — the moment your app server, DB server, and users disagree on zones (they will), plain timestamps become ambiguous garbage. Default to <code>timestamptz</code>; use <code>date</code> for calendar dates ("birthday", "check-in date") and plain <code>timestamp</code> only for genuinely zone-less concepts (rare).</p>
+
+<pre><code>created_at  timestamptz NOT NULL DEFAULT now(),   -- an instant: always timestamptz
+check_in    date NOT NULL,                        -- a calendar date, no time component
+duration    interval NOT NULL DEFAULT '30 minutes'  -- spans of time get their own type</code></pre>
+
+<h3>boolean, arrays</h3>
+<p><code>boolean</code> is a real type (1 byte, accepts <code>true/false</code>) — use it instead of <code>char(1)</code> flags. Arrays (<code>text[]</code>, <code>int[]</code>) are legitimate for <strong>small, atomic, order-matters lists that you never join through</strong> — tags on a row, RGB channels. The moment you need to query "all posts with tag X" efficiently with referential integrity, or attach metadata to the relationship, you want a join table instead. Arrays can't have FKs on their elements — say that sentence in the interview.</p>
+
+<pre><code>-- OK: incidental list, queried via GIN index if needed
+tags text[] NOT NULL DEFAULT '{}'
+-- CREATE INDEX ON posts USING gin (tags);
+
+-- Better when tags are entities: join table (see modeling patterns)</code></pre>
+
+<h3>Enums: native ENUM vs lookup table vs text + CHECK</h3>
+<table>
+<thead><tr><th>Approach</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td><code>CREATE TYPE ... AS ENUM</code></td><td>4 bytes, self-documenting, typo-proof, has a defined sort order</td><td><strong>ALTER pain:</strong> you can add values, but you cannot remove or reorder them without recreating the type; values are global to the DB, not per-table</td></tr>
+<tr><td>Lookup table + FK</td><td>Values are data: add/retire/rename with DML; can carry extra columns (label, sort order, active flag); admin-editable</td><td>An extra join for display; slightly more ceremony</td></tr>
+<tr><td><code>text</code> + <code>CHECK</code></td><td>Simple, readable in every query, constraint change is one fast <code>ALTER</code></td><td>Values are strings (more bytes); the "list of valid values" lives in DDL only</td></tr>
+</tbody>
+</table>
+
+<pre><code>-- Fixed-forever domain: native enum is fine
+CREATE TYPE order_status AS ENUM ('pending','paid','shipped','delivered','cancelled');
+
+-- Product-managed domain: lookup table
+CREATE TABLE ticket_categories (
+    id     int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    code   text NOT NULL UNIQUE,
+    label  text NOT NULL,
+    active boolean NOT NULL DEFAULT true
+);
+
+-- Pragmatic default: text + CHECK (easy to evolve, no join)
+status text NOT NULL CHECK (status IN ('pending','paid','shipped','delivered','cancelled'))</code></pre>
+
+<p>My default interview answer: <strong>text + CHECK</strong> for small stable domains, <strong>lookup table</strong> when values need metadata or non-developer editing, native enum only when I'm confident the set is fixed (and I mention the ALTER pain unprompted).</p>
+
+<h3>Identity columns and JSONB</h3>
+<p>Prefer <code>GENERATED ALWAYS AS IDENTITY</code> over the older <code>SERIAL</code>: it's SQL-standard, the sequence is properly owned by the column, and <code>ALWAYS</code> blocks accidental manual inserts into the ID (use <code>BY DEFAULT</code> if you need to bulk-load explicit IDs). <code>SERIAL</code> is just legacy syntax sugar with looser semantics.</p>
+<p><strong>JSONB</strong> deserves one sentence here: it's the right tool for genuinely schemaless attributes (user-defined fields, webhook payloads) and the wrong tool for data you filter, join, and constrain relationally. Full treatment — operators, GIN indexing, when it beats EAV — is in <a href="15-postgres-jsonb.html">tutorial 15</a>.</p>
+
+<!-- ============================================================ -->
+<h2 id="modeling-patterns">Modeling patterns <span class="tier tier-2">T2</span></h2>
+
+<h3>One-to-many</h3>
+<p>The FK lives on the <strong>many</strong> side. Customer has many orders → <code>orders.customer_id</code>. Nothing on the parent. (Frontend intuition check: it's the opposite of nesting — you don't put an array of order IDs on the customer.)</p>
+
+<h3>Many-to-many: the join table</h3>
+<p>Students↔courses, posts↔tags, users↔roles. A third table holds one row per relationship. The design decision interviewers probe: <strong>composite PK or surrogate PK + unique constraint?</strong></p>
+
+<pre><code>-- Composite PK: lean, duplicate-proof by construction
+CREATE TABLE post_tags (
+    post_id bigint NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+    tag_id  bigint NOT NULL REFERENCES tags(id)  ON DELETE CASCADE,
+    PRIMARY KEY (post_id, tag_id)
+);
+CREATE INDEX idx_post_tags_tag ON post_tags (tag_id);  -- reverse-direction lookups
+
+-- Surrogate + UNIQUE: use when the relationship itself carries data
+-- or other tables reference it
+CREATE TABLE enrollments (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    student_id  bigint NOT NULL REFERENCES students(id),
+    course_id   bigint NOT NULL REFERENCES courses(id),
+    enrolled_at timestamptz NOT NULL DEFAULT now(),
+    grade       text,
+    UNIQUE (student_id, course_id)
+);</code></pre>
+
+<p>Rule of thumb: pure link table → composite PK. Relationship-with-attributes (an <em>associative entity</em> like an enrollment) or anything other rows point at → surrogate PK, and keep the UNIQUE pair so duplicates stay impossible. Note the composite PK <code>(post_id, tag_id)</code> index serves post→tags lookups but <em>not</em> tag→posts — hence the extra index led by <code>tag_id</code>.</p>
+
+<h3>Self-referencing: trees and hierarchies</h3>
+<pre><code>-- Adjacency list: simplest, the right default
+CREATE TABLE employees (
+    id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name       text NOT NULL,
+    manager_id bigint REFERENCES employees(id) ON DELETE SET NULL  -- NULL = the CEO
+);
+CREATE INDEX idx_employees_manager ON employees (manager_id);
+
+-- Whole subtree via recursive CTE:
+WITH RECURSIVE reports AS (
+    SELECT id, name, manager_id, 1 AS depth FROM employees WHERE id = 42
+    UNION ALL
+    SELECT e.id, e.name, e.manager_id, r.depth + 1
+    FROM employees e JOIN reports r ON e.manager_id = r.id
+)
+SELECT * FROM reports;</code></pre>
+
+<p>Alternatives to know by name: a <strong>closure table</strong> (separate table storing every ancestor→descendant pair; subtree queries become a single join, at the cost of O(depth) rows per node on insert and heavier moves) and <code>ltree</code>/materialized-path. Interview answer: "Adjacency list plus recursive CTEs handles org-chart-scale trees fine; I'd reach for a closure table only if deep-subtree reads dominated and profiling justified the write overhead."</p>
+
+<h3>Polymorphic references — comments on posts OR photos</h3>
+<p>A classic trap question, because the naive approach breaks referential integrity. Three approaches:</p>
+
+<table>
+<thead><tr><th>Approach</th><th>How</th><th>Trade-off</th></tr></thead>
+<tbody>
+<tr><td><strong>1. type + id, no FK</strong> (Rails-style)</td><td><code>commentable_type text, commentable_id bigint</code></td><td>One table, flexible — but <strong>zero referential integrity</strong>: orphaned comments, no CASCADE, no join safety. Name this weakness explicitly.</td></tr>
+<tr><td><strong>2. Exclusive-arc FKs</strong></td><td>One nullable FK per target + CHECK that exactly one is set</td><td>Full FK integrity and CASCADEs; each new target type is a migration (new column). Usually the best answer for a handful of known types.</td></tr>
+<tr><td><strong>3. Separate tables</strong></td><td><code>post_comments</code>, <code>photo_comments</code></td><td>Cleanest constraints per table; duplicated structure, and "all comments by user X" becomes a UNION.</td></tr>
+</tbody>
+</table>
+
+<pre><code>-- Approach 2: exclusive arc
+CREATE TABLE comments (
+    id        bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    author_id bigint NOT NULL REFERENCES users(id),
+    body      text NOT NULL,
+    post_id   bigint REFERENCES posts(id)  ON DELETE CASCADE,
+    photo_id  bigint REFERENCES photos(id) ON DELETE CASCADE,
+    CHECK (num_nonnulls(post_id, photo_id) = 1),   -- exactly one target
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX ON comments (post_id)  WHERE post_id  IS NOT NULL;
+CREATE INDEX ON comments (photo_id) WHERE photo_id IS NOT NULL;</code></pre>
+
+<h3>Soft delete vs hard delete</h3>
+<pre><code>ALTER TABLE users ADD COLUMN deleted_at timestamptz;  -- NULL = alive
+
+-- THE GOTCHA: plain UNIQUE(email) blocks a new signup with a
+-- soft-deleted user's email forever. Scope uniqueness to the living:
+CREATE UNIQUE INDEX uq_users_email_alive
+    ON users (email) WHERE deleted_at IS NULL;</code></pre>
+
+<div class="pitfall"><p>Soft delete quietly infects <em>every query</em> in the system with <code>WHERE deleted_at IS NULL</code> — miss it once (in a report, a join, a uniqueness check) and deleted data leaks back. Mitigations: a view exposing only live rows, ORM default filters (Hibernate <code>@SQLRestriction</code>), or row-level security. The alternative — hard delete + copying the row into an <code>audit</code>/history table (or relying on CDC) — keeps the main tables clean and is often the better answer when "undelete" isn't a real product requirement. Compliance regimes like GDPR erasure can also <em>forbid</em> keeping soft-deleted personal data.</p></div>
+
+<h3>Timestamps and optimistic locking conventions</h3>
+<pre><code>CREATE TABLE documents (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    title       text NOT NULL,
+    body        text NOT NULL,
+    version     int  NOT NULL DEFAULT 0,               -- optimistic lock counter
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    updated_at  timestamptz NOT NULL DEFAULT now()      -- maintained by trigger or app/ORM
+);
+
+-- Optimistic locking: the update carries the version you read
+UPDATE documents
+SET body = $1, version = version + 1, updated_at = now()
+WHERE id = $2 AND version = $3;   -- 0 rows updated ⇒ somebody else won; retry or surface a conflict</code></pre>
+
+<p>Put <code>created_at</code>/<code>updated_at</code> on effectively every table — it costs 16 bytes and saves debugging sessions. The <code>version</code> column is exactly what JPA's <code>@Version</code> manages for you (tutorial 08): the schema-level view of the same mechanism. Note Postgres does not auto-update <code>updated_at</code> like MySQL's <code>ON UPDATE CURRENT_TIMESTAMP</code> — you need a trigger or ORM callbacks.</p>
+
+<!-- ============================================================ -->
+<h2 id="multi-tenancy">Multi-tenancy strategies <span class="tier tier-2">T2</span></h2>
+
+<p>"You're building a B2B SaaS — how do you isolate customers' data?" Three strategies, one decision table:</p>
+
+<table>
+<thead><tr><th></th><th>Shared tables + <code>tenant_id</code></th><th>Schema per tenant</th><th>Database per tenant</th></tr></thead>
+<tbody>
+<tr><td>Isolation</td><td>Logical only — one bad WHERE clause away from a breach</td><td>Strong-ish (same instance, separate namespaces)</td><td>Strongest (separate instance possible)</td></tr>
+<tr><td>Scales to N tenants</td><td>Millions</td><td>Hundreds–low thousands (catalog bloat, migration fan-out)</td><td>Dozens–hundreds</td></tr>
+<tr><td>Migrations</td><td>Run once</td><td>Run × N schemas</td><td>Run × N databases</td></tr>
+<tr><td>Per-tenant backup/restore</td><td>Hard (row extraction)</td><td>Moderate (<code>pg_dump -n</code>)</td><td>Trivial</td></tr>
+<tr><td>Noisy-neighbor control</td><td>Weak</td><td>Weak</td><td>Strong</td></tr>
+<tr><td>Cost / ops overhead</td><td>Lowest</td><td>Medium</td><td>Highest</td></tr>
+<tr><td>Typical fit</td><td>Self-serve SaaS, many small tenants</td><td>Mid-market, moderate tenant count</td><td>Enterprise/regulated tenants demanding isolation</td></tr>
+</tbody>
+</table>
+
+<pre><code>-- Shared-table pattern done right
+CREATE TABLE projects (
+    id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    tenant_id  bigint NOT NULL REFERENCES tenants(id),
+    name       text NOT NULL,
+    UNIQUE (tenant_id, name)              -- uniqueness is PER TENANT, not global
+);
+-- Composite indexes LED BY tenant_id: every query filters on it first
+CREATE INDEX idx_projects_tenant_created ON projects (tenant_id, created_at DESC);
+
+-- Defense in depth: Row-Level Security makes the DB enforce tenancy
+ALTER TABLE projects ENABLE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON projects
+    USING (tenant_id = current_setting('app.tenant_id')::bigint);
+-- App sets: SET app.tenant_id = '42';  (per connection/transaction)</code></pre>
+
+<div class="senior"><p>The senior framing: "Default to shared tables with <code>tenant_id</code> — it's the only one that scales operationally — and add RLS so a forgotten WHERE clause fails closed instead of leaking data. I'd reserve database-per-tenant for contractual isolation requirements, and I'd resist schema-per-tenant beyond a few hundred tenants because migrations and connection pooling become the bottleneck." Also note: many real products are hybrids — shared tables for the masses, dedicated DBs for two enterprise whales.</p></div>
+
+<!-- ============================================================ -->
+<h2 id="walkthroughs">Live design walkthroughs</h2>
+
+<p>These two exercises are the most common live-design prompts. Each follows the exact sequence you should use at the whiteboard: <strong>clarify requirements → list entities → draw relationships → write DDL → narrate decisions</strong>. Practice saying the commentary out loud — the "why" is what's graded.</p>
+
+<h3 id="walkthrough-ecommerce">Walkthrough 1: E-commerce orders system</h3>
+
+<p><strong>Prompt:</strong> "Design the schema for the checkout/orders part of an online store."</p>
+
+<p><strong>Step 1 — Clarify (ask these, don't assume):</strong> Multiple addresses per customer? (Yes.) Do product prices change over time? (Yes — so lines must snapshot price.) Partial shipments/refunds? (Out of scope today, but I'll leave room.) Guest checkout? (No — customers have accounts.) One payment per order? (Start there; model as 1-to-many to allow retries.)</p>
+
+<p><strong>Step 2 — Entities:</strong> <code>customers</code>, <code>addresses</code>, <code>products</code>, <code>orders</code>, <code>order_lines</code>, <code>payments</code>.</p>
+
+<p><strong>Step 3 — Relationships:</strong> customer 1—N addresses; customer 1—N orders; order 1—N order_lines; product 1—N order_lines (M:N between orders and products, materialized as the line table — which is also the associative entity carrying quantity and snapshot price); order 1—N payments.</p>
+
+<p><strong>Step 4 — Full DDL:</strong></p>
+
+<pre><code>CREATE TABLE customers (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    public_id   uuid NOT NULL UNIQUE DEFAULT gen_random_uuid(),
+    email       text NOT NULL UNIQUE CHECK (email ~ '^[^@\s]+@[^@\s]+$'),
+    full_name   text NOT NULL,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    updated_at  timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE addresses (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    customer_id bigint NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+    label       text NOT NULL DEFAULT 'home',
+    line1       text NOT NULL,
+    line2       text,
+    city        text NOT NULL,
+    postal_code text NOT NULL,
+    country     char(2) NOT NULL,          -- ISO 3166-1 alpha-2
+    is_default  boolean NOT NULL DEFAULT false
+);
+CREATE INDEX idx_addresses_customer ON addresses (customer_id);
+-- at most one default address per customer:
+CREATE UNIQUE INDEX uq_default_address
+    ON addresses (customer_id) WHERE is_default;
+
+CREATE TABLE products (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    sku         text NOT NULL UNIQUE,
+    name        text NOT NULL,
+    price       numeric(12,2) NOT NULL CHECK (price &gt;= 0),
+    stock_qty   int NOT NULL DEFAULT 0 CHECK (stock_qty &gt;= 0),
+    active      boolean NOT NULL DEFAULT true,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    updated_at  timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE orders (
+    id                  bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    public_id           uuid NOT NULL UNIQUE DEFAULT gen_random_uuid(),
+    customer_id         bigint NOT NULL REFERENCES customers(id) ON DELETE RESTRICT,
+    shipping_address_id bigint NOT NULL REFERENCES addresses(id) ON DELETE RESTRICT,
+    status              text NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending','paid','shipped','delivered','cancelled')),
+    placed_at           timestamptz NOT NULL DEFAULT now(),
+    updated_at          timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_orders_customer ON orders (customer_id, placed_at DESC);
+CREATE INDEX idx_orders_address  ON orders (shipping_address_id);
+
+CREATE TABLE order_lines (
+    order_id    bigint NOT NULL REFERENCES orders(id)   ON DELETE CASCADE,
+    product_id  bigint NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+    quantity    int NOT NULL CHECK (quantity &gt; 0),
+    unit_price  numeric(12,2) NOT NULL CHECK (unit_price &gt;= 0),  -- price AT PURCHASE
+    PRIMARY KEY (order_id, product_id)
+);
+CREATE INDEX idx_order_lines_product ON order_lines (product_id);
+
+CREATE TABLE payments (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    order_id    bigint NOT NULL REFERENCES orders(id) ON DELETE RESTRICT,
+    provider    text NOT NULL,                       -- 'stripe', 'paypal', ...
+    provider_ref text NOT NULL,                      -- charge id from the provider
+    amount      numeric(12,2) NOT NULL CHECK (amount &gt; 0),
+    status      text NOT NULL DEFAULT 'initiated'
+        CHECK (status IN ('initiated','succeeded','failed','refunded')),
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (provider, provider_ref)                  -- idempotency: webhook retries can't double-insert
+);
+CREATE INDEX idx_payments_order ON payments (order_id);</code></pre>
+
+<p><strong>Step 5 — Narrate the decisions (this is the graded part):</strong></p>
+<ul>
+<li><strong>Hybrid keys:</strong> internal <code>bigint</code> PKs keep joins and FK indexes compact; <code>public_id uuid</code> is what URLs and emails expose, so order volume isn't leaked and IDs aren't enumerable.</li>
+<li><strong><code>unit_price</code> on lines is temporal correctness, not denormalization</strong> — the catalog price will change; the order must be a faithful record of what was agreed. I do <em>not</em> store an order <code>total</code> column initially: it's derivable (<code>SUM(quantity * unit_price)</code>), and derived columns are drift risks. If invoice reads get hot, I'd add it maintained in the same transaction that inserts lines — a deliberate denormalization with a named owner.</li>
+<li><strong>Delete policies differ per FK, on purpose:</strong> lines CASCADE with their order (meaningless alone); orders RESTRICT on customer delete (financial records must survive — realistically customers get soft-deleted/anonymized instead); products RESTRICT while referenced (deactivate via <code>active = false</code>, don't delete history).</li>
+<li><strong>Addresses are referenced, not embedded</strong> — but there's a subtlety I'd flag: if a customer <em>edits</em> an address, historical orders would show the new one. Production systems either make address rows immutable (edits create new rows) or snapshot the address text onto the order. I'd raise this and let the interviewer pick the depth.</li>
+<li><strong>Every FK got an index</strong>, and <code>idx_orders_customer</code> is composite with <code>placed_at DESC</code> because "this customer's recent orders" is <em>the</em> hot query.</li>
+<li><strong>Status is text + CHECK</strong>, not a native enum — order-status vocabularies grow ('refunded', 'partially_shipped'), and altering a CHECK is painless. A status-transition history table would be the next evolution if "when did it ship?" matters.</li>
+<li><strong>Payments UNIQUE (provider, provider_ref)</strong> makes webhook processing idempotent at the schema level — retries become no-ops instead of double-charges in your books.</li>
+</ul>
+
+<details class="qa"><summary>Interviewer follow-up: "Where does inventory/stock reservation fit? What about overselling?"</summary><div class="answer"><p><code>products.stock_qty</code> with <code>CHECK (stock_qty &gt;= 0)</code> is the last line of defense: a decrementing <code>UPDATE products SET stock_qty = stock_qty - $1 WHERE id = $2 AND stock_qty &gt;= $1</code> is atomic — if it updates zero rows, the item is out of stock, and two concurrent checkouts can't both take the last unit because row-level locking serializes the updates. For carts that <em>reserve</em> stock before payment, add a <code>reservations</code> table with an <code>expires_at</code>, count active reservations against stock, and sweep expired rows. I'd also flag that at very high scale the product row becomes a lock hot-spot, which pushes you toward per-warehouse stock rows or queue-based allocation — but I wouldn't build that before measuring.</p></div></details>
+
+<details class="qa"><summary>Interviewer follow-up: "The business now wants order history to show the product name even if the product is renamed or removed. Change the design?"</summary><div class="answer"><p>Same reasoning as <code>unit_price</code>: the line should snapshot every fact that must be historically stable — add <code>product_name text NOT NULL</code> (and maybe <code>sku</code>) to <code>order_lines</code>, copied at insert time. Then I can even relax the product FK question: keep <code>product_id</code> as a nullable <code>ON DELETE SET NULL</code> link for analytics, while the line remains self-contained for display. The general principle I'd state: <em>documents</em> (orders, invoices) snapshot; <em>catalogs</em> reference. Confusing the two is the root of most "history changed under us" bugs.</p></div></details>
+
+<details class="qa"><summary>Interviewer follow-up: "Orders is 200M rows and the dashboard's 'revenue per day' query is slow. Options?"</summary><div class="answer"><p>In order of increasing invasiveness: (1) a covering composite index on <code>(placed_at, ...)</code> — probably already insufficient for full scans over months; (2) a <strong>materialized view</strong> of daily revenue refreshed on a schedule — minutes of staleness is fine for a dashboard; (3) an incremental <strong>summary table</strong> (<code>daily_revenue(day, total)</code>) updated by the payment-success path or a rollup job — real-time-ish; (4) declarative <strong>partitioning</strong> of orders by month on <code>placed_at</code>, which also helps archival and vacuum; (5) ship analytics to a columnar store and stop asking OLAP questions of the OLTP database. I'd start at (2), it's an afternoon of work and reversible.</p></div></details>
+
+<h3 id="walkthrough-booking">Walkthrough 2: Booking / reservation system</h3>
+
+<p><strong>Prompt:</strong> "Design a schema for a meeting-room booking system: multiple offices, rooms with capacity, employees book time slots, no double-booking."</p>
+
+<p><strong>Step 1 — Clarify:</strong> Continuous time ranges or fixed slots? (Continuous — 9:17 to 9:44 is legal.) Recurring bookings? (Note it, park it.) Cancellations? (Yes — keep the history.) Can a booking span midnight? (Yes, ranges handle it naturally.) Time zones? (Offices are in different zones — <code>timestamptz</code> everywhere, display conversion is the frontend's job.)</p>
+
+<p><strong>Step 2 — Entities:</strong> <code>offices</code>, <code>rooms</code>, <code>employees</code>, <code>bookings</code> (+ optional <code>booking_attendees</code> M:N).</p>
+
+<p><strong>Step 3 — Relationships:</strong> office 1—N rooms; employee 1—N bookings (organizer); room 1—N bookings; bookings M—N employees as attendees. The interesting constraint isn't a relationship at all — it's "no two bookings for one room overlap in time," and I want the <em>database</em> to enforce it.</p>
+
+<p><strong>Step 4 — Full DDL:</strong></p>
+
+<pre><code>CREATE EXTENSION IF NOT EXISTS btree_gist;   -- equality operators inside GiST indexes
+
+CREATE TABLE offices (
+    id        bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name      text NOT NULL UNIQUE,
+    time_zone text NOT NULL DEFAULT 'UTC'    -- IANA name, for DISPLAY defaults only
+);
+
+CREATE TABLE rooms (
+    id        bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    office_id bigint NOT NULL REFERENCES offices(id) ON DELETE CASCADE,
+    name      text NOT NULL,
+    capacity  int NOT NULL CHECK (capacity &gt; 0),
+    UNIQUE (office_id, name)                 -- "Aspen" can exist in every office
+);
+CREATE INDEX idx_rooms_office ON rooms (office_id);
+
+CREATE TABLE employees (
+    id    bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    email text NOT NULL UNIQUE,
+    name  text NOT NULL
+);
+
+CREATE TABLE bookings (
+    id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    room_id      bigint NOT NULL REFERENCES rooms(id)     ON DELETE CASCADE,
+    organizer_id bigint NOT NULL REFERENCES employees(id) ON DELETE RESTRICT,
+    title        text NOT NULL,
+    during       tstzrange NOT NULL,
+    status       text NOT NULL DEFAULT 'confirmed'
+                 CHECK (status IN ('confirmed','cancelled')),
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    CHECK (NOT isempty(during)),                      -- no zero-length bookings
+    CHECK (upper(during) - lower(during) &lt;= interval '12 hours'),
+    -- THE core rule: same room + overlapping range + still confirmed ⇒ rejected
+    CONSTRAINT no_double_booking
+        EXCLUDE USING gist (room_id WITH =, during WITH &amp;&amp;)
+        WHERE (status = 'confirmed')
+);
+CREATE INDEX idx_bookings_organizer ON bookings (organizer_id);
+CREATE INDEX idx_bookings_room_time ON bookings USING gist (room_id, during);
+
+CREATE TABLE booking_attendees (
+    booking_id  bigint NOT NULL REFERENCES bookings(id)  ON DELETE CASCADE,
+    employee_id bigint NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+    response    text NOT NULL DEFAULT 'invited'
+                CHECK (response IN ('invited','accepted','declined')),
+    PRIMARY KEY (booking_id, employee_id)
+);
+CREATE INDEX idx_attendees_employee ON booking_attendees (employee_id);
+
+-- Booking insert: no SELECT-then-INSERT race, the constraint IS the check
+INSERT INTO bookings (room_id, organizer_id, title, during)
+VALUES (7, 3, 'Design review', tstzrange('2026-07-06 14:00+00','2026-07-06 15:00+00'));
+-- overlapping concurrent insert ⇒ ERROR: conflicting key value violates
+-- exclusion constraint "no_double_booking"
+
+-- "Find free rooms in office 2 for a window" — range operators shine:
+SELECT r.*
+FROM rooms r
+WHERE r.office_id = 2
+  AND NOT EXISTS (
+      SELECT 1 FROM bookings b
+      WHERE b.room_id = r.id
+        AND b.status = 'confirmed'
+        AND b.during &amp;&amp; tstzrange('2026-07-06 14:00+00','2026-07-06 15:00+00')
+  );</code></pre>
+
+<p><strong>Step 5 — Narrate the decisions:</strong></p>
+<ul>
+<li><strong>The exclusion constraint is the star.</strong> The naive design — <code>starts_at</code>/<code>ends_at</code> columns plus an application-level "check availability then insert" — has a race: two users can both pass the check and both insert. Fixing that in app code means <code>SELECT ... FOR UPDATE</code> on the room row or SERIALIZABLE isolation. The exclusion constraint moves the invariant into the database where it's enforced atomically for every writer, including the batch script someone writes next year.</li>
+<li><strong><code>tstzrange</code> over two columns:</strong> one value that carries inclusive/exclusive semantics — <code>['14:00','15:00')</code> half-open by default, so back-to-back meetings at 15:00 don't "overlap." With separate columns, that boundary logic is re-implemented (and off-by-one'd) in every query.</li>
+<li><strong>The partial exclusion (<code>WHERE status = 'confirmed'</code>)</strong> means cancelled bookings stay as history but free the slot — no deletes needed, and no separate archive dance.</li>
+<li><strong><code>timestamptz</code> everywhere; office <code>time_zone</code> is display metadata.</strong> Instants are stored in UTC; "2 PM in the Berlin office" is a rendering concern. Storing local wall-clock times is how systems double-book across DST transitions.</li>
+<li><strong>Recurring bookings (parked earlier):</strong> I'd store the recurrence rule (RRULE-style) on a parent row and <em>materialize occurrences</em> as ordinary booking rows a window ahead — so the exclusion constraint keeps protecting every occurrence. Expanding rules at query time can't be constrained by the DB.</li>
+<li><strong>Organizer is RESTRICT, attendees CASCADE:</strong> a booking without its organizer is a real record we shouldn't silently lose (deactivate employees instead); an attendee row without its booking is noise.</li>
+</ul>
+
+<details class="qa"><summary>Interviewer follow-up: "Enforce 'attendee count must not exceed room capacity' — where?"</summary><div class="answer"><p>This is a cross-table invariant, and I'd be honest that Postgres can't declare it as a simple constraint (CHECKs can't reference other tables). Options: (1) enforce in the service layer inside the same transaction that inserts attendees, reading the room capacity with the booking row locked — fine for one write path; (2) a trigger on <code>booking_attendees</code> that counts and raises — enforced for all writers, at the cost of hidden logic and a count query per insert; (3) accept eventual enforcement (warn in UI, reconcile async) since an over-invited meeting isn't a data-corruption disaster. I'd pick (1) with (2) as hardening if multiple services write this table. The meta-point interviewers want: knowing <em>which invariants the database can own</em> (overlap: yes, via exclusion) and which it can't (cross-table counts: not declaratively).</p></div></details>
+
+<details class="qa"><summary>Interviewer follow-up: "Scale this to 100k rooms and years of history — what worries you?"</summary><div class="answer"><p>The GiST index backing the exclusion constraint grows with all confirmed bookings ever, but overlap checks only ever contend with <em>current and future</em> rows — old rows are dead weight in the index. Mitigations: partition <code>bookings</code> by time range (note: exclusion constraints must include the partition key, which <code>during</code> can, and each partition gets its own constraint — cross-partition overlap needs the partition boundaries to align with booking limits, which our 12-hour CHECK helps with); or periodically move ancient bookings to an archive table. Also, availability searches ("free rooms this week across the campus") become the hot query — the <code>(room_id, during)</code> GiST index covers it, and I'd verify with <code>EXPLAIN ANALYZE</code> before inventing anything cleverer.</p></div></details>
+
+<details class="qa"><summary>Interviewer follow-up: "Why not just book fixed 30-minute slots — one row per slot, UNIQUE(room_id, slot_start)?"</summary><div class="answer"><p>It's a legitimate simplification and I'd say so: a plain UNIQUE constraint replaces the exclusion constraint, every B-tree behavior is well-trodden, and 'find free slots' is a simple anti-join. Costs: bookings spanning multiple slots become multiple rows (or a parent + slot rows), you can't represent a 9:17–9:44 booking, changing slot granularity later is a migration nightmare, and multi-slot booking inserts must be atomic so you don't grab 2 of 3 needed slots. If the product genuinely thinks in fixed slots (doctor's appointments), slots win on simplicity. If time is continuous (room bookings, rentals), ranges + exclusion is less code and more correct. Stating the fork and choosing based on the product requirement is exactly the answer being graded.</p></div></details>
+
+<!-- ============================================================ -->
+<h2 id="interview-qa">Interview Q&amp;A</h2>
+
+<details class="qa"><summary>Explain 1NF, 2NF, and 3NF in under a minute.</summary><div class="answer"><p>1NF: every column atomic, no repeating groups — no comma-separated lists. 2NF: no non-key column depends on just <em>part</em> of a composite key — order-level facts don't live on order-line rows. 3NF: no non-key column depends on another non-key column — customer email lives on the customer, not on the order. Mnemonic: the key, the whole key, and nothing but the key. Each level removes a class of redundancy, and redundancy is what causes update, insert, and delete anomalies. BCNF tightens 3NF: every determinant must be a candidate key — with surrogate single-column keys you're usually there already.</p></div></details>
+
+<details class="qa"><summary>When would you deliberately denormalize, and how do you keep it safe?</summary><div class="answer"><p>When a measured hot read path can't be served affordably from normalized data — read-heavy aggregates (counts, totals rendered on every page) or a hot multi-way join. "Safe" means naming an owner for consistency: a trigger (transactional, can't be bypassed, but hidden and adds write latency), application logic in the same transaction (visible and testable, but every write path must cooperate), or a periodic rebuild/materialized view (simplest, but eventually consistent — the product must tolerate staleness). I always add: storing order-line price at purchase time is <em>not</em> denormalization — it's a different, temporal fact.</p></div></details>
+
+<details class="qa"><summary>Natural key or surrogate key for a users table?</summary><div class="answer"><p>Surrogate PK (<code>bigint</code> identity or UUID), with the natural key (email) as a UNIQUE constraint. Emails change — and a changed PK cascades through every FK and every historical reference. Natural keys are also wide (bloating every child table's FK and its indexes) and their "guaranteed uniqueness" often turns out to be a lie discovered in production. The surrogate gives immutable identity; the UNIQUE preserves the business rule.</p></div></details>
+
+<details class="qa"><summary>UUID or BIGINT for primary keys? Defend your choice.</summary><div class="answer"><p>Context-dependent, and I'd name the mechanics: bigint is 8 bytes and appends to the rightmost B-tree page — compact indexes, cache-friendly inserts — but values are guessable (enumeration attacks) and leak volume, and generation needs the DB sequence. UUIDv4 generates anywhere with no coordination and is safe to expose, but it's 16 bytes and random inserts scatter across the whole index, causing page splits and cache misses at scale. UUIDv7 is the modern middle ground: time-ordered prefix restores append-mostly insert locality while staying globally unique. My default: bigint internally with a UUID <code>public_id</code> for the API surface, or UUIDv7 everywhere if the team wants one key type.</p></div></details>
+
+<details class="qa"><summary>Does Postgres index foreign key columns automatically?</summary><div class="answer"><p>No — and this is a top-tier gotcha. The <em>referenced</em> side is indexed (it must be a PK or UNIQUE), but the <em>referencing</em> column is not. Consequences of missing FK indexes: parent deletes/updates trigger sequential scans of the child table for the integrity check (and hold locks while doing it), and every "children of this parent" query scans. My habit: create an index on every FK column at table-creation time, and drop it later only with evidence it's unused.</p></div></details>
+
+<details class="qa"><summary>What does ON DELETE CASCADE do, and when is it dangerous?</summary><div class="answer"><p>Deleting a parent automatically deletes referencing children (transitively — cascades chain). Right for composition relationships: order lines, attendee rows, tag links — children meaningless without the parent. Dangerous when children have independent value: CASCADE from <code>customers</code> to <code>orders</code> means deleting an account silently destroys financial history. Also operationally risky: one innocent-looking DELETE can fan out to millions of rows, holding locks throughout. Default to RESTRICT and opt into CASCADE per relationship with justification; use SET NULL when the link is optional and the child outlives it.</p></div></details>
+
+<details class="qa"><summary>Why should money never be stored as float? What instead?</summary><div class="answer"><p>Floats are binary fractions; most decimal values (0.1, 0.2) have no exact binary representation, so <code>0.1 + 0.2 = 0.30000000000000004</code> and summing a million small charges drifts by real cents — unacceptable for anything auditable. Use <code>NUMERIC(precision, scale)</code>: exact decimal arithmetic, e.g. <code>numeric(12,2)</code> for currency amounts. Alternative: integer minor units (<code>bigint</code> cents), common in payments code. Avoid Postgres's legacy <code>money</code> type — locale-dependent formatting, awkward casts. For multi-currency, pair the amount with an ISO currency code column.</p></div></details>
+
+<details class="qa"><summary>timestamp vs timestamptz — which and why?</summary><div class="answer"><p>Always <code>timestamptz</code> for instants. The name misleads: it stores no zone — both types are 8-byte UTC-ish microsecond counts. The difference is semantics: <code>timestamptz</code> is an absolute instant, converted to/from the session's <code>TimeZone</code> at the wire; plain <code>timestamp</code> is a zone-less wall-clock reading, ambiguous the moment any two components disagree on zones (or DST shifts). Use <code>date</code> for calendar dates like check-in day, <code>interval</code> for durations. Rendering "2 PM Berlin time" is the frontend's job from the UTC instant.</p></div></details>
+
+<details class="qa"><summary>varchar(255) vs text in Postgres?</summary><div class="answer"><p>No performance or storage difference whatsoever in Postgres — <code>varchar(n)</code> is <code>text</code> plus a length check. The idiom is <code>text</code>, adding <code>CHECK (char_length(col) &lt;= n)</code> only when the limit is a real business rule, because a named CHECK documents intent and is trivially alterable. <code>varchar(255)</code> specifically is cargo cult from MySQL's old index-prefix limits. Bonus point: changing <code>varchar(50)</code> to <code>varchar(100)</code> is a cheap catalog-only ALTER in modern Postgres, but starting with <code>text</code> avoids the ceremony entirely.</p></div></details>
+
+<details class="qa"><summary>How do you model an enum-ish column: native ENUM, lookup table, or text + CHECK?</summary><div class="answer"><p>Three options, chosen by who changes the values and how often. Native <code>ENUM</code>: compact (4 bytes) and typo-proof, but you can add values only (no remove/reorder without recreating the type) and the type is database-global — painful in migrations. Lookup table + FK: values become data — renameable, retireable, can carry labels and sort order, editable by admins — at the cost of a join. Text + CHECK: dead simple, values readable in every query, and evolving the set is one ALTER of the constraint. My default is text + CHECK for small developer-owned domains, lookup table when values need metadata or non-engineers manage them; I reach for native enums rarely and mention the ALTER pain unprompted.</p></div></details>
+
+<details class="qa"><summary>Design a many-to-many relationship. Composite PK or surrogate id on the join table?</summary><div class="answer"><p>Join table with two FKs. Pure link (post_tags): composite PK <code>(post_id, tag_id)</code> — duplicates impossible by construction, no useless extra column; add a second index led by the other column for reverse lookups, since the PK index only serves one direction. When the relationship carries attributes (enrollment with grade and date) or other tables reference it, it's really an <em>entity</em>: give it a surrogate PK and keep <code>UNIQUE (a_id, b_id)</code> so the no-duplicates rule survives. ORMs (JPA) are also happier mapping a surrogate-keyed entity than a composite key class.</p></div></details>
+
+<details class="qa"><summary>How would you model comments that can attach to either a post or a photo?</summary><div class="answer"><p>Polymorphic association — three approaches. (1) <code>commentable_type</code> + <code>commentable_id</code> with no FK (Rails-style): flexible, one table, but zero referential integrity — orphans accumulate and no CASCADE. (2) Exclusive arc: one nullable FK per target plus <code>CHECK (num_nonnulls(post_id, photo_id) = 1)</code> — full FK integrity and cascades, each new target type is one added column; my default for a handful of known types. (3) Separate <code>post_comments</code>/<code>photo_comments</code> tables: cleanest constraints, but duplicated structure and cross-type queries become UNIONs. The differentiator is explicitly naming the integrity loss in option 1 — most candidates don't.</p></div></details>
+
+<details class="qa"><summary>Soft delete: how, and what's the classic gotcha?</summary><div class="answer"><p><code>deleted_at timestamptz</code>, NULL meaning alive (a timestamp beats a boolean — it's audit info for free). Gotcha #1: <code>UNIQUE(email)</code> now blocks re-registration with a soft-deleted user's email — scope uniqueness with a partial unique index: <code>CREATE UNIQUE INDEX ... ON users(email) WHERE deleted_at IS NULL</code>. Gotcha #2: every query in the system must now filter <code>deleted_at IS NULL</code>; one miss leaks "deleted" data — mitigate with a live-rows view or ORM default filters. I'd also challenge the requirement: if undelete isn't a real feature, hard delete + an audit/history table keeps mainline queries clean, and GDPR erasure may forbid retaining the data anyway.</p></div></details>
+
+<details class="qa"><summary>What is an exclusion constraint and when have you'd use one?</summary><div class="answer"><p>A generalized UNIQUE: "no two rows may satisfy this set of operator comparisons simultaneously," enforced through a GiST index. The canonical use is overlap prevention: <code>EXCLUDE USING gist (room_id WITH =, during WITH &amp;&amp;)</code> guarantees no two confirmed bookings for the same room overlap in time — atomically, for every concurrent writer, with no app-level locking. Needs the <code>btree_gist</code> extension to mix equality columns into the GiST index. It turns the hardest concurrency bug in booking systems (check-then-insert races) into a plain constraint violation you handle like any unique conflict.</p></div></details>
+
+<details class="qa"><summary>Shared tenant_id vs schema-per-tenant vs database-per-tenant?</summary><div class="answer"><p>Shared tables + <code>tenant_id</code>: cheapest, migrations run once, scales to millions of tenants — but isolation is only as good as your WHERE clauses, so add Row-Level Security as a fail-closed backstop and lead every composite index with <code>tenant_id</code>. Schema-per-tenant: stronger separation and per-tenant dump/restore, but migrations fan out ×N and the catalog bloats past a few hundred tenants. Database-per-tenant: strongest isolation, trivial per-tenant backup, per-tenant tuning — and the highest ops cost; reserved for enterprise/regulated customers. Real systems hybridize: shared for the long tail, dedicated for the whales. Default answer: shared + RLS unless a contract says otherwise.</p></div></details>
+
+<details class="qa"><summary>Why is SERIAL discouraged in favor of GENERATED AS IDENTITY?</summary><div class="answer"><p><code>SERIAL</code> is pre-standard syntax sugar: it creates a sequence, sets a default, and loosely ties ownership — but permissions and copying behavior (<code>CREATE TABLE ... LIKE</code>) have sharp edges, and nothing stops an INSERT from supplying its own value, silently desynchronizing from the sequence (hello, duplicate-key errors after a data import). <code>GENERATED ALWAYS AS IDENTITY</code> is the SQL standard, manages the sequence as an integral part of the column, and rejects manual values unless you say <code>OVERRIDING SYSTEM VALUE</code> — use <code>BY DEFAULT</code> when bulk loads must specify IDs. Same runtime behavior, tighter semantics.</p></div></details>
+
+<details class="qa"><summary>A UNIQUE constraint on a nullable column — what's the behavior, and how did PG 15 change the options?</summary><div class="answer"><p>By default NULLs are considered distinct from each other (SQL's three-valued logic: <code>NULL = NULL</code> is unknown), so a UNIQUE column can hold unlimited NULLs — usually what you want for optional-but-unique fields like <code>external_id</code>. Postgres 15 added <code>UNIQUE NULLS NOT DISTINCT</code>, which treats NULLs as equal and therefore permits at most one NULL row. Before 15, you'd emulate that with a partial unique index or a unique index on <code>COALESCE(col, sentinel)</code>. Knowing both the default and the PG15 switch signals you actually work with the database rather than through an ORM only.</p></div></details>
+
+<details class="qa"><summary>Walk me through your first five minutes in a live schema-design interview.</summary><div class="answer"><p>(1) <strong>Clarify requirements</strong> — read/write patterns, scale, what history must be preserved, what's out of scope; interviewers plant ambiguity to see if you ask. (2) <strong>List entities as nouns</strong> from the requirements, and identify which are documents (snapshot) vs catalogs (reference). (3) <strong>Sketch relationships</strong> with cardinalities, calling out M:N tables and any associative entities with attributes. (4) <strong>Write DDL for the core tables only</strong>, narrating each decision: key strategy, NOT NULL by default, CHECK for domains, FK delete policies, indexes on FKs and hot query paths. (5) <strong>Volunteer the trade-offs</strong> — where I'd denormalize under load, which invariants the DB can't own, what I'd revisit at 100× scale. The narration is the deliverable; silent perfect DDL scores worse than imperfect DDL with reasoning aloud.</p></div></details>
+
+<!-- ============================================================ -->
+<h2 id="exercises">Hands-on exercises</h2>
+
+<p>Design each on paper (or an empty <code>psql</code>) <em>before</em> opening the solution. Speak your reasoning out loud — literally. That's the skill.</p>
+
+<h3>Exercise 1: URL shortener</h3>
+<p>Design tables for a URL shortener: users create short links to long URLs, links can expire, and you must count clicks (with timestamp and referrer) without slowing redirects. Consider: what's the key for the short code? How do you serve the redirect fast? Where do click counts live?</p>
+
+<details class="qa"><summary>Model solution + commentary</summary><div class="answer">
+<pre><code>CREATE TABLE users (
+    id    bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    email text NOT NULL UNIQUE
+);
+
+CREATE TABLE links (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    short_code  text NOT NULL UNIQUE CHECK (short_code ~ '^[A-Za-z0-9_-]{4,12}$'),
+    long_url    text NOT NULL CHECK (char_length(long_url) &lt;= 8192),
+    owner_id    bigint REFERENCES users(id) ON DELETE SET NULL,  -- links outlive accounts
+    expires_at  timestamptz,                                     -- NULL = never
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    click_count bigint NOT NULL DEFAULT 0                        -- denormalized, eventually consistent
+);
+CREATE INDEX idx_links_owner ON links (owner_id);
+
+CREATE TABLE clicks (
+    id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    link_id    bigint NOT NULL REFERENCES links(id) ON DELETE CASCADE,
+    clicked_at timestamptz NOT NULL DEFAULT now(),
+    referrer   text,
+    user_agent text
+);
+CREATE INDEX idx_clicks_link_time ON clicks (link_id, clicked_at DESC);</code></pre>
+<p><strong>Decisions to narrate:</strong> The short code is the natural key of the system but I still use a surrogate <code>id</code> for FKs — <code>clicks</code> referencing an 8-byte int beats duplicating a text code into billions of rows. The redirect path is <code>SELECT long_url, expires_at FROM links WHERE short_code = $1</code> — one unique-index lookup (and realistically a cache in front). Clicks are an <strong>append-only event table</strong>; the redirect inserts a click row and does <em>not</em> synchronously update <code>click_count</code> — a periodic rollup (or async increment) maintains it, because a trigger would make the link row a write hot-spot for viral links. That's a deliberate eventual-consistency call: dashboards can lag seconds; redirects can't. Expiry is checked at read time (<code>expires_at &gt; now()</code> or NULL) rather than deleted by a cron — the row remains as history. At real scale I'd flag: clicks partitioned by month, and short-code generation (random base62, retry on unique violation) happens in the app.</p>
+</div></details>
+
+<h3>Exercise 2: Multi-tenant SaaS (project tracker)</h3>
+<p>A B2B project tracker: organizations sign up, invite members with roles, and manage projects containing tasks. Requirements: strict data isolation between orgs, "project name unique within an org," a user can belong to several orgs. Choose and justify a tenancy strategy, then write the DDL.</p>
+
+<details class="qa"><summary>Model solution + commentary</summary><div class="answer">
+<pre><code>CREATE TABLE organizations (
+    id   bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    slug text NOT NULL UNIQUE CHECK (slug ~ '^[a-z0-9-]{2,40}$'),
+    name text NOT NULL
+);
+
+CREATE TABLE users (
+    id    bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    email text NOT NULL UNIQUE,
+    name  text NOT NULL
+);
+
+-- M:N with attributes: membership is an entity
+CREATE TABLE memberships (
+    org_id  bigint NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    user_id bigint NOT NULL REFERENCES users(id)         ON DELETE CASCADE,
+    role    text NOT NULL DEFAULT 'member'
+            CHECK (role IN ('owner','admin','member')),
+    joined_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (org_id, user_id)
+);
+CREATE INDEX idx_memberships_user ON memberships (user_id);  -- "my orgs" lookup
+
+CREATE TABLE projects (
+    id     bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    org_id bigint NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    name   text NOT NULL,
+    UNIQUE (org_id, name)                        -- unique PER TENANT
+);
+CREATE INDEX idx_projects_org ON projects (org_id);
+
+CREATE TABLE tasks (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    org_id      bigint NOT NULL REFERENCES organizations(id),  -- denormalized on purpose (see note)
+    project_id  bigint NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    assignee_id bigint REFERENCES users(id) ON DELETE SET NULL,
+    title       text NOT NULL,
+    status      text NOT NULL DEFAULT 'todo'
+                CHECK (status IN ('todo','in_progress','done')),
+    created_at  timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_tasks_org_status ON tasks (org_id, status);
+CREATE INDEX idx_tasks_project    ON tasks (project_id);
+CREATE INDEX idx_tasks_assignee   ON tasks (assignee_id);
+
+-- Fail-closed isolation with RLS
+ALTER TABLE tasks ENABLE ROW LEVEL SECURITY;
+CREATE POLICY org_isolation ON tasks
+    USING (org_id = current_setting('app.org_id')::bigint);
+-- (repeat per tenant-scoped table; app sets app.org_id per transaction)</code></pre>
+<p><strong>Decisions to narrate:</strong> Shared tables + <code>tenant_id</code>, because a self-serve tracker expects thousands of orgs and per-tenant schemas/databases don't scale operationally at that count; RLS is the fail-closed backstop for a missed WHERE clause. Carrying <code>org_id</code> on <code>tasks</code> — reachable via <code>project_id</code> — is a small deliberate denormalization: it lets RLS and composite indexes work directly on the hottest table without a join, and it's safe because a task's org never changes. (Hardening option: <code>UNIQUE (id, org_id)</code> on projects plus a composite FK <code>(project_id, org_id)</code> from tasks makes cross-tenant mismatches impossible, not just unlikely.) Uniqueness rules are tenant-scoped — <code>UNIQUE (org_id, name)</code> — never global. Membership is an associative entity (role, joined_at) with a composite PK; users are global identities so one human spans orgs, which also means "user deleted" must CASCADE memberships but only SET NULL task assignments — history survives people leaving.</p>
+</div></details>
+
+<h3>Exercise 3: Social follows</h3>
+<p>Model "user A follows user B" for a social app: no self-follows, no duplicate follows, and both directions must be fast — "who do I follow?" and "who follows me?" Then: where would follower <em>counts</em> come from at Instagram scale?</p>
+
+<details class="qa"><summary>Model solution + commentary</summary><div class="answer">
+<pre><code>CREATE TABLE follows (
+    follower_id bigint NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    followee_id bigint NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (follower_id, followee_id),          -- no duplicate follows, by construction
+    CHECK (follower_id &lt;&gt; followee_id)               -- no self-follows
+);
+-- PK index serves "who do I follow?" (leading column follower_id).
+-- Reverse direction needs its own index:
+CREATE INDEX idx_follows_followee ON follows (followee_id, created_at DESC);</code></pre>
+<p><strong>Decisions to narrate:</strong> This is a <strong>self-referencing many-to-many</strong> — one users table, a join table with both FKs pointing at it. Composite PK <code>(follower_id, followee_id)</code> encodes "at most one follow per ordered pair"; the <code>CHECK</code> bans self-follows at the schema level (a one-line constraint most candidates forget). Directionality matters: follows are ordered pairs, unlike a "friendship" which is unordered — for friendships you'd store one row with <code>CHECK (user_a_id &lt; user_b_id)</code> to prevent the (A,B)/(B,A) duplicate. The PK's B-tree covers follower→followees; the second index (with <code>created_at DESC</code> for "recent followers" pagination) covers followee→followers — without it, "who follows me" scans. CASCADE on both FKs: follow edges are meaningless once either endpoint is gone. <strong>Counts at scale:</strong> <code>count(*)</code> per profile view dies at celebrity fan-in; store <code>follower_count</code> on a stats row — but a synchronous trigger makes the celebrity's row a lock hot-spot for millions of concurrent follows, so increment asynchronously (queue/batched rollup) and accept seconds of drift, with a periodic reconciliation job recomputing from truth. That answer — trigger rejected <em>because of</em> lock contention, eventual consistency chosen <em>with</em> a reconciliation story — is the senior version.</p>
+</div></details>
+
+<nav class="page-nav"><a href="11-postgres-sql-fluency.html">← Prev: SQL Fluency</a><a href="13-postgres-indexing-performance.html">Next: Indexing &amp; Performance →</a></nav>
+</main></body></html>

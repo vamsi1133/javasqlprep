@@ -1,0 +1,1137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>09 — AOP, Proxies &amp; Testing | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header"><div class="container"><div class="breadcrumb"><a href="index.html">← Course Home</a></div><h1>09 — AOP, Proxies &amp; Testing</h1><p>How Spring's proxy magic actually works, why <code>@Transactional</code> sometimes silently does nothing, and how seniors test Spring apps without lying to themselves.</p></div></header>
+<main class="container">
+
+<p><strong>Why interviewers ask this.</strong> AOP and proxies are the machinery behind almost every Spring annotation you have used so far — <code>@Transactional</code>, <code>@Cacheable</code>, <code>@Async</code>, <code>@PreAuthorize</code>. Interviewers probe it because it separates people who <em>use</em> Spring from people who <em>understand</em> it: the self-invocation bug is the single most common "why is my annotation not working?" production incident. Testing questions, meanwhile, are where seniority shows most clearly. Anyone can write a test; a senior knows <em>which layer to test with which tool</em>, why <code>@SpringBootTest</code> everywhere is a smell, and why H2 gives you green builds and red production. Coming from 7 years of Jest and React Testing Library, you already have the instincts — this page maps them to the JVM equivalents (Mockito ≈ <code>jest.mock</code>, MockMvc ≈ <code>supertest</code>, Testcontainers ≈ running real Postgres in Docker for integration tests) and adds the Spring-specific judgment calls.</p>
+
+<div class="toc"><strong>On this page</strong><ol>
+<li><a href="#why-aop">Why AOP: cross-cutting concerns &amp; terminology</a></li>
+<li><a href="#proxies">How Spring proxies work (and the self-invocation trap)</a></li>
+<li><a href="#writing-aspects">Writing your own aspects</a></li>
+<li><a href="#spring-aop-annotations">Spring annotations that are AOP under the hood</a></li>
+<li><a href="#junit5">JUnit 5 &amp; AssertJ</a></li>
+<li><a href="#mockito">Mockito: mocks, stubs, verification, judgment</a></li>
+<li><a href="#test-slices">Spring test slices: unit → @WebMvcTest → @DataJpaTest → @SpringBootTest</a></li>
+<li><a href="#testcontainers">Testcontainers: real Postgres in your tests</a></li>
+<li><a href="#contract-testing">Contract testing, WireMock &amp; test-quality awareness</a></li>
+<li><a href="#qa">Interview Q&amp;A</a></li>
+<li><a href="#exercises">Hands-on exercises</a></li>
+</ol></div>
+
+<!-- ============================================================ -->
+<h2 id="why-aop">Why AOP: cross-cutting concerns <span class="tier tier-2">T2</span></h2>
+
+<p>Some concerns cut <em>across</em> your whole codebase rather than living in one module: logging, timing/metrics, transactions, security checks, caching, retries. Without AOP you would sprinkle the same boilerplate into every service method:</p>
+
+<pre><code><span class="com">// Without AOP: every method repeats the same ceremony</span>
+<span class="kw">public</span> Order placeOrder(OrderRequest req) {
+    <span class="kw">long</span> start = System.nanoTime();                     <span class="com">// timing</span>
+    log.info(<span class="str">"placeOrder called"</span>);                       <span class="com">// logging</span>
+    TransactionStatus tx = txManager.getTransaction(...); <span class="com">// transaction</span>
+    <span class="kw">try</span> {
+        <span class="com">// ...the 5 lines of ACTUAL business logic...</span>
+        txManager.commit(tx);
+    } <span class="kw">catch</span> (RuntimeException e) {
+        txManager.rollback(tx);
+        <span class="kw">throw</span> e;
+    } <span class="kw">finally</span> {
+        metrics.record(System.nanoTime() - start);
+    }
+}</code></pre>
+
+<p><strong>Aspect-Oriented Programming</strong> extracts that ceremony into reusable modules ("aspects") that are woven around your business code at runtime. Your method becomes just the business logic plus declarative annotations:</p>
+
+<pre><code><span class="ann">@Transactional</span>
+<span class="ann">@LogExecutionTime</span>   <span class="com">// our own custom annotation — we'll build it below</span>
+<span class="kw">public</span> Order placeOrder(OrderRequest req) {
+    <span class="com">// only business logic remains</span>
+}</code></pre>
+
+<p>If you've used higher-order components or decorators in React/TS (<code>withAuth(Component)</code>, <code>@Injectable()</code> in Angular/NestJS), AOP is the same idea: wrap behavior around code without editing the code.</p>
+
+<h3>The terminology (interviewers expect exact words)</h3>
+<table>
+<thead><tr><th>Term</th><th>Meaning</th><th>Mental model</th></tr></thead>
+<tbody>
+<tr><td><strong>Aspect</strong></td><td>A module encapsulating one cross-cutting concern (e.g. "timing").</td><td>The decorator class itself.</td></tr>
+<tr><td><strong>Join point</strong></td><td>A point in program execution where an aspect <em>could</em> apply. In Spring AOP this is always <em>a method execution</em>.</td><td>Every method call is a potential hook.</td></tr>
+<tr><td><strong>Pointcut</strong></td><td>A predicate that selects <em>which</em> join points the advice applies to.</td><td>A CSS selector for methods.</td></tr>
+<tr><td><strong>Advice</strong></td><td>The code that runs at a selected join point (before / after / around it).</td><td>The wrapper function body.</td></tr>
+<tr><td><strong>Weaving</strong></td><td>Linking aspects to target code. Spring weaves <em>at runtime via proxies</em>; AspectJ can weave at compile time.</td><td>How the wrapper gets applied.</td></tr>
+<tr><td><strong>Target / Advised object</strong></td><td>The real bean being wrapped by the proxy.</td><td>Your original component.</td></tr>
+</tbody>
+</table>
+
+<div class="note"><p>Spring AOP is <em>proxy-based</em> and only intercepts <strong>public method executions on Spring beans</strong>. Full AspectJ can intercept field access, constructors, private methods, and objects Spring doesn't manage — but almost nobody needs that, and "Spring AOP is a pragmatic subset of AspectJ" is a great interview line.</p></div>
+
+<!-- ============================================================ -->
+<h2 id="proxies">How Spring proxies work — the mechanics interviewers probe <span class="tier tier-2">T2</span></h2>
+
+<p>This is the section that explains rules you were just told to memorize in earlier tutorials ("<code>@Transactional</code> only works on public methods", "don't call transactional methods from the same class"). When Spring sees a bean that needs AOP behavior (it has <code>@Transactional</code>, matches a pointcut, etc.), it does <strong>not</strong> hand you your object. It hands you a <em>proxy</em> — a stand-in that wraps your object:</p>
+
+<pre><code><span class="com">// What you think you injected:        // What Spring actually injected:</span>
+<span class="com">//                                     </span>
+<span class="com">//  ┌──────────────┐                   ┌──────────────────────────┐</span>
+<span class="com">//  │ OrderService │                   │ OrderService$$SpringCGLIB │  ← the proxy</span>
+<span class="com">//  └──────────────┘                   │  before-advice (open tx)  │</span>
+<span class="com">//                                     │   ┌──────────────┐        │</span>
+<span class="com">//                                     │   │ OrderService │ target │</span>
+<span class="com">//                                     │   └──────────────┘        │</span>
+<span class="com">//                                     │  after-advice (commit)    │</span>
+<span class="com">//                                     └──────────────────────────┘</span></code></pre>
+
+<h3>Two proxy strategies</h3>
+<table>
+<thead><tr><th></th><th>JDK dynamic proxy</th><th>CGLIB proxy</th></tr></thead>
+<tbody>
+<tr><td><strong>Mechanism</strong></td><td><code>java.lang.reflect.Proxy</code> generates a class implementing your bean's <em>interfaces</em> at runtime.</td><td>Generates a <em>subclass</em> of your concrete class at runtime, overriding its methods.</td></tr>
+<tr><td><strong>Requires</strong></td><td>The bean must implement at least one interface; you must inject it <em>by the interface type</em>.</td><td>Class must not be <code>final</code>; methods to advise must not be <code>final</code> or <code>private</code>.</td></tr>
+<tr><td><strong>Spring Boot default</strong></td><td colspan="2">Boot defaults to <strong>CGLIB for everything</strong> (<code>proxyTargetClass=true</code>), even for beans with interfaces — so injecting by concrete class always works.</td></tr>
+<tr><td><strong>Jest analogy</strong></td><td><code>jest.mock()</code> replacing a module behind its exported interface.</td><td>Subclassing/monkey-patching the class itself.</td></tr>
+</tbody>
+</table>
+
+<pre><code><span class="com">// Proof — print the runtime class of an injected bean:</span>
+System.out.println(orderService.getClass());
+<span class="com">// → class com.demo.OrderService$$SpringCGLIB$$0   (not OrderService!)</span></code></pre>
+
+<h3>The self-invocation problem — the #1 proxy gotcha</h3>
+
+<p>The proxy only intercepts calls that <strong>arrive from outside</strong>, through the proxy reference. When a method calls another method on <em>the same object</em> (<code>this.otherMethod()</code>), the call goes straight to the target — the proxy never sees it, so its advice never runs. Result: <code>@Transactional</code>, <code>@Cacheable</code>, <code>@Async</code>, <code>@PreAuthorize</code> on the inner method <strong>silently no-op</strong>.</p>
+
+<pre><code><span class="ann">@Service</span>
+<span class="kw">public class</span> <span class="typ">ReportService</span> {
+
+    <span class="kw">public void</span> generateAll() {
+        <span class="kw">for</span> (Long id : reportIds) {
+            <span class="com">// BROKEN: this is this.generateOne(id) — a plain Java call</span>
+            <span class="com">// on the target object. It bypasses the proxy, so NO new</span>
+            <span class="com">// transaction is opened per report. @Transactional no-ops.</span>
+            generateOne(id);
+        }
+    }
+
+    <span class="ann">@Transactional</span>(propagation = Propagation.REQUIRES_NEW)
+    <span class="kw">public void</span> generateOne(Long id) {
+        <span class="com">// you THINK each report gets its own transaction... it doesn't</span>
+    }
+}</code></pre>
+
+<div class="pitfall"><p><strong>No error, no warning, no log line.</strong> The code runs, tests may even pass (if they don't assert transactional behavior), and you discover it in production when one failing report rolls back all the others — or when <code>@Cacheable</code> never caches and your DB melts. Interviewers love asking "my <code>@Transactional</code> isn't working, what do you check first?" — self-invocation is answer #1.</p></div>
+
+<h3>Fix 1 (preferred): extract to another bean</h3>
+<pre><code><span class="ann">@Service</span>
+<span class="ann">@RequiredArgsConstructor</span>
+<span class="kw">public class</span> <span class="typ">ReportOrchestrator</span> {
+    <span class="kw">private final</span> ReportWorker worker;   <span class="com">// injected = proxied reference</span>
+
+    <span class="kw">public void</span> generateAll() {
+        <span class="kw">for</span> (Long id : reportIds) {
+            worker.generateOne(id);       <span class="com">// crosses the proxy ✔ — advice runs</span>
+        }
+    }
+}
+
+<span class="ann">@Service</span>
+<span class="kw">public class</span> <span class="typ">ReportWorker</span> {
+    <span class="ann">@Transactional</span>(propagation = Propagation.REQUIRES_NEW)
+    <span class="kw">public void</span> generateOne(Long id) { <span class="com">/* now truly transactional */</span> }
+}</code></pre>
+<p>This is preferred because it usually reveals a hidden design seam anyway — the orchestration and the unit of work are different responsibilities.</p>
+
+<h3>Fix 2: self-injection via <code>ObjectProvider</code></h3>
+<pre><code><span class="ann">@Service</span>
+<span class="kw">public class</span> <span class="typ">ReportService</span> {
+    <span class="kw">private final</span> ObjectProvider&lt;ReportService&gt; self;
+
+    <span class="kw">public</span> ReportService(ObjectProvider&lt;ReportService&gt; self) {
+        <span class="kw">this</span>.self = self;   <span class="com">// lazy lookup avoids the circular-dependency error</span>
+    }
+
+    <span class="kw">public void</span> generateAll() {
+        <span class="kw">for</span> (Long id : reportIds) {
+            self.getObject().generateOne(id);  <span class="com">// goes through the proxy ✔</span>
+        }
+    }
+
+    <span class="ann">@Transactional</span>(propagation = Propagation.REQUIRES_NEW)
+    <span class="kw">public void</span> generateOne(Long id) { ... }
+}</code></pre>
+
+<div class="senior"><p>Mention both fixes but state a preference for extraction: self-injection works but smells — a class calling its own proxied version is a sign two responsibilities are trapped in one class. Also mention the anti-fix: <code>AopContext.currentProxy()</code> exists but requires <code>exposeProxy=true</code> and couples business code to Spring AOP internals — flag it as something you'd reject in code review.</p></div>
+
+<h3>Other proxy consequences (this explains earlier tutorials' rules)</h3>
+<ul>
+<li><strong><code>final</code> methods/classes can't be advised.</strong> CGLIB subclasses your class and overrides methods; Java forbids overriding <code>final</code>. A <code>final</code> class fails at startup; a <code>final</code> method is silently skipped (newer Spring versions log a warning). This is also why Kotlin Spring projects need the <code>kotlin-spring</code> compiler plugin to open classes.</li>
+<li><strong><code>private</code> methods can't be advised</strong> — can't be overridden, and JDK proxies only see interface methods. <code>@Transactional</code> on a private method does nothing.</li>
+<li><strong>Field access isn't intercepted.</strong> The proxy delegates to the target, whose fields are its own; only method <em>entry</em> is wrapped.</li>
+<li><strong>Constructors run twice-ish surprises:</strong> CGLIB instantiates the proxy subclass; don't put logic in constructors that assumes it runs once per logical bean.</li>
+</ul>
+
+<div class="note"><p>Since Spring Framework 6 / Boot 3, CGLIB is repackaged inside <code>spring-core</code> (<code>org.springframework.cglib</code>), so you never add it as a dependency — it's just there.</p></div>
+
+<!-- ============================================================ -->
+<h2 id="writing-aspects">Writing your own aspects <span class="tier tier-2">T2</span></h2>
+
+<p>You rarely write aspects day-to-day (mostly you consume Spring's), but interviewers use "write a timing aspect" as a litmus test, and it's the cleanest way to add cross-cutting logging/metrics. Setup: <code>spring-boot-starter-aop</code> on the classpath (auto-enables <code>@EnableAspectJAutoProxy</code> in Boot).</p>
+
+<h3>Advice types</h3>
+<table>
+<thead><tr><th>Annotation</th><th>Runs</th><th>Can it...</th></tr></thead>
+<tbody>
+<tr><td><code>@Before</code></td><td>Before the method</td><td>Read args; veto only by throwing.</td></tr>
+<tr><td><code>@AfterReturning</code></td><td>After normal return</td><td>Read (not replace) the return value.</td></tr>
+<tr><td><code>@AfterThrowing</code></td><td>After an exception escapes</td><td>Inspect the exception; can't swallow it.</td></tr>
+<tr><td><code>@After</code></td><td>After return <em>or</em> throw (finally)</td><td>Cleanup only.</td></tr>
+<tr><td><code>@Around</code></td><td>Wraps the whole call</td><td>Everything: skip the call, change args, replace return value, catch/translate exceptions. Uses <code>ProceedingJoinPoint</code>.</td></tr>
+</tbody>
+</table>
+
+<h3>Pointcut expressions — the two you must know</h3>
+<pre><code><span class="com">// 1. execution() — match by method signature pattern</span>
+<span class="com">//    execution(modifiers? return-type declaring-type?.name(params))</span>
+execution(<span class="kw">public</span> * com.demo.service.*.*(..))
+<span class="com">//        │      │  └ any class in service pkg . any method (any args)</span>
+<span class="com">//        │      └ any return type</span>
+<span class="com">//        └ public only (Spring AOP can only see public anyway)</span>
+
+execution(* com.demo..*Service.find*(..))   <span class="com">// ".." = this pkg + subpackages</span>
+
+<span class="com">// 2. @annotation() — match methods carrying a specific annotation</span>
+<span class="ann">@annotation</span>(com.demo.aop.LogExecutionTime)
+
+<span class="com">// Combinators: &amp;&amp;  ||  !</span>
+execution(* com.demo..*(..)) &amp;&amp; <span class="ann">@annotation</span>(org.springframework.transaction.annotation.Transactional)</code></pre>
+
+<h3>Complete example: a custom <code>@LogExecutionTime</code> annotation + timing aspect</h3>
+
+<pre><code><span class="com">// 1. The marker annotation</span>
+<span class="kw">package</span> com.demo.aop;
+
+<span class="kw">import</span> java.lang.annotation.*;
+
+<span class="ann">@Target</span>(ElementType.METHOD)
+<span class="ann">@Retention</span>(RetentionPolicy.RUNTIME)   <span class="com">// must survive to runtime for the proxy to see it</span>
+<span class="kw">public</span> <span class="ann">@interface</span> <span class="typ">LogExecutionTime</span> {
+    <span class="kw">long</span> warnAboveMillis() <span class="kw">default</span> <span class="num">500</span>;
+}</code></pre>
+
+<pre><code><span class="com">// 2. The aspect — @Aspect makes it an aspect, @Component makes it a bean</span>
+<span class="kw">package</span> com.demo.aop;
+
+<span class="kw">import</span> org.aspectj.lang.ProceedingJoinPoint;
+<span class="kw">import</span> org.aspectj.lang.annotation.Around;
+<span class="kw">import</span> org.aspectj.lang.annotation.Aspect;
+<span class="kw">import</span> org.aspectj.lang.reflect.MethodSignature;
+
+<span class="ann">@Aspect</span>
+<span class="ann">@Component</span>
+<span class="kw">public class</span> <span class="typ">ExecutionTimeAspect</span> {
+
+    <span class="kw">private static final</span> Logger log = LoggerFactory.getLogger(ExecutionTimeAspect.<span class="kw">class</span>);
+
+    <span class="ann">@Around</span>(<span class="str">"@annotation(logExecutionTime)"</span>)  <span class="com">// binds the annotation instance as a param</span>
+    <span class="kw">public</span> Object time(ProceedingJoinPoint pjp, LogExecutionTime logExecutionTime)
+            <span class="kw">throws</span> Throwable {
+
+        MethodSignature sig = (MethodSignature) pjp.getSignature();
+        String method = sig.getDeclaringType().getSimpleName() + <span class="str">"."</span> + sig.getName();
+
+        <span class="kw">long</span> start = System.nanoTime();
+        <span class="kw">try</span> {
+            <span class="kw">return</span> pjp.proceed();   <span class="com">// ← calls the real method. Forget this = method never runs!</span>
+        } <span class="kw">finally</span> {
+            <span class="kw">long</span> ms = (System.nanoTime() - start) / <span class="num">1_000_000</span>;
+            <span class="kw">if</span> (ms &gt; logExecutionTime.warnAboveMillis()) {
+                log.warn(<span class="str">"{} took {} ms (threshold {})"</span>, method, ms,
+                         logExecutionTime.warnAboveMillis());
+            } <span class="kw">else</span> {
+                log.debug(<span class="str">"{} took {} ms"</span>, method, ms);
+            }
+        }
+    }
+}</code></pre>
+
+<pre><code><span class="com">// 3. Usage — any Spring bean's public method</span>
+<span class="ann">@Service</span>
+<span class="kw">public class</span> <span class="typ">SearchService</span> {
+
+    <span class="ann">@LogExecutionTime</span>(warnAboveMillis = <span class="num">200</span>)
+    <span class="kw">public</span> List&lt;Product&gt; search(String query) { ... }
+}</code></pre>
+
+<div class="pitfall"><p>Two classic <code>@Around</code> bugs: (1) forgetting to <code>return pjp.proceed()</code> — for non-void methods every caller suddenly receives <code>null</code>; (2) swallowing the exception from <code>proceed()</code> — the caller sees success while the operation failed. <code>@Around</code> is powerful precisely because it can do these things, so use the least powerful advice type that works (<code>@Before</code>/<code>@AfterReturning</code> can't break the call).</p></div>
+
+<div class="senior"><p>Ordering: when multiple aspects apply to one method (yours + <code>@Transactional</code> + security), order matters. Implement <code>Ordered</code> or add <code>@Order(n)</code> on the aspect — lower value = outermost. E.g. a timing aspect should usually be <em>outside</em> the transaction advice if you want to measure commit time too.</p></div>
+
+<!-- ============================================================ -->
+<h2 id="spring-aop-annotations">Spring's own annotations that are AOP under the hood <span class="tier tier-3">T3</span></h2>
+
+<p>Everything below is "just" an aspect + proxy — which is why <em>all</em> of them share the same failure modes: self-invocation, non-public methods, <code>final</code>, and non-Spring-managed objects (<code>new MyService()</code> gets no proxy, no magic).</p>
+
+<h3>@Transactional</h3>
+<p>Covered in depth in the JPA tutorial — the advice opens a transaction before the method, commits on return, rolls back on unchecked exceptions. Now you know <em>why</em> the rules exist: they're proxy rules, not transaction rules.</p>
+
+<h3>@Cacheable / @CacheEvict / @CachePut — 60-second caching intro</h3>
+<pre><code><span class="ann">@Configuration</span>
+<span class="ann">@EnableCaching</span>          <span class="com">// switches on the caching aspect infrastructure</span>
+<span class="kw">public class</span> <span class="typ">CacheConfig</span> { }
+
+<span class="ann">@Service</span>
+<span class="kw">public class</span> <span class="typ">ProductService</span> {
+
+    <span class="ann">@Cacheable</span>(cacheNames = <span class="str">"products"</span>, key = <span class="str">"#id"</span>)
+    <span class="kw">public</span> Product findById(Long id) {
+        <span class="com">// Around-advice: check cache first; only runs this body on a miss,</span>
+        <span class="com">// then stores the return value under key `id`.</span>
+        <span class="kw">return</span> repository.findById(id).orElseThrow();
+    }
+
+    <span class="ann">@CacheEvict</span>(cacheNames = <span class="str">"products"</span>, key = <span class="str">"#product.id"</span>)
+    <span class="kw">public</span> Product update(Product product) {   <span class="com">// evict stale entry on write</span>
+        <span class="kw">return</span> repository.save(product);
+    }
+}</code></pre>
+<p>Default store is a simple in-memory <code>ConcurrentHashMap</code>; add Caffeine or Redis via starters for real deployments. The <code>key</code> attribute is a SpEL expression over method parameters.</p>
+<div class="pitfall"><p><code>@Cacheable</code> on a method called via <code>this.</code> never caches — same self-invocation trap. Also: cached objects are shared references with the default in-memory store; mutating a returned entity mutates the cache.</p></div>
+
+<h3>@Async</h3>
+<pre><code><span class="ann">@Configuration</span>
+<span class="ann">@EnableAsync</span>            <span class="com">// REQUIRED — without it, @Async is silently ignored</span>
+<span class="kw">public class</span> <span class="typ">AsyncConfig</span> { }
+
+<span class="ann">@Service</span>
+<span class="kw">public class</span> <span class="typ">NotificationService</span> {
+
+    <span class="ann">@Async</span>
+    <span class="kw">public</span> CompletableFuture&lt;Void&gt; sendWelcomeEmail(String to) {
+        <span class="com">// runs on a task-executor thread; the caller returns immediately</span>
+        mailClient.send(to, <span class="str">"Welcome!"</span>);
+        <span class="kw">return</span> CompletableFuture.completedFuture(<span class="kw">null</span>);
+    }
+}</code></pre>
+<ul>
+<li>Return <code>CompletableFuture&lt;T&gt;</code> (or <code>void</code> for fire-and-forget). Think <code>async</code> functions returning a Promise.</li>
+<li><strong>Exception gotcha:</strong> an exception in a <code>void</code> <code>@Async</code> method never reaches the caller — it vanishes into an <code>AsyncUncaughtExceptionHandler</code> (default: just logs). If you return a <code>CompletableFuture</code>, the exception lands in the future and surfaces only when someone calls <code>.join()</code>/<code>.get()</code>. Unhandled promise rejection, JVM edition.</li>
+<li>Configure a proper <code>ThreadPoolTaskExecutor</code> bean; the default executor settings are rarely what you want in production.</li>
+</ul>
+
+<h3>@Retryable (awareness level)</h3>
+<pre><code><span class="com">// spring-retry + @EnableRetry</span>
+<span class="ann">@Retryable</span>(retryFor = TransientDataAccessException.<span class="kw">class</span>,
+           maxAttempts = <span class="num">3</span>,
+           backoff = <span class="ann">@Backoff</span>(delay = <span class="num">200</span>, multiplier = <span class="num">2</span>))
+<span class="kw">public</span> Payment charge(Card card) { ... }
+
+<span class="ann">@Recover</span>   <span class="com">// fallback after retries exhausted</span>
+<span class="kw">public</span> Payment recover(TransientDataAccessException e, Card card) { ... }</code></pre>
+<p>Same proxy mechanics; know it exists and that Resilience4j is the common alternative for retry/circuit-breaking in microservices.</p>
+
+<!-- ============================================================ -->
+<h2 id="junit5">JUnit 5 &amp; AssertJ <span class="tier tier-1">T1</span></h2>
+
+<p>JUnit 5 (a.k.a. Jupiter) is the test runner — your Jest. It's in <code>spring-boot-starter-test</code> along with AssertJ, Mockito, MockMvc and more, so a Boot project needs zero extra test dependencies.</p>
+
+<h3>Lifecycle &amp; structure</h3>
+<pre><code><span class="kw">class</span> <span class="typ">PriceCalculatorTest</span> {            <span class="com">// no annotation needed on the class itself</span>
+
+    <span class="kw">private</span> PriceCalculator calculator;
+
+    <span class="ann">@BeforeAll</span>                            <span class="com">// ≈ beforeAll — static by default</span>
+    <span class="kw">static void</span> initExpensiveSharedResource() { }
+
+    <span class="ann">@BeforeEach</span>                           <span class="com">// ≈ beforeEach — fresh state per test</span>
+    <span class="kw">void</span> setUp() {
+        calculator = <span class="kw">new</span> PriceCalculator();
+    }
+
+    <span class="ann">@AfterEach</span>  <span class="kw">void</span> tearDown() { }       <span class="com">// ≈ afterEach</span>
+    <span class="ann">@AfterAll</span>   <span class="kw">static void</span> cleanup() { }  <span class="com">// ≈ afterAll</span>
+
+    <span class="ann">@Test</span>
+    <span class="ann">@DisplayName</span>(<span class="str">"applies 10% discount for gold members"</span>)  <span class="com">// ≈ it('applies...')</span>
+    <span class="kw">void</span> appliesGoldDiscount() {
+        BigDecimal price = calculator.price(<span class="kw">new</span> BigDecimal(<span class="str">"100"</span>), Tier.GOLD);
+        assertEquals(<span class="kw">new</span> BigDecimal(<span class="str">"90.00"</span>), price);
+    }
+
+    <span class="ann">@Test</span>
+    <span class="ann">@Disabled</span>(<span class="str">"flaky until PRICE-123 is fixed"</span>)   <span class="com">// ≈ it.skip — always give a reason</span>
+    <span class="kw">void</span> skipped() { }
+}</code></pre>
+<p>Key difference from Jest: JUnit creates a <strong>new instance of the test class for every test method</strong> by default, so instance fields are naturally isolated — you often don't need <code>@BeforeEach</code> at all, just field initializers.</p>
+
+<h3>Core assertions</h3>
+<pre><code><span class="kw">import static</span> org.junit.jupiter.api.Assertions.*;
+
+assertEquals(expected, actual);                   <span class="com">// note the order: expected FIRST</span>
+assertTrue(order.isPaid());
+assertNotNull(result);
+
+<span class="com">// assertThrows ≈ expect(() =&gt; fn()).toThrow() — and returns the exception</span>
+IllegalArgumentException ex = assertThrows(
+        IllegalArgumentException.<span class="kw">class</span>,
+        () -&gt; calculator.price(<span class="kw">null</span>, Tier.GOLD));
+assertEquals(<span class="str">"price must not be null"</span>, ex.getMessage());
+
+<span class="com">// assertAll: run every assertion, report ALL failures (soft assertions)</span>
+assertAll(
+    () -&gt; assertEquals(<span class="str">"Ada"</span>, user.firstName()),
+    () -&gt; assertEquals(<span class="str">"Lovelace"</span>, user.lastName()),
+    () -&gt; assertTrue(user.active())
+);</code></pre>
+
+<h3>AssertJ — the fluent style seniors actually use</h3>
+<pre><code><span class="kw">import static</span> org.assertj.core.api.Assertions.*;
+
+assertThat(price).isEqualByComparingTo(<span class="str">"90.00"</span>);      <span class="com">// BigDecimal-aware compare</span>
+assertThat(user.name()).isEqualTo(<span class="str">"Ada"</span>).startsWith(<span class="str">"A"</span>);
+
+assertThat(orders)                                     <span class="com">// collection assertions shine</span>
+        .hasSize(<span class="num">3</span>)
+        .extracting(Order::status)
+        .containsExactly(Status.NEW, Status.PAID, Status.SHIPPED);
+
+assertThatThrownBy(() -&gt; service.cancel(<span class="num">999L</span>))
+        .isInstanceOf(OrderNotFoundException.<span class="kw">class</span>)
+        .hasMessageContaining(<span class="str">"999"</span>);</code></pre>
+<p>Prefer AssertJ over raw JUnit assertions: it reads left-to-right (<em>actual</em> first, like <code>expect(actual).toBe(expected)</code> — familiar!), gives dramatically better failure messages, and autocompletes. Most Spring codebases standardize on it.</p>
+
+<h3>@ParameterizedTest — <code>it.each</code>, but typed</h3>
+<pre><code><span class="ann">@ParameterizedTest</span>
+<span class="ann">@ValueSource</span>(strings = {<span class="str">""</span>, <span class="str">"  "</span>, <span class="str">"\t"</span>})
+<span class="kw">void</span> rejectsBlankNames(String name) {
+    assertThatThrownBy(() -&gt; <span class="kw">new</span> Customer(name))
+            .isInstanceOf(IllegalArgumentException.<span class="kw">class</span>);
+}
+
+<span class="ann">@ParameterizedTest</span>(name = <span class="str">"{0} member paying {1} owes {2}"</span>)
+<span class="ann">@CsvSource</span>({
+    <span class="str">"GOLD,   100.00, 90.00"</span>,
+    <span class="str">"SILVER, 100.00, 95.00"</span>,
+    <span class="str">"NONE,   100.00, 100.00"</span>
+})
+<span class="kw">void</span> tierDiscounts(Tier tier, BigDecimal input, BigDecimal expected) {
+    assertThat(calculator.price(input, tier)).isEqualByComparingTo(expected);
+}
+
+<span class="ann">@ParameterizedTest</span>
+<span class="ann">@MethodSource</span>(<span class="str">"invalidRequests"</span>)      <span class="com">// for complex objects</span>
+<span class="kw">void</span> rejectsInvalidRequests(OrderRequest bad) { ... }
+
+<span class="kw">static</span> Stream&lt;OrderRequest&gt; invalidRequests() {
+    <span class="kw">return</span> Stream.of(
+        <span class="kw">new</span> OrderRequest(<span class="kw">null</span>, <span class="num">1</span>),
+        <span class="kw">new</span> OrderRequest(<span class="str">"sku-1"</span>, <span class="num">0</span>),
+        <span class="kw">new</span> OrderRequest(<span class="str">"sku-1"</span>, -<span class="num">5</span>));
+}</code></pre>
+
+<h3>@Nested — <code>describe</code> blocks</h3>
+<pre><code><span class="kw">class</span> <span class="typ">OrderServiceTest</span> {
+
+    <span class="ann">@Nested</span>
+    <span class="kw">class</span> <span class="typ">WhenOrderExists</span> {              <span class="com">// ≈ describe('when order exists')</span>
+        <span class="ann">@BeforeEach</span> <span class="kw">void</span> givenExistingOrder() { ... }
+
+        <span class="ann">@Test</span> <span class="kw">void</span> cancelsIt() { ... }
+        <span class="ann">@Test</span> <span class="kw">void</span> refundsPayment() { ... }
+    }
+
+    <span class="ann">@Nested</span>
+    <span class="kw">class</span> <span class="typ">WhenOrderMissing</span> {
+        <span class="ann">@Test</span> <span class="kw">void</span> throwsNotFound() { ... }
+    }
+}</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="mockito">Mockito: mocks, stubs, verification &amp; judgment <span class="tier tier-1">T1</span></h2>
+
+<p>Mockito ≈ <code>jest.mock</code> + <code>jest.fn()</code> + <code>expect(mock).toHaveBeenCalledWith(...)</code> rolled into one library. The big mindset shift: in Jest you mock <em>modules</em>; in Java you mock <em>the collaborator objects injected via constructor</em> — which is exactly why constructor injection (tutorial 05) matters: it makes classes testable without Spring.</p>
+
+<h3>Setup: @Mock / @InjectMocks + MockitoExtension</h3>
+<pre><code><span class="ann">@ExtendWith</span>(MockitoExtension.<span class="kw">class</span>)     <span class="com">// activates the annotations — NO Spring here</span>
+<span class="kw">class</span> <span class="typ">OrderServiceTest</span> {
+
+    <span class="ann">@Mock</span>    <span class="kw">private</span> OrderRepository orderRepository;   <span class="com">// ≈ jest.mocked dependency</span>
+    <span class="ann">@Mock</span>    <span class="kw">private</span> PaymentClient paymentClient;
+    <span class="ann">@InjectMocks</span> <span class="kw">private</span> OrderService service;         <span class="com">// real class, mocks injected</span>
+
+    <span class="ann">@Test</span>
+    <span class="kw">void</span> placesOrderAndCharges() {
+        <span class="com">// stub: when X is called, return Y  ≈ mockFn.mockReturnValue(y)</span>
+        when(orderRepository.save(any(Order.<span class="kw">class</span>)))
+                .thenAnswer(inv -&gt; inv.getArgument(<span class="num">0</span>));      <span class="com">// echo back the arg</span>
+        when(paymentClient.charge(any())).thenReturn(PaymentResult.ok(<span class="str">"tx-1"</span>));
+
+        Order order = service.placeOrder(<span class="kw">new</span> OrderRequest(<span class="str">"sku-1"</span>, <span class="num">2</span>));
+
+        assertThat(order.status()).isEqualTo(Status.PAID);
+        verify(paymentClient).charge(any());                <span class="com">// ≈ toHaveBeenCalled</span>
+    }
+
+    <span class="ann">@Test</span>
+    <span class="kw">void</span> failsWhenPaymentDeclined() {
+        when(paymentClient.charge(any()))
+                .thenThrow(<span class="kw">new</span> PaymentDeclinedException(<span class="str">"insufficient funds"</span>));
+
+        assertThatThrownBy(() -&gt; service.placeOrder(<span class="kw">new</span> OrderRequest(<span class="str">"sku-1"</span>, <span class="num">2</span>)))
+                .isInstanceOf(OrderFailedException.<span class="kw">class</span>);
+
+        verify(orderRepository, never()).save(any());       <span class="com">// nothing persisted ✔</span>
+    }
+}</code></pre>
+
+<h3>BDDMockito — same engine, given/when/then vocabulary</h3>
+<pre><code><span class="kw">import static</span> org.mockito.BDDMockito.*;
+
+given(paymentClient.charge(any())).willReturn(PaymentResult.ok(<span class="str">"tx-1"</span>));
+given(paymentClient.charge(any())).willThrow(<span class="kw">new</span> PaymentDeclinedException(<span class="str">"no"</span>));
+
+<span class="com">// verification counterpart:</span>
+then(paymentClient).should(times(<span class="num">1</span>)).charge(any());
+then(orderRepository).should(never()).save(any());</code></pre>
+<p>Purely stylistic — some teams mandate it because <code>when(...)</code> in the <em>given</em> section of a given/when/then test reads oddly. Know both spellings.</p>
+
+<h3>Verification: times, never, order</h3>
+<pre><code>verify(mailer).send(any());                 <span class="com">// exactly once (default)</span>
+verify(mailer, times(<span class="num">2</span>)).send(any());      <span class="com">// ≈ toHaveBeenCalledTimes(2)</span>
+verify(mailer, never()).send(any());        <span class="com">// ≈ not.toHaveBeenCalled()</span>
+verify(mailer, atLeastOnce()).send(any());
+verifyNoInteractions(auditLog);             <span class="com">// nothing at all touched this mock</span>
+
+InOrder inOrder = inOrder(repo, mailer);    <span class="com">// assert call ordering when it matters</span>
+inOrder.verify(repo).save(any());
+inOrder.verify(mailer).send(any());</code></pre>
+
+<h3>ArgumentCaptor — inspect what was actually passed</h3>
+<p>Equivalent of <code>mockFn.mock.calls[0][0]</code>, but typed. Use it when the interesting behavior is <em>what your service constructed and handed to a collaborator</em>:</p>
+<pre><code><span class="ann">@ExtendWith</span>(MockitoExtension.<span class="kw">class</span>)
+<span class="kw">class</span> <span class="typ">RegistrationServiceTest</span> {
+
+    <span class="ann">@Mock</span>        <span class="kw">private</span> UserRepository userRepository;
+    <span class="ann">@InjectMocks</span> <span class="kw">private</span> RegistrationService service;
+
+    <span class="ann">@Captor</span>      <span class="kw">private</span> ArgumentCaptor&lt;User&gt; userCaptor;   <span class="com">// or ArgumentCaptor.forClass(User.class)</span>
+
+    <span class="ann">@Test</span>
+    <span class="kw">void</span> persistsUserWithNormalizedEmailAndHashedPassword() {
+        service.register(<span class="str">"  Ada@Example.COM "</span>, <span class="str">"s3cret!"</span>);
+
+        verify(userRepository).save(userCaptor.capture());   <span class="com">// grab the actual arg</span>
+        User saved = userCaptor.getValue();
+
+        assertThat(saved.email()).isEqualTo(<span class="str">"ada@example.com"</span>);  <span class="com">// trimmed + lowered</span>
+        assertThat(saved.passwordHash()).isNotEqualTo(<span class="str">"s3cret!"</span>) <span class="com">// never plaintext</span>
+                                        .startsWith(<span class="str">"$2a$"</span>);      <span class="com">// bcrypt prefix</span>
+    }
+}</code></pre>
+
+<h3>Argument matchers — and THE mixing rule</h3>
+<pre><code>when(repo.findByTierAndActive(any(Tier.<span class="kw">class</span>), anyBoolean())).thenReturn(users);
+
+<span class="com">// ❌ COMPILE-TIME OK, RUNTIME ERROR: "InvalidUseOfMatchersException"</span>
+when(repo.findByTierAndActive(Tier.GOLD, anyBoolean())).thenReturn(users);
+
+<span class="com">// ✔ RULE: if ANY argument uses a matcher, ALL must — wrap literals in eq()</span>
+when(repo.findByTierAndActive(eq(Tier.GOLD), anyBoolean())).thenReturn(users);</code></pre>
+<div class="pitfall"><p>The matcher-mixing rule trips up everyone once. Mockito matchers work via a thread-local side-effect stack, so raw values and matchers can't be interleaved. Jest has no equivalent because <code>expect.any()</code> objects are just values.</p></div>
+
+<h3>@Spy vs @Mock</h3>
+<table>
+<thead><tr><th></th><th><code>@Mock</code></th><th><code>@Spy</code></th></tr></thead>
+<tbody>
+<tr><td>Default behavior</td><td>All methods stubbed: return null/0/empty.</td><td>Real object; real methods run unless stubbed.</td></tr>
+<tr><td>Jest analogy</td><td><code>jest.fn()</code> for everything</td><td><code>jest.spyOn(obj, 'method')</code> — partial mock</td></tr>
+<tr><td>Stubbing syntax</td><td><code>when(mock.m()).thenReturn(x)</code></td><td><code>doReturn(x).when(spy).m()</code> — the <code>when()</code> form would <em>execute</em> the real method while stubbing!</td></tr>
+<tr><td>Senior take</td><td>Default choice for collaborators.</td><td>Usually a design smell: needing a partial mock often means the class does two things. Legit for legacy code you can't split yet.</td></tr>
+</tbody>
+</table>
+
+<h3>When NOT to mock — the senior judgment part</h3>
+<ul>
+<li><strong>Value objects &amp; entities.</strong> Never <code>mock(Money.class)</code> — just <code>new Money("9.99", EUR)</code>. Mocking data is pure noise. Same instinct as never mocking a plain JS object.</li>
+<li><strong>The class under test.</strong> If you're stubbing methods of the thing you're testing (spy on itself), you're testing your stubs.</li>
+<li><strong>Types you don't own</strong> (e.g. <code>RestClient</code>, JPA <code>EntityManager</code>) — mocking them couples tests to a vendor API's call sequence. Wrap them in your own thin adapter interface and mock <em>that</em>, or use WireMock/Testcontainers to test against the real protocol.</li>
+<li><strong>The over-mocked test smell:</strong> if a test sets up 8 stubs and then verifies those same 8 interactions, it asserts "the code calls what the code calls" — a mirror of the implementation that breaks on every refactor and catches no bugs. Prefer state-based assertions (what came back / what was persisted) over interaction verification, and reserve <code>verify()</code> for genuinely important side effects (email sent, event published, nothing saved on failure).</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="test-slices">Spring test slices: choosing the right weapon per layer <span class="tier tier-2">T2</span></h2>
+
+<p>The core decision framework — this table is basically an interview answer in itself:</p>
+
+<table>
+<thead><tr><th>Layer</th><th>Tool</th><th>Spring context?</th><th>Speed</th><th>Jest analogy</th></tr></thead>
+<tbody>
+<tr><td>Domain / service logic</td><td>Plain JUnit + Mockito</td><td><strong>None</strong></td><td>ms</td><td>Unit test with <code>jest.mock</code></td></tr>
+<tr><td>Web layer (controllers, validation, serialization, security)</td><td><code>@WebMvcTest</code> + MockMvc</td><td>Web slice only</td><td>~1–2 s first, then fast</td><td><code>supertest</code> against the Express app</td></tr>
+<tr><td>Persistence (queries, mappings)</td><td><code>@DataJpaTest</code> (+ Testcontainers)</td><td>JPA slice only</td><td>~2–5 s</td><td>Integration test against test DB</td></tr>
+<tr><td>Whole app wiring / E2E flows</td><td><code>@SpringBootTest</code></td><td>Full</td><td>5–30 s+</td><td>E2E with real server (Playwright-ish tier)</td></tr>
+</tbody>
+</table>
+
+<h3>Default choice: services with plain Mockito, no Spring at all</h3>
+<p>Because you used constructor injection, your service is a plain Java class. Test it exactly as in the Mockito section above — <strong>no</strong> <code>@SpringBootTest</code>, no context, sub-millisecond tests. This should be the bulk of your suite. Reaching for Spring to test business logic is the #1 junior tell.</p>
+
+<h3>@WebMvcTest + MockMvc — the supertest of Spring</h3>
+<p><code>@WebMvcTest</code> boots <em>only</em> the web layer: your controller, Jackson, validation, exception handlers, filters. Services are replaced with mocks via <code>@MockitoBean</code>.</p>
+
+<div class="note"><p><strong>Boot 3.4 naming change:</strong> <code>@MockBean</code>/<code>@SpyBean</code> are deprecated (removed in later versions) in favor of <code>@MockitoBean</code>/<code>@MockitoSpyBean</code> from <code>org.springframework.test.context.bean.override.mockito</code>. Say <code>@MockitoBean</code> in interviews and mention the rename — it signals you're current.</p></div>
+
+<pre><code><span class="ann">@WebMvcTest</span>(OrderController.<span class="kw">class</span>)        <span class="com">// only this controller's slice</span>
+<span class="kw">class</span> <span class="typ">OrderControllerTest</span> {
+
+    <span class="ann">@Autowired</span>   <span class="kw">private</span> MockMvc mockMvc;          <span class="com">// ≈ supertest(app)</span>
+    <span class="ann">@Autowired</span>   <span class="kw">private</span> ObjectMapper objectMapper;
+    <span class="ann">@MockitoBean</span> <span class="kw">private</span> OrderService orderService; <span class="com">// mock replaces real bean in context</span>
+
+    <span class="ann">@Test</span>
+    <span class="kw">void</span> createsOrderAndReturns201() <span class="kw">throws</span> Exception {
+        given(orderService.placeOrder(any()))
+                .willReturn(<span class="kw">new</span> OrderResponse(<span class="num">42L</span>, <span class="str">"sku-1"</span>, <span class="num">2</span>, Status.PAID));
+
+        mockMvc.perform(post(<span class="str">"/api/orders"</span>)
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .content(objectMapper.writeValueAsString(
+                            <span class="kw">new</span> OrderRequest(<span class="str">"sku-1"</span>, <span class="num">2</span>))))
+               .andExpect(status().isCreated())
+               .andExpect(header().string(<span class="str">"Location"</span>, <span class="str">"/api/orders/42"</span>))
+               .andExpect(jsonPath(<span class="str">"$.id"</span>).value(<span class="num">42</span>))
+               .andExpect(jsonPath(<span class="str">"$.status"</span>).value(<span class="str">"PAID"</span>));
+    }
+
+    <span class="ann">@Test</span>
+    <span class="kw">void</span> returns400WithFieldErrorsWhenValidationFails() <span class="kw">throws</span> Exception {
+        <span class="com">// quantity = 0 violates @Positive on the request DTO —</span>
+        <span class="com">// note: the service mock is never touched; validation rejects first</span>
+        mockMvc.perform(post(<span class="str">"/api/orders"</span>)
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .content(<span class="str">"""
+                        {"sku": "", "quantity": 0}
+                        """</span>))
+               .andExpect(status().isBadRequest())
+               .andExpect(jsonPath(<span class="str">"$.title"</span>).value(<span class="str">"Validation failed"</span>))
+               .andExpect(jsonPath(<span class="str">"$.errors[?(@.field=='sku')].message"</span>)
+                       .value(<span class="str">"must not be blank"</span>))
+               .andExpect(jsonPath(<span class="str">"$.errors[?(@.field=='quantity')].message"</span>)
+                       .value(<span class="str">"must be greater than 0"</span>));
+
+        then(orderService).shouldHaveNoInteractions();   <span class="com">// prove it never got through</span>
+    }
+
+    <span class="ann">@Test</span>
+    <span class="kw">void</span> returns404WhenOrderMissing() <span class="kw">throws</span> Exception {
+        given(orderService.findById(<span class="num">99L</span>))
+                .willThrow(<span class="kw">new</span> OrderNotFoundException(<span class="num">99L</span>));
+
+        mockMvc.perform(get(<span class="str">"/api/orders/99"</span>))
+               .andExpect(status().isNotFound())          <span class="com">// exercises @RestControllerAdvice</span>
+               .andExpect(jsonPath(<span class="str">"$.detail"</span>).value(<span class="str">"Order 99 not found"</span>));
+    }
+}</code></pre>
+<p>What <code>@WebMvcTest</code> earns you that a unit test can't: HTTP status codes, request/response JSON shape, Bean Validation wiring, your <code>@RestControllerAdvice</code> error mapping, content negotiation, and (with Spring Security on the classpath) security rules via <code>@WithMockUser</code>.</p>
+
+<h3>@DataJpaTest — persistence slice</h3>
+<pre><code><span class="ann">@DataJpaTest</span>       <span class="com">// boots JPA + repositories only; each test runs in a rolled-back tx</span>
+<span class="kw">class</span> <span class="typ">OrderRepositoryTest</span> {
+
+    <span class="ann">@Autowired</span> <span class="kw">private</span> OrderRepository repository;
+    <span class="ann">@Autowired</span> <span class="kw">private</span> TestEntityManager em;   <span class="com">// arrange/flush helper, bypasses the repo</span>
+
+    <span class="ann">@Test</span>
+    <span class="kw">void</span> findsPaidOrdersNewerThan() {
+        em.persist(order(<span class="str">"sku-1"</span>, Status.PAID,    daysAgo(<span class="num">1</span>)));
+        em.persist(order(<span class="str">"sku-2"</span>, Status.PAID,    daysAgo(<span class="num">10</span>)));
+        em.persist(order(<span class="str">"sku-3"</span>, Status.PENDING, daysAgo(<span class="num">1</span>)));
+        em.flush();
+        em.clear();   <span class="com">// force the query to hit the DB, not the persistence context</span>
+
+        List&lt;Order&gt; result = repository.findByStatusAndCreatedAtAfter(
+                Status.PAID, daysAgo(<span class="num">3</span>));
+
+        assertThat(result).extracting(Order::getSku).containsExactly(<span class="str">"sku-1"</span>);
+    }
+}</code></pre>
+<div class="pitfall"><p>By default <code>@DataJpaTest</code> swaps your datasource for <strong>in-memory H2</strong>. That means you are not testing against Postgres — see the Testcontainers section for why that's a lie and how to fix it with two annotations. Also note <code>em.flush(); em.clear();</code>: without them, JPA's first-level cache can return the objects you just persisted <em>without ever executing your query's SQL</em>, making broken queries pass.</p></div>
+
+<h3>@SpringBootTest — when it's justified</h3>
+<pre><code><span class="ann">@SpringBootTest</span>(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+<span class="kw">class</span> <span class="typ">OrderE2ETest</span> {
+
+    <span class="ann">@Autowired</span> <span class="kw">private</span> TestRestTemplate rest;   <span class="com">// real HTTP over a real port</span>
+
+    <span class="ann">@Test</span>
+    <span class="kw">void</span> fullOrderLifecycle() {
+        ResponseEntity&lt;OrderResponse&gt; created = rest.postForEntity(
+                <span class="str">"/api/orders"</span>, <span class="kw">new</span> OrderRequest(<span class="str">"sku-1"</span>, <span class="num">2</span>), OrderResponse.<span class="kw">class</span>);
+
+        assertThat(created.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+
+        OrderResponse fetched = rest.getForObject(
+                <span class="str">"/api/orders/"</span> + created.getBody().id(), OrderResponse.<span class="kw">class</span>);
+        assertThat(fetched.status()).isEqualTo(Status.PAID);
+    }
+}</code></pre>
+<p><strong>Justified for:</strong> verifying the whole app wires up (one smoke test that the context loads is genuinely valuable), a handful of critical end-to-end flows, and configuration-heavy behavior (security filter chains + real serialization + real DB together). <strong>Not justified for:</strong> business-logic permutations — that's what the fast layers are for.</p>
+<p><strong>Why it's slow and how Spring mitigates it:</strong> booting the full context takes seconds. Spring <em>caches contexts across test classes</em> keyed by configuration — so 50 <code>@SpringBootTest</code> classes with identical config boot one context total. Every <code>@MockitoBean</code>, <code>@ActiveProfiles</code>, or <code>@TestPropertySource</code> variation forks a new cache entry, and <code>@DirtiesContext</code> throws the context away. Senior move: standardize test configuration so the cache actually hits.</p>
+
+<h3>The test pyramid, senior edition</h3>
+<pre><code>        /  E2E (@SpringBootTest + Testcontainers)  \      few — critical flows only
+       /   slice tests (@WebMvcTest, @DataJpaTest)  \     some — per controller/repo
+      /    unit tests (JUnit + Mockito, no Spring)   \    many — all business logic
+</code></pre>
+<div class="senior"><p>The senior answer isn't "pyramid good" — it's <em>cost/confidence trade-off per layer</em>: push each behavior to the cheapest layer that can falsify it. Validation rules → <code>@WebMvcTest</code>. Discount math → pure unit. Custom JPQL → <code>@DataJpaTest</code> on real Postgres. "Does the app even start with prod-ish config" → one <code>@SpringBootTest</code>. If a bug class can't be caught below E2E (e.g. security filter ordering), that's what E2E budget is for. Also say the quiet part: a slow suite is a broken suite, because people stop running it.</p></div>
+
+<!-- ============================================================ -->
+<h2 id="testcontainers">Testcontainers: real Postgres in your tests <span class="tier tier-2">T2</span></h2>
+
+<p>This is the modern differentiator topic — teams that adopted it can't imagine going back, and mentioning it fluently marks you as current.</p>
+
+<h3>Why H2 lies to you</h3>
+<p>H2 is a Java in-memory database with a "Postgres compatibility mode" that is compatible right up until it isn't:</p>
+<ul>
+<li><strong>Postgres-specific SQL &amp; types:</strong> <code>JSONB</code> columns and operators (<code>-&gt;&gt;</code>, <code>@&gt;</code>), arrays, <code>ON CONFLICT ... DO UPDATE</code> upserts, <code>RETURNING</code>, full-text search — H2 either rejects them or fakes them differently.</li>
+<li><strong>Window functions &amp; CTE edge cases</strong> behave subtly differently or are missing.</li>
+<li><strong>Different transaction/locking semantics</strong>, sequence behavior, case-sensitivity of identifiers, and error codes.</li>
+<li><strong>Your Flyway migrations</strong> are written for Postgres; on H2 you either can't run them or maintain a parallel dialect — so the schema you test isn't the schema you ship.</li>
+</ul>
+<p>Net effect: green H2 tests, production incident on real Postgres. The frontend analogy: testing in jsdom and shipping to Safari — fine until you hit anything real.</p>
+
+<h3>Testcontainers: throwaway Docker containers per test run</h3>
+<p>Testcontainers starts a <em>real Postgres</em> in Docker for your tests and tears it down after. Boot 3.1+ made wiring it one annotation: <code>@ServiceConnection</code> reads the container's host/port/credentials and configures the datasource automatically — no URL property gymnastics.</p>
+
+<pre><code><span class="com">// build.gradle: testImplementation "org.springframework.boot:spring-boot-testcontainers"</span>
+<span class="com">//               testImplementation "org.testcontainers:junit-jupiter"</span>
+<span class="com">//               testImplementation "org.testcontainers:postgresql"</span>
+
+<span class="ann">@DataJpaTest</span>
+<span class="ann">@AutoConfigureTestDatabase</span>(replace = AutoConfigureTestDatabase.Replace.NONE) <span class="com">// keep OUR datasource, don't swap in H2</span>
+<span class="ann">@Testcontainers</span>                       <span class="com">// JUnit extension managing container lifecycle</span>
+<span class="kw">class</span> <span class="typ">OrderRepositoryPostgresTest</span> {
+
+    <span class="ann">@Container</span>
+    <span class="ann">@ServiceConnection</span>                <span class="com">// Boot 3.1+: auto-wires spring.datasource.* from the container</span>
+    <span class="kw">static</span> PostgreSQLContainer&lt;?&gt; postgres =
+            <span class="kw">new</span> PostgreSQLContainer&lt;&gt;(<span class="str">"postgres:16-alpine"</span>);
+
+    <span class="ann">@Autowired</span> <span class="kw">private</span> OrderRepository repository;
+
+    <span class="ann">@Test</span>
+    <span class="kw">void</span> upsertUsesRealOnConflictClause() {
+        <span class="com">// This @Query uses ON CONFLICT (sku) DO UPDATE — impossible to</span>
+        <span class="com">// verify on H2, trivially verified here on genuine Postgres 16.</span>
+        repository.upsert(<span class="str">"sku-1"</span>, <span class="num">5</span>);
+        repository.upsert(<span class="str">"sku-1"</span>, <span class="num">9</span>);
+
+        assertThat(repository.findBySku(<span class="str">"sku-1"</span>).getQuantity()).isEqualTo(<span class="num">9</span>);
+    }
+
+    <span class="ann">@Test</span>
+    <span class="kw">void</span> jsonbQueryFindsByAttribute() {
+        repository.save(orderWithMetadata(<span class="str">"{\"channel\": \"mobile\"}"</span>));
+
+        List&lt;Order&gt; result = repository.findByMetadataChannel(<span class="str">"mobile"</span>);  <span class="com">// metadata-&gt;&gt;'channel'</span>
+
+        assertThat(result).hasSize(<span class="num">1</span>);
+    }
+}</code></pre>
+
+<p>The <code>static</code> on the container matters: JUnit starts a static <code>@Container</code> <strong>once per test class</strong> (instead of per test method). Flyway runs your real production migrations against it, so schema drift is caught too.</p>
+
+<h3>Singleton container pattern — once per JVM, not per class</h3>
+<p>Even once-per-class adds up across 30 repository test classes. The classic pattern shares one container for the whole test run:</p>
+
+<pre><code><span class="com">// A base class; the container is started once, in a static initializer,</span>
+<span class="com">// and deliberately never stopped — Testcontainers' Ryuk sidecar reaps it</span>
+<span class="com">// when the JVM exits.</span>
+<span class="kw">public abstract class</span> <span class="typ">AbstractPostgresTest</span> {
+
+    <span class="kw">static final</span> PostgreSQLContainer&lt;?&gt; POSTGRES =
+            <span class="kw">new</span> PostgreSQLContainer&lt;&gt;(<span class="str">"postgres:16-alpine"</span>).withReuse(<span class="kw">true</span>);
+
+    <span class="kw">static</span> { POSTGRES.start(); }
+
+    <span class="ann">@DynamicPropertySource</span>       <span class="com">// pre-@ServiceConnection way to inject the coordinates</span>
+    <span class="kw">static void</span> props(DynamicPropertyRegistry registry) {
+        registry.add(<span class="str">"spring.datasource.url"</span>,      POSTGRES::getJdbcUrl);
+        registry.add(<span class="str">"spring.datasource.username"</span>, POSTGRES::getUsername);
+        registry.add(<span class="str">"spring.datasource.password"</span>, POSTGRES::getPassword);
+    }
+}
+
+<span class="kw">class</span> <span class="typ">OrderRepositoryTest</span> <span class="kw">extends</span> AbstractPostgresTest { ... }
+<span class="kw">class</span> <span class="typ">CustomerRepositoryTest</span> <span class="kw">extends</span> AbstractPostgresTest { ... }  <span class="com">// same container ✔</span></code></pre>
+
+<p>Alternatively in Boot 3.1+: declare the <code>@ServiceConnection</code> container as a <code>@Bean</code> in a <code>@TestConfiguration(proxyBeanMethods = false)</code> class and <code>@Import</code> it — the context cache then shares it naturally. With <code>.withReuse(true)</code> plus <code>testcontainers.reuse.enable=true</code> in <code>~/.testcontainers.properties</code>, the container even survives <em>between</em> test runs on your dev machine — near-instant local feedback.</p>
+
+<div class="note"><p>Awareness: the same pattern covers the rest of your infrastructure — <code>KafkaContainer</code>, Redis via <code>GenericContainer("redis:7")</code>, <code>LocalStackContainer</code> for AWS APIs, even a browser for Selenium. One line each with <code>@ServiceConnection</code> support for Kafka/Redis in recent Boot versions. CI needs a Docker daemon (standard on GitHub Actions runners).</p></div>
+
+<div class="senior"><p>Trade-off framing for interviews: Testcontainers tests are integration tests — seconds, not milliseconds. You don't replace unit tests with them; you replace the <em>lying</em> H2 layer with them, keep the count moderate, and use the singleton pattern + context caching so the whole suite still runs in a couple of minutes. Cleanup between tests matters too: <code>@DataJpaTest</code>'s per-test rollback still applies; for <code>@SpringBootTest</code> flows, truncate tables in <code>@BeforeEach</code> or use SQL scripts via <code>@Sql</code>.</p></div>
+
+<!-- ============================================================ -->
+<h2 id="contract-testing">Contract testing, WireMock &amp; test-quality awareness <span class="tier tier-3">T3</span></h2>
+
+<h3>Contract testing — why microservices need it</h3>
+<p>Problem: service A's tests mock service B; service B's tests mock service A. Both suites are green while the <em>real</em> API drifted — B renamed a field, A still expects the old one, and nobody finds out until staging (or production). Mocks encode <em>assumptions</em>, and nothing verifies the assumptions.</p>
+<p><strong>Consumer-driven contracts</strong> fix this: the consumer records its expectations of the provider as a machine-readable contract; the provider's CI replays those contracts against the <em>real</em> provider code. Drift breaks the provider's build, not production.</p>
+<ul>
+<li><strong>Spring Cloud Contract:</strong> contracts as Groovy/YAML in the provider repo; generates provider-side verification tests and consumer-side stubs.</li>
+<li><strong>Pact:</strong> polyglot (you may know <code>pact-js</code> from the frontend world — same tool, JVM flavor); consumer tests generate pact files, shared via a Pact Broker, provider verifies them.</li>
+</ul>
+<p>Awareness depth is enough: know the problem (API drift between independently deployed services), the mechanism (consumer expectations verified against the real provider), and the two tool names.</p>
+
+<h3>WireMock — stubbing external HTTP</h3>
+<p>When your service calls a third-party API (payment provider, geocoder), you can't mock <code>RestClient</code> meaningfully and you can't call the real thing in CI. WireMock runs a real local HTTP server that returns canned responses — <code>msw</code>/<code>nock</code> for the JVM, exercising your <em>actual</em> HTTP client, serialization, timeouts and error handling:</p>
+
+<pre><code><span class="com">// testImplementation "org.wiremock:wiremock-standalone"</span>
+<span class="ann">@SpringBootTest</span>
+<span class="kw">class</span> <span class="typ">PaymentClientTest</span> {
+
+    <span class="kw">static</span> WireMockServer wireMock = <span class="kw">new</span> WireMockServer(<span class="num">0</span>);  <span class="com">// random port</span>
+
+    <span class="ann">@BeforeAll</span>  <span class="kw">static void</span> start() { wireMock.start(); }
+    <span class="ann">@AfterAll</span>   <span class="kw">static void</span> stop()  { wireMock.stop(); }
+    <span class="ann">@AfterEach</span>  <span class="kw">void</span> reset()         { wireMock.resetAll(); }
+
+    <span class="ann">@DynamicPropertySource</span>
+    <span class="kw">static void</span> props(DynamicPropertyRegistry r) {
+        r.add(<span class="str">"payment.api.base-url"</span>, wireMock::baseUrl);  <span class="com">// point client at the stub</span>
+    }
+
+    <span class="ann">@Autowired</span> PaymentClient client;
+
+    <span class="ann">@Test</span>
+    <span class="kw">void</span> mapsDeclinedResponseToDomainException() {
+        wireMock.stubFor(post(urlEqualTo(<span class="str">"/v1/charges"</span>))
+                .willReturn(aResponse()
+                        .withStatus(<span class="num">402</span>)
+                        .withHeader(<span class="str">"Content-Type"</span>, <span class="str">"application/json"</span>)
+                        .withBody(<span class="str">"""
+                            {"error": "card_declined", "code": "insufficient_funds"}
+                            """</span>)));
+
+        assertThatThrownBy(() -&gt; client.charge(testCard()))
+                .isInstanceOf(PaymentDeclinedException.<span class="kw">class</span>)
+                .hasMessageContaining(<span class="str">"insufficient_funds"</span>);
+    }
+
+    <span class="ann">@Test</span>
+    <span class="kw">void</span> timesOutSlowProvider() {
+        wireMock.stubFor(post(urlEqualTo(<span class="str">"/v1/charges"</span>))
+                .willReturn(aResponse().withFixedDelay(<span class="num">5000</span>)));  <span class="com">// slower than client timeout</span>
+
+        assertThatThrownBy(() -&gt; client.charge(testCard()))
+                .isInstanceOf(PaymentUnavailableException.<span class="kw">class</span>);
+    }
+}</code></pre>
+
+<h3>Test data builders — taming Java's arrange phase</h3>
+<p>Java test setup gets verbose fast. The builder pattern with sensible defaults keeps tests focused on what varies (think a typed <code>factory</code> function / fishery in TS):</p>
+<pre><code><span class="kw">public class</span> <span class="typ">OrderTestBuilder</span> {
+    <span class="kw">private</span> String sku = <span class="str">"sku-default"</span>;         <span class="com">// every field has a valid default</span>
+    <span class="kw">private int</span> quantity = <span class="num">1</span>;
+    <span class="kw">private</span> Status status = Status.NEW;
+    <span class="kw">private</span> Instant createdAt = Instant.now();
+
+    <span class="kw">public static</span> OrderTestBuilder anOrder() { <span class="kw">return new</span> OrderTestBuilder(); }
+
+    <span class="kw">public</span> OrderTestBuilder paid()             { <span class="kw">this</span>.status = Status.PAID; <span class="kw">return this</span>; }
+    <span class="kw">public</span> OrderTestBuilder withSku(String s)  { <span class="kw">this</span>.sku = s; <span class="kw">return this</span>; }
+    <span class="kw">public</span> OrderTestBuilder createdDaysAgo(<span class="kw">int</span> d) {
+        <span class="kw">this</span>.createdAt = Instant.now().minus(Duration.ofDays(d)); <span class="kw">return this</span>;
+    }
+    <span class="kw">public</span> Order build() { <span class="kw">return new</span> Order(sku, quantity, status, createdAt); }
+}
+
+<span class="com">// In tests — reads like the requirement:</span>
+Order stale = anOrder().paid().createdDaysAgo(<span class="num">10</span>).build();</code></pre>
+
+<h3>Coverage honesty &amp; mutation testing (awareness)</h3>
+<p>Line coverage (JaCoCo on the JVM, ≈ Istanbul) measures what <em>executed</em>, not what was <em>verified</em> — a test with zero assertions can produce 100% coverage. <strong>Mutation testing</strong> (PIT/pitest for Java, ≈ Stryker in JS) measures test quality directly: it mutates your code (flip a <code>&gt;</code> to <code>&gt;=</code>, delete a call) and checks that some test fails. Surviving mutants = code your suite executes but doesn't actually check. Senior stance: coverage thresholds as a <em>tripwire</em>, never a target (Goodhart's law); run mutation testing occasionally on critical packages rather than every build (it's expensive).</p>
+
+<!-- ============================================================ -->
+<h2 id="qa">Interview Q&amp;A</h2>
+
+<details class="qa"><summary>What is a cross-cutting concern, and how does Spring AOP address it?</summary><div class="answer"><p>A concern that spans many modules regardless of their business purpose — logging, timing, transactions, security, caching, retries. Without AOP each method repeats the same wrapper boilerplate. Spring AOP extracts that into an <em>aspect</em>: advice code plus a pointcut selecting which method executions (join points) it wraps. Spring implements this with runtime proxies — the container hands you a wrapper object instead of your bean, and the wrapper runs advice around delegated calls. Result: business methods contain only business logic, and the concern is defined once.</p></div></details>
+
+<details class="qa"><summary>Explain the difference between JDK dynamic proxies and CGLIB proxies. Which does Spring Boot use?</summary><div class="answer"><p>JDK dynamic proxies use <code>java.lang.reflect.Proxy</code> to generate, at runtime, a class implementing the target's <em>interfaces</em> — so they require an interface and you must inject by the interface type. CGLIB generates a <em>subclass</em> of the concrete class, overriding its public methods — no interface needed, but the class and advised methods can't be <code>final</code>. Spring Framework's classic default was JDK proxies when an interface exists; <strong>Spring Boot defaults to CGLIB for everything</strong> (<code>proxyTargetClass=true</code>) so that injecting by concrete class always works. Bonus point: since Spring 6, CGLIB is repackaged inside spring-core, not a separate dependency.</p></div></details>
+
+<details class="qa"><summary>My @Transactional method doesn't open a transaction. Walk me through your debugging checklist.</summary><div class="answer"><p>In order of likelihood: (1) <strong>Self-invocation</strong> — is the method called via <code>this.method()</code> from another method in the same class? That bypasses the proxy entirely. Fix by extracting to another bean or self-injecting via <code>ObjectProvider</code>. (2) <strong>Method visibility</strong> — is it public? Proxies can't advise private methods; historically only public was supported. (3) <strong>Is the object a Spring bean at all?</strong> If it was created with <code>new</code>, there's no proxy. (4) <strong>Is the method or class <code>final</code>?</strong> CGLIB can't override it. (5) Is the exception checked? Default rollback rules only cover unchecked exceptions — the transaction exists but commits anyway. (6) Rarely: wrong <code>@Transactional</code> import (jakarta vs Spring — both work in Boot but with different attribute sets), or no transaction manager configured. I'd verify by logging <code>TransactionSynchronizationManager.isActualTransactionActive()</code> or enabling <code>org.springframework.transaction</code> DEBUG logs.</p></div></details>
+
+<details class="qa"><summary>What exactly happens on self-invocation, and what are the fixes?</summary><div class="answer"><p>The proxy wraps the target object; advice runs only when a call enters <em>through the proxy reference</em>. Inside the target, <code>this</code> is the raw target, so <code>this.otherMethod()</code> is a plain Java call that never touches the proxy — any <code>@Transactional</code>/<code>@Cacheable</code>/<code>@Async</code> on <code>otherMethod</code> silently no-ops. Fixes: (1) <em>preferred</em> — extract the advised method into a separate bean and inject it, which usually improves the design anyway; (2) self-inject the bean via <code>ObjectProvider&lt;Self&gt;</code> (lazy, avoids circular-dependency issues) and call <code>self.getObject().otherMethod()</code>; (3) <code>AopContext.currentProxy()</code> with <code>exposeProxy=true</code> — works but couples business code to AOP internals, I'd push back on it in review. AspectJ compile-time weaving also solves it but is a heavy hammer.</p></div></details>
+
+<details class="qa"><summary>Name the five advice types and when you'd choose @Around vs the others.</summary><div class="answer"><p><code>@Before</code> (pre-call), <code>@AfterReturning</code> (successful return, can read the value), <code>@AfterThrowing</code> (exception escaped), <code>@After</code> (finally-style, either way), and <code>@Around</code>, which receives a <code>ProceedingJoinPoint</code> and fully controls the invocation — it can modify arguments, skip the call, replace the return value, catch/translate exceptions, and measure time across the whole call. Rule of thumb: use the <em>least powerful</em> advice that works, because <code>@Around</code>'s power is also its risk — forgetting <code>proceed()</code> silently prevents the target from running, and swallowing its exception hides failures. Timing and caching genuinely need <code>@Around</code>; simple logging usually only needs <code>@Before</code>/<code>@AfterThrowing</code>.</p></div></details>
+
+<details class="qa"><summary>What are the limitations of Spring AOP compared to full AspectJ?</summary><div class="answer"><p>Spring AOP is proxy-based and runtime-only, so it can only intercept <strong>public method executions on Spring-managed beans, called from outside the object</strong>. It cannot advise: self-invocations, private/protected methods, <code>final</code> methods/classes, static methods, constructors, field access, or objects created with <code>new</code>. AspectJ weaves bytecode (compile-time or load-time) and can do all of those, at the cost of build/agent complexity. In practice Spring AOP covers ~95% of real needs, and its limitations are the same ones that explain <code>@Transactional</code>'s rules — which is why understanding proxies pays off across the whole framework.</p></div></details>
+
+<details class="qa"><summary>How does @Cacheable work, and what are two gotchas?</summary><div class="answer"><p>With <code>@EnableCaching</code>, Spring wraps the bean in a proxy whose around-advice computes a cache key (from parameters, customizable via SpEL in <code>key</code>), checks the configured <code>CacheManager</code>, and only invokes the method body on a miss, storing the result afterwards. <code>@CacheEvict</code>/<code>@CachePut</code> handle invalidation and forced refresh. Gotchas: (1) self-invocation — an internal call never hits the caching advice, so it recomputes every time; (2) with the default in-memory store, cached values are shared object references — mutating a returned entity corrupts the cache; (3) bonus: null handling and cache stampedes on hot keys need explicit thought (<code>sync=true</code> helps with stampedes).</p></div></details>
+
+<details class="qa"><summary>What are the gotchas of @Async?</summary><div class="answer"><p>(1) It requires <code>@EnableAsync</code> — without it, the annotation is silently ignored. (2) Same proxy rules: self-invoked <code>@Async</code> methods run synchronously. (3) <strong>Exception swallowing:</strong> for a <code>void</code> method, exceptions never reach the caller — they go to an <code>AsyncUncaughtExceptionHandler</code> that by default just logs; returning <code>CompletableFuture</code> puts the exception in the future, but it only surfaces if someone actually joins it — the JVM's unhandled promise rejection. (4) The default executor should be replaced with a tuned <code>ThreadPoolTaskExecutor</code>; unbounded queues or too-small pools cause invisible latency. (5) Thread-locals (security context, MDC, transaction) don't propagate to the async thread by default.</p></div></details>
+
+<details class="qa"><summary>How do JUnit 5 and Jest differ in test isolation?</summary><div class="answer"><p>Jest isolates via module registry resets and fresh closures per test file; state inside a <code>describe</code> persists across <code>it</code>s unless reset. JUnit 5 creates a <strong>new instance of the test class for every test method</strong> (default <code>PER_METHOD</code> lifecycle), so instance fields are automatically fresh — <code>@BeforeEach</code> is for setup logic, not for resetting fields. Static state (and <code>@BeforeAll</code>, which must be static by default) is shared. You can opt into <code>@TestInstance(PER_CLASS)</code> to share one instance, which is occasionally useful for expensive non-static setup. Structurally, <code>@Nested</code> classes ≈ <code>describe</code> blocks, <code>@DisplayName</code> ≈ the test string, <code>@ParameterizedTest</code> ≈ <code>it.each</code>.</p></div></details>
+
+<details class="qa"><summary>Why prefer AssertJ over JUnit's built-in assertions?</summary><div class="answer"><p>Three reasons: (1) <strong>readability/discoverability</strong> — <code>assertThat(actual)</code> puts the actual value first (like Jest's <code>expect</code>) and the fluent API autocompletes to type-appropriate assertions; JUnit's <code>assertEquals(expected, actual)</code> argument order is a chronic source of confusing failure messages. (2) <strong>Failure messages</strong> — AssertJ diffs collections, shows which elements were missing/unexpected, etc. (3) <strong>Rich collection/exception support</strong> — <code>extracting()</code>, <code>containsExactlyInAnyOrder()</code>, <code>assertThatThrownBy().hasMessageContaining()</code> replace loops and try/catch in tests. It ships in <code>spring-boot-starter-test</code>, so there's no cost to adopting it.</p></div></details>
+
+<details class="qa"><summary>Explain @Mock vs @Spy vs @InjectMocks vs @MockitoBean.</summary><div class="answer"><p><code>@Mock</code> creates a full stub — every method returns default values until stubbed (≈ <code>jest.fn()</code> for the whole object). <code>@Spy</code> wraps a real object — real methods execute unless explicitly stubbed with <code>doReturn().when()</code> (≈ <code>jest.spyOn</code>); needing one is often a design smell. <code>@InjectMocks</code> instantiates the <em>real</em> class under test and injects the <code>@Mock</code>s into its constructor — all plain Mockito, no Spring context, activated by <code>@ExtendWith(MockitoExtension.class)</code>. <code>@MockitoBean</code> is different in kind: it's a <em>Spring test</em> annotation that replaces a bean <strong>inside the Spring application context</strong> with a mock — used in slice tests like <code>@WebMvcTest</code>. It replaced <code>@MockBean</code>, which is deprecated since Boot 3.4. Rule: no context → <code>@Mock</code>; context → <code>@MockitoBean</code>.</p></div></details>
+
+<details class="qa"><summary>What's the argument-matcher mixing rule in Mockito and why does it exist?</summary><div class="answer"><p>If any argument in a stub/verify uses a matcher (<code>any()</code>, <code>anyLong()</code>, <code>argThat()</code>), then <em>all</em> arguments must be matchers — wrap literals with <code>eq()</code>: <code>verify(repo).find(eq(Tier.GOLD), anyBoolean())</code>. Mixing raw values and matchers throws <code>InvalidUseOfMatchersException</code> at runtime. The reason is mechanical: matchers don't pass values, they push markers onto a thread-local stack as a side effect, and Mockito pops them positionally when the mocked call is recorded — a raw value in the middle desynchronizes the stack. Jest has no analogue because <code>expect.any()</code> returns real objects compared structurally.</p></div></details>
+
+<details class="qa"><summary>When would you use an ArgumentCaptor, and what's the alternative?</summary><div class="answer"><p>Use it when the behavior under test is <em>what your code constructed and passed to a collaborator</em> — e.g. the service builds a <code>User</code> with normalized email and hashed password and hands it to <code>repository.save()</code>. <code>verify(repo).save(captor.capture())</code> then rich AssertJ assertions on <code>captor.getValue()</code> beats trying to build the exact expected object for an equality match. Alternative: <code>verify(repo).save(argThat(u -&gt; u.email().equals("ada@example.com")))</code> — fine for one condition, but captor + assertThat gives far better failure messages for multi-property checks. Anti-pattern to mention: capturing arguments merely to re-verify things already asserted elsewhere — captors are for genuinely important outputs.</p></div></details>
+
+<details class="qa"><summary>What does @WebMvcTest actually load, and what belongs in that layer's tests?</summary><div class="answer"><p>It boots only the MVC slice: the specified controller(s), Jackson converters, Bean Validation, <code>@ControllerAdvice</code> exception handlers, filters, and (if present) the Spring Security filter chain — no services, no repositories, no datasource. Collaborators are provided as <code>@MockitoBean</code>s. Tests drive it through <code>MockMvc</code> (mocked servlet infrastructure — no real port; ≈ supertest against the Express app). What belongs here: HTTP semantics — routing, status codes, request/response JSON shape via <code>jsonPath</code>, validation failures producing correct error bodies, exception-to-status mapping, headers, and security rules with <code>@WithMockUser</code>. What doesn't: business logic permutations — those are stubbed here and unit-tested in the service.</p></div></details>
+
+<details class="qa"><summary>Why is @SpringBootTest slow, and how does Spring keep suites tolerable?</summary><div class="answer"><p>It bootstraps the entire application context — component scan, all beans, auto-configuration, connection pools — which costs seconds per distinct context. Spring's mitigation is the <strong>context cache</strong>: contexts are cached across test classes within a JVM keyed by their full configuration (classes, profiles, properties, bean overrides). Fifty test classes with identical configuration boot one context. What breaks the cache: each distinct combination of <code>@MockitoBean</code>s, <code>@ActiveProfiles</code>, <code>@TestPropertySource</code>, or <code>@DirtiesContext</code> forces a new (or discarded) context. Senior practice: standardize a small number of test configurations (e.g. one shared base class for integration tests), watch for accidental cache-key drift, and keep <code>@SpringBootTest</code> count low by pushing checks down to slices and unit tests.</p></div></details>
+
+<details class="qa"><summary>Why can H2 pass tests that fail on Postgres? Give concrete examples.</summary><div class="answer"><p>H2 is a different database engine with a Postgres <em>compatibility mode</em>, not Postgres. Concrete divergences: <code>JSONB</code> columns and operators (<code>-&gt;&gt;</code>, <code>@&gt;</code>) aren't really supported; <code>ON CONFLICT ... DO UPDATE</code> upserts and <code>RETURNING</code> differ; window functions and CTE edge cases behave differently; identifier case-sensitivity, sequence allocation, locking semantics, and error codes all differ. Worse, your Flyway migrations are written in Postgres dialect — on H2 you either can't run them or maintain a parallel set, so the tested schema isn't the shipped schema. Any native query or Postgres-specific feature is therefore untested until production. The fix is Testcontainers: run the real Postgres image in Docker during tests.</p></div></details>
+
+<details class="qa"><summary>Walk me through setting up Testcontainers Postgres in Boot 3.x. What does @ServiceConnection do?</summary><div class="answer"><p>Dependencies: <code>spring-boot-testcontainers</code>, <code>testcontainers:junit-jupiter</code>, <code>testcontainers:postgresql</code>. On the test class: <code>@Testcontainers</code> (JUnit extension managing lifecycle), a <code>static</code> field <code>@Container @ServiceConnection PostgreSQLContainer&lt;?&gt; postgres = new PostgreSQLContainer&lt;&gt;("postgres:16-alpine")</code>, and for <code>@DataJpaTest</code> also <code>@AutoConfigureTestDatabase(replace = NONE)</code> so Boot doesn't swap in H2. <code>@ServiceConnection</code> (Boot 3.1+) inspects the container type and auto-populates the matching connection properties — URL, username, password for a datasource; bootstrap servers for Kafka — replacing the older <code>@DynamicPropertySource</code> boilerplate. <code>static</code> means once per class; for suite-wide sharing use the singleton pattern (static initializer in a base class, or a <code>@TestConfiguration</code> bean shared via context caching) plus optionally <code>withReuse(true)</code> for cross-run reuse locally.</p></div></details>
+
+<details class="qa"><summary>You inherit a suite that's 400 @SpringBootTest classes taking 40 minutes. Plan?</summary><div class="answer"><p>(1) <strong>Measure first</strong>: how many distinct contexts are being created (Spring logs context creation; the cache size is the multiplier), which tests are slowest. (2) <strong>Fix cache churn</strong> — consolidate <code>@MockitoBean</code>/profile/property variations into a handful of shared configurations; hunt down <code>@DirtiesContext</code>. That alone often halves runtime with zero test rewrites. (3) <strong>Demote tests down the pyramid</strong>: business-logic tests hiding inside <code>@SpringBootTest</code> become plain Mockito unit tests; controller-shape tests become <code>@WebMvcTest</code>; query tests become <code>@DataJpaTest</code> on a singleton Testcontainer. (4) Parallelize what remains (JUnit parallel execution / Gradle forks — mind shared DB state). (5) Ratchet: fail CI if context count grows. Frame it as an incremental migration with the fast-feedback win stated in minutes, not ideology.</p></div></details>
+
+<details class="qa"><summary>What is consumer-driven contract testing and when is it worth adopting?</summary><div class="answer"><p>It solves mock drift between independently deployed services: consumer tests stub the provider, provider tests stub the consumer, both green while the real API diverged. In CDC, the <em>consumer</em> publishes machine-readable expectations (a contract/pact: "POST /v1/charges with this shape returns 201 with that shape"); the <em>provider's</em> CI replays those contracts against real provider code, so a breaking change fails the provider's build before deployment — and consumers get auto-generated stubs guaranteed to match. Tools: Spring Cloud Contract (JVM-centric, contracts in the provider repo) and Pact (polyglot, broker-based — the same Pact known from pact-js). Worth it when: multiple teams deploy services independently and integration bugs are escaping to staging. Overkill for: a monolith, or two services owned by one team who can just run real integration tests together.</p></div></details>
+
+<details class="qa"><summary>A service has 92% line coverage. Is it well-tested? How would you actually find out?</summary><div class="answer"><p>Unknown — coverage measures execution, not verification. A test that calls code and asserts nothing produces coverage; assertions that check the wrong thing produce coverage; the missing 8% might contain the only genuinely risky branches. To assess quality: (1) read a sample of tests — do they assert observable behavior or mirror implementation via stub-then-verify-the-stubs? (2) run <strong>mutation testing</strong> (PIT/pitest, ≈ Stryker in JS): it mutates the code (invert conditionals, remove calls) and reports mutants no test kills — surviving mutants in critical code are directly actionable; (3) check the layer mix — is Postgres-specific SQL tested on Postgres or on H2? (4) check what coverage <em>excludes</em> (generated code, config). Senior stance: coverage thresholds as a tripwire against regressions in test discipline, never as a target — Goodhart's law applies immediately.</p></div></details>
+
+<!-- ============================================================ -->
+<h2 id="exercises">Hands-on exercises</h2>
+
+<div class="exercise">
+<h4>Exercise 1 — Build an audit aspect</h4>
+<p>Create a custom <code>@Audited(action = "...")</code> annotation and an aspect that, after a successful method return, records who did what: the annotation's <code>action</code>, the method name, and the current username (assume a <code>CurrentUserProvider</code> bean). On exception, record a failed audit entry instead. Use the appropriate advice types (not everything needs <code>@Around</code>).</p>
+<details><summary>Solution</summary>
+<pre><code><span class="ann">@Target</span>(ElementType.METHOD)
+<span class="ann">@Retention</span>(RetentionPolicy.RUNTIME)
+<span class="kw">public</span> <span class="ann">@interface</span> <span class="typ">Audited</span> {
+    String action();
+}
+
+<span class="ann">@Aspect</span>
+<span class="ann">@Component</span>
+<span class="ann">@RequiredArgsConstructor</span>
+<span class="kw">public class</span> <span class="typ">AuditAspect</span> {
+
+    <span class="kw">private final</span> AuditLog auditLog;
+    <span class="kw">private final</span> CurrentUserProvider currentUser;
+
+    <span class="ann">@AfterReturning</span>(<span class="str">"@annotation(audited)"</span>)
+    <span class="kw">public void</span> onSuccess(JoinPoint jp, Audited audited) {
+        auditLog.record(AuditEntry.success(
+                audited.action(),
+                jp.getSignature().toShortString(),
+                currentUser.username()));
+    }
+
+    <span class="ann">@AfterThrowing</span>(pointcut = <span class="str">"@annotation(audited)"</span>, throwing = <span class="str">"ex"</span>)
+    <span class="kw">public void</span> onFailure(JoinPoint jp, Audited audited, Exception ex) {
+        auditLog.record(AuditEntry.failure(
+                audited.action(),
+                jp.getSignature().toShortString(),
+                currentUser.username(),
+                ex.getClass().getSimpleName()));
+    }
+}
+
+<span class="com">// Usage:</span>
+<span class="ann">@Audited</span>(action = <span class="str">"ORDER_CANCELLED"</span>)
+<span class="kw">public void</span> cancel(Long orderId) { ... }</code></pre>
+<p>Note the deliberate choice of <code>@AfterReturning</code>/<code>@AfterThrowing</code> over <code>@Around</code>: this aspect cannot accidentally swallow the return value or the exception. Binding <code>audited</code> in the pointcut expression gives type-safe access to the annotation's attributes.</p>
+</details>
+</div>
+
+<div class="exercise">
+<h4>Exercise 2 — Diagnose and fix the silent no-op</h4>
+<p>The following class is buggy: the cache never populates and each import doesn't get its own transaction. Explain exactly why, then fix it two different ways.</p>
+<pre><code><span class="ann">@Service</span>
+<span class="kw">public class</span> <span class="typ">CatalogService</span> {
+
+    <span class="kw">public void</span> refreshAll(List&lt;String&gt; skus) {
+        <span class="kw">for</span> (String sku : skus) {
+            importOne(sku);
+            Product p = findCached(sku);   <span class="com">// warm the cache?</span>
+        }
+    }
+
+    <span class="ann">@Transactional</span>(propagation = Propagation.REQUIRES_NEW)
+    <span class="kw">public void</span> importOne(String sku) { ... }
+
+    <span class="ann">@Cacheable</span>(<span class="str">"products"</span>)
+    <span class="kw">public</span> Product findCached(String sku) { ... }
+}</code></pre>
+<details><summary>Solution</summary>
+<p><strong>Diagnosis:</strong> <code>refreshAll</code> calls <code>importOne</code> and <code>findCached</code> through <code>this</code> — plain Java calls on the target object that never pass through the CGLIB proxy. The transactional advice and the caching advice therefore never run: no <code>REQUIRES_NEW</code> transaction per import (everything joins whatever transaction the outer caller has, or none), and every <code>findCached</code> executes the body, never touching the cache.</p>
+<p><strong>Fix A — extract a worker bean (preferred):</strong></p>
+<pre><code><span class="ann">@Service</span>
+<span class="ann">@RequiredArgsConstructor</span>
+<span class="kw">public class</span> <span class="typ">CatalogRefresher</span> {
+    <span class="kw">private final</span> CatalogService catalog;   <span class="com">// injected → proxied</span>
+
+    <span class="kw">public void</span> refreshAll(List&lt;String&gt; skus) {
+        <span class="kw">for</span> (String sku : skus) {
+            catalog.importOne(sku);      <span class="com">// crosses the proxy ✔</span>
+            catalog.findCached(sku);     <span class="com">// caching advice runs ✔</span>
+        }
+    }
+}</code></pre>
+<p><strong>Fix B — self-injection:</strong></p>
+<pre><code><span class="ann">@Service</span>
+<span class="kw">public class</span> <span class="typ">CatalogService</span> {
+    <span class="kw">private final</span> ObjectProvider&lt;CatalogService&gt; self;
+
+    <span class="kw">public</span> CatalogService(ObjectProvider&lt;CatalogService&gt; self) { <span class="kw">this</span>.self = self; }
+
+    <span class="kw">public void</span> refreshAll(List&lt;String&gt; skus) {
+        <span class="kw">for</span> (String sku : skus) {
+            self.getObject().importOne(sku);
+            self.getObject().findCached(sku);
+        }
+    }
+    <span class="com">// annotated methods unchanged</span>
+}</code></pre>
+<p>Prefer Fix A: orchestration and per-item work are separate responsibilities, and the resulting classes are easier to test independently.</p>
+</details>
+</div>
+
+<div class="exercise">
+<h4>Exercise 3 — Unit-test a service with Mockito + ArgumentCaptor</h4>
+<p>Given <code>TransferService.transfer(fromId, toId, amount)</code> which loads both accounts from <code>AccountRepository</code>, debits/credits them, saves both, and publishes a <code>TransferCompleted</code> event via <code>EventPublisher</code> — write a plain Mockito test (no Spring) proving: both accounts saved with correct balances (use a captor), the event carries the right amount, and that an insufficient balance throws and publishes <em>nothing</em>.</p>
+<details><summary>Solution</summary>
+<pre><code><span class="ann">@ExtendWith</span>(MockitoExtension.<span class="kw">class</span>)
+<span class="kw">class</span> <span class="typ">TransferServiceTest</span> {
+
+    <span class="ann">@Mock</span>        AccountRepository accounts;
+    <span class="ann">@Mock</span>        EventPublisher events;
+    <span class="ann">@InjectMocks</span> TransferService service;
+
+    <span class="ann">@Captor</span> ArgumentCaptor&lt;Account&gt; accountCaptor;
+
+    <span class="ann">@Test</span>
+    <span class="kw">void</span> transfersAndPublishesEvent() {
+        given(accounts.findById(<span class="num">1L</span>)).willReturn(Optional.of(account(<span class="num">1L</span>, <span class="str">"100.00"</span>)));
+        given(accounts.findById(<span class="num">2L</span>)).willReturn(Optional.of(account(<span class="num">2L</span>, <span class="str">"50.00"</span>)));
+
+        service.transfer(<span class="num">1L</span>, <span class="num">2L</span>, <span class="kw">new</span> BigDecimal(<span class="str">"30.00"</span>));
+
+        verify(accounts, times(<span class="num">2</span>)).save(accountCaptor.capture());
+        assertThat(accountCaptor.getAllValues())
+                .extracting(Account::getId, Account::getBalance)
+                .containsExactlyInAnyOrder(
+                        tuple(<span class="num">1L</span>, <span class="kw">new</span> BigDecimal(<span class="str">"70.00"</span>)),
+                        tuple(<span class="num">2L</span>, <span class="kw">new</span> BigDecimal(<span class="str">"80.00"</span>)));
+
+        verify(events).publish(argThat((TransferCompleted e) -&gt;
+                e.amount().compareTo(<span class="kw">new</span> BigDecimal(<span class="str">"30.00"</span>)) == <span class="num">0</span>));
+    }
+
+    <span class="ann">@Test</span>
+    <span class="kw">void</span> insufficientBalanceThrowsAndPublishesNothing() {
+        given(accounts.findById(<span class="num">1L</span>)).willReturn(Optional.of(account(<span class="num">1L</span>, <span class="str">"10.00"</span>)));
+        given(accounts.findById(<span class="num">2L</span>)).willReturn(Optional.of(account(<span class="num">2L</span>, <span class="str">"50.00"</span>)));
+
+        assertThatThrownBy(() -&gt; service.transfer(<span class="num">1L</span>, <span class="num">2L</span>, <span class="kw">new</span> BigDecimal(<span class="str">"30.00"</span>)))
+                .isInstanceOf(InsufficientBalanceException.<span class="kw">class</span>);
+
+        verify(accounts, never()).save(any());
+        verifyNoInteractions(events);
+    }
+
+    <span class="kw">private static</span> Account account(<span class="kw">long</span> id, String balance) {
+        <span class="kw">return new</span> Account(id, <span class="kw">new</span> BigDecimal(balance));
+    }
+}</code></pre>
+<p>Notes: <code>getAllValues()</code> collects every captured argument across the two <code>save</code> calls; AssertJ's <code>tuple</code> keeps the multi-property assertion readable. The failure test asserts both the exception <em>and</em> the absence of side effects — the latter is the business-critical part.</p>
+</details>
+</div>
+
+<div class="exercise">
+<h4>Exercise 4 — Controller slice test with validation errors</h4>
+<p>Write a <code>@WebMvcTest</code> for <code>POST /api/customers</code> accepting <code>{"name": "...", "email": "..."}</code> where name is <code>@NotBlank</code> and email is <code>@Email</code>. Cover: 201 + Location header on success; 400 with both field errors when both fields are invalid (assert the error body and that the service was never called).</p>
+<details><summary>Solution</summary>
+<pre><code><span class="ann">@WebMvcTest</span>(CustomerController.<span class="kw">class</span>)
+<span class="kw">class</span> <span class="typ">CustomerControllerTest</span> {
+
+    <span class="ann">@Autowired</span>   MockMvc mockMvc;
+    <span class="ann">@MockitoBean</span> CustomerService customerService;
+
+    <span class="ann">@Test</span>
+    <span class="kw">void</span> createsCustomer() <span class="kw">throws</span> Exception {
+        given(customerService.create(any()))
+                .willReturn(<span class="kw">new</span> CustomerResponse(<span class="num">7L</span>, <span class="str">"Ada"</span>, <span class="str">"ada@example.com"</span>));
+
+        mockMvc.perform(post(<span class="str">"/api/customers"</span>)
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .content(<span class="str">"""
+                        {"name": "Ada", "email": "ada@example.com"}
+                        """</span>))
+               .andExpect(status().isCreated())
+               .andExpect(header().string(<span class="str">"Location"</span>, <span class="str">"/api/customers/7"</span>))
+               .andExpect(jsonPath(<span class="str">"$.name"</span>).value(<span class="str">"Ada"</span>));
+    }
+
+    <span class="ann">@Test</span>
+    <span class="kw">void</span> rejectsInvalidBodyWithFieldErrors() <span class="kw">throws</span> Exception {
+        mockMvc.perform(post(<span class="str">"/api/customers"</span>)
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .content(<span class="str">"""
+                        {"name": "", "email": "not-an-email"}
+                        """</span>))
+               .andExpect(status().isBadRequest())
+               .andExpect(jsonPath(<span class="str">"$.errors.length()"</span>).value(<span class="num">2</span>))
+               .andExpect(jsonPath(<span class="str">"$.errors[?(@.field=='name')]"</span>).exists())
+               .andExpect(jsonPath(<span class="str">"$.errors[?(@.field=='email')]"</span>).exists());
+
+        then(customerService).shouldHaveNoInteractions();
+    }
+}</code></pre>
+<p>The second test exercises three things you'd otherwise never cover in unit tests: Bean Validation wiring on the DTO, your <code>@RestControllerAdvice</code>'s <code>MethodArgumentNotValidException</code> handler producing the error body shape, and the guarantee that invalid input never reaches the service.</p>
+</details>
+</div>
+
+<div class="exercise">
+<h4>Exercise 5 — Repository test on real Postgres with Testcontainers</h4>
+<p>You have a native query using Postgres's <code>ON CONFLICT</code>: <code>InventoryRepository.upsertStock(sku, qty)</code>. Write a <code>@DataJpaTest</code> that runs against a real <code>postgres:16-alpine</code> container using <code>@ServiceConnection</code>, verifies the upsert behavior (second call updates, doesn't duplicate), and explain the two extra annotations needed beyond a plain <code>@DataJpaTest</code>.</p>
+<details><summary>Solution</summary>
+<pre><code><span class="ann">@DataJpaTest</span>
+<span class="ann">@AutoConfigureTestDatabase</span>(replace = AutoConfigureTestDatabase.Replace.NONE)
+<span class="ann">@Testcontainers</span>
+<span class="kw">class</span> <span class="typ">InventoryRepositoryTest</span> {
+
+    <span class="ann">@Container</span>
+    <span class="ann">@ServiceConnection</span>
+    <span class="kw">static</span> PostgreSQLContainer&lt;?&gt; postgres =
+            <span class="kw">new</span> PostgreSQLContainer&lt;&gt;(<span class="str">"postgres:16-alpine"</span>);
+
+    <span class="ann">@Autowired</span> InventoryRepository repository;
+
+    <span class="ann">@Test</span>
+    <span class="kw">void</span> upsertInsertsThenUpdatesWithoutDuplicating() {
+        repository.upsertStock(<span class="str">"sku-1"</span>, <span class="num">5</span>);
+        repository.upsertStock(<span class="str">"sku-1"</span>, <span class="num">12</span>);   <span class="com">// ON CONFLICT (sku) DO UPDATE</span>
+
+        List&lt;Inventory&gt; all = repository.findAll();
+        assertThat(all).hasSize(<span class="num">1</span>);
+        assertThat(all.get(<span class="num">0</span>).getQuantity()).isEqualTo(<span class="num">12</span>);
+    }
+}
+
+<span class="com">/* The repository method under test:
+@Modifying
+@Query(value = """
+    INSERT INTO inventory (sku, quantity) VALUES (:sku, :qty)
+    ON CONFLICT (sku) DO UPDATE SET quantity = EXCLUDED.quantity
+    """, nativeQuery = true)
+void upsertStock(@Param("sku") String sku, @Param("qty") int qty);
+*/</span></code></pre>
+<p><strong>The two extra annotations:</strong> (1) <code>@AutoConfigureTestDatabase(replace = NONE)</code> — without it, <code>@DataJpaTest</code> silently replaces your datasource with embedded H2, which would reject the <code>ON CONFLICT</code> syntax (or, worse in other cases, accept a subtly different behavior); (2) <code>@Testcontainers</code> + the <code>static @Container @ServiceConnection</code> field — <code>@Testcontainers</code> manages start/stop via the JUnit extension, <code>static</code> shares one container across the class's tests, and <code>@ServiceConnection</code> (Boot 3.1+) feeds the container's JDBC URL/credentials into Spring's datasource properties automatically. For a large suite, promote the container to the singleton pattern in a shared base class.</p>
+</details>
+</div>
+
+<nav class="page-nav"><a href="08-spring-security.html">← Prev: Spring Security</a><a href="10-spring-microservices.html">Next: Microservices →</a></nav>
+</main></body></html>
