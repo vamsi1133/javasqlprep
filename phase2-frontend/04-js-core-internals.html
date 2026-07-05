@@ -1,0 +1,1133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 — JS Core Internals | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header"><div class="container"><div class="breadcrumb"><a href="index.html">← Course Home</a></div><h1>04 — JS Core Internals</h1><p>Execution contexts, closures, <code>this</code>, prototypes, and the event loop — the mental models behind every "what does this print?" question.</p></div></header>
+<main class="container">
+
+<section>
+  <h2>Why interviewers ask this</h2>
+  <p>Senior frontend loops at FAANG and product startups lean hard on JS internals for one reason: they separate people who <em>use</em> JavaScript from people who can <em>predict</em> it. Seven years of React experience can coexist with fuzzy models of the microtask queue or <code>this</code> binding — frameworks paper over both — and interviewers know it. The dominant format is <strong>output prediction</strong>: a 5–15 line snippet, "walk me through what prints and why." There is no partial credit for vibes; you either trace the engine correctly or you don't.</p>
+  <p>The good news: this entire topic is a small set of deterministic rules. Hoisting has exactly three behaviors. <code>this</code> has exactly four binding rules plus one arrow-function exception. The event loop has one drain rule. Once those are airtight, every snippet — no matter how adversarial — becomes mechanical. This tutorial builds each model from the spec's point of view, then drills it with the exact snippet shapes interviewers use.</p>
+  <div class="senior"><p>Signal to send in interviews: narrate your trace in engine terms ("this call pushes a frame… the <code>await</code> suspends and queues a microtask… the task ends, so we drain the microtask queue…"). Interviewers upgrade candidates who show the machine, not just the answer.</p></div>
+</section>
+
+<div class="toc">
+  <strong>On this page</strong>
+  <ul>
+    <li><a href="#execution-model">1. Execution model: contexts, stack, scope, hoisting &amp; TDZ</a></li>
+    <li><a href="#closures">2. Closures — deep</a></li>
+    <li><a href="#this-binding">3. <code>this</code> binding — the complete ruleset</a></li>
+    <li><a href="#prototypes">4. Prototypes &amp; inheritance</a></li>
+    <li><a href="#event-loop">5. The event loop (definitive)</a></li>
+    <li><a href="#coercion">6. Coercion &amp; equality</a></li>
+    <li><a href="#objects-deep">7. Objects deep: descriptors, Map/WeakMap, iterators, Proxy</a></li>
+    <li><a href="#memory-gc">8. Memory &amp; garbage collection</a></li>
+    <li><a href="#modules">9. Modules: ESM vs CJS</a></li>
+    <li><a href="#misc-trivia">10. Senior trivia: strict mode, <code>??</code>, structuredClone, array methods</a></li>
+    <li><a href="#drills">Output-prediction drills (12)</a></li>
+    <li><a href="#qa">Interview Q&amp;A (25)</a></li>
+    <li><a href="#exercises">Hands-on exercises</a></li>
+  </ul>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="execution-model">1. Execution model: contexts, stack, scope, hoisting &amp; TDZ <span class="tier tier-1">T1</span></h2>
+
+<h3>Execution contexts and the call stack</h3>
+<p>Every time JS runs code it does so inside an <strong>execution context</strong>. There are three kinds: the <em>global</em> context (created once per realm), a <em>function</em> context (created per call), and <em>eval</em> (ignore it). Each context carries three things you should be able to name:</p>
+<ul>
+  <li>A <strong>Lexical Environment</strong> — where <code>let</code>/<code>const</code>/functions live, with a pointer to the <em>outer</em> environment (this pointer chain <em>is</em> the scope chain).</li>
+  <li>A <strong>Variable Environment</strong> — where <code>var</code> declarations live (function-scoped, hence the classic bugs).</li>
+  <li>A <strong>this binding</strong> — resolved at call time for normal functions (section 3).</li>
+</ul>
+<p>Contexts are managed on the <strong>call stack</strong>: calling a function pushes a context, returning pops it. Creation happens in two passes per context:</p>
+<ol>
+  <li><strong>Creation phase</strong> — the engine scans declarations: <code>var</code> names are registered and initialized to <code>undefined</code>; function <em>declarations</em> are registered and initialized to the full function object; <code>let</code>/<code>const</code>/<code>class</code> names are registered but left <em>uninitialized</em> (the TDZ).</li>
+  <li><strong>Execution phase</strong> — statements run top to bottom, assignments happen.</li>
+</ol>
+
+<h3>Hoisting — precisely</h3>
+<p><em>Everything</em> is hoisted, in the sense that the engine knows about every declaration before executing a line. What differs is <strong>initialization</strong>:</p>
+<table>
+  <thead><tr><th>Declaration</th><th>Hoisted?</th><th>Initialized during creation phase?</th><th>Access before declaration line</th></tr></thead>
+  <tbody>
+    <tr><td><code>var x</code></td><td>Yes (to function/global top)</td><td>Yes, to <code>undefined</code></td><td><code>undefined</code></td></tr>
+    <tr><td><code>function f() {}</code></td><td>Yes</td><td>Yes, to the full function</td><td>Callable — works</td></tr>
+    <tr><td><code>let</code> / <code>const</code> / <code>class</code></td><td>Yes (to block top)</td><td><strong>No</strong> — uninitialized</td><td><code>ReferenceError</code> (TDZ)</td></tr>
+    <tr><td><code>var f = function () {}</code> (function expression)</td><td>The <code>var</code> is</td><td>To <code>undefined</code></td><td><code>TypeError: f is not a function</code> if called</td></tr>
+  </tbody>
+</table>
+
+<pre><code>console.log(a);      <span class="com">// undefined  (var hoisted &amp; initialized to undefined)</span>
+console.log(f());    <span class="com">// "hi"       (function declaration fully hoisted)</span>
+console.log(g);      <span class="com">// undefined  (only the var half of the expression hoisted)</span>
+console.log(b);      <span class="com">// ReferenceError: Cannot access 'b' before initialization</span>
+
+var a = 1;
+function f() { return "hi"; }
+var g = function () {};
+let b = 2;</code></pre>
+
+<h3>Proving the TDZ (let/const ARE hoisted)</h3>
+<p>A favorite senior follow-up: "if <code>let</code> isn't accessible early, is it even hoisted?" Yes — and here's the proof. If <code>let x</code> were simply "not hoisted," the inner <code>console.log</code> would find the outer <code>x</code> via the scope chain. Instead it throws, because the inner block's <code>x</code> is registered (shadowing the outer one) but sits in its <strong>Temporal Dead Zone</strong> from the start of the block until its declaration executes:</p>
+<pre><code>let x = "outer";
+{
+  <span class="com">// TDZ for the inner `x` starts at the top of this block</span>
+  console.log(x);   <span class="com">// ReferenceError — NOT "outer"!</span>
+  let x = "inner";  <span class="com">// TDZ ends here</span>
+}</code></pre>
+<div class="note"><p>Even <code>typeof x</code> throws inside the TDZ — unlike a truly undeclared identifier, where <code>typeof missing</code> safely returns <code>"undefined"</code>. TDZ variables are <em>more</em> protected than nonexistent ones.</p></div>
+
+<h3>Function scope vs block scope</h3>
+<pre><code>function demo() {
+  if (true) {
+    var v = 1;     <span class="com">// scoped to the FUNCTION</span>
+    let l = 2;     <span class="com">// scoped to the BLOCK</span>
+  }
+  console.log(v);  <span class="com">// 1</span>
+  console.log(l);  <span class="com">// ReferenceError: l is not defined</span>
+}</code></pre>
+
+<h3>The classic: var + setTimeout in a loop (and 3 fixes)</h3>
+<pre><code>for (var i = 0; i &lt; 3; i++) {
+  setTimeout(() =&gt; console.log(i), 0);
+}
+<span class="com">// 3, 3, 3</span></code></pre>
+<p><strong>Why:</strong> <code>var i</code> creates <em>one</em> function-scoped binding. All three arrow functions close over that single variable. The synchronous loop finishes (leaving <code>i === 3</code>) before any timer callback runs — timers can't run until the call stack is empty (section 5). Each callback then reads the same, final <code>i</code>.</p>
+<p><strong>Fix 1 — <code>let</code> (the modern answer):</strong> the spec gives <code>let</code> loop headers special treatment — a <em>fresh binding per iteration</em>, copied from the previous iteration's final value. Each closure captures its own <code>i</code>.</p>
+<pre><code>for (let i = 0; i &lt; 3; i++) {
+  setTimeout(() =&gt; console.log(i), 0);  <span class="com">// 0, 1, 2</span>
+}</code></pre>
+<p><strong>Fix 2 — IIFE (the pre-ES6 answer):</strong> create a new scope per iteration by passing <code>i</code> as an argument; the parameter is a fresh variable each call.</p>
+<pre><code>for (var i = 0; i &lt; 3; i++) {
+  (function (j) {
+    setTimeout(() =&gt; console.log(j), 0);  <span class="com">// 0, 1, 2</span>
+  })(i);
+}</code></pre>
+<p><strong>Fix 3 — setTimeout's extra arguments (the trivia answer):</strong> arguments after the delay are passed to the callback, evaluated <em>now</em>.</p>
+<pre><code>for (var i = 0; i &lt; 3; i++) {
+  setTimeout(j =&gt; console.log(j), 0, i);  <span class="com">// 0, 1, 2</span>
+}</code></pre>
+<div class="senior"><p>Mentioning that <code>let</code> works because the spec creates a <em>per-iteration environment record</em> (not because "let is block scoped" in a hand-wavy sense) is a genuine differentiator. A block-scoped variable declared <em>once</em> per loop would still print 3,3,3 — the magic is the fresh copy per iteration.</p></div>
+
+<!-- ============================================================ -->
+<h2 id="closures">2. Closures — deep <span class="tier tier-1">T1</span></h2>
+
+<h3>The precise definition</h3>
+<p>A <strong>closure</strong> is a function bundled with a reference to the Lexical Environment in which it was <em>defined</em>. When a function is created, it stores an internal <code>[[Environment]]</code> pointer to the current environment record. When called later — from anywhere — its scope chain starts from that stored environment, not from wherever it was called. That's it. Everything else (counters, modules, stale state) falls out of this.</p>
+<p>Key consequence: an environment record normally dies when its function returns, but if any surviving function still points at it, the GC keeps it alive. Closures are how local variables outlive their stack frame.</p>
+
+<h3>Canonical examples: counter and module</h3>
+<pre><code>function makeCounter() {
+  let count = 0;                <span class="com">// lives in makeCounter's environment record</span>
+  return {
+    inc: () =&gt; ++count,
+    dec: () =&gt; --count,
+    get: () =&gt; count,
+  };
+}
+const c = makeCounter();
+c.inc(); c.inc();
+console.log(c.get());           <span class="com">// 2</span>
+console.log(c.count);           <span class="com">// undefined — truly private, not a property</span>
+
+const c2 = makeCounter();
+console.log(c2.get());          <span class="com">// 0 — each call = fresh environment</span></code></pre>
+<p>This is the <strong>module pattern</strong>: private state plus a public API, and the standard way to get privacy before class <code>#fields</code> existed. All three methods share <em>one</em> environment (same <code>count</code>); separate calls to <code>makeCounter</code> create independent environments.</p>
+
+<h3>Closures capture VARIABLES, not values</h3>
+<p>The single most-tested closure fact. A closure holds a live link to the <em>binding</em>; it sees the current value at call time, not a snapshot from creation time:</p>
+<pre><code>function make() {
+  let x = 10;
+  const get = () =&gt; x;   <span class="com">// captures the variable x, not the number 10</span>
+  x = 20;
+  return get;
+}
+console.log(make()());   <span class="com">// 20 — not 10</span></code></pre>
+<p>This is exactly why the <code>var</code> loop prints 3,3,3 and why React state goes stale (below).</p>
+
+<h3>Memory implications</h3>
+<p>A closure keeps its whole captured environment reachable. Closing over one small value inside a function that also holds a 50&nbsp;MB parsed payload can retain far more than you intended:</p>
+<pre><code>function processData(hugeArray) {
+  const summary = hugeArray.length;
+  return function report() {
+    <span class="com">// only uses `summary`, but naive mental model says hugeArray is retained too</span>
+    return `processed ${summary} rows`;
+  };
+}</code></pre>
+<p>Modern engines <em>can</em> free variables the closure provably never references — but the optimization is per-environment: if <em>any</em> closure in the same scope references <code>hugeArray</code> (even via <code>eval</code> or a debugger-visible path), all closures sharing that environment retain it. The safe senior habit: copy out what you need (<code>const summary = ...</code>) and let the big object go out of scope, or explicitly <code>hugeArray = null</code> after use in long-lived closures.</p>
+<div class="pitfall"><p>Long-lived closures are a top-3 frontend leak source: an event listener or interval callback closing over a large component scope keeps that scope alive as long as the listener is registered. Removing the listener releases it — forgetting to is the leak (section 8).</p></div>
+
+<h3>Closures in React — why stale state happens</h3>
+<p>Every render of a function component is a <em>new function call</em>, so every render creates fresh variables and fresh closures over them. An effect or timer created in render #1 closes over render #1's <code>count</code> — forever:</p>
+<pre><code>function Timer() {
+  const [count, setCount] = useState(0);
+  useEffect(() =&gt; {
+    const id = setInterval(() =&gt; {
+      setCount(count + 1);   <span class="com">// `count` is render #1's count = 0, always</span>
+    }, 1000);                <span class="com">// so this sets 1, 1, 1, 1... forever</span>
+    return () =&gt; clearInterval(id);
+  }, []);                    <span class="com">// empty deps = closure never refreshed</span>
+}</code></pre>
+<p>Fixes: functional update <code>setCount(c =&gt; c + 1)</code> (reads latest state from React, not from the closure), add <code>count</code> to deps (re-create the interval each change), or a ref for an escape hatch. The mechanism is pure closure semantics — nothing React-specific is "broken." Tutorial 08 builds on this.</p>
+
+<h3>Private state: closures vs #fields</h3>
+<pre><code><span class="com">// Pre-#fields: closure privacy (per-instance functions — small memory cost)</span>
+function BankAccount(opening) {
+  let balance = opening;
+  this.deposit = (n) =&gt; { balance += n; };
+  this.getBalance = () =&gt; balance;
+}
+
+<span class="com">// Modern: #fields (methods stay on the prototype, shared)</span>
+class BankAccount2 {
+  #balance;
+  constructor(opening) { this.#balance = opening; }
+  deposit(n) { this.#balance += n; }
+  getBalance() { return this.#balance; }
+}</code></pre>
+<p>Both give hard privacy (no reflection escape hatch, unlike <code>_underscore</code> conventions). <code>#fields</code> win on memory (shared prototype methods) and on <code>instanceof</code>-style brand checks (<code>#x in obj</code>).</p>
+
+<!-- ============================================================ -->
+<h2 id="this-binding">3. <code>this</code> binding — the complete ruleset <span class="tier tier-1">T1</span></h2>
+
+<p>For a <em>normal</em> function, <code>this</code> is determined entirely by <strong>how the function is called</strong> — never by where it's defined. Four rules, in precedence order:</p>
+<table>
+  <thead><tr><th>#</th><th>Rule</th><th>Trigger</th><th><code>this</code> is…</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td><strong>new</strong> binding</td><td><code>new Fn()</code></td><td>The freshly created object</td></tr>
+    <tr><td>2</td><td><strong>Explicit</strong> binding</td><td><code>fn.call(obj)</code>, <code>fn.apply(obj)</code>, <code>fn.bind(obj)</code></td><td><code>obj</code></td></tr>
+    <tr><td>3</td><td><strong>Implicit</strong> binding</td><td><code>obj.fn()</code> — a receiver at the call site</td><td>The object before the dot</td></tr>
+    <tr><td>4</td><td><strong>Default</strong> binding</td><td>Plain call <code>fn()</code></td><td><code>globalThis</code> (sloppy) / <code>undefined</code> (strict)</td></tr>
+  </tbody>
+</table>
+<p><strong>Exception that overrides everything:</strong> arrow functions have <em>no own</em> <code>this</code> (and no own <code>arguments</code>, <code>super</code>, or <code>new.target</code>). They resolve <code>this</code> lexically — through the scope chain, like any other variable — from the enclosing normal function or module. <code>call</code>/<code>apply</code>/<code>bind</code> cannot change an arrow's <code>this</code>; <code>new</code> on an arrow throws.</p>
+
+<h3>Each rule in code</h3>
+<pre><code>"use strict";
+function whoAmI() { return this; }
+
+<span class="com">// 4. Default: plain call</span>
+whoAmI();                          <span class="com">// undefined (strict); globalThis in sloppy mode</span>
+
+<span class="com">// 3. Implicit: receiver at the call site</span>
+const obj = { name: "obj", whoAmI };
+obj.whoAmI();                      <span class="com">// obj — the object before the dot, at THIS call</span>
+
+<span class="com">// 2. Explicit: call/apply/bind beat implicit</span>
+const other = { name: "other" };
+obj.whoAmI.call(other);            <span class="com">// other</span>
+
+<span class="com">// 1. new beats everything (even a bound this — see below)</span>
+function Person(name) { this.name = name; }
+const p = new Person("Ada");       <span class="com">// this = the new object</span></code></pre>
+
+<h3>What <code>bind</code> really does — and why it's permanent</h3>
+<pre><code>function greet(greeting) { return `${greeting}, ${this.name}`; }
+const ada = { name: "Ada" };
+const bob = { name: "Bob" };
+
+const greetAda = greet.bind(ada);
+greetAda("Hi");                    <span class="com">// "Hi, Ada"</span>
+
+<span class="com">// Attempt to re-bind or override: IMPOSSIBLE for `this`</span>
+greetAda.call(bob, "Hi");          <span class="com">// "Hi, Ada" — call's thisArg ignored</span>
+greetAda.bind(bob)("Hi");          <span class="com">// "Hi, Ada" — re-bind wraps but inner binding wins</span>
+
+<span class="com">// The one thing that pierces bind: `new`</span>
+function Point(x) { this.x = x; }
+const BoundPoint = Point.bind({ x: 999 });
+const pt = new BoundPoint(5);
+console.log(pt.x);                 <span class="com">// 5 — new ignores the bound this (partial-applied args DO still apply)</span></code></pre>
+<p><code>bind</code> returns a new <em>exotic bound function</em> object wrapping the target: the wrapper hard-codes <code>this</code> (and any partially applied arguments), which is why later <code>call</code>/<code>bind</code> attempts can't reach the original. Interviewers love asking you to implement it — exercise 1.</p>
+
+<h3>Lost-<code>this</code> classics</h3>
+<pre><code>class Store {
+  items = [];
+  add(item) { this.items.push(item); }
+}
+const store = new Store();
+
+<span class="com">// 1. Extracted method — receiver lost</span>
+const add = store.add;
+add("x");                            <span class="com">// TypeError: Cannot read properties of undefined (class bodies are strict)</span>
+
+<span class="com">// 2. Passed as a callback — same failure, just deferred</span>
+button.addEventListener("click", store.add);   <span class="com">// `this` = the button, not store</span>
+[1, 2, 3].forEach(store.add);                  <span class="com">// `this` = undefined</span>
+
+<span class="com">// Fixes:</span>
+button.addEventListener("click", store.add.bind(store));   <span class="com">// bind</span>
+button.addEventListener("click", (e) =&gt; store.add(e));     <span class="com">// arrow wrapper (implicit binding preserved)</span></code></pre>
+<div class="pitfall"><p>The mental model that fixes everything: <code>store.add</code> as an <em>expression</em> is just a function value — the <code>store.</code> part only matters when the property access and the call happen <strong>together</strong> at the call site (<code>store.add()</code>). Separate them and the receiver is gone.</p></div>
+
+<h3>Class field arrows — the "fix" and its cost</h3>
+<pre><code>class Store {
+  items = [];
+  <span class="com">// Field initializers run per-instance with this = the instance,</span>
+  <span class="com">// so the arrow lexically captures each instance:</span>
+  add = (item) =&gt; { this.items.push(item); };
+}
+button.addEventListener("click", store.add);   <span class="com">// works — this is locked to store</span></code></pre>
+<p><strong>Cost:</strong> a normal method lives <em>once</em> on the prototype; a class-field arrow is a <em>fresh function per instance</em> (more memory, worse for many instances), it's an own property (shows up in spreads, shadows prototype methods, awkward to spy/override in tests, and <code>super.add</code> won't find it in subclasses). Fine for a handful of component instances; wrong default for a class instantiated thousands of times.</p>
+
+<h3>Getters/setters and event listeners</h3>
+<pre><code>const user = {
+  first: "Ada", last: "Lovelace",
+  get fullName() { return `${this.first} ${this.last}`; }  <span class="com">// this = object the getter is invoked THROUGH</span>
+};
+const clone = Object.create(user);
+clone.first = "Grace";
+console.log(clone.fullName);   <span class="com">// "Grace Lovelace" — this = clone (receiver), even though getter lives on user</span>
+
+<span class="com">// DOM listeners: normal function → this === e.currentTarget</span>
+button.addEventListener("click", function (e) {
+  console.log(this === e.currentTarget);   <span class="com">// true</span>
+});
+<span class="com">// Arrow listener → this is lexical (the enclosing scope), NOT the element</span>
+button.addEventListener("click", (e) =&gt; {
+  console.log(this);                       <span class="com">// whatever `this` is outside — use e.currentTarget instead</span>
+});</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="prototypes">4. Prototypes &amp; inheritance <span class="tier tier-1">T1</span></h2>
+
+<h3><code>__proto__</code> vs <code>prototype</code> — the eternal confusion</h3>
+<p>Two completely different things with confusingly similar names:</p>
+<ul>
+  <li><strong><code>[[Prototype]]</code></strong> (exposed as <code>__proto__</code>, properly read via <code>Object.getPrototypeOf(obj)</code>) — an internal slot <em>every object</em> has: the next object in its lookup chain.</li>
+  <li><strong><code>Fn.prototype</code></strong> — an ordinary property that <em>only functions</em> have. It is <strong>not</strong> the function's own prototype; it's the object that will be <em>assigned as <code>[[Prototype]]</code></em> to instances created via <code>new Fn()</code>.</li>
+</ul>
+<pre><code>function Animal(name) { this.name = name; }
+Animal.prototype.speak = function () { return `${this.name} makes a sound`; };
+
+const rex = new Animal("Rex");
+
+<span class="com">┌─────────────┐  .prototype   ┌──────────────────────┐</span>
+<span class="com">│  Animal (fn)│──────────────▶│ Animal.prototype     │──[[Prototype]]──▶ Object.prototype ──▶ null</span>
+<span class="com">└─────────────┘◀──────────────│  { speak, constructor}│</span>
+<span class="com">      ▲          .constructor └──────────────────────┘</span>
+<span class="com">      │                                  ▲</span>
+<span class="com">      │ [[Prototype]] of Animal itself   │ [[Prototype]] (aka rex.__proto__)</span>
+<span class="com">      │ is Function.prototype     ┌──────┴──────┐</span>
+<span class="com">      │                           │ rex         │</span>
+<span class="com">      │                           │ { name:"Rex"}│</span>
+<span class="com">                                  └─────────────┘</span>
+
+Object.getPrototypeOf(rex) === Animal.prototype;   <span class="com">// true</span>
+rex.prototype;                                     <span class="com">// undefined — rex isn't a function</span>
+Animal.__proto__ === Function.prototype;           <span class="com">// true — a function's OWN chain</span></code></pre>
+
+<h3>Property lookup walk</h3>
+<p><code>rex.speak</code> → engine checks <code>rex</code>'s own properties → not found → follows <code>[[Prototype]]</code> to <code>Animal.prototype</code> → found. If not found there, continues to <code>Object.prototype</code>, then <code>null</code>, then yields <code>undefined</code>. <strong>Writes don't walk the chain</strong>: <code>rex.speak = fn</code> creates an <em>own</em> property that shadows the prototype's (exception: inherited setters intercept, and inherited non-writable data properties reject the write).</p>
+
+<h3>What <code>new</code> does — the 4 steps</h3>
+<ol>
+  <li>Create a fresh plain object.</li>
+  <li>Set its <code>[[Prototype]]</code> to <code>Fn.prototype</code>.</li>
+  <li>Call <code>Fn</code> with <code>this</code> = the new object (and <code>new.target</code> set).</li>
+  <li>If <code>Fn</code> returns an <strong>object</strong>, that object is the result; otherwise (primitives/undefined ignored) return the new object from step 1.</li>
+</ol>
+<pre><code>function myNew(Fn, ...args) {
+  const obj = Object.create(Fn.prototype);     <span class="com">// steps 1 + 2</span>
+  const result = Fn.apply(obj, args);          <span class="com">// step 3</span>
+  return (typeof result === "object" &amp;&amp; result !== null) ? result : obj;  <span class="com">// step 4</span>
+}</code></pre>
+
+<h3><code>Object.create</code> and delegation without constructors</h3>
+<pre><code>const canSpeak = { speak() { return `${this.name} speaks`; } };
+const dog = Object.create(canSpeak);   <span class="com">// dog's [[Prototype]] = canSpeak</span>
+dog.name = "Rex";
+dog.speak();                           <span class="com">// "Rex speaks"</span>
+Object.create(null);                   <span class="com">// object with NO prototype — no toString, no proto-pollution surface; great for dictionaries</span></code></pre>
+
+<h3><code>class</code> is (mostly) sugar — what it actually creates</h3>
+<pre><code>class Animal {
+  constructor(name) { this.name = name; }       <span class="com">// → the Animal function itself</span>
+  speak() { return `${this.name} speaks`; }     <span class="com">// → Animal.prototype.speak (NON-enumerable)</span>
+  static create(n) { return new Animal(n); }    <span class="com">// → Animal.create (on the constructor itself)</span>
+  #secret = 42;                                 <span class="com">// per-instance private slot, brand-checked</span>
+  getSecret() { return this.#secret; }
+}
+class Dog extends Animal {
+  constructor(name) {
+    super(name);        <span class="com">// calls Animal's constructor with this; MUST run before `this` is touched</span>
+  }
+  speak() { return super.speak() + " (woof)"; } <span class="com">// super = lookup starting at Animal.prototype, this stays the Dog</span>
+}</code></pre>
+<p>Exactly what the sugar produces: a constructor function, methods on <code>.prototype</code>, statics on the constructor, and for <code>extends</code>: <code>Dog.prototype.[[Prototype]] = Animal.prototype</code> <em>and</em> <code>Dog.[[Prototype]] = Animal</code> (so statics inherit too). Where it's <em>more</em> than sugar: class bodies are always strict mode; classes throw if called without <code>new</code>; methods are non-enumerable and can't be used as constructors; class declarations have TDZ; <code>#fields</code> and <code>super</code> have no pre-class equivalent.</p>
+
+<h3><code>instanceof</code> mechanics</h3>
+<p><code>x instanceof Fn</code> walks <code>x</code>'s prototype chain asking "is <code>Fn.prototype</code> anywhere on it?" (customizable via <code>Symbol.hasInstance</code>).</p>
+<pre><code>rex instanceof Animal;            <span class="com">// true: Animal.prototype is on rex's chain</span>
+rex instanceof Object;            <span class="com">// true: Object.prototype is further up</span>
+Object.create(null) instanceof Object;  <span class="com">// false — chain is just null</span>
+<span class="com">// Consequence: instanceof is unreliable across iframes/realms (each realm has its own Array, Object…)</span>
+Array.isArray(arr);               <span class="com">// realm-safe; prefer over `arr instanceof Array`</span></code></pre>
+
+<h3><code>hasOwnProperty</code> vs <code>in</code></h3>
+<pre><code>"speak" in rex;                        <span class="com">// true  — checks the WHOLE chain</span>
+rex.hasOwnProperty("speak");           <span class="com">// false — own properties only</span>
+Object.hasOwn(rex, "name");            <span class="com">// true  — modern, safe replacement (works on null-proto objects too)</span></code></pre>
+
+<h3>Prototype pollution — the security angle</h3>
+<p>If attacker-controlled keys reach a recursive merge/assign, a key of <code>"__proto__"</code> can write onto <code>Object.prototype</code> itself — poisoning <em>every object in the app</em> (e.g., setting <code>isAdmin: true</code> globally, or breaking library checks). Real CVEs hit lodash <code>merge</code>, jQuery <code>extend</code>, and countless query-string parsers.</p>
+<pre><code>const payload = JSON.parse('{ "__proto__": { "isAdmin": true } }');
+naiveDeepMerge({}, payload);
+({}).isAdmin;    <span class="com">// true — every object in the realm now "has" isAdmin</span></code></pre>
+<p>Defenses: block the keys <code>__proto__</code>, <code>prototype</code>, <code>constructor</code> in merges; use <code>Object.create(null)</code> or <code>Map</code> for untrusted-key dictionaries; <code>Object.freeze(Object.prototype)</code> in hardened environments.</p>
+
+<!-- ============================================================ -->
+<h2 id="event-loop">5. The event loop — definitive <span class="tier tier-1">T1</span></h2>
+
+<p>The single most-asked JS interview topic. JS is single-threaded: one call stack, one thing at a time. Concurrency comes from the <strong>host</strong> (browser/Node) running work elsewhere and queueing callbacks. The moving parts:</p>
+<ul>
+  <li><strong>Call stack</strong> — currently executing frames. The loop can't proceed until it's empty.</li>
+  <li><strong>Web APIs / host</strong> — timers, fetch/network, DOM events run outside JS; when done, they enqueue callbacks.</li>
+  <li><strong>Task queue(s)</strong> (a.k.a. macrotask) — <code>setTimeout</code>/<code>setInterval</code>, I/O completions, UI events, <code>postMessage</code>, script execution itself. One task is taken per loop turn.</li>
+  <li><strong>Microtask queue</strong> — promise reactions (<code>.then/.catch/.finally</code> and everything after an <code>await</code>), <code>queueMicrotask</code>, <code>MutationObserver</code> callbacks.</li>
+</ul>
+<p><strong>THE rule</strong> (memorize verbatim): <em>run one task to completion → drain the ENTIRE microtask queue (including microtasks queued by other microtasks) → maybe render → take the next task.</em> Microtasks always win over waiting tasks; a microtask that queues microtasks forever will starve tasks and rendering completely.</p>
+
+<table>
+  <thead><tr><th></th><th>Task (macrotask)</th><th>Microtask</th></tr></thead>
+  <tbody>
+    <tr><td>Sources</td><td><code>setTimeout</code>/<code>setInterval</code>, DOM events, I/O, <code>postMessage</code>, <code>MessageChannel</code>, script tags</td><td>Promise callbacks, <code>await</code> continuations, <code>queueMicrotask</code>, <code>MutationObserver</code></td></tr>
+    <tr><td>Scheduling</td><td>One per loop turn</td><td>Queue fully drained after every task <em>and</em> after every microtask batch grows</td></tr>
+    <tr><td>Can block rendering?</td><td>A long task does</td><td>Yes — the whole drain happens before paint</td></tr>
+  </tbody>
+</table>
+
+<h3>Rendering and requestAnimationFrame</h3>
+<p>Rendering (style → layout → paint) is <em>not</em> a task; it's an opportunity the browser takes <em>between</em> tasks (at most ~once per frame, ~16.7ms at 60Hz), always <em>after</em> microtasks drain. <code>requestAnimationFrame</code> callbacks run in a special slot <strong>just before</strong> that render step — which is why rAF is the right place for visual updates and <code>setTimeout(fn, 0)</code> is not (it lands in some future turn with no frame alignment). Order within a turn that renders: <em>task → microtasks → rAF callbacks → style/layout/paint</em>.</p>
+
+<h3>async/await desugared</h3>
+<p><code>await x</code> means: wrap <code>x</code> in a resolved promise, <strong>suspend the function</strong>, and register <em>the rest of the function body</em> as a microtask continuation. The function returns a pending promise to its caller immediately. Mental rewrite:</p>
+<pre><code>async function f() {
+  console.log("before");
+  const v = await getValue();
+  console.log("after", v);
+}
+<span class="com">// ≈ equivalent to:</span>
+function f() {
+  console.log("before");
+  return Promise.resolve(getValue()).then(v =&gt; {
+    console.log("after", v);       <span class="com">// "the rest of the function" = a microtask</span>
+  });
+}</code></pre>
+<p>Everything up to the first <code>await</code> runs <strong>synchronously</strong> in the caller's turn. Since ES2019, <code>await</code> on an already-resolved native promise (or a plain value) costs exactly <strong>one</strong> microtask tick; <code>await</code>ing a foreign <em>thenable</em> costs extra ticks.</p>
+
+<h3>Walkthrough 1 — the baseline</h3>
+<pre><code>console.log("1");
+setTimeout(() =&gt; console.log("2"), 0);
+Promise.resolve().then(() =&gt; console.log("3"));
+console.log("4");</code></pre>
+<p><strong>Output: 1, 4, 3, 2.</strong> The script itself is a task. Sync logs 1, registers a timer (task), queues a microtask, logs 4. Script task ends → drain microtasks → 3. Next task → 2. <code>setTimeout(…, 0)</code> can never beat a microtask.</p>
+
+<h3>Walkthrough 2 — microtasks spawning microtasks</h3>
+<pre><code>Promise.resolve().then(() =&gt; {
+  console.log("A");
+  Promise.resolve().then(() =&gt; console.log("B"));
+});
+setTimeout(() =&gt; console.log("C"), 0);
+Promise.resolve().then(() =&gt; console.log("D"));</code></pre>
+<p><strong>Output: A, D, B, C.</strong> After sync: micro = [A-cb, D-cb], tasks = [C]. A-cb logs A and <em>appends</em> B-cb to the (still-draining) microtask queue → [D-cb, B-cb]. D logs, B logs — the drain continues until empty. Only then the task: C. Newly-queued microtasks jump ahead of every waiting task.</p>
+
+<h3>Walkthrough 3 — chains interleave tick by tick</h3>
+<pre><code>Promise.resolve().then(() =&gt; console.log("p1")).then(() =&gt; console.log("p2"));
+Promise.resolve().then(() =&gt; console.log("q1")).then(() =&gt; console.log("q2"));</code></pre>
+<p><strong>Output: p1, q1, p2, q2.</strong> Each <code>.then</code> link is one microtask, queued only when its predecessor settles. Micro = [p1, q1] → p1 runs (queues p2) → q1 runs (queues q2) → p2 → q2. Chains of equal depth interleave like round-robin.</p>
+
+<h3>Walkthrough 4 — where await splits the function</h3>
+<pre><code>async function f() {
+  console.log("f1");
+  await undefined;
+  console.log("f2");
+}
+console.log("s1");
+f();
+Promise.resolve().then(() =&gt; console.log("m1"));
+console.log("s2");</code></pre>
+<p><strong>Output: s1, f1, s2, f2, m1.</strong> <code>f()</code> runs synchronously to the <code>await</code>: logs f1, then suspends, queueing its continuation (f2) — <em>before</em> the next line queues m1. Micro = [f2-cont, m1]. Sync finishes with s2, then f2, then m1. Common wrong answer: putting f2 after m1 — but f's continuation was enqueued first.</p>
+
+<h3>Walkthrough 5 — awaited values vs promises (post-ES2019 they cost the same)</h3>
+<pre><code>async function one() { await Promise.resolve(); console.log("one"); }
+async function two() { await null; console.log("two"); }
+one();
+two();
+Promise.resolve().then(() =&gt; console.log("three"));</code></pre>
+<p><strong>Output: one, two, three.</strong> Both awaits cost exactly one tick (the ES2019 <code>await</code> optimization treats native resolved promises and plain values identically), so continuations queue in call order, then the <code>.then</code>. Pre-2019 engines printed <em>two, three, one</em> (awaiting a promise cost 3 ticks) — worth mentioning if the interviewer looks old-school; today's engines all print one/two/three.</p>
+
+<h3>Walkthrough 6 — returning a promise from .then costs ~2 extra ticks</h3>
+<pre><code>Promise.resolve()
+  .then(() =&gt; { console.log("a"); return Promise.resolve("x"); })
+  .then(v =&gt; console.log("b", v));
+
+Promise.resolve()
+  .then(() =&gt; console.log(1))
+  .then(() =&gt; console.log(2))
+  .then(() =&gt; console.log(3))
+  .then(() =&gt; console.log(4));</code></pre>
+<p><strong>Output: a, 1, 2, 3, b x, 4.</strong> Resolving a promise <em>with another promise</em> isn't instant: the spec queues (1) a job that calls <code>inner.then(resolveOuter)</code>, then (2) the reaction that actually resolves the outer — two extra microtask ticks before <code>b</code>'s callback can even be queued. So <code>b</code> lands after 1, 2, 3 (which each cost one tick) but before 4. This exact snippet (as "0 1 2 3 4 5 6") is a famous hard-mode drill; if you can trace this, you own the event loop.</p>
+
+<h3>Node.js differences — awareness level</h3>
+<ul>
+  <li>Node's loop (libuv) runs <strong>phases</strong>: timers → pending callbacks → poll (I/O) → check (<code>setImmediate</code>) → close callbacks. Microtasks still drain between every callback.</li>
+  <li><code>process.nextTick</code> is its own queue that drains <strong>before</strong> promise microtasks — "microtask VIP lane" (and can starve promises if abused).</li>
+  <li><code>setImmediate</code> vs <code>setTimeout(fn, 0)</code>: inside an I/O callback, <code>setImmediate</code> always fires first (check phase follows poll); at top level the order is nondeterministic (timer clamp race).</li>
+</ul>
+
+<h3>Starving the loop — the performance tie-in</h3>
+<p>Any task (or microtask drain) over ~50ms is a "long task": input events queue behind it and <strong>INP</strong> (Interaction to Next Paint) tanks. Fixes: chunk work and yield with <code>await scheduler.yield()</code> (or the <code>setTimeout(0)</code>/<code>MessageChannel</code> fallback — crucially these yield <em>as tasks</em>, letting input and paint through, whereas chunking with microtasks yields nothing), move work to a Web Worker, or use <code>isInputPending()</code>. Note the subtle trap: <code>await</code>-ing resolved promises in a loop keeps you in the same microtask drain — the browser never paints.</p>
+<div class="senior"><p>Interview gold: "microtasks run <em>before</em> rendering, so a microtask loop blocks paint just as badly as sync code; to actually yield to the browser you must yield at <em>task</em> granularity." Very few candidates articulate this.</p></div>
+
+<!-- ============================================================ -->
+<h2 id="coercion">6. Coercion &amp; equality <span class="tier tier-2">T2</span></h2>
+
+<h3>The <code>==</code> algorithm — the highlights that matter</h3>
+<ol>
+  <li>Same types → behaves like <code>===</code>.</li>
+  <li><code>null == undefined</code> → <code>true</code>, and they equal <strong>nothing else</strong> (not <code>0</code>, not <code>""</code>, not <code>false</code>).</li>
+  <li>Number vs string → string is converted to number.</li>
+  <li>Boolean vs anything → boolean converted to number <em>first</em> (<code>true</code>→1, <code>false</code>→0).</li>
+  <li>Object vs primitive → object converted via <code>ToPrimitive</code> (<code>Symbol.toPrimitive</code>, else <code>valueOf</code>, else <code>toString</code>).</li>
+</ol>
+<pre><code>[] == false     <span class="com">// true:  false→0; []→""(toString)→0; 0 == 0</span>
+[] == ![]       <span class="com">// true:  ![] is false (arrays are truthy!), then same as above</span>
+"" == 0         <span class="com">// true:  ""→0</span>
+"0" == false    <span class="com">// true:  false→0, "0"→0</span>
+null == 0       <span class="com">// false: null only equals undefined</span>
+null == undefined  <span class="com">// true (the one useful == idiom)</span>
+NaN == NaN      <span class="com">// false — NaN equals nothing, even itself</span>
+{} == "[object Object]"  <span class="com">// true (as an expression): ToPrimitive({}) via toString</span></code></pre>
+
+<h3><code>===</code> vs <code>Object.is</code></h3>
+<table>
+  <thead><tr><th>Comparison</th><th><code>===</code></th><th><code>Object.is</code></th></tr></thead>
+  <tbody>
+    <tr><td><code>NaN</code> vs <code>NaN</code></td><td><code>false</code></td><td><code>true</code></td></tr>
+    <tr><td><code>0</code> vs <code>-0</code></td><td><code>true</code></td><td><code>false</code></td></tr>
+    <tr><td>Everything else</td><td colspan="2">identical (reference equality for objects, value for primitives)</td></tr>
+  </tbody>
+</table>
+<div class="note"><p>React's bail-out checks (<code>useState</code> setter, deps arrays) use <code>Object.is</code> — which is why <code>setState(NaN)</code> when state is already <code>NaN</code> does <em>not</em> re-render, and why a new object literal always does.</p></div>
+
+<h3>Truthiness — the complete falsy list</h3>
+<p>Exactly eight falsy values: <code>false</code>, <code>0</code>, <code>-0</code>, <code>0n</code>, <code>""</code>, <code>null</code>, <code>undefined</code>, <code>NaN</code>. <em>Everything else is truthy</em> — including <code>"0"</code>, <code>"false"</code>, <code>[]</code>, <code>{}</code>, and <code>new Boolean(false)</code> (it's an object!).</p>
+
+<h3>"When would you ever use ==?" — the senior answer</h3>
+<p>"Almost never — I lint with <code>eqeqeq</code>. The one deliberate exception is <code>x == null</code>, which is the idiomatic check for 'null <strong>or</strong> undefined' in a single comparison, because the spec guarantees <code>null</code> and <code>undefined</code> coerce-equal only each other. Any other <code>==</code> in a codebase is a bug waiting for a code review." Bonus: in TS codebases <code>x == null</code> correctly narrows <code>T | null | undefined</code> to <code>T</code>.</p>
+
+<h3>typeof quirks &amp; Symbol.toPrimitive</h3>
+<pre><code>typeof null          <span class="com">// "object"  — 1995 bug, unfixable (would break the web)</span>
+typeof function(){}  <span class="com">// "function" — the only non-object answer for an object value</span>
+typeof NaN           <span class="com">// "number"  (Not-a-Number is a number, enjoy)</span>
+typeof undeclaredVar <span class="com">// "undefined" — safe; but typeof on a TDZ let throws!</span>
+
+<span class="com">// Objects control their own coercion:</span>
+const money = {
+  amount: 42,
+  [Symbol.toPrimitive](hint) {          <span class="com">// hint: "number" | "string" | "default"</span>
+    return hint === "string" ? `$${this.amount}` : this.amount;
+  }
+};
++money;        <span class="com">// 42</span>
+`${money}`;    <span class="com">// "$42"</span>
+money + 1;     <span class="com">// 43 (hint "default" → number branch here)</span></code></pre>
+
+<!-- ============================================================ -->
+<h2 id="objects-deep">7. Objects deep <span class="tier tier-2">T2</span></h2>
+
+<h3>Property descriptors</h3>
+<p>Every data property has four attributes: <code>value</code>, <code>writable</code> (can assign?), <code>enumerable</code> (shows in <code>for…in</code>/<code>Object.keys</code>/spread?), <code>configurable</code> (can delete/redefine?). Accessor properties swap value/writable for <code>get</code>/<code>set</code>.</p>
+<pre><code>const obj = {};
+Object.defineProperty(obj, "id", {
+  value: 7, writable: false, enumerable: false, configurable: false
+});
+obj.id = 99;               <span class="com">// silently ignored (throws in strict mode)</span>
+Object.keys(obj);          <span class="com">// [] — non-enumerable hidden from iteration &amp; spread</span>
+delete obj.id;             <span class="com">// false — non-configurable</span>
+<span class="com">// Note: defineProperty defaults are all FALSE; literal properties default all TRUE.</span>
+<span class="com">// Class methods are writable+configurable but NOT enumerable.</span></code></pre>
+
+<h3>Getters/setters, freeze vs seal, spread</h3>
+<pre><code>const temp = {
+  celsius: 25,
+  get fahrenheit() { return this.celsius * 9/5 + 32; },
+  set fahrenheit(f) { this.celsius = (f - 32) * 5/9; }
+};
+
+const cfg = Object.freeze({ mode: "dark", nested: { level: 1 } });
+cfg.mode = "light";        <span class="com">// no-op (TypeError in strict mode)</span>
+cfg.nested.level = 2;      <span class="com">// WORKS — freeze is SHALLOW</span>
+
+<span class="com">// freeze: no add / no delete / no write / no reconfigure</span>
+<span class="com">// seal:   no add / no delete — but existing values still writable</span>
+<span class="com">// preventExtensions: no add only</span>
+
+const copy = { ...cfg };   <span class="com">// spread = shallow copy of OWN ENUMERABLE props;</span>
+                           <span class="com">// nested objects shared by reference; getters EVALUATED into plain values;</span>
+                           <span class="com">// prototype NOT copied</span></code></pre>
+
+<h3>Computed keys &amp; key ordering</h3>
+<pre><code>const k = "dynamic";
+const o = { [k + "Key"]: 1, [`id_${42}`]: 2 };
+
+<span class="com">// Own-key ordering rule (Object.keys / for-in / spread / JSON.stringify):</span>
+<span class="com">// 1. integer-like string keys, ASCENDING numerically</span>
+<span class="com">// 2. remaining string keys, INSERTION order</span>
+<span class="com">// 3. symbol keys, insertion order (excluded from Object.keys)</span>
+Object.keys({ b: 1, 2: 2, a: 3, 1: 4 });   <span class="com">// ["1", "2", "b", "a"]</span></code></pre>
+<div class="pitfall"><p>The integer-key rule silently reorders things like objects keyed by numeric IDs — a classic "why did my dropdown reorder itself?" bug. If order matters with numeric-ish keys, use a <code>Map</code>.</p></div>
+
+<h3>Map vs Object — when to reach for Map</h3>
+<table>
+  <thead><tr><th></th><th>Object</th><th>Map</th></tr></thead>
+  <tbody>
+    <tr><td>Key types</td><td>Strings &amp; symbols only (else coerced)</td><td><strong>Anything</strong> — objects, functions, NaN</td></tr>
+    <tr><td>Iteration order</td><td>Integer-key quirk (above)</td><td>Pure insertion order, directly iterable</td></tr>
+    <tr><td>Size</td><td><code>Object.keys(o).length</code> — O(n)</td><td><code>map.size</code> — O(1)</td></tr>
+    <tr><td>Prototype baggage</td><td>Inherits <code>toString</code> etc.; pollution surface</td><td>None; no injection risk from key names</td></tr>
+    <tr><td>Frequent add/delete perf</td><td>Can degrade (hidden-class churn)</td><td>Optimized for it</td></tr>
+    <tr><td>JSON</td><td>Native</td><td>Manual (<code>Object.fromEntries(map)</code>)</td></tr>
+  </tbody>
+</table>
+<p><strong>Rule of thumb:</strong> Object = fixed-shape record ("struct"); Map = dynamic dictionary, especially with unknown/user-supplied or non-string keys.</p>
+
+<h3>WeakMap / WeakSet — metadata without leaks</h3>
+<p>A <code>WeakMap</code> holds its keys <em>weakly</em>: if nothing else references a key object, the GC collects it and the entry vanishes. No <code>.size</code>, no iteration (contents are nondeterministic by design). Perfect for attaching data to objects you don't own:</p>
+<pre><code>const nodeMeta = new WeakMap();
+function track(el) {
+  nodeMeta.set(el, { renderedAt: Date.now() });   <span class="com">// annotate a DOM node</span>
+}
+<span class="com">// When the node is removed from the DOM and dereferenced, BOTH the node</span>
+<span class="com">// and its metadata are collected. A regular Map here would pin every node</span>
+<span class="com">// forever — a textbook leak.</span></code></pre>
+<p>Other uses: per-instance private data (pre-#fields), memoization caches keyed by object arguments, "have I seen this object" via <code>WeakSet</code>.</p>
+
+<h3>Symbols &amp; well-known symbols</h3>
+<pre><code>const id = Symbol("id");           <span class="com">// unique, never collides, hidden from Object.keys/JSON</span>
+obj[id] = 123;                     <span class="com">// safe metadata channel on foreign objects</span>
+
+<span class="com">// Well-known symbols = protocol hooks the language itself calls:</span>
+<span class="com">// Symbol.iterator      → makes anything for-of / spread-able</span>
+<span class="com">// Symbol.asyncIterator → for await…of</span>
+<span class="com">// Symbol.toPrimitive   → coercion (section 6)</span>
+<span class="com">// Symbol.toStringTag   → Object.prototype.toString branding:</span>
+class Money { get [Symbol.toStringTag]() { return "Money"; } }
+Object.prototype.toString.call(new Money());   <span class="com">// "[object Money]"</span>
+<span class="com">// Symbol.hasInstance   → customize instanceof</span></code></pre>
+
+<h3>Iterators &amp; generators</h3>
+<p><strong>Protocol:</strong> an object is <em>iterable</em> if it has <code>[Symbol.iterator]()</code> returning an <em>iterator</em> — an object with <code>next()</code> returning <code>{ value, done }</code>. <code>for…of</code>, spread, destructuring, <code>Array.from</code>, <code>Promise.all</code> all consume it.</p>
+<pre><code>class Range {
+  constructor(from, to) { this.from = from; this.to = to; }
+  *[Symbol.iterator]() {                     <span class="com">// generator = easiest way to implement an iterator</span>
+    for (let n = this.from; n &lt;= this.to; n++) yield n;
+  }
+}
+[...new Range(1, 4)];        <span class="com">// [1, 2, 3, 4]</span>
+
+function* take(iterable, n) {                <span class="com">// generators are LAZY — pull-based</span>
+  let i = 0;
+  for (const v of iterable) {
+    if (i++ &gt;= n) return;
+    yield v;
+  }
+}
+function* naturals() { let n = 0; while (true) yield n++; }   <span class="com">// infinite is fine…</span>
+[...take(naturals(), 3)];    <span class="com">// [0, 1, 2] …because consumers pull only what they need</span></code></pre>
+<p>Generator use cases: lazy/infinite sequences, pagination cursors, custom iteration for data structures, coroutine-style control flow (redux-saga), and async generators for streams (<code>for await…of</code>).</p>
+
+<h3>Proxy &amp; Reflect</h3>
+<p>A <code>Proxy</code> wraps a target and intercepts fundamental operations via <em>traps</em> (<code>get</code>, <code>set</code>, <code>has</code>, <code>deleteProperty</code>, <code>apply</code>, <code>construct</code>…). <code>Reflect</code> mirrors those operations as functions — the correct way to forward to default behavior inside a trap.</p>
+<pre><code>const user = { name: "Ada", age: 36 };
+const validated = new Proxy(user, {
+  set(target, prop, value, receiver) {
+    if (prop === "age" &amp;&amp; (!Number.isInteger(value) || value &lt; 0)) {
+      throw new TypeError("age must be a non-negative integer");
+    }
+    console.log(`set ${String(prop)} = ${value}`);       <span class="com">// logging trap</span>
+    return Reflect.set(target, prop, value, receiver);   <span class="com">// forward correctly (handles getters/receiver)</span>
+  }
+});
+validated.age = 37;      <span class="com">// logs, then sets</span>
+validated.age = -1;      <span class="com">// TypeError</span></code></pre>
+<p><strong>Framework relevance:</strong> Vue 3's reactivity wraps state in a Proxy — <code>get</code> traps record which effect read which key (dependency tracking), <code>set</code> traps trigger re-runs. MobX 5+ does the same. This is why Vue 3 tracks <em>property additions</em> and array indices that Vue 2's <code>defineProperty</code> approach couldn't. Limits worth knowing: proxies can't intercept private <code>#fields</code> or built-in internal slots (so wrapping a <code>Map</code> naively breaks it), and identity differs (<code>proxy !== target</code>).</p>
+
+<!-- ============================================================ -->
+<h2 id="memory-gc">8. Memory &amp; garbage collection <span class="tier tier-2">T2</span></h2>
+
+<h3>Reachability &amp; mark-and-sweep</h3>
+<p>JS GC is based on <strong>reachability</strong>, not reference counting: starting from <em>roots</em> (global object, current stack, active closures' environments), the collector <em>marks</em> everything transitively reachable and <em>sweeps</em> the rest. Cycles are collected fine (A↔B referencing each other but unreachable from roots → both freed) — "circular reference leak" is an obsolete IE6 answer. The corollary that matters: <strong>a leak in JS is always a reachable-but-unwanted reference</strong>. You never free memory; you sever paths from roots.</p>
+
+<h3>V8 specifics — awareness level</h3>
+<p>V8 is <strong>generational</strong>: new objects go to a small "new space" collected frequently by a fast copying <em>Scavenger</em> (most objects die young); survivors get promoted to "old space," collected by mark-sweep-compact, done mostly <em>incrementally and concurrently</em> (Orinoco) to keep pauses off the main thread. Practical takeaways: short-lived garbage is cheap; churning <em>long-lived</em> objects is what hurts; huge allocation spikes trigger major GC pauses visible as frame drops.</p>
+
+<h3>The four classic frontend leaks</h3>
+<table>
+  <thead><tr><th>Leak</th><th>Mechanism</th><th>Fix</th></tr></thead>
+  <tbody>
+    <tr><td>Detached DOM nodes</td><td>JS variable/array/Map still references a node removed from the document — the node (and often its whole subtree) can't be freed</td><td>Null out refs on teardown; use <code>WeakMap</code>/<code>WeakRef</code> for node metadata</td></tr>
+    <tr><td>Forgotten listeners &amp; timers</td><td><code>addEventListener</code> on a long-lived target (window, document, store) with a callback closing over component scope; <code>setInterval</code> never cleared</td><td>Symmetric cleanup (React effect cleanup fn), <code>AbortController</code> signal for listeners, clear intervals</td></tr>
+    <tr><td>Closures over large data</td><td>Long-lived callback retains a big environment (section 2)</td><td>Extract only needed values; null out big refs</td></tr>
+    <tr><td>Unbounded caches</td><td>Module-level <code>Map</code>/array/memoizer that only grows</td><td>LRU with a cap, <code>WeakMap</code> keys, TTL eviction</td></tr>
+  </tbody>
+</table>
+
+<h3>Finding leaks — the DevTools workflow</h3>
+<ol>
+  <li><strong>Suspect:</strong> Performance panel memory graph (or <code>performance.memory</code>) sawtooths ever upward across interactions that should be net-zero.</li>
+  <li><strong>Prove:</strong> Memory panel → the <em>3-snapshot technique</em>: snapshot → do the action + undo it (open/close modal) → snapshot → repeat → snapshot. Compare 2 vs 3; leaked objects grow linearly with repetitions. Filter for "Detached" to find detached DOM trees.</li>
+    <li><strong>Diagnose:</strong> select a leaked object and read its <strong>Retainers</strong> tree — the reference path from a GC root that keeps it alive. That path names the culprit (e.g., <code>window → myStore → listeners[3] → context → bigComponentScope</code>).</li>
+</ol>
+
+<h3>WeakRef &amp; FinalizationRegistry — awareness</h3>
+<pre><code>const ref = new WeakRef(bigObject);        <span class="com">// doesn't prevent collection</span>
+const maybe = ref.deref();                 <span class="com">// the object, or undefined if collected</span>
+
+const registry = new FinalizationRegistry((label) =&gt; {
+  console.log(`${label} was collected`);   <span class="com">// cleanup callback SOME time after GC</span>
+});
+registry.register(bigObject, "bigObject");</code></pre>
+<p>Legit uses: caches that shouldn't pin entries, mapping to external resources (Wasm memory, workers). The senior caveat: GC timing is <strong>nondeterministic and unobservable by spec</strong> — never build program <em>correctness</em> on WeakRef/finalizers; TC39's own proposal text says to avoid them if possible.</p>
+
+<!-- ============================================================ -->
+<h2 id="modules">9. Modules: ESM vs CJS <span class="tier tier-2">T2</span></h2>
+
+<h3>ESM semantics</h3>
+<p>ES modules are <strong>static</strong>: imports/exports are declared syntax, resolved at parse time, before any code runs. This enables tree-shaking, cyclic-safe linking, and toolable analysis — and it's why you can't conditionally <code>import x from cond ? "a" : "b"</code> (use dynamic <code>import()</code> for that). Modules are singletons (evaluated once per graph, cached), always strict mode, with module-level <code>this === undefined</code>.</p>
+
+<h3>Live bindings — prove it</h3>
+<p>ESM exports are <strong>live read-only views</strong> onto the exporting module's bindings — not copies:</p>
+<pre><code><span class="com">// counter.mjs</span>
+export let count = 0;
+export function inc() { count++; }
+
+<span class="com">// main.mjs</span>
+import { count, inc } from "./counter.mjs";
+console.log(count);   <span class="com">// 0</span>
+inc();
+console.log(count);   <span class="com">// 1  ← the import SEES the update (live binding)</span>
+count++;              <span class="com">// TypeError: Assignment to constant variable / read-only binding</span></code></pre>
+<p>The equivalent CJS (<code>exports.count = 0</code> then <code>count++</code> internally… actually reassigning a primitive on <code>module.exports</code>) hands consumers a <strong>value copy at require time</strong> — destructured <code>const { count } = require("./counter")</code> stays <code>0</code> forever. That difference is the #1 source of "why is my mocked/updated value stale" confusion in mixed codebases.</p>
+
+<h3>ESM vs CJS — the comparison table</h3>
+<table>
+  <thead><tr><th></th><th>ESM</th><th>CommonJS</th></tr></thead>
+  <tbody>
+    <tr><td>Loading</td><td>Static, parse-time graph; async-capable</td><td>Dynamic, synchronous <code>require()</code> at runtime</td></tr>
+    <tr><td>Exports are</td><td>Live bindings</td><td>Values snapshotted when <code>require</code> returns</td></tr>
+    <tr><td>Conditional import</td><td>Only via <code>import()</code></td><td><code>if (x) require(…)</code> just works</td></tr>
+    <tr><td>Tree-shaking</td><td>Yes (static structure)</td><td>Effectively no</td></tr>
+    <tr><td>Top-level await</td><td>Yes</td><td>No (require is sync)</td></tr>
+    <tr><td>Strict mode</td><td>Always</td><td>Opt-in</td></tr>
+    <tr><td>Misc</td><td><code>import.meta.url</code></td><td><code>__dirname</code>, <code>__filename</code>, <code>require.cache</code></td></tr>
+  </tbody>
+</table>
+<div class="pitfall"><p><strong>Interop pain — the default-export mismatch:</strong> CJS has no real "default", so when a transpiler compiles <code>export default fn</code> it emits <code>exports.default = fn</code> plus an <code>__esModule</code> flag; consuming that from real CJS gives you <code>{ default: fn }</code>, hence the classic <code>require("lib").default</code> dance and "lib_1.default is not a function" errors. Conversely, Node importing a CJS module from ESM synthesizes <code>module.exports</code> as the default export. Dual-package setups can even load <em>both</em> copies (the "dual package hazard") breaking <code>instanceof</code> across them.</p></div>
+
+<h3>Circular imports</h3>
+<p><strong>ESM:</strong> the graph links all bindings <em>before</em> evaluation, so cycles resolve — but a module that runs early may read a binding of its cyclic partner while it's still in TDZ (<code>ReferenceError</code>) or, for <code>var</code>/hoisted functions, see them fine. Function declarations across a cycle work; top-level <code>const</code> reads at import-evaluation time can throw. <strong>CJS:</strong> a cycle returns the <em>partial</em> <code>module.exports</code> as it existed when the cycle was hit — silently missing later exports (classic "undefined is not a function" hours into debugging). In both systems the real fix is to break the cycle (extract shared code) or defer access until runtime (call-time, not load-time).</p>
+
+<h3>Dynamic <code>import()</code> and top-level await</h3>
+<pre><code>const module = await import(`./locales/${lang}.js`);  <span class="com">// returns a promise of the namespace object</span>
+
+<span class="com">// Top-level await (ESM only): the whole module — and its importers — wait</span>
+const config = await fetch("/config.json").then(r =&gt; r.json());
+export default config;</code></pre>
+<p><code>import()</code> is the primitive under every code-splitting feature (<code>React.lazy</code>, route-based chunks). Bundler mechanics are covered in tutorial 16.</p>
+
+<!-- ============================================================ -->
+<h2 id="misc-trivia">10. Senior trivia <span class="tier tier-3">T3</span></h2>
+
+<h3>What strict mode actually changes</h3>
+<ul>
+  <li>Assigning to undeclared variables throws (no accidental globals); writes to non-writable/frozen properties throw instead of silently failing.</li>
+  <li>Default <code>this</code> in plain function calls is <code>undefined</code>, not <code>globalThis</code>.</li>
+  <li><code>delete variable</code>, duplicate parameter names, octal literals like <code>012</code> → SyntaxError; <code>with</code> banned.</li>
+  <li><code>arguments</code> no longer aliases parameters; <code>eval</code> gets its own scope.</li>
+  <li>Automatic inside ESM modules and class bodies — modern code is effectively always strict.</li>
+</ul>
+
+<h3><code>??</code> vs <code>||</code> — the 0/'' case</h3>
+<pre><code>const pageSize = userInput || 50;    <span class="com">// BUG: user's explicit 0 or "" becomes 50</span>
+const pageSize2 = userInput ?? 50;   <span class="com">// only null/undefined fall back — 0 and "" survive</span>
+
+0  || 10;   <span class="com">// 10</span>
+0  ?? 10;   <span class="com">// 0</span>
+"" || "x";  <span class="com">// "x"</span>
+"" ?? "x";  <span class="com">// ""</span>
+
+obj?.a?.b;        <span class="com">// optional chaining: short-circuits to undefined on null/undefined (NOT on other falsy)</span>
+obj?.method?.();  <span class="com">// safe call; also works for obj?.[key]</span>
+list?.[0];
+<span class="com">// Trivia: `a ?? b || c` is a SyntaxError — must parenthesize when mixing ?? with ||/&amp;&amp;</span></code></pre>
+
+<h3><code>structuredClone</code> vs <code>JSON.parse(JSON.stringify(x))</code></h3>
+<table>
+  <thead><tr><th>Value</th><th>JSON round-trip</th><th><code>structuredClone</code></th></tr></thead>
+  <tbody>
+    <tr><td><code>Date</code></td><td>→ ISO string (type lost)</td><td>Real <code>Date</code></td></tr>
+    <tr><td><code>Map</code> / <code>Set</code></td><td>→ <code>{}</code> (data lost!)</td><td>Cloned properly</td></tr>
+    <tr><td><code>undefined</code> in object</td><td>Key dropped</td><td>Preserved</td></tr>
+    <tr><td><code>NaN</code>/<code>Infinity</code></td><td>→ <code>null</code></td><td>Preserved</td></tr>
+    <tr><td>Circular references</td><td><strong>Throws</strong></td><td>Handled</td></tr>
+    <tr><td><code>RegExp</code>, <code>ArrayBuffer</code>, typed arrays, <code>Blob</code></td><td>Lost/<code>{}</code></td><td>Cloned</td></tr>
+    <tr><td>Functions, DOM nodes, class instances' prototypes</td><td>Functions dropped silently</td><td><strong>Throws</strong> on functions/DOM nodes; prototype (class identity) lost — becomes plain object with own props</td></tr>
+  </tbody>
+</table>
+<p><code>structuredClone</code> is the same algorithm used by <code>postMessage</code>/IndexedDB. Neither clones functions — for state with methods, rebuild via constructors or use plain data.</p>
+
+<h3>Array methods: mutating vs returning-new</h3>
+<table>
+  <thead><tr><th>Mutates in place</th><th>Returns new array</th><th>New immutable twins (ES2023)</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>push pop shift unshift splice sort reverse fill copyWithin</code></td>
+      <td><code>map filter slice concat flat flatMap</code> — plus non-array returns: <code>reduce find findIndex findLast some every indexOf includes join at</code></td>
+      <td><code>toSorted toReversed toSpliced with(i, v)</code></td>
+    </tr>
+  </tbody>
+</table>
+<pre><code><span class="com">// The React-state classic: sort mutates AND returns the same reference</span>
+const sorted = items.sort(byName);      <span class="com">// sorted === items → setState sees same ref, may skip render</span>
+const sorted2 = items.toSorted(byName); <span class="com">// new array — safe for immutable state</span>
+const updated = items.with(2, newItem); <span class="com">// immutable index write</span>
+<span class="com">// Also remember: sort's default comparator is STRING-based → [10, 9, 1].sort() = [1, 10, 9]</span></code></pre>
+
+<h3>Labeled statements exist</h3>
+<pre><code>outer: for (const row of grid) {
+  for (const cell of row) {
+    if (cell === target) break outer;   <span class="com">// breaks BOTH loops</span>
+  }
+}
+<span class="com">// Rarely good style (extract a function instead), but you should recognize it —</span>
+<span class="com">// and it explains why `{ a: 1 }` at statement position parses as a LABEL + expression.</span></code></pre>
+
+<h3>Tagged template literals — styled-components mechanics</h3>
+<pre><code>function tag(strings, ...values) {
+  <span class="com">// strings: ["sum is ", ", ok"] (the static chunks, plus .raw with un-escaped text)</span>
+  <span class="com">// values:  [3]                 (the interpolations, ANY type — not stringified!)</span>
+  return strings[0] + values[0] * 2 + strings[1];
+}
+tag`sum is ${1 + 2}, ok`;   <span class="com">// "sum is 6, ok"</span>
+
+<span class="com">// styled-components: the tag receives CSS chunks + interpolated FUNCTIONS,</span>
+<span class="com">// stores them, and at render time calls each fn with props to build final CSS:</span>
+const Button = styled.button`
+  color: ${(props) =&gt; (props.primary ? "white" : "black")};
+`;</code></pre>
+<p>Because interpolated values arrive <em>unstringified</em>, tags can keep functions, sanitize inputs (safe-HTML tags), or build query ASTs (graphql-tag). Bonus trivia: the <code>strings</code> array is frozen and identity-stable per call site — libraries use it as a cache key.</p>
+
+<!-- ============================================================ -->
+<h2 id="drills">Output-prediction drills</h2>
+<p>The interview format. For each: read the code, commit to an exact output (write it down — no hedging), then reveal. Trace out loud like you would on-site.</p>
+
+<h3>Drill 1 — hoisting trio</h3>
+<pre><code>console.log(a);
+console.log(f());
+var a = 1;
+function f() { return "hi"; }
+console.log(b);
+let b = 2;</code></pre>
+<details class="qa"><summary>Reveal output &amp; explanation</summary><div class="answer">
+<p><strong>Output:</strong></p>
+<pre><code>undefined
+hi
+ReferenceError: Cannot access 'b' before initialization</code></pre>
+<p><strong>Trace:</strong> Creation phase: <code>a</code> registered = <code>undefined</code>; <code>f</code> registered = full function; <code>b</code> registered but uninitialized (TDZ). Execution: line 1 reads <code>a</code> → <code>undefined</code>. Line 2 calls fully-hoisted <code>f</code> → "hi". Line 5 reads <code>b</code> inside its TDZ → throws, so line 6 never runs. Note the error is <em>"cannot access before initialization"</em> — different from "is not defined" (undeclared), which is a hint interviewers listen for.</p>
+</div></details>
+
+<h3>Drill 2 — the loop everyone gets asked</h3>
+<pre><code>for (var i = 0; i &lt; 3; i++) {
+  setTimeout(() =&gt; console.log(i), 0);
+}
+for (let j = 0; j &lt; 3; j++) {
+  setTimeout(() =&gt; console.log(j), 0);
+}</code></pre>
+<details class="qa"><summary>Reveal output &amp; explanation</summary><div class="answer">
+<p><strong>Output:</strong> <code>3 3 3 0 1 2</code></p>
+<p><strong>Trace:</strong> Both loops run synchronously first; all six timers fire afterward in registration order (all 0ms). The <code>var</code> loop has ONE shared binding — by timer time <code>i === 3</code>, so 3,3,3. The <code>let</code> loop creates a fresh <code>j</code> per iteration; each closure captured its own copy → 0,1,2. All the var-callbacks were registered before the let-callbacks, hence the ordering 3,3,3,0,1,2.</p>
+</div></details>
+
+<h3>Drill 3 — closures capture variables, not values</h3>
+<pre><code>function make() {
+  let x = 10;
+  const get = () =&gt; x;
+  x = 20;
+  return get;
+}
+console.log(make()());
+
+const fns = [];
+for (let i = 0; i &lt; 3; i++) fns.push(() =&gt; i++);
+console.log(fns[0](), fns[0](), fns[1]());</code></pre>
+<details class="qa"><summary>Reveal output &amp; explanation</summary><div class="answer">
+<p><strong>Output:</strong></p>
+<pre><code>20
+0 1 0</code></pre>
+<p><strong>Trace:</strong> Part 1: <code>get</code> holds a live link to the binding <code>x</code>; by call time <code>x</code> is 20 → prints <strong>20</strong>, not 10. Part 2: each iteration has its own <code>i</code>. <code>fns[0]</code> closes over iteration 0's binding: first call returns 0 (post-increment) and mutates <em>that binding</em> to 1; second call returns 1. <code>fns[1]</code> has an untouched separate binding → returns 0 (mutating its own copy to 1). Closures can <em>write</em> to captured variables — and per-iteration bindings are independent.</p>
+</div></details>
+
+<h3>Drill 4 — <code>this</code> and the permanence of bind</h3>
+<pre><code>"use strict";
+const counter = {
+  count: 0,
+  inc() { this.count++; return this.count; }
+};
+const inc = counter.inc;
+console.log(counter.inc());
+try { inc(); } catch (e) { console.log(e.constructor.name); }
+const bound = counter.inc.bind(counter);
+console.log(bound.call({ count: 100 }));</code></pre>
+<details class="qa"><summary>Reveal output &amp; explanation</summary><div class="answer">
+<p><strong>Output:</strong></p>
+<pre><code>1
+TypeError
+2</code></pre>
+<p><strong>Trace:</strong> <code>counter.inc()</code> — implicit binding, <code>this = counter</code>, count 0→1, prints 1. <code>inc()</code> — plain call in strict mode, <code>this = undefined</code>, <code>undefined.count</code> throws → we print the constructor name, <strong>TypeError</strong>. <code>bound.call({count: 100})</code> — the bound function's <code>this</code> is locked to <code>counter</code>; <code>call</code>'s thisArg is <strong>ignored</strong>. counter.count 1→2, prints 2 (not 101). Only <code>new</code> can pierce a bind.</p>
+</div></details>
+
+<h3>Drill 5 — prototype reassignment</h3>
+<pre><code>function Animal(name) { this.name = name; }
+Animal.prototype.speak = function () { return this.name + "!"; };
+
+const dog = new Animal("Rex");
+console.log(dog.speak());
+console.log(dog.hasOwnProperty("speak"), "speak" in dog);
+
+Animal.prototype = { speak() { return "???"; } };
+const cat = new Animal("Tom");
+console.log(cat.speak());
+console.log(dog.speak());
+console.log(dog instanceof Animal);</code></pre>
+<details class="qa"><summary>Reveal output &amp; explanation</summary><div class="answer">
+<p><strong>Output:</strong></p>
+<pre><code>Rex!
+false true
+???
+Rex!
+false</code></pre>
+<p><strong>Trace:</strong> <code>dog</code>'s <code>[[Prototype]]</code> was set at construction to the <em>original</em> prototype object — <code>speak</code> found there (not own → <code>hasOwnProperty</code> false, but <code>in</code> walks the chain → true). Reassigning <code>Animal.prototype</code> swaps the <em>property on the function</em>; it does NOT retarget existing instances. So <code>cat</code> (constructed after) gets the new object → "???", while <code>dog</code> still walks to the old one → "Rex!". The kicker: <code>dog instanceof Animal</code> is now <strong>false</strong> — instanceof checks whether the <em>current</em> <code>Animal.prototype</code> is on dog's chain, and it isn't anymore.</p>
+</div></details>
+
+<h3>Drill 6 — event loop baseline</h3>
+<pre><code>console.log("A");
+setTimeout(() =&gt; console.log("B"), 0);
+Promise.resolve().then(() =&gt; console.log("C"));
+queueMicrotask(() =&gt; console.log("D"));
+console.log("E");</code></pre>
+<details class="qa"><summary>Reveal output &amp; explanation</summary><div class="answer">
+<p><strong>Output:</strong> <code>A E C D B</code></p>
+<p><strong>Trace:</strong> Script task: logs A, registers timer task [B], queues microtasks [C, D], logs E. Script task ends → drain microtasks in FIFO order: C, D. Loop takes next task: B. <code>queueMicrotask</code> and promise reactions share the same queue — ordering between them is pure FIFO.</p>
+</div></details>
+
+<h3>Drill 7 — microtasks spawn microtasks; timeout spawned late</h3>
+<pre><code>setTimeout(() =&gt; console.log("t1"), 0);
+Promise.resolve()
+  .then(() =&gt; {
+    console.log("p1");
+    setTimeout(() =&gt; console.log("t2"), 0);
+    return Promise.resolve();
+  })
+  .then(() =&gt; console.log("p2"));
+Promise.resolve().then(() =&gt; console.log("p3"));</code></pre>
+<details class="qa"><summary>Reveal output &amp; explanation</summary><div class="answer">
+<p><strong>Output:</strong> <code>p1 p3 p2 t1 t2</code></p>
+<p><strong>Trace:</strong> After sync: tasks [t1], micro [p1-cb, p3-cb]. Drain: p1-cb logs <strong>p1</strong>, registers t2 (tasks: [t1, t2]), and returns a promise — resolving-with-a-promise costs ~2 extra microtask ticks before p2's callback is queued. Next in queue: p3-cb logs <strong>p3</strong>. Then the adoption ticks run and p2-cb logs <strong>p2</strong> — still within the same drain, so still before ANY task. Finally tasks in order: <strong>t1</strong>, <strong>t2</strong>. Key points: microtasks queued mid-drain still run before tasks, and returning a promise from <code>.then</code> delays the chain by extra ticks (hence p3 before p2).</p>
+</div></details>
+
+<h3>Drill 8 — the async/await interleave (asked constantly)</h3>
+<pre><code>async function a() {
+  console.log("a start");
+  await b();
+  console.log("a end");
+}
+async function b() {
+  console.log("b");
+}
+console.log("script start");
+a();
+console.log("script end");
+setTimeout(() =&gt; console.log("timeout"), 0);</code></pre>
+<details class="qa"><summary>Reveal output &amp; explanation</summary><div class="answer">
+<p><strong>Output:</strong></p>
+<pre><code>script start
+a start
+b
+script end
+a end
+timeout</code></pre>
+<p><strong>Trace:</strong> "script start". <code>a()</code> runs synchronously: "a start", then evaluates <code>b()</code> — which also runs synchronously to completion, logging "b", returning a resolved promise. The <code>await</code> then suspends <code>a</code>, queueing "a end" as a microtask, and control returns to the script: "script end", timer registered. Script task ends → microtask: "a end". Next task: "timeout". The trap: people forget <code>b()</code> executes <em>synchronously</em> — async functions only yield at <code>await</code>, not at invocation.</p>
+</div></details>
+
+<h3>Drill 9 — await + then interleaving (hard)</h3>
+<pre><code>async function main() {
+  console.log(1);
+  await null;
+  console.log(2);
+  await null;
+  console.log(3);
+}
+main();
+Promise.resolve().then(() =&gt; console.log("A")).then(() =&gt; console.log("B"));
+console.log(0);</code></pre>
+<details class="qa"><summary>Reveal output &amp; explanation</summary><div class="answer">
+<p><strong>Output:</strong> <code>1 0 2 A 3 B</code></p>
+<p><strong>Trace:</strong> Sync: <code>main()</code> logs <strong>1</strong>, first <code>await</code> queues continuation M1; the then-chain queues A-cb; script logs <strong>0</strong>. Micro queue: [M1, A]. M1: logs <strong>2</strong>, second await queues M2 → queue [A, M2]. A-cb: logs <strong>A</strong>, its <code>.then</code> queues B → [M2, B]. M2: logs <strong>3</strong> (main finishes) → [B]. B logs <strong>B</strong>. Each <code>await null</code> costs exactly one tick, so <code>main</code>'s segments and the then-chain's links interleave round-robin: 2/A, then 3/B.</p>
+</div></details>
+
+<h3>Drill 10 — coercion gauntlet</h3>
+<pre><code>console.log([] == false);
+console.log([] == ![]);
+console.log(null == undefined, null == 0);
+console.log(NaN === NaN, Object.is(NaN, NaN), Object.is(0, -0));
+console.log(typeof null, typeof NaN);
+console.log(1 + "2", "3" - 1, "3" + 1);
+console.log(0.1 + 0.2 === 0.3);</code></pre>
+<details class="qa"><summary>Reveal output &amp; explanation</summary><div class="answer">
+<p><strong>Output:</strong></p>
+<pre><code>true
+true
+true false
+false true false
+object number
+12 2 31
+false</code></pre>
+<p><strong>Trace:</strong> <code>[] == false</code>: false→0, []→""→0 → true. <code>![]</code>: arrays are truthy so <code>![]</code> is <code>false</code> → same as line 1 → true. <code>null == undefined</code> true by special rule; <code>null == 0</code> false (null equals only undefined). <code>NaN === NaN</code> false; <code>Object.is</code> fixes NaN (true) but distinguishes ±0 (false). <code>typeof null</code> is the historic "object"; NaN is a "number". <code>+</code> with any string concatenates ("12", "31"); <code>-</code> is numeric-only → "3"-1 = 2. And 0.1+0.2 is 0.30000000000000004 in IEEE-754 → false.</p>
+</div></details>
+
+<h3>Drill 11 — Object.freeze is shallow; spread is shallow</h3>
+<pre><code><span class="com">// (non-strict script)</span>
+const config = Object.freeze({ mode: "dark", nested: { level: 1 } });
+config.mode = "light";
+config.nested.level = 2;
+const copy = { ...config };
+copy.mode = "light";
+copy.nested.level = 3;
+console.log(config.mode, config.nested.level);
+console.log(copy.mode, copy.nested.level);</code></pre>
+<details class="qa"><summary>Reveal output &amp; explanation</summary><div class="answer">
+<p><strong>Output:</strong></p>
+<pre><code>dark 3
+light 3</code></pre>
+<p><strong>Trace:</strong> <code>config.mode = "light"</code> silently fails (frozen; in strict mode/ESM this line would throw TypeError). <code>config.nested.level = 2</code> <em>succeeds</em> — freeze is shallow; <code>nested</code> is a normal mutable object. Spread creates a new top-level object (so <code>copy.mode = "light"</code> works — the copy isn't frozen) but <code>copy.nested</code> is the <strong>same reference</strong> as <code>config.nested</code>, so <code>copy.nested.level = 3</code> overwrites the 2 and is visible through <em>both</em>. Hence <code>dark 3</code> and <code>light 3</code>.</p>
+</div></details>
+
+<h3>Drill 12 — the hard one: returning a promise inside a chain</h3>
+<pre><code>Promise.resolve()
+  .then(() =&gt; { console.log("a"); return Promise.resolve("x"); })
+  .then((v) =&gt; console.log("b", v));
+
+Promise.resolve()
+  .then(() =&gt; console.log(1))
+  .then(() =&gt; console.log(2))
+  .then(() =&gt; console.log(3))
+  .then(() =&gt; console.log(4));</code></pre>
+<details class="qa"><summary>Reveal output &amp; explanation</summary><div class="answer">
+<p><strong>Output:</strong> <code>a 1 2 3 b x 4</code></p>
+<p><strong>Trace (tick by tick):</strong> Initial micro queue: [a-cb, 1-cb].</p>
+<ol>
+<li><strong>a-cb</strong>: logs "a", returns promise P. Resolving the chain's promise <em>with a thenable</em> queues a special job J1 (which will call <code>P.then(resolveOuter)</code>). Queue: [1-cb, J1].</li>
+<li><strong>1-cb</strong>: logs 1 → queues 2-cb. Queue: [J1, 2-cb].</li>
+<li><strong>J1</strong>: subscribes to P; P is already resolved so its reaction J2 is queued. Queue: [2-cb, J2].</li>
+<li><strong>2-cb</strong>: logs 2 → queues 3-cb. Queue: [J2, 3-cb].</li>
+<li><strong>J2</strong>: outer promise finally resolves with "x" → queues b-cb. Queue: [3-cb, b-cb].</li>
+<li><strong>3-cb</strong>: logs 3 → queues 4-cb. Queue: [b-cb, 4-cb].</li>
+<li><strong>b-cb</strong>: logs "b x". Then <strong>4-cb</strong>: logs 4.</li>
+</ol>
+<p>Moral: <code>return somePromise</code> inside <code>.then</code> = +2 microtask ticks (thenable-adoption job + reaction). Using <code>return await somePromise</code>... behaves similarly (+ticks). If an interviewer gives you this, narrate the adoption job explicitly — it's the whole question.</p>
+</div></details>
+
+<!-- ============================================================ -->
+<h2 id="qa">Interview Q&amp;A</h2>
+
+<details class="qa"><summary>What is an execution context and what does it contain?</summary><div class="answer"><p>The environment a piece of code runs in: a Lexical Environment (let/const/function bindings + pointer to the outer environment — the scope chain), a Variable Environment (var bindings), and a <code>this</code> binding. Global context is created once; a function context per call. Contexts live on the call stack; creation happens in two passes (declaration registration, then execution), which is what produces hoisting behavior.</p></div></details>
+
+<details class="qa"><summary>Explain hoisting precisely — including let/const.</summary><div class="answer"><p>All declarations are registered during the creation phase, so the engine knows every name before executing a line. The difference is initialization: <code>var</code> → initialized to <code>undefined</code>; function declarations → initialized to the complete function object (callable early); <code>let</code>/<code>const</code>/<code>class</code> → registered but uninitialized until their declaration executes — accessing them in that window (the Temporal Dead Zone) throws a ReferenceError. Proof they're hoisted: an inner <code>let x</code> makes an earlier read in the same block throw rather than resolve to an outer <code>x</code>.</p></div></details>
+
+<details class="qa"><summary>What is a closure and where do you actually use them?</summary><div class="answer"><p>A function plus a reference to the lexical environment where it was defined (its <code>[[Environment]]</code> slot); called later, it resolves free variables through that captured environment, keeping it alive past the enclosing call. Uses: private state (module pattern, memoization caches), factories (<code>once</code>, <code>debounce</code>, curried functions), event/callback state, and every React hook — a component render's state values are visible to effects and handlers purely via closure. Crucial nuance: closures capture <em>variables</em> (live bindings), not values.</p></div></details>
+
+<details class="qa"><summary>Why does the var-in-a-loop setTimeout print the final value, and what are the fixes?</summary><div class="answer"><p><code>var</code> creates one function-scoped binding shared by all iterations; timers can't run until the sync loop finishes (call stack must empty), so all callbacks read the final value. Fixes: (1) <code>let</code> — spec creates a fresh binding per iteration; (2) an IIFE passing the value as a parameter (fresh scope per iteration); (3) <code>setTimeout</code>'s extra arguments, evaluated at scheduling time. Bonus: <code>.forEach</code> with a callback parameter achieves the same as (2).</p></div></details>
+
+<details class="qa"><summary>How is <code>this</code> determined? Give the precedence order.</summary><div class="answer"><p>For normal functions, entirely by the call site, in precedence: (1) <code>new</code> → the fresh instance; (2) explicit — <code>call</code>/<code>apply</code>/<code>bind</code> → the given object; (3) implicit — <code>obj.fn()</code> → the receiver before the dot; (4) default — plain <code>fn()</code> → <code>undefined</code> in strict mode, <code>globalThis</code> in sloppy. Arrow functions opt out entirely: no own <code>this</code>, resolved lexically from the enclosing scope, immune to call/apply/bind and illegal with <code>new</code>. Precedence proof: <code>new</code> even overrides a bound <code>this</code>.</p></div></details>
+
+<details class="qa"><summary>call vs apply vs bind?</summary><div class="answer"><p><code>call(thisArg, a, b)</code> and <code>apply(thisArg, [a, b])</code> invoke immediately — identical except argument style (spread syntax has mostly obsoleted apply). <code>bind(thisArg, ...partial)</code> does NOT invoke: it returns a new bound function with <code>this</code> (and optionally leading arguments) permanently fixed — used for callbacks executed later.</p></div></details>
+
+<details class="qa"><summary>Can you re-bind a function that's already bound?</summary><div class="answer"><p>No. <code>bind</code> returns an exotic wrapper hard-wired to the original target and thisArg; a second <code>bind</code> or a <code>call</code> just wraps/invokes the wrapper, which ignores the new thisArg. The single exception: constructing with <code>new</code> — the bound <code>this</code> is discarded in favor of the new instance (partially applied arguments still apply).</p></div></details>
+
+<details class="qa"><summary>Arrow functions vs regular functions — all the differences?</summary><div class="answer"><p>Arrows have no own <code>this</code>, <code>arguments</code>, <code>super</code>, or <code>new.target</code> (all lexical); can't be constructors (no <code>new</code>, no <code>prototype</code> property); can't be generators; and as object-literal methods they don't see the object as <code>this</code>. Practical guidance: arrows for callbacks and anywhere you want lexical <code>this</code>; regular methods on prototypes/classes; class-field arrows only when you need a pre-bound handler per instance and accept the per-instance memory + testing/override costs.</p></div></details>
+
+<details class="qa"><summary>Explain <code>__proto__</code> vs <code>prototype</code>.</summary><div class="answer"><p><code>__proto__</code> (properly <code>Object.getPrototypeOf</code>) is the internal <code>[[Prototype]]</code> link every object has — the next stop in property lookup. <code>Fn.prototype</code> is a regular property only functions have: the object that <em>will become</em> the <code>[[Prototype]]</code> of instances created by <code>new Fn()</code>. So <code>rex.__proto__ === Animal.prototype</code>, while <code>Animal.__proto__ === Function.prototype</code> (the function's own chain). One is a link, the other is a template-to-be-linked.</p></div></details>
+
+<details class="qa"><summary>What exactly does the <code>new</code> operator do?</summary><div class="answer"><p>Four steps: (1) create a fresh object; (2) set its <code>[[Prototype]]</code> to <code>Fn.prototype</code>; (3) invoke <code>Fn</code> with <code>this</code> bound to that object (and <code>new.target</code> set); (4) return the object — unless the function explicitly returned a different <em>object</em>, which wins (returned primitives are ignored). Being able to write this as a <code>myNew(Fn, ...args)</code> helper is a common follow-up.</p></div></details>
+
+<details class="qa"><summary>How does <code>instanceof</code> work, and when is it unreliable?</summary><div class="answer"><p><code>x instanceof Fn</code> walks <code>x</code>'s prototype chain checking each link against the <em>current</em> <code>Fn.prototype</code> (overridable via <code>Symbol.hasInstance</code>). Unreliable when: prototypes are reassigned after construction; across realms/iframes (each has its own <code>Array</code> etc. — use <code>Array.isArray</code>); on null-prototype objects; and with primitives (<code>"a" instanceof String</code> is false). For brand-checking class instances robustly, use a <code>#field in obj</code> check.</p></div></details>
+
+<details class="qa"><summary>Is <code>class</code> just syntactic sugar over prototypes?</summary><div class="answer"><p>~90% sugar: it produces a constructor function, prototype methods, statics on the constructor, and for <code>extends</code> both <code>SubClass.prototype → Super.prototype</code> and <code>SubClass → Super</code> links. Beyond sugar: class bodies are always strict; calling without <code>new</code> throws; methods are non-enumerable and non-constructible; class bindings have TDZ; derived constructors must call <code>super()</code> before touching <code>this</code>; and <code>#private</code> fields plus <code>super</code> method dispatch have no faithful pre-class emulation.</p></div></details>
+
+<details class="qa"><summary>Define microtask vs (macro)task, and state the event loop's core rule.</summary><div class="answer"><p>Tasks: setTimeout/setInterval callbacks, DOM/UI events, I/O completions, postMessage, script execution. Microtasks: promise reactions and await continuations, queueMicrotask, MutationObserver. Core rule: run one task to completion, then drain the <em>entire</em> microtask queue — including microtasks enqueued during the drain — then optionally render (rAF callbacks immediately before paint), then take the next task. Consequences: a microtask always beats a pending setTimeout-0; a self-perpetuating microtask chain starves rendering and input entirely.</p></div></details>
+
+<details class="qa"><summary>What does <code>await</code> actually do under the hood?</summary><div class="answer"><p>An async function runs synchronously until the first <code>await</code>. There, the awaited value is wrapped via <code>Promise.resolve</code>-like semantics, the function <em>suspends</em>, and the remainder of its body is registered as a microtask continuation (with resume-or-throw depending on settlement); the caller immediately receives the function's still-pending promise. Post-ES2019, awaiting a plain value or an already-resolved native promise costs exactly one microtask tick. So <code>await</code> is essentially compiler-generated <code>.then</code> chaining over a state machine — plus try/catch mapping to rejections.</p></div></details>
+
+<details class="qa"><summary>Why doesn't <code>setTimeout(fn, 0)</code> run immediately?</summary><div class="answer"><p>Three reasons: (1) the callback is a <em>task</em> — it can't run until the current task finishes and the call stack is empty; (2) all pending microtasks drain first; (3) timers have clamping — browsers clamp nested timeouts (depth &gt; 5) to a 4ms minimum, and background tabs throttle far more aggressively (≥1s). So "0" means "as soon as the loop gets around to it," never "now."</p></div></details>
+
+<details class="qa"><summary>Node.js: process.nextTick vs setImmediate vs setTimeout(0)?</summary><div class="answer"><p><code>process.nextTick</code> — its own queue drained before promise microtasks, i.e., soonest of all (and easiest to starve the loop with). Promise microtasks next. <code>setTimeout(0)</code> runs in the timers phase; <code>setImmediate</code> in the check phase after poll — so inside an I/O callback <code>setImmediate</code> reliably beats <code>setTimeout(0)</code>, while at top level their order is a nondeterministic race with the 1ms timer clamp. Naming is historically backwards (nextTick is more immediate than setImmediate).</p></div></details>
+
+<details class="qa"><summary>== vs === vs Object.is — and when would you use ==?</summary><div class="answer"><p><code>===</code>: no coercion; NaN ≠ NaN; +0 === −0. <code>Object.is</code>: like === but NaN equals NaN and ±0 differ (React's bail-out comparison). <code>==</code>: coercing algorithm — booleans→numbers, string↔number conversion, ToPrimitive on objects, and the special rule that null/undefined equal only each other. Senior answer for using ==: only <code>x == null</code> as the deliberate "null or undefined" check, everything else banned by <code>eqeqeq</code> linting.</p></div></details>
+
+<details class="qa"><summary>When would you choose Map over a plain object?</summary><div class="answer"><p>When keys are dynamic or untrusted (no prototype-pollution/injection surface), non-string (objects, numbers kept as numbers), when you need reliable insertion-order iteration (objects reorder integer-like keys), O(1) <code>.size</code>, or heavy add/delete churn (engines optimize Map for it; objects suffer hidden-class churn). Plain objects remain right for fixed-shape records, JSON round-trips, and destructuring ergonomics. WeakMap when keys are objects whose lifetime you don't control.</p></div></details>
+
+<details class="qa"><summary>What problems do WeakMap/WeakSet solve?</summary><div class="answer"><p>Associating data with objects <em>without extending their lifetime</em>. Keys are held weakly: when the key becomes otherwise unreachable, the entry is collected. Canonical cases: metadata for DOM nodes (a normal Map would pin removed nodes forever — a leak), private per-instance data, caches keyed by object identity, seen-object tracking in graph traversal/cloning. Deliberate limitations — no size, no iteration — exist because contents depend on nondeterministic GC timing.</p></div></details>
+
+<details class="qa"><summary>How does JS garbage collection work, and what leaks do you look for in a frontend app?</summary><div class="answer"><p>Reachability-based mark-and-sweep from roots (globals, stack, live closures); cycles are handled fine. V8 is generational (fast scavenger for the young space, incremental/concurrent mark-sweep-compact for old space). A "leak" is always a reachable-but-unwanted reference: detached DOM nodes still referenced from JS, listeners/intervals on long-lived targets closing over component scopes, long-lived closures over large data, unbounded module-level caches. Diagnosis: DevTools Memory panel, 3-snapshot comparison across a repeatable action, filter "Detached," then read the Retainers path to find what's pinning the object.</p></div></details>
+
+<details class="qa"><summary>Key differences between ESM and CommonJS?</summary><div class="answer"><p>ESM is static (parse-time graph → tree-shaking, no conditional import syntax, async-capable loading, top-level await) with <em>live read-only bindings</em>; CJS is dynamic (sync <code>require</code> anywhere) exporting <em>value snapshots</em>. ESM is always strict with <code>import.meta</code>; CJS has <code>__dirname</code>/<code>require.cache</code>. Interop pain: CJS lacks a true default export, so transpiled defaults become <code>.default</code> properties (<code>__esModule</code> flag), and dual packages risk loading two copies. Circular deps: ESM pre-links bindings (may hit TDZ); CJS returns partial exports silently.</p></div></details>
+
+<details class="qa"><summary>Is Object.freeze deep? How would you deep-freeze?</summary><div class="answer"><p>Shallow — only the object's own properties are locked; nested objects stay mutable. Deep-freeze = recursively freeze children first (post-order), guarding against cycles with a WeakSet, and skipping already-frozen objects. Production note: freezing large graphs costs time and de-optimizes some engine fast paths — in app code, immutability by convention/types (readonly, Immer) usually beats runtime freezing; freeze shared constants and use it in dev to catch accidental mutation.</p></div></details>
+
+<details class="qa"><summary>What are Symbols for? Name well-known symbols.</summary><div class="answer"><p>Guaranteed-unique property keys: collision-free metadata on objects you don't own, hidden from <code>Object.keys</code>/<code>for…in</code>/<code>JSON.stringify</code> (though discoverable via <code>getOwnPropertySymbols</code> — hiding, not security). Well-known symbols are protocol hooks the language invokes: <code>Symbol.iterator</code>/<code>asyncIterator</code> (for-of / for-await), <code>Symbol.toPrimitive</code> (coercion), <code>Symbol.toStringTag</code> (branding), <code>Symbol.hasInstance</code> (instanceof), plus regex hooks like <code>Symbol.replace</code>. <code>Symbol.for(key)</code> uses a global cross-realm registry.</p></div></details>
+
+<details class="qa"><summary>How do frameworks like Vue use Proxy?</summary><div class="answer"><p>Vue 3's <code>reactive()</code> wraps state in a Proxy: the <code>get</code> trap records "current effect depends on this object+key" (dependency tracking), the <code>set</code>/<code>deleteProperty</code> traps look up and re-run subscribed effects (targeted re-render). Versus Vue 2's <code>defineProperty</code>: Proxies catch property additions/deletions and array index writes without <code>Vue.set</code>. Caveats worth volunteering: proxy identity ≠ target identity, built-ins with internal slots (Map/Set) need special-cased traps, and reads are marginally slower than raw access — hence Vue's <code>shallowRef</code>/<code>markRaw</code> escape hatches.</p></div></details>
+
+<details class="qa"><summary>structuredClone vs JSON.parse(JSON.stringify())?</summary><div class="answer"><p><code>structuredClone</code> (the postMessage/IndexedDB algorithm) correctly clones Dates, Map/Set, RegExp, typed arrays/ArrayBuffers, Blobs, NaN/Infinity/undefined, and — critically — handles circular references. JSON round-trip corrupts all of those (dates→strings, Map→{}, undefined dropped, NaN→null) and throws on cycles. Neither clones functions (JSON drops silently; structuredClone throws) and neither preserves prototypes — class instances come back as plain objects. It's also generally faster than stringify/parse for large object graphs.</p></div></details>
+
+<details class="qa"><summary>Which array methods mutate, and what changed in ES2023?</summary><div class="answer"><p>Mutators: push, pop, shift, unshift, splice, sort, reverse, fill, copyWithin. Non-mutating: map, filter, slice, concat, flat, flatMap (plus readers like reduce/find/includes). ES2023 added immutable twins — <code>toSorted</code>, <code>toReversed</code>, <code>toSpliced</code>, <code>with(index, value)</code> — designed for immutable-state code so you stop writing <code>[...arr].sort()</code>. The trap that motivates them: <code>sort</code>/<code>reverse</code> mutate AND return the same reference, so <code>setState(items.sort(...))</code> both corrupts previous state and can skip re-render (same reference under Object.is).</p></div></details>
+
+<!-- ============================================================ -->
+<h2 id="exercises">Hands-on exercises</h2>
+
+<div class="exercise">
+  <h3>Exercise 1 — implement <code>Function.prototype.myBind</code></h3>
+  <p>Write <code>myBind(thisArg, ...partial)</code> matching native semantics: returns a new function with locked <code>this</code> and partial args; later <code>call</code>/<code>bind</code> can't override; and — the senior part — when the bound function is invoked with <code>new</code>, the bound <code>this</code> is ignored and the instance's prototype chain points at the <em>original</em> function's prototype. Hint: detect construction via <code>this instanceof boundFn</code> or <code>new.target</code>. Verify against native <code>bind</code> with a test that does <code>new BoundPoint(5)</code>.</p>
+</div>
+
+<div class="exercise">
+  <h3>Exercise 2 — event-loop trace by hand, then verify</h3>
+  <p>Without running it, write the exact output of a snippet combining: two <code>setTimeout(0)</code>s, a three-link promise chain, an async function with two <code>await</code>s, and a <code>queueMicrotask</code> inside one of the <code>.then</code>s. Maintain explicit "task queue / microtask queue / stack" columns on paper for every step. Then run it in the browser console AND in Node — outputs should match. Finally add a <code>process.nextTick</code> (Node) and predict where it lands before running.</p>
+</div>
+
+<div class="exercise">
+  <h3>Exercise 3 — <code>once</code> and <code>memoize</code> with proper closure hygiene</h3>
+  <p>Implement (a) <code>once(fn)</code> — first call runs and caches; later calls return the cached result — and make it release its reference to <code>fn</code> after first call (why does that matter for memory?). (b) <code>memoize(fn)</code> that uses a <code>Map</code> for primitive single arguments and a <code>WeakMap</code> when the argument is an object — explain what leak the WeakMap variant prevents. Both must preserve <code>this</code> (test as an object method) — decide: arrow or function, and why?</p>
+</div>
+
+<div class="exercise">
+  <h3>Exercise 4 — mini EventEmitter with leak-safe subscriptions</h3>
+  <p>Build <code>class Emitter</code> with <code>on(event, fn)</code> returning an <em>unsubscribe function</em>, <code>once</code>, <code>off</code>, and <code>emit</code>. Requirements: <code>emit</code> must tolerate a listener unsubscribing itself mid-emit (iterate a copy); <code>once</code> must remove before invoking (re-entrancy); listeners run with a documented <code>this</code>. Then write the leak scenario: a long-lived emitter, a "component" object subscribing with a method that closes over a large array, and show that forgetting unsubscribe pins the array — confirm with a DevTools heap snapshot retainer path.</p>
+</div>
+
+<div class="exercise">
+  <h3>Exercise 5 — reproduce and fix a detached-DOM leak</h3>
+  <p>Make a page with a button that renders a list of 1,000 items into a container and a "clear" button that does <code>container.innerHTML = ""</code> — but first stashes <code>container.firstChild</code> into a module-level array ("for undo"). Click render/clear 5 times. Take heap snapshots, filter "Detached," and follow the Retainers path to your array. Fix it three ways: cap the undo stack, switch to <code>WeakRef</code>s, and null the array on a timer — compare snapshots after each fix and note which actually returns memory.</p>
+</div>
+
+<nav class="page-nav"><a href="03-css-modern-architecture.html">← Prev: Modern CSS</a><a href="05-js-async-implementations.html">Next: Async JS &amp; Drills →</a></nav>
+</main></body></html>

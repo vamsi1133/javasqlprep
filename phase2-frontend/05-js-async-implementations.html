@@ -1,0 +1,1424 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 — Async JS &amp; Implementation Drills | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <div class="breadcrumb"><a href="index.html">← Course Home</a></div>
+    <h1>05 — Async JS &amp; Implementation Drills</h1>
+    <p>The machine-coding round: debounce, polyfills, deep clone, retry, concurrency limiters — every "implement X" you'll be asked, built to production quality.</p>
+  </div>
+</header>
+
+<main class="container">
+
+<h2>Why interviewers ask this</h2>
+<p>The "implement X from scratch" round is the frontend equivalent of LeetCode. FAANG companies use it as a screen for JavaScript fluency; product startups use it as the <em>whole</em> technical bar. You get 30–45 minutes, a blank editor, and a prompt like "implement debounce" or "run these 100 requests but only 5 at a time." Nobody actually ships a hand-rolled debounce — the point is that these small problems expose whether you truly understand closures, <code>this</code>, timers, promise semantics, and API design, all at once, under time pressure.</p>
+<p>Here is how you are actually graded, in order:</p>
+<table>
+  <thead><tr><th>Criterion</th><th>What it looks like</th><th>Weight</th></tr></thead>
+  <tbody>
+    <tr><td><strong>1. Correctness</strong></td><td>The happy path works. A debounce that never fires, or a <code>Promise.all</code> that scrambles result order, fails the round immediately.</td><td>Table stakes</td></tr>
+    <tr><td><strong>2. Edge cases</strong></td><td>Empty array into <code>Promise.all</code>? Non-promise values? Cyclic object into deep clone? <code>this</code> lost in debounce? Seniors are expected to raise these <em>unprompted</em>.</td><td>Separates mid from senior</td></tr>
+    <tr><td><strong>3. API design</strong></td><td>Options objects with sane defaults, returned <code>cancel</code>/unsubscribe functions, accepting an <code>AbortSignal</code>. Shows you've designed libraries, not just consumed them.</td><td>Senior signal</td></tr>
+    <tr><td><strong>4. Narration</strong></td><td>You explain trade-offs <em>while</em> typing: "I'll use a Map here rather than a plain object so keys aren't coerced to strings." Silence reads as memorization.</td><td>The hire/no-hire tiebreaker</td></tr>
+  </tbody>
+</table>
+<div class="senior">Before writing a single line, spend 60 seconds asking clarifying questions (each section below lists them). It costs almost nothing and instantly signals seniority — interviewers deliberately leave prompts underspecified to see if you notice. Then state your plan in one sentence, then code.</div>
+<div class="note">This file assumes the event-loop model from <a href="04-js-core-internals.html">tutorial 04</a> (call stack, microtask vs macrotask queues, render steps). We recap only what's needed for timing arguments.</div>
+
+<div class="toc">
+  <strong>Contents</strong>
+  <ol>
+    <li><a href="#promise-semantics">Promise semantics, precisely</a></li>
+    <li><a href="#async-await">async/await: desugaring &amp; the parallelism trap</a></li>
+    <li><a href="#combinators">Combinators, timeouts &amp; AbortController (deep)</a></li>
+    <li><a href="#debounce-throttle">Implement: debounce &amp; throttle</a></li>
+    <li><a href="#promise-all">Implement: Promise.all / allSettled / race polyfills</a></li>
+    <li><a href="#promisify">Implement: promisify</a></li>
+    <li><a href="#event-emitter">Implement: EventEmitter</a></li>
+    <li><a href="#deep-clone">Implement: deep clone</a></li>
+    <li><a href="#curry-compose">Implement: curry, partial, compose/pipe</a></li>
+    <li><a href="#memoize">Implement: memoize + LRU cache</a></li>
+    <li><a href="#array-utils">Implement: flatten, groupBy, chunk</a></li>
+    <li><a href="#promise-utils">Implement: sleep, retry, concurrency pool</a></li>
+    <li><a href="#race-conditions">Async patterns in apps: races, dedup, polling</a></li>
+    <li><a href="#main-thread">Keeping the main thread free</a></li>
+    <li><a href="#qa">Interview Q&amp;A</a></li>
+    <li><a href="#drills">More practice drills</a></li>
+  </ol>
+</div>
+
+<!-- ================================================================ -->
+<h2 id="promise-semantics">1. Promise semantics, precisely <span class="tier tier-1">Tier 1</span></h2>
+<p>You cannot implement promise-based utilities — or debug production async code — with a fuzzy mental model. These are the exact rules.</p>
+
+<h3>States and settling</h3>
+<ul>
+  <li>A promise is in exactly one of three states: <strong>pending</strong>, <strong>fulfilled</strong> (with a value), or <strong>rejected</strong> (with a reason).</li>
+  <li>Fulfilled + rejected together are called <strong>settled</strong>. A promise settles <strong>at most once</strong> — later calls to <code>resolve</code>/<code>reject</code> inside the executor are silently ignored. This "first settle wins" rule is exactly what makes <code>Promise.race</code> and the timeout pattern work.</li>
+  <li>The executor function passed to <code>new Promise(executor)</code> runs <strong>synchronously, immediately</strong>. Only the <code>.then</code> callbacks are deferred (to the microtask queue).</li>
+</ul>
+<pre><code><span class="com">// Executor runs synchronously; handlers run as microtasks.</span>
+console.log('A');
+const p = new Promise((resolve) =&gt; {
+  console.log('B');          <span class="com">// runs NOW, not later</span>
+  resolve(1);
+  resolve(2);                <span class="com">// ignored — already settled</span>
+  throw new Error('nope');   <span class="com">// ALSO ignored — already settled</span>
+});
+p.then((v) =&gt; console.log('C', v));
+console.log('D');
+<span class="com">// Output: A B D C 1</span></code></pre>
+
+<h3>The three .then chaining rules</h3>
+<p>Every <code>.then(onFulfilled, onRejected)</code> call returns a <strong>new</strong> promise. What settles that new promise is determined entirely by what the handler does:</p>
+<table>
+  <thead><tr><th>Handler does…</th><th>Returned promise…</th></tr></thead>
+  <tbody>
+    <tr><td><strong>returns a plain value</strong> (incl. <code>undefined</code>)</td><td>fulfills with that value</td></tr>
+    <tr><td><strong>throws</strong></td><td>rejects with the thrown error</td></tr>
+    <tr><td><strong>returns a promise/thenable</strong></td><td><strong>adopts</strong> its state — waits for it, then mirrors its fulfillment or rejection</td></tr>
+  </tbody>
+</table>
+<pre><code>Promise.resolve(1)
+  .then((v) =&gt; v + 1)                        <span class="com">// rule 1: fulfills with 2</span>
+  .then((v) =&gt; { throw new Error('boom'); }) <span class="com">// rule 2: rejects</span>
+  .catch((e) =&gt; fetch('/recover'))           <span class="com">// rule 3: adopts the fetch promise</span>
+  .then((res) =&gt; res.json());                <span class="com">// runs only after fetch settles</span></code></pre>
+<div class="pitfall">A very common quiz: <code>Promise.resolve(1).then(() =&gt; {}).then(v =&gt; console.log(v))</code> logs <code>undefined</code> — the arrow body <code>{}</code> is a block, not an object literal, so the handler returns <code>undefined</code>, which fulfills the next promise (rule 1). Rejections only come from <em>throwing</em> or returning a rejected promise — never from returning "falsy" values.</div>
+
+<h3>Error propagation and .catch positioning</h3>
+<p>A rejection propagates down the chain, skipping every <code>onFulfilled</code> handler, until it meets an <code>onRejected</code> handler (a <code>.catch</code> or a second argument to <code>.then</code>). Once handled, the chain is back on the fulfillment track — <code>.catch</code> returns a new promise that <em>fulfills</em> with whatever the catch handler returns (unless it throws again).</p>
+<p><strong>Why <code>.then(ok, fail)</code> ≠ <code>.then(ok).catch(fail)</code>:</strong></p>
+<pre><code><span class="com">// Version A: fail does NOT see errors thrown inside ok.</span>
+<span class="com">// The pair only handles rejections of the UPSTREAM promise.</span>
+getUser().then(renderUser, showError);
+
+<span class="com">// Version B: catch sees upstream rejections AND errors thrown in renderUser.</span>
+getUser().then(renderUser).catch(showError);</code></pre>
+<ul>
+  <li>Use <code>.then(ok, fail)</code> when you want to handle <em>only</em> the upstream failure and let handler bugs surface separately (this exact distinction matters inside a <code>Promise.all</code> polyfill).</li>
+  <li>Use <code>.then(ok).catch(fail)</code> as the default: one safety net for the whole chain above it.</li>
+</ul>
+
+<h3>finally semantics</h3>
+<ul>
+  <li><code>.finally(cb)</code> runs on fulfillment <em>or</em> rejection; <code>cb</code> receives <strong>no arguments</strong> (it can't know the outcome).</li>
+  <li>It is <strong>pass-through</strong>: the returned promise settles with the <em>original</em> value/reason, ignoring <code>cb</code>'s return value…</li>
+  <li>…with two exceptions: if <code>cb</code> throws (or returns a rejected promise), that error <em>replaces</em> the outcome; and if <code>cb</code> returns a pending promise, settlement is <em>delayed</em> until it resolves.</li>
+</ul>
+<pre><code>fetchData()
+  .finally(() =&gt; setLoading(false))  <span class="com">// runs either way; value passes through</span>
+  .then(render)
+  .catch(showError);</code></pre>
+
+<h3>Microtask timing (30-second recap)</h3>
+<p>Promise reactions (<code>.then</code>/<code>await</code> continuations) are <strong>microtasks</strong>. After each macrotask (script, timer, event handler) the engine drains the <em>entire</em> microtask queue — including microtasks queued by other microtasks — before rendering or running the next macrotask. That's why <code>Promise.resolve().then(f)</code> always beats <code>setTimeout(f, 0)</code>, and why an infinite microtask loop freezes the page while an infinite <code>setTimeout</code> loop doesn't. Full treatment in <a href="04-js-core-internals.html">tutorial 04</a>.</p>
+<div class="senior">Narration line that lands well: "A promise doesn't make anything asynchronous by itself — the executor is synchronous. A promise is just a container for an eventual value plus a guarantee that observers are called asynchronously, exactly once, in a consistent order."</div>
+
+<!-- ================================================================ -->
+<h2 id="async-await">2. async/await: desugaring &amp; the parallelism trap <span class="tier tier-1">Tier 1</span></h2>
+
+<h3>What await actually does</h3>
+<p><code>async</code>/<code>await</code> is syntax over promises — but knowing the precise desugaring lets you answer any ordering quiz:</p>
+<ul>
+  <li>An <code>async</code> function <strong>always returns a promise</strong>. <code>return v</code> resolves it with <code>v</code> (adopting <code>v</code> if it's a thenable); an uncaught <code>throw</code> rejects it.</li>
+  <li>The function body runs <strong>synchronously until the first <code>await</code></strong>. At each <code>await</code>, the rest of the function is suspended and scheduled as a microtask continuation once the awaited value settles.</li>
+  <li><code>await x</code> works on <em>any</em> value: non-thenables are wrapped as if by <code>Promise.resolve(x)</code>, so <code>await 42</code> still yields to the microtask queue once.</li>
+  <li><code>await</code> on a rejected promise <strong>throws</strong> the rejection reason at that line — which is what makes <code>try/catch</code> work with async code.</li>
+</ul>
+<pre><code>async function f() {
+  const a = await getA();
+  return a * 2;
+}
+<span class="com">// is morally equivalent to:</span>
+function f() {
+  return Promise.resolve(getA()).then((a) =&gt; a * 2);
+}</code></pre>
+
+<h3>The sequential-vs-parallel mistake (asked constantly)</h3>
+<pre><code><span class="com">// ❌ Sequential: total time = sum of all requests</span>
+async function loadDashboardSlow(ids) {
+  const results = [];
+  for (const id of ids) {
+    results.push(await fetchUser(id));  <span class="com">// each await blocks the next fetch from STARTING</span>
+  }
+  return results;
+}
+
+<span class="com">// ✅ Parallel: total time = the slowest request</span>
+async function loadDashboardFast(ids) {
+  return Promise.all(ids.map((id) =&gt; fetchUser(id)));
+  <span class="com">// .map starts ALL fetches immediately; Promise.all just waits</span>
+}</code></pre>
+<pre><code><span class="com">// Timing diagram, 3 requests × 100ms each:</span>
+<span class="com">//</span>
+<span class="com">// await-in-loop (300ms total):        Promise.all (100ms total):</span>
+<span class="com">//   req1 ██████████                     req1 ██████████</span>
+<span class="com">//   req2           ██████████           req2 ██████████</span>
+<span class="com">//   req3                     ██████     req3 ██████████</span></code></pre>
+<div class="pitfall">The subtle middle case: <code>const a = fetchA(); const b = fetchB(); return [await a, await b];</code> — starting both promises <em>before</em> awaiting gives parallelism without <code>Promise.all</code>. But if <code>b</code> rejects while you're still awaiting <code>a</code>, the rejection is unobserved for a tick and can fire an <code>unhandledrejection</code> event. <code>Promise.all</code> is the correct tool; mention this trap and you score points.</div>
+<div class="note">Sequential awaiting is sometimes <em>correct</em> — when each call depends on the previous result, or when you must not hammer an API (see the <a href="#promise-utils">concurrency pool</a> for the middle ground: N at a time).</div>
+
+<h3>Error-handling patterns</h3>
+<pre><code><span class="com">// Pattern 1: narrow try/catch — only wrap what can fail, keep handling specific</span>
+async function save(form) {
+  let user;
+  try {
+    user = await api.createUser(form);
+  } catch (err) {
+    if (err instanceof ValidationError) return showFieldErrors(err);
+    throw err;                    <span class="com">// don't swallow what you can't handle</span>
+  }
+  await redirectToProfile(user);  <span class="com">// bugs here surface loudly, not as "save failed"</span>
+}
+
+<span class="com">// Pattern 2: .catch on the promise — good for fallback VALUES</span>
+const config = await fetchConfig().catch(() =&gt; DEFAULT_CONFIG);
+
+<span class="com">// Pattern 3: partial failure — don't let one widget kill the dashboard</span>
+const [user, orders] = await Promise.allSettled([fetchUser(), fetchOrders()]);</code></pre>
+<div class="pitfall">A giant <code>try { ...20 lines... } catch (e) { console.log(e) }</code> is an anti-pattern trifecta: it hides <em>which</em> operation failed, it swallows programmer errors (typos become "network error" toasts), and it converts rejections into silent <code>undefined</code>s. Catch narrowly, handle specifically, rethrow the rest.</div>
+<p><strong>Also mention when relevant:</strong></p>
+<ul>
+  <li><strong>Top-level await</strong> — legal in ES modules only; the importing module waits for it. Great for one-time config; dangerous in a widely-imported module because it delays the whole graph.</li>
+  <li><strong><code>for await...of</code></strong> — iterates an <em>async iterable</em> (object with <code>[Symbol.asyncIterator]</code>), awaiting each item: streaming fetch bodies, paginated APIs, async generators. Note it's inherently sequential — that's usually the point.</li>
+</ul>
+<pre><code>async function* paginate(url) {
+  while (url) {
+    const page = await (await fetch(url)).json();
+    yield* page.items;
+    url = page.next;         <span class="com">// null on last page ends the loop</span>
+  }
+}
+for await (const item of paginate('/api/items')) render(item);</code></pre>
+
+<!-- ================================================================ -->
+<h2 id="combinators">3. Combinators, timeouts &amp; AbortController <span class="tier tier-1">Tier 1</span></h2>
+
+<h3>The four combinators — decision table</h3>
+<table>
+  <thead><tr><th>Combinator</th><th>Resolves when…</th><th>Rejects when…</th><th>Use for</th></tr></thead>
+  <tbody>
+    <tr><td><code>Promise.all</code></td><td><strong>all</strong> fulfill → array of values, input order preserved</td><td><strong>any one</strong> rejects (fail-fast, first rejection wins)</td><td>"I need every result or the operation is meaningless" — parallel fetches for one screen</td></tr>
+    <tr><td><code>Promise.allSettled</code></td><td><strong>always</strong> → array of <code>{status:'fulfilled', value}</code> / <code>{status:'rejected', reason}</code></td><td>never</td><td>Independent operations where partial success is fine — batch saves, dashboard widgets</td></tr>
+    <tr><td><code>Promise.race</code></td><td>first promise to <strong>settle</strong> fulfills</td><td>first to settle rejects</td><td>Timeouts, "whichever source answers first"</td></tr>
+    <tr><td><code>Promise.any</code></td><td>first to <strong>fulfill</strong> (ignores rejections)</td><td><strong>all</strong> reject → <code>AggregateError</code> with <code>.errors</code> array</td><td>Redundant sources: CDN mirrors, fastest-of-N endpoints</td></tr>
+  </tbody>
+</table>
+<div class="pitfall">Two classic traps: (1) when <code>Promise.all</code> fail-fasts, the <em>other promises keep running</em> — JS promises are not cancellable; you only stop observing them. Pair with AbortController if you need real cancellation. (2) <code>race</code> vs <code>any</code>: <code>race</code> cares about the first <em>settle</em> (a fast rejection wins the race); <code>any</code> cares about the first <em>fulfillment</em>.</div>
+
+<h3>Timeout-a-promise with race</h3>
+<pre><code>function withTimeout(promise, ms) {
+  let timerId;
+  const timeout = new Promise((_, reject) =&gt; {
+    timerId = setTimeout(() =&gt; reject(new Error(`Timed out after ${ms}ms`)), ms);
+  });
+  <span class="com">// finally: clear the timer either way so we don't hold the event loop / leak</span>
+  return Promise.race([promise, timeout]).finally(() =&gt; clearTimeout(timerId));
+}</code></pre>
+<div class="note">This only stops <em>waiting</em>; the underlying work continues. For real cancellation of a fetch, use <code>AbortSignal.timeout()</code> below — and say so in the interview.</div>
+
+<h3>AbortController / AbortSignal — the modern cancellation story</h3>
+<p>Promises can't be cancelled; <strong>AbortController is the standard fix</strong>: a controller owns a signal, you pass the signal to any abortable operation, and <code>controller.abort(reason)</code> flips <code>signal.aborted</code> to true and fires its <code>'abort'</code> event. Every React dev doing data fetching needs this cold.</p>
+<pre><code><span class="com">// 1. Aborting fetch — rejects with DOMException named 'AbortError'</span>
+const controller = new AbortController();
+fetch('/api/search?q=react', { signal: controller.signal })
+  .then((r) =&gt; r.json())
+  .catch((err) =&gt; {
+    if (err.name === 'AbortError') return;  <span class="com">// expected — not a real failure</span>
+    throw err;
+  });
+controller.abort();  <span class="com">// e.g. user typed again, or component unmounted</span>
+
+<span class="com">// 2. React effect cleanup — the canonical pattern</span>
+useEffect(() =&gt; {
+  const controller = new AbortController();
+  fetchResults(query, controller.signal).then(setResults).catch(ignoreAbort);
+  return () =&gt; controller.abort();  <span class="com">// cancels on unmount AND on query change</span>
+}, [query]);
+
+<span class="com">// 3. addEventListener cleanup — one abort removes MANY listeners</span>
+const c = new AbortController();
+window.addEventListener('resize', onResize, { signal: c.signal });
+window.addEventListener('scroll', onScroll, { signal: c.signal });
+c.abort();  <span class="com">// both removed — no need to keep handler references around</span>
+
+<span class="com">// 4. Static helpers</span>
+const s1 = AbortSignal.timeout(5000);          <span class="com">// auto-aborts with 'TimeoutError' after 5s</span>
+const s2 = AbortSignal.any([s1, userSignal]);  <span class="com">// aborts when EITHER does — compose timeout + manual cancel</span>
+fetch(url, { signal: s2 });</code></pre>
+<p><strong>Making your own operations abortable</strong> — the contract every abortable API follows: (a) if already aborted, fail immediately; (b) listen for <code>'abort'</code> to stop work and reject with <code>signal.reason</code>; (c) remove the listener when done to avoid leaks.</p>
+<pre><code>function abortableDelay(ms, signal) {
+  return new Promise((resolve, reject) =&gt; {
+    if (signal?.aborted) return reject(signal.reason);       <span class="com">// (a) pre-aborted</span>
+    const id = setTimeout(() =&gt; {
+      signal?.removeEventListener('abort', onAbort);          <span class="com">// (c) cleanup</span>
+      resolve();
+    }, ms);
+    const onAbort = () =&gt; {
+      clearTimeout(id);                                       <span class="com">// (b) actually stop the work</span>
+      reject(signal.reason);
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}</code></pre>
+<div class="senior">Interviewers increasingly probe cancellation because it's where real apps break (stale search results, setState-after-unmount, wasted bandwidth). If you volunteer "I'd thread an AbortSignal through this API" during any async implementation, you're speaking the language of TanStack Query, Axios v1+, and Node's own APIs — all of which standardized on it.</div>
+
+<!-- ================================================================ -->
+<h2 id="debounce-throttle">4. Implement: debounce &amp; throttle <span class="tier tier-1">Tier 1</span></h2>
+<p><strong>Problem:</strong> Implement <code>debounce(fn, wait)</code> — returns a function that delays invoking <code>fn</code> until <code>wait</code> ms have elapsed since the <em>last</em> call. Then <code>throttle(fn, wait)</code> — invokes <code>fn</code> at most once per <code>wait</code> ms.</p>
+<p><strong>Clarifying questions to ask:</strong></p>
+<ul>
+  <li>"Should the debounced function support a <em>leading</em> (immediate) invocation option?"</li>
+  <li>"Do you want a <code>cancel()</code> method? A <code>flush()</code>?"</li>
+  <li>"Should <code>this</code> and arguments be preserved?" (Yes — say it before they ask.)</li>
+  <li>"For throttle: leading edge, trailing edge, or both?"</li>
+</ul>
+
+<h3>Naive debounce (say: "I'll start simple, then harden it")</h3>
+<pre><code>function debounce(fn, wait) {
+  let timerId;
+  return (...args) =&gt; {
+    clearTimeout(timerId);           <span class="com">// every call resets the clock</span>
+    timerId = setTimeout(() =&gt; fn(...args), wait);
+  };
+}</code></pre>
+<p>Problems: loses <code>this</code> (arrow function + <code>fn(...args)</code> — breaks when debouncing a method), no way to cancel a pending call (unmount leak in React), no leading option.</p>
+
+<h3>Production debounce</h3>
+<pre><code>function debounce(fn, wait, { leading = false, trailing = true } = {}) {
+  let timerId = null;
+  let lastArgs, lastThis;
+
+  const invoke = () =&gt; {
+    const args = lastArgs, thisArg = lastThis;
+    lastArgs = lastThis = undefined;      <span class="com">// clear BEFORE calling (fn might call debounced again)</span>
+    fn.apply(thisArg, args);
+  };
+
+  function debounced(...args) {          <span class="com">// function keyword: we need dynamic `this`</span>
+    lastArgs = args;
+    lastThis = this;
+    const isLeadingCall = leading &amp;&amp; timerId === null;
+
+    clearTimeout(timerId);               <span class="com">// safe even if timerId is null</span>
+    timerId = setTimeout(() =&gt; {
+      timerId = null;
+      <span class="com">// lastArgs is undefined if the only call was the leading one —</span>
+      <span class="com">// that check prevents a duplicate trailing invocation</span>
+      if (trailing &amp;&amp; lastArgs !== undefined) invoke();
+    }, wait);
+
+    if (isLeadingCall) invoke();
+  }
+
+  debounced.cancel = () =&gt; {
+    clearTimeout(timerId);
+    timerId = null;
+    lastArgs = lastThis = undefined;
+  };
+
+  debounced.flush = () =&gt; {              <span class="com">// fire pending call NOW (e.g. on form submit)</span>
+    if (timerId !== null &amp;&amp; lastArgs !== undefined) {
+      clearTimeout(timerId);
+      timerId = null;
+      invoke();
+    }
+  };
+
+  return debounced;
+}</code></pre>
+<p><strong>Edge cases handled (list these out loud):</strong></p>
+<ul>
+  <li><code>this</code> + args preserved via <code>function</code> keyword and <code>fn.apply</code> — <code>el.addEventListener('input', debounce(handler, 300))</code> keeps <code>this === el</code>.</li>
+  <li><code>leading: true</code> fires immediately on the first call of a burst; the <code>lastArgs !== undefined</code> guard stops a single call from firing <em>twice</em> (leading + trailing).</li>
+  <li><code>cancel()</code> clears both the timer and captured args — no stale closure retained, no post-unmount call.</li>
+  <li>Timer cleanup: we null out <code>timerId</code> when the timer fires so <code>leading</code> detection (<code>timerId === null</code>) stays correct.</li>
+</ul>
+
+<h3>Throttle — timestamp + timer hybrid (leading and trailing)</h3>
+<p>Two naive approaches, each half-right: <em>timestamp-only</em> gives a leading call but drops the final call of a burst (a scroll handler misses the resting position); <em>timer-only</em> gives trailing calls but delays the first reaction. Production throttle combines both:</p>
+<pre><code>function throttle(fn, wait, { leading = true, trailing = true } = {}) {
+  let lastInvokeTime = 0;
+  let timerId = null;
+  let lastArgs, lastThis;
+
+  const invoke = (time) =&gt; {
+    lastInvokeTime = time;
+    const args = lastArgs, thisArg = lastThis;
+    lastArgs = lastThis = undefined;
+    fn.apply(thisArg, args);
+  };
+
+  function throttled(...args) {
+    const now = Date.now();
+    if (lastInvokeTime === 0 &amp;&amp; !leading) lastInvokeTime = now;  <span class="com">// suppress leading edge</span>
+    lastArgs = args;
+    lastThis = this;
+    const remaining = wait - (now - lastInvokeTime);
+
+    if (remaining &lt;= 0) {                <span class="com">// window elapsed → invoke immediately (leading)</span>
+      if (timerId !== null) { clearTimeout(timerId); timerId = null; }
+      invoke(now);
+    } else if (trailing &amp;&amp; timerId === null) {
+      timerId = setTimeout(() =&gt; {       <span class="com">// schedule ONE trailing call for end of window</span>
+        timerId = null;
+        invoke(leading ? Date.now() : 0);
+      }, remaining);
+    }
+    <span class="com">// calls landing mid-window with a timer pending just update lastArgs —</span>
+    <span class="com">// the trailing call uses the FRESHEST arguments</span>
+  }
+
+  throttled.cancel = () =&gt; {
+    clearTimeout(timerId);
+    timerId = null;
+    lastInvokeTime = 0;
+    lastArgs = lastThis = undefined;
+  };
+
+  return throttled;
+}</code></pre>
+
+<h3>When to use which</h3>
+<table>
+  <thead><tr><th>Scenario</th><th>Tool</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td>Search-as-you-type, autosave, resize-end layout</td><td><strong>debounce</strong></td><td>You only care about the <em>final</em> state after the user pauses</td></tr>
+    <tr><td>Scroll position tracking, drag, mousemove, infinite-scroll checks</td><td><strong>throttle</strong></td><td>You need <em>periodic</em> updates during continuous activity — debounce would go silent for the whole gesture</td></tr>
+    <tr><td>Button double-click protection</td><td>throttle (leading, no trailing) or <code>once</code></td><td>Act on the first click, swallow the burst</td></tr>
+  </tbody>
+</table>
+
+<h3>The React gotcha</h3>
+<pre><code><span class="com">// ❌ New debounced fn every render → its private timer is thrown away →</span>
+<span class="com">// nothing is actually debounced across renders</span>
+function Search() {
+  const [q, setQ] = useState('');
+  const search = debounce((v) =&gt; api.search(v), 300);   <span class="com">// recreated each render!</span>
+  ...
+}
+
+<span class="com">// ✅ Create once; cancel on unmount</span>
+function Search() {
+  const search = useMemo(() =&gt; debounce((v) =&gt; api.search(v), 300), []);
+  useEffect(() =&gt; () =&gt; search.cancel(), [search]);     <span class="com">// this is why cancel() exists</span>
+  ...
+}</code></pre>
+<div class="pitfall">Even the <code>useMemo</code> version has a stale-closure risk: if the debounced callback reads props/state, it sees the values from the render where it was created. Fixes: pass everything as arguments, or keep the latest callback in a ref (<code>useEffectEvent</code> / the "latest ref" pattern). Raising this unprompted is a strong senior signal.</div>
+<p><strong>Follow-ups you may get:</strong> add <code>maxWait</code> (debounce that can't starve — which is how lodash implements throttle: <code>debounce(fn, wait, { maxWait: wait })</code>); return the result — explain why leading mode can return a value but trailing mode needs a promise.</p>
+
+<!-- ================================================================ -->
+<h2 id="promise-all">5. Implement: Promise.all / allSettled / race polyfills <span class="tier tier-1">Tier 1</span></h2>
+<p><strong>Problem:</strong> Implement <code>Promise.all(iterable)</code> from scratch: resolves with an array of values <em>in input order</em> when all fulfill; rejects with the first rejection.</p>
+<p><strong>Clarifying questions:</strong></p>
+<ul>
+  <li>"Can the iterable contain non-promise values?" (Yes — spec wraps them with <code>Promise.resolve</code>.)</li>
+  <li>"Empty iterable?" (Resolves with <code>[]</code> — synchronously scheduled, still async delivery.)</li>
+  <li>"Should results preserve input order even if promises settle out of order?" (Yes — this is the crux.)</li>
+</ul>
+
+<h3>Naive attempt — and why it's wrong</h3>
+<pre><code><span class="com">// ❌ Pushing on settle → results appear in COMPLETION order, not input order</span>
+promises.forEach((p) =&gt; p.then((v) =&gt; { results.push(v); ... }));</code></pre>
+<p>Fix: write each result to its <strong>index</strong>, and count completions separately — you can't use <code>results.length</code> as the counter because assigning to index 2 of an empty array makes length 3 with holes.</p>
+
+<h3>Production Promise.all</h3>
+<pre><code>function promiseAll(iterable) {
+  return new Promise((resolve, reject) =&gt; {
+    const items = [...iterable];              <span class="com">// accept any iterable, snapshot it</span>
+    const results = new Array(items.length);
+    let remaining = items.length;
+
+    if (remaining === 0) return resolve(results);   <span class="com">// edge: empty → resolve []</span>
+
+    items.forEach((item, i) =&gt; {
+      <span class="com">// Promise.resolve handles plain values AND foreign thenables</span>
+      Promise.resolve(item).then(
+        (value) =&gt; {
+          results[i] = value;                 <span class="com">// write by INDEX → input order preserved</span>
+          remaining -= 1;                     <span class="com">// count-based resolution</span>
+          if (remaining === 0) resolve(results);
+        },
+        reject                                <span class="com">// first rejection wins; later resolve() calls</span>
+      );                                      <span class="com">// are no-ops because promises settle once</span>
+    });
+  });
+}</code></pre>
+<p><strong>Say while coding:</strong> "I don't need to 'cancel' the other promises on rejection — <code>reject</code> settles the outer promise, and the settle-once rule makes every later <code>resolve</code> call a no-op. And I pass <code>reject</code> as the second <code>.then</code> argument rather than <code>.catch</code>, since I only want upstream rejections."</p>
+
+<h3>allSettled and race (short — same skeleton)</h3>
+<pre><code>function promiseAllSettled(iterable) {
+  const items = [...iterable];
+  return promiseAll(items.map((item) =&gt;
+    Promise.resolve(item).then(
+      (value) =&gt; ({ status: 'fulfilled', value }),
+      (reason) =&gt; ({ status: 'rejected', reason })
+    )
+  ));  <span class="com">// mapping every outcome to fulfillment means promiseAll can never fail-fast</span>
+}
+
+function promiseRace(iterable) {
+  return new Promise((resolve, reject) =&gt; {
+    for (const item of iterable) {
+      Promise.resolve(item).then(resolve, reject);  <span class="com">// first settle wins — that's it</span>
+    }
+    <span class="com">// edge: empty iterable → stays pending FOREVER (matches the spec)</span>
+  });
+}</code></pre>
+<p><strong>Follow-ups:</strong> <code>Promise.any</code> (inverted counting + <code>AggregateError</code> — solved in <a href="#drills">drills</a>); "make <code>promiseAll</code> accept a concurrency limit" (that's the <a href="#promise-utils">pool</a>).</p>
+
+<!-- ================================================================ -->
+<h2 id="promisify">6. Implement: promisify <span class="tier tier-1">Tier 1</span></h2>
+<p><strong>Problem:</strong> Convert a Node-style callback function — <code>fn(...args, (err, result) =&gt; {})</code> — into one that returns a promise.</p>
+<p><strong>Clarifying questions:</strong> "Error-first callback convention? Can the callback receive multiple success values? Should <code>this</code> be preserved (method on an object)?"</p>
+<pre><code>function promisify(fn) {
+  return function promisified(...args) {        <span class="com">// function keyword → preserves `this`</span>
+    return new Promise((resolve, reject) =&gt; {
+      fn.call(this, ...args, (err, result) =&gt; { <span class="com">// append the callback LAST</span>
+        if (err != null) reject(err);            <span class="com">// error-first convention</span>
+        else resolve(result);
+      });
+    });
+  };
+}
+
+<span class="com">// Usage:</span>
+const readFileAsync = promisify(fs.readFile);
+const data = await readFileAsync('config.json', 'utf8');</code></pre>
+<p><strong>Edge cases:</strong> <code>this</code> preserved (promisifying <code>db.query</code> must keep <code>db</code>); <code>err != null</code> (loose) treats both <code>null</code> and <code>undefined</code> as success; if <code>fn</code> throws <em>synchronously</em>, the executor is already running, so the throw is caught by the promise machinery and becomes a rejection — free correctness, worth pointing out.</p>
+<p><strong>Follow-ups:</strong> multi-value callbacks (<code>(err, a, b)</code> → resolve with array — Node's <code>util.promisify</code> uses a symbol for custom behavior); reverse direction, "callbackify".</p>
+
+<!-- ================================================================ -->
+<h2 id="event-emitter">7. Implement: EventEmitter <span class="tier tier-1">Tier 1</span></h2>
+<p><strong>Problem:</strong> Implement a class with <code>on(event, fn)</code>, <code>off(event, fn)</code>, <code>once(event, fn)</code>, <code>emit(event, ...args)</code>.</p>
+<p><strong>Clarifying questions:</strong></p>
+<ul>
+  <li>"If a handler calls <code>off</code> <em>during</em> an emit, should removal affect the current emit?" (Convention: no — snapshot the list.)</li>
+  <li>"Should <code>on</code> return an unsubscribe function?" (Modern API design — do it.)</li>
+  <li>"Duplicate handler registered twice — called twice?" (Node says yes; simplest and I'll match it.)</li>
+  <li>"Should a throwing handler stop the others?" (Discuss; default: let it throw, or isolate with try/catch.)</li>
+</ul>
+<pre><code>class EventEmitter {
+  #events = new Map();   <span class="com">// Map&lt;string, Array&lt;fn&gt;&gt; — Map, not {}, so no</span>
+                         <span class="com">// prototype-key collisions ('constructor', '__proto__')</span>
+  on(event, handler) {
+    if (typeof handler !== 'function') throw new TypeError('handler must be a function');
+    const list = this.#events.get(event) ?? [];
+    list.push(handler);
+    this.#events.set(event, list);
+    return () =&gt; this.off(event, handler);   <span class="com">// unsubscribe fn — the modern contract</span>
+  }
+
+  off(event, handler) {
+    const list = this.#events.get(event);
+    if (!list) return this;
+    <span class="com">// match the handler itself OR a once-wrapper wrapping it</span>
+    const i = list.findIndex((h) =&gt; h === handler || h.original === handler);
+    if (i !== -1) list.splice(i, 1);          <span class="com">// remove ONE occurrence (Node semantics)</span>
+    if (list.length === 0) this.#events.delete(event);  <span class="com">// don't leak empty arrays</span>
+    return this;
+  }
+
+  once(event, handler) {
+    const wrapper = (...args) =&gt; {
+      this.off(event, wrapper);               <span class="com">// remove BEFORE calling —</span>
+      handler.apply(this, args);              <span class="com">// re-entrant emit inside handler can't double-fire</span>
+    };
+    wrapper.original = handler;               <span class="com">// so off(event, handler) can find it</span>
+    return this.on(event, wrapper);
+  }
+
+  emit(event, ...args) {
+    const list = this.#events.get(event);
+    if (!list || list.length === 0) return false;
+    for (const handler of [...list]) {        <span class="com">// SNAPSHOT: on/off during emit can't</span>
+      handler.apply(this, args);              <span class="com">// skip or double-call handlers mid-loop</span>
+    }
+    return true;
+  }
+}</code></pre>
+<p><strong>The two subtle bugs this design avoids — narrate them:</strong></p>
+<ul>
+  <li><strong>Mutation during emit:</strong> without the <code>[...list]</code> snapshot, a handler calling <code>off</code> shifts the array under the loop and the <em>next</em> handler gets skipped. This is a real bug class in hand-rolled emitters.</li>
+  <li><strong><code>once</code> + <code>off</code> interop:</strong> users hold a reference to <em>their</em> handler, not your wrapper. Tagging <code>wrapper.original</code> lets <code>off(event, theirHandler)</code> still work.</li>
+</ul>
+<div class="senior">Memory-leak discussion (expect it as a follow-up): the emitter holds <strong>strong references</strong> to every handler, and handlers close over their subscribers — a long-lived emitter (app-wide bus) subscribed to by short-lived components keeps those components, their DOM, and their state alive forever. Mitigations: always return/store unsubscribe functions and call them on teardown (React: in the effect cleanup); support <code>{ signal }</code> in <code>on</code> like <code>addEventListener</code> does; a <code>removeAllListeners(event)</code> escape hatch; and Node's max-listeners warning exists precisely to surface forgotten unsubscribes.</div>
+<p><strong>Follow-ups:</strong> wildcard events (<code>on('*', fn)</code> — check a second list in <code>emit</code>); async handlers (<code>emit</code> returning <code>Promise.all</code> of results); priority ordering (solved in <a href="#drills">drills</a>).</p>
+
+<!-- ================================================================ -->
+<h2 id="deep-clone">8. Implement: deep clone <span class="tier tier-1">Tier 1</span></h2>
+<p><strong>Problem:</strong> <code>deepClone(value)</code> — a fully independent copy: mutating the clone never affects the original.</p>
+<p><strong>Clarifying questions:</strong></p>
+<ul>
+  <li>"Which types must I support — just JSON-ish data, or Date, RegExp, Map, Set?"</li>
+  <li>"Can the input contain <strong>circular references</strong>?" (Ask this one always — it's the trap.)</li>
+  <li>"Functions, DOM nodes, class instances — clone, copy by reference, or throw?"</li>
+  <li>"Can I just use <code>structuredClone</code>?" (Great question — implement anyway, then compare.)</li>
+</ul>
+
+<h3>Naive: JSON round-trip — know exactly why it fails</h3>
+<pre><code>const clone = JSON.parse(JSON.stringify(obj));
+<span class="com">// Loses: undefined &amp; functions (dropped), Date (→ string), Map/Set (→ {}),</span>
+<span class="com">// NaN/Infinity (→ null), BigInt (throws). Circular refs: THROWS.</span>
+<span class="com">// Fine for plain config objects; wrong as a general answer.</span></code></pre>
+
+<h3>Production deepClone</h3>
+<pre><code>function deepClone(value, seen = new WeakMap()) {
+  <span class="com">// 1. Primitives &amp; functions: returned as-is.</span>
+  <span class="com">//    (typeof null === 'object' — hence the explicit null check)</span>
+  if (value === null || typeof value !== 'object') return value;
+
+  <span class="com">// 2. Cycles: if we've cloned this exact object before, reuse that clone.</span>
+  <span class="com">//    WeakMap so the bookkeeping doesn't prevent garbage collection.</span>
+  if (seen.has(value)) return seen.get(value);
+
+  <span class="com">// 3. Built-ins with internal state (not copiable via key iteration):</span>
+  if (value instanceof Date)   return new Date(value.getTime());
+  if (value instanceof RegExp) return new RegExp(value.source, value.flags);
+
+  if (value instanceof Map) {
+    const result = new Map();
+    seen.set(value, result);               <span class="com">// register BEFORE recursing (cycle safety)</span>
+    for (const [k, v] of value) result.set(deepClone(k, seen), deepClone(v, seen));
+    return result;
+  }
+
+  if (value instanceof Set) {
+    const result = new Set();
+    seen.set(value, result);
+    for (const item of value) result.add(deepClone(item, seen));
+    return result;
+  }
+
+  if (Array.isArray(value)) {
+    const result = [];
+    seen.set(value, result);
+    for (let i = 0; i &lt; value.length; i++) result[i] = deepClone(value[i], seen);
+    return result;
+  }
+
+  <span class="com">// 4. Plain objects — preserve the prototype (class instances keep methods)</span>
+  const result = Object.create(Object.getPrototypeOf(value));
+  seen.set(value, result);
+  for (const key of Reflect.ownKeys(value)) {   <span class="com">// string keys + symbols</span>
+    result[key] = deepClone(value[key], seen);
+  }
+  return result;
+}</code></pre>
+<p><strong>The critical line to narrate:</strong> <code>seen.set(value, result)</code> happens <em>before</em> recursing into children. For a self-referencing object (<code>a.self = a</code>), the recursive call finds the half-built clone in <code>seen</code> and wires the cycle correctly instead of recursing forever.</p>
+<p><strong>Edge cases handled:</strong> primitives, <code>null</code>, functions (by reference — cloning a closure is impossible in general), Date/RegExp/Map/Set, arrays (incl. as Map values), circular and <em>shared</em> references (two properties pointing at the same object stay the <em>same</em> clone — <code>seen</code> gives you this for free), symbol keys, prototypes.</p>
+
+<h3>structuredClone — the modern answer</h3>
+<p>Say this proactively: "In production I'd reach for <code>structuredClone(value)</code> — a native, spec'd deep clone that handles cycles, Date, Map, Set, ArrayBuffer, typed arrays, Blob, and more. It's the same algorithm used for <code>postMessage</code> and IndexedDB." Then show you know its limits:</p>
+<ul>
+  <li><strong>Throws</strong> (<code>DataCloneError</code>) on: functions, DOM nodes, class instances with methods you care about — actually it clones own data properties but the <strong>prototype is lost</strong> (clone of a <code>class User</code> instance is a plain object), plus <code>Error</code> subclass specifics, <code>WeakMap</code>/<code>WeakRef</code>, property getters (invoked, result cloned — accessor-ness lost).</li>
+  <li>So the hand-rolled version still earns its keep for class instances — which is why the interviewer asks anyway.</li>
+</ul>
+<p><strong>Follow-ups:</strong> depth limit / max-nodes guard; clone with a transform callback; "how would you deep-<em>freeze</em> instead?" (same traversal, <code>Object.freeze</code>, no cycle map needed if you check <code>Object.isFrozen</code>).</p>
+
+<!-- ================================================================ -->
+<h2 id="curry-compose">9. Implement: curry, partial, compose/pipe <span class="tier tier-1">Tier 1</span></h2>
+<p><strong>Problem:</strong> <code>curry(fn)</code> — transform <code>f(a, b, c)</code> so that <code>f(a)(b)(c)</code>, <code>f(a, b)(c)</code>, and <code>f(a)(b, c)</code> all work.</p>
+<p><strong>Clarifying questions:</strong> "Fixed arity from <code>fn.length</code>, or explicit? Should extra arguments beyond arity be passed through? Placeholders needed?"</p>
+<pre><code>function curry(fn) {
+  return function curried(...args) {
+    if (args.length &gt;= fn.length) {         <span class="com">// fn.length = declared parameter count</span>
+      return fn.apply(this, args);          <span class="com">// enough args → actually invoke</span>
+    }
+    <span class="com">// not enough yet → return a collector that accumulates more</span>
+    return (...next) =&gt; curried.apply(this, [...args, ...next]);
+  };
+}
+
+const add3 = curry((a, b, c) =&gt; a + b + c);
+add3(1)(2)(3);    <span class="com">// 6</span>
+add3(1, 2)(3);    <span class="com">// 6</span>
+add3(1)(2, 3);    <span class="com">// 6</span></code></pre>
+<div class="pitfall"><code>fn.length</code> counts parameters <em>before</em> the first default or rest parameter: <code>(a, b = 1) =&gt; …</code> has length 1, <code>(...args) =&gt; …</code> has length 0. So <code>curry</code> silently misbehaves on such functions — state this limitation and offer <code>curry(fn, arity)</code> with an explicit arity as the fix.</div>
+<p><strong>Placeholder awareness</strong> (know the idea; implement only if asked): lodash's <code>curry</code> supports <code>add3(1, _, 3)(2)</code> — the check becomes "enough args <em>and</em> no placeholders among the first <code>arity</code> slots", and merging fills placeholders before appending. Mentioning this shows depth without burning time.</p>
+<pre><code><span class="com">// Partial application — fix some leading args, one shot (vs curry's chaining):</span>
+const partial = (fn, ...preset) =&gt;
+  function (...later) { return fn.call(this, ...preset, ...later); };
+
+const log = (level, msg) =&gt; console.log(`[${level}] ${msg}`);
+const warn = partial(log, 'WARN');
+warn('disk almost full');   <span class="com">// [WARN] disk almost full</span>
+
+<span class="com">// pipe: left-to-right (reads like a pipeline); compose: right-to-left (math order)</span>
+const pipe    = (...fns) =&gt; (input) =&gt; fns.reduce((acc, fn) =&gt; fn(acc), input);
+const compose = (...fns) =&gt; (input) =&gt; fns.reduceRight((acc, fn) =&gt; fn(acc), input);
+
+const slugify = pipe(
+  (s) =&gt; s.trim().toLowerCase(),
+  (s) =&gt; s.replace(/[^a-z0-9]+/g, '-'),
+  (s) =&gt; s.replace(/^-+|-+$/g, '')
+);
+slugify('  Hello, World!  ');  <span class="com">// 'hello-world'</span></code></pre>
+<p><strong>Edge cases:</strong> <code>pipe()</code> with zero functions returns identity (reduce with the input as seed — free); each stage receives exactly one value, so multi-arg functions need currying/wrapping first. <strong>Follow-up:</strong> async pipe (stages return promises) — solved in <a href="#drills">drills</a>.</p>
+
+<!-- ================================================================ -->
+<h2 id="memoize">10. Implement: memoize + LRU cache <span class="tier tier-1">Tier 1</span></h2>
+<p><strong>Problem:</strong> <code>memoize(fn)</code> — cache results by arguments so repeat calls skip computation.</p>
+<p><strong>Clarifying questions:</strong> "Single argument or multiple? Can arguments be objects? Is unbounded cache growth acceptable, or do we need eviction? Is <code>fn</code> pure?" (Memoizing an impure function is a bug — say so.)</p>
+
+<h3>Step 1: single-argument version</h3>
+<pre><code>function memoize(fn) {
+  const cache = new Map();      <span class="com">// Map: any key type, no prototype pollution, has() is O(1)</span>
+  return function (...args) {
+    const key = args[0];
+    if (cache.has(key)) return cache.get(key);   <span class="com">// has(), not get() truthiness —</span>
+    const result = fn.apply(this, args);          <span class="com">// cached undefined/0/'' must count as hits</span>
+    cache.set(key, result);
+    return result;
+  };
+}</code></pre>
+
+<h3>Step 2: multi-arg — the key-strategy discussion</h3>
+<p>This discussion IS the interview. Options, with trade-offs:</p>
+<table>
+  <thead><tr><th>Key strategy</th><th>Pros</th><th>Cons</th></tr></thead>
+  <tbody>
+    <tr><td><code>JSON.stringify(args)</code></td><td>Trivial; value-equality for plain data</td><td>Key-order sensitivity (<code>{a,b}</code> vs <code>{b,a}</code>), can't handle functions/cycles/undefined, O(size) per call</td></tr>
+    <tr><td>Caller-supplied <code>keyFn</code></td><td>Caller knows what identifies a call — the pragmatic default</td><td>Pushes work to the caller</td></tr>
+    <tr><td>Nested Map trie (one level per arg)</td><td>Identity-based, handles any values, no serialization</td><td>More code; object args are compared by <em>reference</em></td></tr>
+    <tr><td>WeakMap for object args</td><td>Cache entries die with their keys — <strong>no leak</strong></td><td>Only object keys; no size/iteration</td></tr>
+  </tbody>
+</table>
+<pre><code>function memoize(fn, keyFn = (...args) =&gt; JSON.stringify(args)) {
+  const cache = new Map();
+  return function (...args) {
+    const key = keyFn(...args);
+    if (cache.has(key)) return cache.get(key);
+    const result = fn.apply(this, args);
+    cache.set(key, result);
+    return result;
+  };
+}
+
+<span class="com">// WeakMap variant for single OBJECT arg — e.g. memoizing a selector over a</span>
+<span class="com">// state object. When the state object is GC'd, its cache entry goes with it.</span>
+function memoizeWeak(fn) {
+  const cache = new WeakMap();
+  return (obj) =&gt; {
+    if (cache.has(obj)) return cache.get(obj);
+    const result = fn(obj);
+    cache.set(obj, result);
+    return result;
+  };
+}</code></pre>
+<div class="pitfall">Memoizing async functions caches the <em>promise</em> — nice (concurrent callers share one in-flight request — this is request deduplication) but a <strong>rejected</strong> promise gets cached too, so one transient network error is replayed forever. Fix: <code>cache.set(key, p); p.catch(() =&gt; cache.delete(key));</code>. Raising this unprompted is a strong senior moment.</div>
+
+<h3>Step 3: bounded cache — LRU via Map's ordering trick</h3>
+<p>Unbounded memoization is a memory leak with good PR. The classic fix is least-recently-used eviction. The elegant JS implementation exploits that <strong><code>Map</code> preserves insertion order</strong>: delete + re-insert moves a key to the "back", so the <em>first</em> key is always the least recently used.</p>
+<pre><code>class LRUCache {
+  #map = new Map();
+  constructor(capacity) {
+    if (capacity &lt; 1) throw new RangeError('capacity must be ≥ 1');
+    this.capacity = capacity;
+  }
+
+  get(key) {
+    if (!this.#map.has(key)) return undefined;
+    const value = this.#map.get(key);
+    this.#map.delete(key);          <span class="com">// re-insert → moves key to most-recent position</span>
+    this.#map.set(key, value);
+    return value;
+  }
+
+  set(key, value) {
+    if (this.#map.has(key)) {
+      this.#map.delete(key);        <span class="com">// updating counts as a "use" too</span>
+    } else if (this.#map.size &gt;= this.capacity) {
+      const oldest = this.#map.keys().next().value;   <span class="com">// FIRST key = LRU</span>
+      this.#map.delete(oldest);
+    }
+    this.#map.set(key, value);
+  }
+
+  has(key) { return this.#map.has(key); }   <span class="com">// design choice: has() does NOT refresh recency</span>
+}
+
+<span class="com">// Plug it in: memoize with bounded memory</span>
+function memoizeLRU(fn, capacity = 100, keyFn = (...a) =&gt; JSON.stringify(a)) {
+  const cache = new LRUCache(capacity);
+  return function (...args) {
+    const key = keyFn(...args);
+    if (cache.has(key)) return cache.get(key);
+    const result = fn.apply(this, args);
+    cache.set(key, result);
+    return result;
+  };
+}</code></pre>
+<p><strong>Say while coding:</strong> "All operations are O(1) — <code>Map</code> is a hash table plus an insertion-order linked list, so I get the doubly-linked-list-plus-hashmap LRU design from the classic LeetCode problem for free." <strong>Follow-ups:</strong> TTL expiry (store <code>{value, expiresAt}</code>); cache statistics; <code>memoize.clear()</code>.</p>
+
+<!-- ================================================================ -->
+<h2 id="array-utils">11. Implement: flatten, groupBy, chunk <span class="tier tier-1">Tier 1</span></h2>
+
+<h3>flatten — recursive, iterative, and with depth</h3>
+<p><strong>Clarify:</strong> "Full flatten or to a given depth? Are the arrays potentially deep enough to blow the call stack?"</p>
+<pre><code><span class="com">// Recursive with depth — mirrors Array.prototype.flat(depth)</span>
+function flatten(arr, depth = 1) {
+  const result = [];
+  for (const item of arr) {
+    if (Array.isArray(item) &amp;&amp; depth &gt; 0) {
+      result.push(...flatten(item, depth - 1));
+    } else {
+      result.push(item);
+    }
+  }
+  return result;
+}
+flatten([1, [2, [3, [4]]]], Infinity);   <span class="com">// [1, 2, 3, 4]</span>
+
+<span class="com">// Iterative with an explicit stack — no recursion depth limit</span>
+function flattenIterative(arr) {
+  const stack = [...arr];
+  const result = [];
+  while (stack.length &gt; 0) {
+    const item = stack.pop();                <span class="com">// take from the END (that's the twist)</span>
+    if (Array.isArray(item)) stack.push(...item);
+    else result.push(item);
+  }
+  return result.reverse();                   <span class="com">// pop() walked right-to-left → reverse once</span>
+}</code></pre>
+<div class="pitfall">The iterative version's <code>reverse()</code> is where people slip: popping from the stack processes elements right-to-left, so results come out backwards. Alternatives — <code>stack.shift()</code> keeps order but each shift is O(n), or push children reversed. One final <code>reverse()</code> is the clean O(n) answer.</div>
+<p><strong>Mention:</strong> "Natively this is <code>arr.flat(depth)</code> (default depth 1, <code>Infinity</code> for full) and <code>flatMap</code> for map-then-flatten-one — I'm implementing it because you asked, but I'd never hand-roll it in app code."</p>
+
+<h3>groupBy</h3>
+<pre><code>function groupBy(items, keyFn) {
+  const groups = new Map();          <span class="com">// Map keeps key types intact (true !== 'true')</span>
+  for (const item of items) {
+    const key = keyFn(item);
+    const bucket = groups.get(key);
+    if (bucket) bucket.push(item);
+    else groups.set(key, [item]);
+  }
+  return groups;
+}
+<span class="com">// groupBy(users, u =&gt; u.role) → Map { 'admin' =&gt; [...], 'viewer' =&gt; [...] }</span>
+<span class="com">// Native (2024+): Object.groupBy(items, fn) / Map.groupBy(items, fn) — know they exist.</span></code></pre>
+
+<h3>chunk</h3>
+<pre><code>function chunk(arr, size) {
+  if (!Number.isInteger(size) || size &lt; 1) throw new RangeError('size must be a positive integer');
+  const result = [];
+  for (let i = 0; i &lt; arr.length; i += size) {
+    result.push(arr.slice(i, i + size));   <span class="com">// slice clamps past the end — last chunk may be short</span>
+  }
+  return result;
+}
+chunk([1, 2, 3, 4, 5], 2);   <span class="com">// [[1,2], [3,4], [5]]</span></code></pre>
+<p><strong>Edge cases across all three:</strong> empty input → empty output (all handle it naturally — verify out loud); <code>chunk</code> guards nonsense sizes; <code>groupBy</code> with a Map avoids the classic object-key coercion bug where <code>u.age</code> keys 18 and "18" collide.</p>
+
+<!-- ================================================================ -->
+<h2 id="promise-utils">12. Implement: sleep, retry, concurrency pool <span class="tier tier-1">Tier 1</span></h2>
+<p>These three compose into real API-client code — interviewers love them because they test promise construction, error strategy, and scheduling in one arc. The pool is the acknowledged <strong>senior differentiator</strong>.</p>
+
+<h3>sleep — abortable</h3>
+<pre><code>const sleep = (ms, { signal } = {}) =&gt;
+  new Promise((resolve, reject) =&gt; {
+    if (signal?.aborted) return reject(signal.reason);
+    const id = setTimeout(() =&gt; {
+      signal?.removeEventListener('abort', onAbort);   <span class="com">// cleanup — no listener leak</span>
+      resolve();
+    }, ms);
+    const onAbort = () =&gt; {
+      clearTimeout(id);                                 <span class="com">// actually cancel the timer</span>
+      reject(signal.reason);
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });</code></pre>
+
+<h3>retry — exponential backoff + jitter + AbortSignal (production-grade)</h3>
+<p><strong>Clarify:</strong> "Retry on <em>every</em> error, or only retryable ones (network/5xx/429 — never 400)? Max attempts? Should waits be cancellable?"</p>
+<pre><code>async function retry(task, {
+  retries = 3,             <span class="com">// retries AFTER the first attempt → up to 4 calls total</span>
+  baseDelay = 200,
+  maxDelay = 10_000,
+  shouldRetry = () =&gt; true,
+  signal,
+  onRetry,                 <span class="com">// observability hook: (err, attempt) =&gt; log/metric</span>
+} = {}) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await task({ attempt, signal });   <span class="com">// pass signal down so the WORK is abortable too</span>
+    } catch (err) {
+      const outOfAttempts = attempt &gt;= retries;
+      if (outOfAttempts || !shouldRetry(err) || signal?.aborted) throw err;
+
+      <span class="com">// Exponential: 200, 400, 800, ... capped at maxDelay</span>
+      const backoff = Math.min(maxDelay, baseDelay * 2 ** attempt);
+      <span class="com">// "Equal jitter": half fixed + half random. Without jitter, every client</span>
+      <span class="com">// that failed together retries together — a synchronized thundering herd</span>
+      <span class="com">// that re-kills the recovering server.</span>
+      const delay = backoff / 2 + Math.random() * (backoff / 2);
+
+      onRetry?.(err, attempt + 1);
+      await sleep(delay, { signal });    <span class="com">// abortable wait — abort during backoff rejects here</span>
+    }
+  }
+}
+
+<span class="com">// Usage — retry transient failures only, cancellable by the caller:</span>
+const data = await retry(
+  ({ signal }) =&gt; fetchJson('/api/report', { signal }),
+  { retries: 4, shouldRetry: (e) =&gt; e.status === 429 || e.status &gt;= 500, signal: controller.signal }
+);</code></pre>
+<p><strong>Edge cases to narrate:</strong> abort during the <em>sleep</em> (handled — sleep rejects), abort during the <em>task</em> (handled — signal passed down; and <code>shouldRetry</code> should return false for <code>AbortError</code>), non-retryable errors thrown immediately, delay cap so attempt 10 isn't a 3-minute wait. Bonus: honor a <code>Retry-After</code> header when present.</p>
+
+<h3>Concurrency pool — run N at a time</h3>
+<p><strong>Problem:</strong> given 100 task functions and a limit of 5, run at most 5 concurrently; resolve with all results <em>in input order</em>.</p>
+<p><strong>Clarify:</strong> "Tasks are <em>functions returning promises</em>, right? (If I'm handed promises, the work has already started — nothing to limit.) Fail-fast like <code>Promise.all</code>, or collect all outcomes?"</p>
+<pre><code><span class="com">// The elegant worker-pool formulation — memorize this one.</span>
+async function promisePool(tasks, limit) {
+  const results = new Array(tasks.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    <span class="com">// Each worker pulls the next unclaimed task until none remain.</span>
+    while (nextIndex &lt; tasks.length) {
+      const i = nextIndex++;       <span class="com">// read+increment is safe: JS is single-threaded and</span>
+                                   <span class="com">// there's no await between the read and the write</span>
+      results[i] = await tasks[i]();
+    }
+  }
+
+  <span class="com">// Spawn min(limit, tasks.length) workers; each is an async fn = a promise.</span>
+  const workers = Array.from({ length: Math.min(limit, tasks.length) }, worker);
+  await Promise.all(workers);      <span class="com">// also propagates the first rejection (fail-fast)</span>
+  return results;
+}
+
+<span class="com">// Usage:</span>
+const tasks = urls.map((url) =&gt; () =&gt; fetchJson(url));   <span class="com">// note: thunks, not promises</span>
+const data = await promisePool(tasks, 5);</code></pre>
+<p><strong>Why this is correct — the three-sentence proof to give:</strong> "Each worker is a sequential loop, so a worker never runs two tasks at once; with K workers, at most K tasks are in flight. Workers claim indices from a shared counter, and because JavaScript is single-threaded with no <code>await</code> between reading and incrementing <code>nextIndex</code>, no two workers can claim the same index. Results are written by index, so order is preserved regardless of completion order."</p>
+<p><strong>Follow-up: a reusable <code>pLimit</code>-style limiter</strong> (limit shared across independent call sites — how the <code>p-limit</code> package works):</p>
+<pre><code>function pLimit(concurrency) {
+  const queue = [];
+  let active = 0;
+
+  const runNext = () =&gt; {
+    if (active &gt;= concurrency || queue.length === 0) return;
+    active++;
+    const { fn, resolve, reject } = queue.shift();
+    fn().then(resolve, reject)
+        .finally(() =&gt; { active--; runNext(); });  <span class="com">// a finishing task admits the next one</span>
+  };
+
+  <span class="com">// Returns a function that schedules fn under the shared limit</span>
+  return (fn) =&gt; new Promise((resolve, reject) =&gt; {
+    queue.push({ fn, resolve, reject });
+    runNext();
+  });
+}
+
+const limit = pLimit(3);
+const results = await Promise.all(urls.map((u) =&gt; limit(() =&gt; fetchJson(u))));</code></pre>
+<p><strong>Edge cases:</strong> <code>limit ≥ tasks.length</code> degrades to plain <code>Promise.all</code>; empty task list → resolves <code>[]</code>; a rejecting task rejects the pool but already-started tasks keep running (same caveat as <code>Promise.all</code> — combine with AbortSignal to actually stop them); errors in <code>pLimit</code> still trigger <code>finally</code>, so the slot is always released — no starvation.</p>
+
+<h3>Sequential runner (the trivial cousin — know it cold)</h3>
+<pre><code>async function runSequential(tasks) {
+  const results = [];
+  for (const task of tasks) {
+    results.push(await task());   <span class="com">// here await-in-loop is the POINT, not a bug</span>
+  }
+  return results;
+}</code></pre>
+
+<!-- ================================================================ -->
+<h2 id="race-conditions">13. Async patterns in apps: races, dedup, polling <span class="tier tier-2">Tier 2</span></h2>
+
+<h3>The stale-search-results problem</h3>
+<p>The most common real-world async bug, and a favorite system-y interview probe. User types <code>"re"</code> → request A; types <code>"react"</code> → request B. B returns in 80ms, A returns in 300ms. A's handler runs <em>last</em> and overwrites the UI with results for <code>"re"</code>. The network gives <strong>no ordering guarantee</strong> — responses arrive in any order.</p>
+<p><strong>Fix 1 — ignore-stale flag (the minimal React fix):</strong></p>
+<pre><code>useEffect(() =&gt; {
+  let stale = false;                       <span class="com">// closure flag, one per effect run</span>
+  search(query).then((results) =&gt; {
+    if (!stale) setResults(results);       <span class="com">// old effect's flag is true → old response ignored</span>
+  });
+  return () =&gt; { stale = true; };          <span class="com">// cleanup runs before the next effect</span>
+}, [query]);</code></pre>
+<p><strong>Fix 2 — AbortController per request</strong> (better: also cancels the network work — the pattern from section 3). <strong>Fix 3 — a generic <code>takeLatest</code> wrapper</strong> (implement this when asked):</p>
+<pre><code><span class="com">// Version A: token check — old calls resolve to a sentinel you filter out</span>
+function takeLatest(fn) {
+  let latestCallId = 0;
+  return async (...args) =&gt; {
+    const callId = ++latestCallId;         <span class="com">// this call is now "the latest"</span>
+    const result = await fn(...args);
+    if (callId !== latestCallId) {
+      const err = new Error('Superseded by a newer call');
+      err.name = 'StaleError';
+      throw err;                           <span class="com">// caller treats like AbortError: ignore</span>
+    }
+    return result;
+  };
+}
+
+<span class="com">// Version B: real cancellation — fn must accept a signal as its first arg</span>
+function takeLatestAbortable(fn) {
+  let controller = null;
+  return (...args) =&gt; {
+    controller?.abort(new DOMException('Superseded', 'AbortError'));
+    controller = new AbortController();
+    return fn(controller.signal, ...args);
+  };
+}
+
+const searchLatest = takeLatestAbortable((signal, q) =&gt; fetchJson(`/search?q=${q}`, { signal }));</code></pre>
+
+<h3>Request deduplication — the in-flight map</h3>
+<p>Five components mount and each fetches <code>/api/me</code> → five identical requests. Deduplication shares one in-flight promise per key — this is the core trick inside TanStack Query and SWR (same key ⇒ same in-flight promise ⇒ one network call, many subscribers).</p>
+<pre><code>const inFlight = new Map();
+
+function dedupedFetch(url) {
+  const existing = inFlight.get(url);
+  if (existing) return existing;           <span class="com">// join the request already in progress</span>
+
+  const promise = fetch(url)
+    .then((res) =&gt; {
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res.json();
+    })
+    .finally(() =&gt; inFlight.delete(url));  <span class="com">// CRITICAL: delete on settle — success or failure.</span>
+                                            <span class="com">// Forget this and a failed request is cached forever,</span>
+                                            <span class="com">// replaying its rejection to every future caller.</span>
+  inFlight.set(url, promise);
+  return promise;
+}</code></pre>
+<div class="note">Dedup ≠ caching: dedup shares while in flight and forgets on settle; a cache also retains <em>after</em> settle (then you need TTL/invalidation — TanStack Query's <code>staleTime</code>/<code>gcTime</code> split). Keep the two ideas separate and say so.</div>
+
+<h3>Polling with backoff + visibility pause</h3>
+<pre><code>function poll(task, { interval = 5000, maxInterval = 60_000, signal } = {}) {
+  let delay = interval;
+  (async () =&gt; {
+    while (!signal?.aborted) {
+      <span class="com">// Pause while tab is hidden — don't burn battery/server on background tabs</span>
+      if (document.visibilityState === 'hidden') {
+        await new Promise((resolve) =&gt; document.addEventListener(
+          'visibilitychange', resolve, { once: true, signal }));
+        if (signal?.aborted) break;
+      }
+      try {
+        await task({ signal });
+        delay = interval;                        <span class="com">// success → reset backoff</span>
+      } catch {
+        delay = Math.min(delay * 2, maxInterval); <span class="com">// failure → back off (recovering server)</span>
+      }
+      try { await sleep(delay, { signal }); } catch { break; }  <span class="com">// abort during sleep exits</span>
+    }
+  })();
+}</code></pre>
+<div class="pitfall">Never poll with <code>setInterval(fetchStuff, 5000)</code>: if a request takes longer than the interval, requests overlap and pile up. The while-loop shape waits for each cycle (request + delay) to finish first — self-adjusting by construction.</div>
+
+<h3>Optimistic update + rollback (sketch)</h3>
+<pre><code>async function toggleLike(postId) {
+  const previous = store.get(postId);                    <span class="com">// 1. snapshot for rollback</span>
+  store.update(postId, { liked: !previous.liked });      <span class="com">// 2. update UI immediately</span>
+  try {
+    const serverState = await api.toggleLike(postId);    <span class="com">// 3. fire the request</span>
+    store.update(postId, serverState);                   <span class="com">// 4. reconcile with truth</span>
+  } catch {
+    store.update(postId, previous);                      <span class="com">// 5. roll back + toast</span>
+    toast('Could not save — try again');
+  }
+}</code></pre>
+<p>Discussion points if probed: concurrent optimistic updates to the same entity need a queue or last-write-wins policy; rollback restores the <em>snapshot</em>, which may itself be stale if another update landed in between — TanStack Query solves this with <code>onMutate</code> context + query cancellation + invalidation on settle.</p>
+
+<!-- ================================================================ -->
+<h2 id="main-thread">14. Keeping the main thread free <span class="tier tier-2">Tier 2</span></h2>
+<p>Everything above is I/O-async. CPU-bound work is different: a 200ms synchronous loop blocks the <em>single</em> main thread — no clicks processed, no rendering, no React updates. INP (Interaction to Next Paint) directly measures this; sustained blocks over ~50ms mark you as "long tasks" and tank the metric.</p>
+<h3>Chunking work — yield to the event loop</h3>
+<pre><code>async function processInChunks(items, processItem, chunkSize = 500) {
+  for (let i = 0; i &lt; items.length; i += chunkSize) {
+    for (let j = i; j &lt; Math.min(i + chunkSize, items.length); j++) {
+      processItem(items[j]);
+    }
+    <span class="com">// Yield: a macrotask boundary lets pending input + a render frame run.</span>
+    <span class="com">// NOTE: await Promise.resolve() would NOT work — microtasks run before</span>
+    <span class="com">// rendering, so the loop would still hog the thread.</span>
+    await new Promise((resolve) =&gt; setTimeout(resolve, 0));
+  }
+}</code></pre>
+<table>
+  <thead><tr><th>Yield mechanism</th><th>Behavior</th><th>Use when</th></tr></thead>
+  <tbody>
+    <tr><td><code>setTimeout(fn, 0)</code></td><td>Macrotask; ~ next tick, clamped to 4ms when nested</td><td>Universal fallback; fine for most chunking</td></tr>
+    <tr><td><code>requestIdleCallback(fn)</code></td><td>Runs in frame <em>idle time</em>, gives a <code>deadline.timeRemaining()</code> budget</td><td>True background work (prefetch, analytics); may be starved on busy pages — pass <code>{ timeout }</code></td></tr>
+    <tr><td><code>scheduler.postTask(fn, { priority })</code></td><td>Prioritized scheduling: <code>'user-blocking' | 'user-visible' | 'background'</code>, abortable via signal</td><td>The modern answer (broadly available in 2025-era browsers); <code>scheduler.yield()</code> gives a continuation that resumes at the <em>front</em> of the queue</td></tr>
+  </tbody>
+</table>
+<h3>Web Workers — when it's genuinely CPU-bound</h3>
+<p>Chunking makes jank <em>intermittent</em>; the total work still runs on the main thread. Parsing a 50MB CSV, image processing, crypto, diffing huge trees → move it off-thread:</p>
+<pre><code><span class="com">// worker.js</span>
+self.onmessage = (e) =&gt; {
+  const result = heavyParse(e.data);        <span class="com">// blocks the WORKER thread — fine</span>
+  self.postMessage(result);
+};
+
+<span class="com">// main.js — wrap message-passing in a promise</span>
+function runInWorker(worker, payload) {
+  return new Promise((resolve, reject) =&gt; {
+    worker.onmessage = (e) =&gt; resolve(e.data);
+    worker.onerror = (e) =&gt; reject(e.error ?? new Error(e.message));
+    worker.postMessage(payload);
+  });
+}</code></pre>
+<p>Key constraints to mention: workers share <strong>no memory</strong> with the page (no DOM access); messages are copied via <strong>structured clone</strong> (same algorithm/limits as <code>structuredClone</code> — no functions), so huge payloads cost serialization time unless you <em>transfer</em> ownership (<code>ArrayBuffer</code> transferables — zero-copy) or use <code>SharedArrayBuffer</code>. And name-drop <strong>Comlink</strong>: a tiny library that proxies a worker behind an async function interface so you stop hand-writing postMessage plumbing.</p>
+
+<!-- ================================================================ -->
+<h2 id="qa">15. Interview Q&amp;A</h2>
+
+<details class="qa"><summary>Q1. What are the possible states of a promise, and what does "settled once" guarantee?</summary><div class="answer"><p>Pending, fulfilled, rejected. A promise transitions at most once, permanently; subsequent <code>resolve</code>/<code>reject</code> calls are ignored. This guarantee is load-bearing: <code>Promise.race</code> and the timeout pattern work <em>because</em> the first settle wins and the losers' calls are no-ops. It also means attaching <code>.then</code> after settlement still works — the handler is scheduled as a microtask with the stored value.</p></div></details>
+
+<details class="qa"><summary>Q2. Why is <code>.then(onSuccess, onError)</code> different from <code>.then(onSuccess).catch(onError)</code>?</summary><div class="answer"><p>The two-argument form's <code>onError</code> only handles rejections of the <em>upstream</em> promise — an error thrown inside <code>onSuccess</code> is not caught by its sibling. The chained <code>.catch</code> handles both upstream rejections and errors thrown in <code>onSuccess</code>, because it sits downstream of the promise <code>.then</code> returns. Use the two-arg form when you deliberately don't want the error handler to mask handler bugs (e.g., inside a Promise.all polyfill); use chained <code>.catch</code> as the everyday default.</p></div></details>
+
+<details class="qa"><summary>Q3. What exactly happens at an <code>await</code> expression?</summary><div class="answer"><p>The operand is wrapped as if by <code>Promise.resolve()</code>. The function suspends; the remainder of its body becomes a reaction on that promise, scheduled onto the <strong>microtask queue</strong> when it settles. Control returns synchronously to the caller. If the promise rejects, resumption <em>throws</em> the reason at the await site. Even <code>await 42</code> suspends for at least one microtask tick — which is why inserting an <code>await</code> can change observable ordering.</p></div></details>
+
+<details class="qa"><summary>Q4. When is <code>await</code> in a loop correct, and when is it a bug?</summary><div class="answer"><p>It's a bug when iterations are independent — you serialize work that could overlap, turning N×100ms of parallel I/O into sequential. Use <code>Promise.all(items.map(fn))</code>. It's correct when each iteration depends on the previous result (pagination cursors), when order/side-effect sequencing matters (migrations), or when you must limit pressure on a resource — though for "some but not unlimited parallelism" the right tool is a concurrency pool.</p></div></details>
+
+<details class="qa"><summary>Q5. Promise.all vs allSettled vs race vs any — one-line discriminator for each?</summary><div class="answer"><p><code>all</code>: all-or-nothing, fail-fast on first rejection, ordered results. <code>allSettled</code>: never rejects, gives every outcome as <code>{status, value|reason}</code> — for independent operations. <code>race</code>: first to <em>settle</em> wins, fulfillment or rejection — for timeouts. <code>any</code>: first to <em>fulfill</em> wins, ignores rejections until all fail, then rejects with <code>AggregateError</code> (inspect <code>.errors</code>) — for redundant sources.</p></div></details>
+
+<details class="qa"><summary>Q6. Does <code>Promise.all</code> cancel the remaining promises when one rejects?</summary><div class="answer"><p>No. Promises are not cancellable; <code>Promise.all</code> merely stops <em>waiting</em> — every other operation continues to completion, consuming network/CPU, its result discarded. For real cancellation, pair the combinator with an <code>AbortController</code>: on first failure, call <code>controller.abort()</code> and have each task honor the shared signal.</p></div></details>
+
+<details class="qa"><summary>Q7. How does AbortController work, and how do you make your own function abortable?</summary><div class="answer"><p>A controller owns a signal; <code>abort(reason)</code> sets <code>signal.aborted</code>, stores <code>signal.reason</code>, and fires the <code>'abort'</code> event. Consumers like <code>fetch</code> reject with an <code>AbortError</code> DOMException. To make your own function abortable, follow the contract: (1) check <code>signal.aborted</code> up front and fail immediately; (2) add an <code>'abort'</code> listener that stops the underlying work (clear timers, close connections) and rejects with <code>signal.reason</code>; (3) remove the listener on completion. Also know <code>AbortSignal.timeout(ms)</code> and <code>AbortSignal.any([...])</code> for composing timeout + user cancellation.</p></div></details>
+
+<details class="qa"><summary>Q8. Debounce vs throttle — definitions and one canonical use case each?</summary><div class="answer"><p>Debounce fires <em>after activity stops</em>: it postpones invocation until <code>wait</code> ms pass with no new calls — search-as-you-type, autosave. Throttle fires <em>during activity at a bounded rate</em>: at most once per window — scroll/mousemove handlers where you need periodic updates throughout the gesture. Litmus test: "do I want the final state after a pause (debounce) or a steady stream of samples (throttle)?"</p></div></details>
+
+<details class="qa"><summary>Q9. Why does <code>debounce(fn, 300)</code> inside a React component body silently do nothing, and what's the fix?</summary><div class="answer"><p>Every render creates a <em>new</em> debounced function with a fresh internal timer, so the "previous call" it's supposed to supersede belongs to a different closure — nothing is debounced across renders (and the old timers still fire). Fix: create it once with <code>useMemo(() =&gt; debounce(fn, 300), [])</code> or store it in a ref, and call <code>.cancel()</code> in the effect cleanup. Then handle the stale-closure follow-up: pass changing values as arguments or read them from a "latest" ref.</p></div></details>
+
+<details class="qa"><summary>Q10. In a Promise.all polyfill, why can't you use <code>results.push(value)</code> and <code>results.length</code> as the completion check?</summary><div class="answer"><p>Push ordering follows <em>completion</em> order, not input order — a fast third promise lands at index 0. Writing to <code>results[i]</code> fixes order but breaks <code>length</code> as a counter: assigning index 2 of an empty array yields length 3 with holes, so you'd resolve early with sparse results. Hence the two separate mechanisms: index-addressed writes for ordering, a decrementing <code>remaining</code> counter for completion.</p></div></details>
+
+<details class="qa"><summary>Q11. In an EventEmitter, why must <code>emit</code> iterate over a copy of the handler list?</summary><div class="answer"><p>Handlers may call <code>on</code>/<code>off</code> during the emit. Mutating the array mid-iteration causes skipped or double-invoked handlers (removing index 1 while the loop is at index 1 shifts index 2 into the current slot). Snapshotting (<code>[...list]</code>) freezes the invocation set at emit time: removals apply to future emits, and a <code>once</code> wrapper that unsubscribes itself can't corrupt the loop.</p></div></details>
+
+<details class="qa"><summary>Q12. How do event emitters cause memory leaks, and what are the mitigations?</summary><div class="answer"><p>The emitter holds strong references to handlers; handlers close over their subscriber's scope. A long-lived emitter (app singleton) + short-lived subscribers (components) that never unsubscribe = components, their DOM, and captured state stay reachable forever. Mitigations: return unsubscribe functions from <code>on</code> and call them on teardown (React effect cleanup); accept <code>{ signal }</code> so one abort detaches everything; <code>once</code> for one-shots; leak canaries like Node's max-listeners warning. WeakRef-based handler storage is possible but rarely worth the complexity.</p></div></details>
+
+<details class="qa"><summary>Q13. What does <code>JSON.parse(JSON.stringify(x))</code> get wrong as a deep clone?</summary><div class="answer"><p><code>undefined</code>, functions, and symbols are dropped (or become <code>null</code> in arrays); <code>Date</code> becomes an ISO string; <code>Map</code>/<code>Set</code>/<code>RegExp</code> become <code>{}</code>; <code>NaN</code>/<code>Infinity</code> become <code>null</code>; <code>BigInt</code> throws; getters are evaluated and flattened; prototypes/class identity are lost; and circular references throw <code>TypeError</code>. It's acceptable only for known plain-JSON data — and even then <code>structuredClone</code> is now the better native answer.</p></div></details>
+
+<details class="qa"><summary>Q14. What can <code>structuredClone</code> handle that JSON can't — and what can't it clone?</summary><div class="answer"><p>Handles: circular references, <code>Date</code>, <code>RegExp</code>, <code>Map</code>, <code>Set</code>, <code>ArrayBuffer</code>/typed arrays, <code>Blob</code>/<code>File</code>, <code>Error</code> objects — the structured clone algorithm shared with <code>postMessage</code> and IndexedDB. Can't: functions and DOM nodes (throws <code>DataCloneError</code>), <code>WeakMap</code>/<code>WeakSet</code>, property descriptors/getters (getter results are cloned as plain values), and prototypes — a class instance comes back as a plain object with its data but not its methods. That last one is why hand-rolled clones still exist.</p></div></details>
+
+<details class="qa"><summary>Q15. Why is a WeakMap the right structure for both cycle-tracking in deepClone and object-keyed memoization?</summary><div class="answer"><p>WeakMap keys are held <em>weakly</em>: the map doesn't prevent its keys from being garbage collected, and entries vanish when keys die. In deepClone the <code>seen</code> map lives only for the call, but WeakMap is still semantically right (bookkeeping shouldn't extend lifetimes) — and doubles as the cycle detector: registering the clone <em>before</em> recursing means a self-reference finds the in-progress clone instead of recursing infinitely. In memoization it eliminates the classic leak where a cache keyed by objects pins every object (and its results) in memory forever. Trade-off: no iteration, no <code>size</code>, no <code>clear</code> — by design, since GC timing is unobservable.</p></div></details>
+
+<details class="qa"><summary>Q16. How can a Map implement an O(1) LRU cache?</summary><div class="answer"><p><code>Map</code> preserves insertion order and is internally a hash table plus an order list, so: on <code>get</code>, delete and re-insert the key — it moves to the most-recent end in O(1). On <code>set</code> at capacity, evict <code>map.keys().next().value</code> — the first key, i.e., least recently used. This is exactly the hashmap + doubly-linked-list LRU design, with the linked list provided by Map's insertion-order guarantee.</p></div></details>
+
+<details class="qa"><summary>Q17. What's the danger in memoizing an async function, and the fix?</summary><div class="answer"><p>You cache the <em>promise</em>, which is great for deduplicating concurrent calls — but if the promise rejects, the rejected promise stays cached and every future call replays the failure without ever retrying. Fix: evict on rejection — <code>cache.set(key, p); p.catch(() =&gt; cache.delete(key));</code>. Related design questions: should in-flight and settled entries have different lifetimes (TanStack Query's staleTime vs gcTime), and do you need TTL on successes too?</p></div></details>
+
+<details class="qa"><summary>Q18. Explain the stale-response race in a typeahead and rank the fixes.</summary><div class="answer"><p>Two keystrokes launch two requests; the network doesn't guarantee response order, so the older request can resolve last and overwrite newer results. Fixes, weakest to strongest: (1) ignore-stale closure flag in the effect — simple, but the wasted request completes anyway; (2) monotonic token / takeLatest wrapper — generic, framework-free; (3) AbortController per request, aborting the previous — also cancels network work and composes with fetch natively; (4) a data-fetching layer (TanStack Query) that keys requests, dedupes, cancels, and caches — what you'd actually ship. Bonus: debouncing input reduces the race window but does not eliminate it — it's a complement, not a fix.</p></div></details>
+
+<details class="qa"><summary>Q19. Why does exponential backoff need jitter?</summary><div class="answer"><p>When a server blips, all its clients fail <em>simultaneously</em>. With deterministic backoff they all retry simultaneously too — at 200ms, 400ms, 800ms — arriving as synchronized waves ("thundering herd") that can re-topple the recovering service. Randomizing each client's delay (e.g., equal jitter: <code>backoff/2 + random(backoff/2)</code>, or full jitter: <code>random(backoff)</code>) decorrelates the waves and spreads load flat. Also cap the delay, retry only retryable errors (5xx/429/network — never 400), and honor <code>Retry-After</code>.</p></div></details>
+
+<details class="qa"><summary>Q20. In the worker-pool concurrency limiter, why is <code>const i = nextIndex++</code> safe without locks?</summary><div class="answer"><p>JavaScript executes on a single thread with run-to-completion semantics: code between awaits never interleaves. The read of <code>nextIndex</code> and its increment happen in one synchronous step with no <code>await</code> between them, so no other worker can observe the intermediate state — two workers can't claim the same index. The general lesson: in JS, race conditions live <em>at await boundaries</em>, not between adjacent synchronous statements. If the claim spanned an await (<code>const i = nextIndex; await something; nextIndex = i + 1</code>), it would be a genuine race.</p></div></details>
+
+<!-- ================================================================ -->
+<h2 id="drills">16. More practice drills</h2>
+<p>Each drill: read the prompt, implement it yourself in an editor, <em>then</em> open the solution. Set a 20-minute timer per problem — that's roughly the interview budget after questions and discussion.</p>
+
+<div class="exercise">
+  <h4>Drill 1 — Implement <code>Promise.any</code></h4>
+  <p>Resolve with the first <em>fulfillment</em>; if all reject, reject with an <code>AggregateError</code> whose <code>.errors</code> preserves input order. Handle empty iterables and non-promise values.</p>
+  <details><summary>Solution &amp; notes</summary>
+<pre><code>function promiseAny(iterable) {
+  return new Promise((resolve, reject) =&gt; {
+    const items = [...iterable];
+    const errors = new Array(items.length);
+    let remaining = items.length;
+
+    <span class="com">// Edge: empty input → immediate AggregateError (per spec)</span>
+    if (remaining === 0) {
+      return reject(new AggregateError([], 'All promises were rejected'));
+    }
+
+    items.forEach((item, i) =&gt; {
+      Promise.resolve(item).then(
+        resolve,                            <span class="com">// first fulfillment wins (settle-once)</span>
+        (reason) =&gt; {
+          errors[i] = reason;               <span class="com">// index-addressed → error order = input order</span>
+          if (--remaining === 0) {
+            reject(new AggregateError(errors, 'All promises were rejected'));
+          }
+        }
+      );
+    });
+  });
+}</code></pre>
+    <p>Note the symmetry with <code>Promise.all</code>: the counting logic is identical with success and failure roles swapped. Saying that sentence in the interview shows you understand the pattern rather than memorized four polyfills.</p>
+  </details>
+</div>
+
+<div class="exercise">
+  <h4>Drill 2 — Cancellable fetch wrapper with timeout</h4>
+  <p>Implement <code>fetchWithTimeout(url, { timeout, signal, ...init })</code>: rejects with <code>TimeoutError</code> after <code>timeout</code> ms, still cancellable by the caller's own signal, and throws on non-2xx responses.</p>
+  <details><summary>Solution &amp; notes</summary>
+<pre><code><span class="com">// Modern version — compose signals declaratively</span>
+async function fetchWithTimeout(url, { timeout = 8000, signal, ...init } = {}) {
+  const timeoutSignal = AbortSignal.timeout(timeout);      <span class="com">// aborts with 'TimeoutError'</span>
+  const combined = signal
+    ? AbortSignal.any([signal, timeoutSignal])             <span class="com">// EITHER aborts the fetch</span>
+    : timeoutSignal;
+
+  const res = await fetch(url, { ...init, signal: combined });
+  if (!res.ok) {
+    const err = new Error(`HTTP ${res.status} for ${url}`);
+    err.status = res.status;                               <span class="com">// lets retry() decide retryability</span>
+    throw err;
+  }
+  return res;
+}
+
+<span class="com">// Manual fallback if AbortSignal.any is off the table — same idea by hand:</span>
+async function fetchWithTimeoutManual(url, { timeout = 8000, signal, ...init } = {}) {
+  const controller = new AbortController();
+  const timerId = setTimeout(
+    () =&gt; controller.abort(new DOMException('Timed out', 'TimeoutError')), timeout);
+  const onCallerAbort = () =&gt; controller.abort(signal.reason);
+  signal?.addEventListener('abort', onCallerAbort, { once: true });
+  try {
+    const res = await fetch(url, { ...init, signal: controller.signal });
+    if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status });
+    return res;
+  } finally {
+    clearTimeout(timerId);                                 <span class="com">// cleanup on EVERY path</span>
+    signal?.removeEventListener('abort', onCallerAbort);
+  }
+}</code></pre>
+    <p>Callers distinguish outcomes by <code>err.name</code>: <code>'TimeoutError'</code> (retry candidate), <code>'AbortError'</code> (user cancelled — ignore silently), HTTP error with <code>.status</code> (retry only 5xx/429).</p>
+  </details>
+</div>
+
+<div class="exercise">
+  <h4>Drill 3 — Pipe for async functions</h4>
+  <p>Implement <code>asyncPipe(...fns)</code> where each stage may be sync or async, each receives the previous stage's <em>resolved</em> value, and the first rejection short-circuits.</p>
+  <details><summary>Solution &amp; notes</summary>
+<pre><code>const asyncPipe = (...fns) =&gt; (input) =&gt;
+  fns.reduce(
+    (acc, fn) =&gt; acc.then(fn),        <span class="com">// .then adopts fn's result whether it's a value</span>
+    Promise.resolve(input)            <span class="com">// or a promise (chaining rule 3) — sync and async</span>
+  );                                  <span class="com">// stages need zero special-casing</span>
+
+<span class="com">// Equivalent, arguably clearer for narration:</span>
+const asyncPipe2 = (...fns) =&gt; async (input) =&gt; {
+  let value = input;
+  for (const fn of fns) value = await fn(value);   <span class="com">// sequential BY DESIGN here</span>
+  return value;
+};
+
+const loadUserPosts = asyncPipe(
+  (id) =&gt; fetchJson(`/users/${id}`),
+  (user) =&gt; user.postsUrl,            <span class="com">// sync stage mixes in seamlessly</span>
+  (url) =&gt; fetchJson(url)
+);</code></pre>
+    <p>The one-liner works because <code>.then</code>'s adoption rule erases the sync/async distinction. Error propagation is free: a rejection skips remaining <code>.then</code>s and surfaces to the caller. Follow-up: add tap/trace stages, or an AbortSignal threaded through each stage.</p>
+  </details>
+</div>
+
+<div class="exercise">
+  <h4>Drill 4 — Rate limiter: at most N calls per second</h4>
+  <p>Implement <code>rateLimit(fn, limit, interval)</code>: the wrapper accepts unlimited calls but <em>executes</em> at most <code>limit</code> per sliding <code>interval</code>, queueing the excess in order. Each call returns a promise for its (eventual) result.</p>
+  <details><summary>Solution &amp; notes</summary>
+<pre><code>function rateLimit(fn, limit, interval = 1000) {
+  const queue = [];        <span class="com">// pending invocations, FIFO</span>
+  const timestamps = [];   <span class="com">// start times of executions in the current window</span>
+
+  const process = () =&gt; {
+    const now = Date.now();
+    <span class="com">// 1. Slide the window: drop timestamps older than `interval`</span>
+    while (timestamps.length &gt; 0 &amp;&amp; now - timestamps[0] &gt;= interval) {
+      timestamps.shift();
+    }
+    <span class="com">// 2. Execute while we have both queued calls and window capacity</span>
+    while (queue.length &gt; 0 &amp;&amp; timestamps.length &lt; limit) {
+      const { args, resolve, reject } = queue.shift();
+      timestamps.push(Date.now());
+      <span class="com">// Promise.resolve normalizes sync returns AND sync throws into the promise</span>
+      Promise.resolve().then(() =&gt; fn(...args)).then(resolve, reject);
+    }
+    <span class="com">// 3. Still queued? Wake up exactly when the oldest timestamp expires</span>
+    if (queue.length &gt; 0) {
+      setTimeout(process, interval - (Date.now() - timestamps[0]));
+    }
+  };
+
+  return (...args) =&gt;
+    new Promise((resolve, reject) =&gt; {
+      queue.push({ args, resolve, reject });
+      process();
+    });
+}
+
+const limitedSearch = rateLimit(searchApi, 5, 1000);  <span class="com">// ≤ 5 calls/sec, extras queue up</span></code></pre>
+    <p>Design notes to narrate: this limits <em>start rate</em>, not concurrency — pair with <code>pLimit</code> if you need both. <code>process()</code> is idempotent (it re-derives everything from state), so an extra timer firing is harmless. Distinguish from throttle: throttle <em>drops</em> intermediate calls; a rate limiter <em>defers</em> them — every call eventually runs.</p>
+  </details>
+</div>
+
+<div class="exercise">
+  <h4>Drill 5 — Implement <code>once(fn)</code></h4>
+  <p>The returned function invokes <code>fn</code> at most once; subsequent calls return the first result without calling <code>fn</code> again. Preserve <code>this</code> and arguments. Discuss: what if the first call throws?</p>
+  <details><summary>Solution &amp; notes</summary>
+<pre><code>function once(fn) {
+  let called = false;
+  let result;
+  return function (...args) {
+    if (!called) {
+      called = true;                   <span class="com">// set BEFORE calling — if fn (re-)enters the</span>
+      result = fn.apply(this, args);   <span class="com">// wrapper, it won't recurse infinitely</span>
+    }
+    return result;
+  };
+}
+
+const init = once(() =&gt; expensiveSetup());
+init(); init(); init();               <span class="com">// setup runs exactly once</span></code></pre>
+    <p>Design decisions to surface: (1) a boolean flag rather than <code>result === undefined</code> — <code>fn</code> may legitimately return <code>undefined</code>; (2) if the first call <em>throws</em>, this implementation still marks <code>called = true</code>, so the failure is permanent (and later calls return <code>undefined</code>) — for an initializer you often want "throw = didn't count, allow retry": move <code>called = true</code> after the call, or cache and rethrow the error deliberately. Asking the interviewer which semantics they want IS the senior answer. (3) For async <code>fn</code>, the memoize-rejection caveat applies: cache the promise, evict on rejection if retries should be possible.</p>
+  </details>
+</div>
+
+<div class="exercise">
+  <h4>Drill 6 — Pub-sub with priority</h4>
+  <p>Extend the emitter: <code>on(event, handler, priority = 0)</code> — on emit, higher-priority handlers run first; equal priorities run in subscription order. A handler may call <code>stopPropagation()</code> to prevent lower-priority handlers from running.</p>
+  <details><summary>Solution &amp; notes</summary>
+<pre><code>class PriorityEmitter {
+  #events = new Map();   <span class="com">// Map&lt;string, Array&lt;{handler, priority, seq}&gt;&gt;</span>
+  #seq = 0;
+
+  on(event, handler, priority = 0) {
+    const list = this.#events.get(event) ?? [];
+    list.push({ handler, priority, seq: this.#seq++ });
+    <span class="com">// Sort: priority DESC, then seq ASC. Array.prototype.sort is stable,</span>
+    <span class="com">// but the explicit seq tiebreak makes the guarantee self-documenting.</span>
+    list.sort((a, b) =&gt; b.priority - a.priority || a.seq - b.seq);
+    this.#events.set(event, list);
+    return () =&gt; this.off(event, handler);
+  }
+
+  off(event, handler) {
+    const list = this.#events.get(event);
+    if (!list) return;
+    const i = list.findIndex((e) =&gt; e.handler === handler);
+    if (i !== -1) list.splice(i, 1);
+    if (list.length === 0) this.#events.delete(event);
+  }
+
+  emit(event, payload) {
+    const list = this.#events.get(event);
+    if (!list) return false;
+    let stopped = false;
+    const stopPropagation = () =&gt; { stopped = true; };
+    for (const { handler } of [...list]) {       <span class="com">// snapshot, as always</span>
+      if (stopped) break;
+      handler(payload, { stopPropagation });
+    }
+    return true;
+  }
+}
+
+<span class="com">// Usage: validation (10) runs before analytics (0); can veto them.</span>
+bus.on('form:submit', validate, 10);
+bus.on('form:submit', trackAnalytics, 0);</code></pre>
+    <p>Trade-off worth stating: sorting on subscribe is O(n log n) per <code>on</code> but keeps <code>emit</code> a straight scan — right for the common emit-heavy workload. (Insertion via binary search would be O(n) per subscribe; either is fine, but say <em>why</em> you chose.) <code>stopPropagation</code> mirrors DOM event semantics, which interviewers appreciate as prior art.</p>
+  </details>
+</div>
+
+<div class="exercise">
+  <h4>Drill 7 — <code>JSON.stringify</code> for a subset</h4>
+  <p>Support objects, arrays, strings, numbers, booleans, <code>null</code>. Match real semantics: <code>undefined</code>/functions are dropped from objects but become <code>null</code> in arrays; non-finite numbers become <code>null</code>. Bonus: cycle detection.</p>
+  <details><summary>Solution &amp; notes</summary>
+<pre><code>function stringify(value, seen = new WeakSet()) {
+  if (value === null) return 'null';
+
+  const t = typeof value;
+  if (t === 'number')  return Number.isFinite(value) ? String(value) : 'null';  <span class="com">// NaN/Infinity → null</span>
+  if (t === 'boolean') return String(value);
+  if (t === 'string')  return quote(value);
+  <span class="com">// undefined / function / symbol → the SENTINEL undefined:</span>
+  <span class="com">// callers decide (drop key in objects, 'null' in arrays) — real JSON.stringify semantics</span>
+  if (t !== 'object')  return undefined;
+
+  if (seen.has(value)) throw new TypeError('Converting circular structure to JSON');
+  seen.add(value);
+
+  let json;
+  if (Array.isArray(value)) {
+    json = `[${value.map((v) =&gt; stringify(v, seen) ?? 'null').join(',')}]`;
+  } else {
+    const entries = [];
+    for (const key of Object.keys(value)) {        <span class="com">// own enumerable string keys only</span>
+      const s = stringify(value[key], seen);
+      if (s !== undefined) entries.push(`${quote(key)}:${s}`);  <span class="com">// drop undefined-valued keys</span>
+    }
+    json = `{${entries.join(',')}}`;
+  }
+  seen.delete(value);   <span class="com">// only reject CYCLES; the same object appearing twice as a sibling is legal</span>
+  return json;
+}
+
+function quote(s) {
+  <span class="com">// minimal escaping for the subset: backslash, quote, common control chars</span>
+  return `"${s.replace(/[\\"]/g, (c) =&gt; '\\' + c)
+              .replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/\t/g, '\\t')}"`;
+}</code></pre>
+    <p>The interesting 20%: the <code>undefined</code>-as-sentinel protocol (exactly how the real API signals "omit this"), array vs object treatment of unserializable values, and <code>seen.delete</code> after recursion — a WeakSet you never delete from would wrongly reject DAGs (shared but acyclic references), which real <code>JSON.stringify</code> allows. Skipped, and worth listing as known omissions: <code>toJSON()</code>, replacer, indent, unicode edge escaping.</p>
+  </details>
+</div>
+
+<div class="exercise">
+  <h4>Drill 8 — <code>getByPath</code> / <code>setByPath</code> (lodash get/set)</h4>
+  <p><code>get(obj, 'a.b[2].c', default?)</code> — walk the path, return <code>default</code> if any hop is missing. <code>set(obj, 'a.b[2].c', value)</code> — walk and <em>create</em> intermediate containers (array when the next key is an index, else object).</p>
+  <details><summary>Solution &amp; notes</summary>
+<pre><code><span class="com">// Shared: 'a.b[2].c' → ['a','b','2','c'] (also accepts a pre-split array)</span>
+const toKeys = (path) =&gt;
+  Array.isArray(path)
+    ? path
+    : path.replace(/\[(\d+)\]/g, '.$1')   <span class="com">// [2] → .2</span>
+          .split('.')
+          .filter(Boolean);               <span class="com">// drops empties from leading '.' etc.</span>
+
+function get(obj, path, defaultValue) {
+  let current = obj;
+  for (const key of toKeys(path)) {
+    if (current == null) return defaultValue;  <span class="com">// == null catches null AND undefined —</span>
+    current = current[key];                     <span class="com">// can't read properties of either</span>
+  }
+  return current === undefined ? defaultValue : current;
+  <span class="com">// note: an explicit null result is returned as-is (lodash semantics) —</span>
+  <span class="com">// only undefined triggers the default</span>
+}
+
+function set(obj, path, value) {
+  const keys = toKeys(path);
+  if (keys.length === 0) return obj;
+  let current = obj;
+  for (let i = 0; i &lt; keys.length - 1; i++) {
+    const key = keys[i];
+    if (typeof current[key] !== 'object' || current[key] === null) {
+      <span class="com">// create the missing container; look AHEAD to pick its type</span>
+      current[key] = /^\d+$/.test(keys[i + 1]) ? [] : {};
+    }
+    current = current[key];
+  }
+  current[keys.at(-1)] = value;
+  return obj;
+}
+
+get({ a: { b: [{ c: 3 }] } }, 'a.b[0].c');      <span class="com">// 3</span>
+get({}, 'a.b.c', 'fallback');                   <span class="com">// 'fallback'</span>
+set({}, 'a.b[1].c', 5);                         <span class="com">// { a: { b: [ &lt;hole&gt;, { c: 5 } ] } }</span></code></pre>
+    <p>Edge cases that earn points: <code>current == null</code> mid-path (the whole reason <code>get</code> exists), <code>null</code>-vs-<code>undefined</code> default semantics, the look-ahead array-vs-object decision in <code>set</code>, and paths as arrays (which also sidesteps keys containing dots). Security note for real code: guard <code>set</code> against <code>__proto__</code>/<code>constructor</code>/<code>prototype</code> path segments — unguarded setByPath is the canonical <strong>prototype pollution</strong> vulnerability, and mentioning it unprompted is a strong senior signal.</p>
+  </details>
+</div>
+
+<nav class="page-nav">
+  <a href="04-js-core-internals.html">← Prev: JS Core Internals</a>
+  <a href="06-typescript-advanced.html">Next: TypeScript Advanced →</a>
+</nav>
+
+</main>
+</body>
+</html>

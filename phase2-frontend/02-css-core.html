@@ -1,0 +1,1149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 — CSS Core Internals | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <div class="breadcrumb"><a href="index.html">← Course Home</a></div>
+    <h1>02 — CSS Core Internals</h1>
+    <p>Box model, cascade, formatting contexts, flex/grid math, and the stacking-context traps senior interviews are built on</p>
+  </div>
+</header>
+
+<main class="container">
+
+  <p><strong>Why interviewers ask this:</strong> at 7+ years, nobody quizzes you on "how do I make text red." They probe whether you understand the <em>rendering model</em> underneath the syntax — why <code>z-index: 9999</code> silently fails, why a flex item refuses to shrink, what number the browser actually computes when three items fight over leftover space. These questions separate people who copy Stack Overflow fixes from people who can debug layout from first principles. Almost every question in this page maps to a real production bug you've probably hit; the interview just asks you to explain the <em>mechanism</em> out loud.</p>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ol>
+      <li><a href="#box-model">Box model deep dive</a></li>
+      <li><a href="#cascade">Specificity &amp; the cascade — internals</a></li>
+      <li><a href="#formatting-contexts">Formatting contexts (BFC / IFC / display)</a></li>
+      <li><a href="#flexbox">Flexbox deep dive (incl. grow/shrink math)</a></li>
+      <li><a href="#grid">Grid deep dive</a></li>
+      <li><a href="#stacking">Positioning &amp; stacking contexts</a></li>
+      <li><a href="#units">Units &amp; values</a></li>
+      <li><a href="#overflow">Overflow &amp; scrolling</a></li>
+      <li><a href="#selectors">Selectors — the senior tour</a></li>
+      <li><a href="#media">Media queries beyond width</a></li>
+      <li><a href="#qa">Interview Q&amp;A</a></li>
+      <li><a href="#exercises">Hands-on exercises</a></li>
+    </ol>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="box-model">Box model deep dive <span class="tier tier-1">T1</span></h2>
+
+  <h3>content-box vs border-box</h3>
+  <p>Every box has four areas, inside-out: <strong>content → padding → border → margin</strong>. The <code>box-sizing</code> property controls what the <code>width</code>/<code>height</code> properties <em>refer to</em>:</p>
+  <ul>
+    <li><code>content-box</code> (initial value, per CSS 2.1 legacy): <code>width</code> sets the <em>content area only</em>. Rendered width = width + padding + border.</li>
+    <li><code>border-box</code>: <code>width</code> sets content + padding + border. The content area shrinks to make room. Margin is <em>never</em> included in either model.</li>
+  </ul>
+
+  <pre><code><span class="com">/* Same declared width, very different rendered widths */</span>
+.a { box-sizing: content-box; width: 200px; padding: 20px; border: 5px solid; }
+<span class="com">/* rendered: 200 + 20*2 + 5*2 = 250px wide */</span>
+
+.b { box-sizing: border-box; width: 200px; padding: 20px; border: 5px solid; }
+<span class="com">/* rendered: exactly 200px; content area = 200 - 40 - 10 = 150px */</span></code></pre>
+
+  <p><strong>Why the universal border-box reset exists:</strong> with <code>content-box</code>, <code>width: 50%; padding: 1rem</code> overflows its parent — the two 50% halves plus padding exceed 100%. <code>border-box</code> makes percentage layouts and form controls composable: "the box is this big, period." The canonical reset:</p>
+
+  <pre><code>*, *::before, *::after { box-sizing: border-box; }
+
+<span class="com">/* Alternative "inheritable" form — lets a component opt back out
+   for a whole subtree by setting box-sizing on its root: */</span>
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }</code></pre>
+
+  <div class="note">Form controls (<code>input</code>, <code>select</code>, <code>textarea</code>, <code>button</code>) already default to <code>border-box</code> in the UA stylesheet — one reason mixing reset-less custom elements with native inputs produces misaligned widths.</div>
+
+  <h3>Margin collapsing — the actual rules</h3>
+  <p>This is a classic gotcha because it only applies in a very specific situation, and interviewers love asking you to enumerate the cases. Vertical margins of <strong>block-level boxes in the same block formatting context, in normal flow</strong>, collapse when they are <em>adjoining</em> — meaning nothing separates them (no border, no padding, no clearance, no inline content, no line box). The collapsed margin equals the <strong>larger of the two</strong> (for two positives), the more-negative of two negatives, or the <em>sum</em> when signs mix.</p>
+
+  <p><strong>Case 1 — adjacent siblings:</strong></p>
+  <pre><code>&lt;p class="first"&gt;Paragraph one&lt;/p&gt;
+&lt;p class="second"&gt;Paragraph two&lt;/p&gt;
+
+.first  { margin-bottom: 30px; }
+.second { margin-top: 20px; }
+<span class="com">/* Gap between them = 30px, NOT 50px. max(30, 20). */</span></code></pre>
+
+  <p><strong>Case 2 — parent and first/last child</strong> (the one that actually bites in production):</p>
+  <pre><code>&lt;div class="card"&gt;
+  &lt;h3&gt;Title&lt;/h3&gt;   <span class="com">&lt;!-- h3 has UA margin-top ≈ 1em --&gt;</span>
+&lt;/div&gt;
+
+.card { background: lavender; margin-top: 0; }
+<span class="com">/* Visual result: the h3's margin-top "escapes" THROUGH the card.
+   The lavender box gets pushed down and the h3 sits flush at its top —
+   the margin appears OUTSIDE the parent, not as space inside it. */</span></code></pre>
+  <p>This happens because there is no border, padding, or inline content between the parent's top edge and the child's top edge, so the two <code>margin-top</code>s are adjoining and collapse into one margin that now belongs, effectively, to the parent. Fixes — anything that breaks "adjoining":</p>
+  <ul>
+    <li><code>padding-top: 0.05px</code> or a real <code>border-top</code> on the parent</li>
+    <li>Make the parent establish a new BFC: <code>display: flow-root</code> (the modern, no-side-effect fix), <code>overflow: hidden/auto</code>, or make it a flex/grid container (flex/grid item margins <em>never</em> collapse)</li>
+    <li><code>padding</code>-based spacing plus <code>gap</code> instead of child margins entirely</li>
+  </ul>
+
+  <p><strong>Case 3 — empty blocks:</strong> if a block has no border, padding, height, or content, its own <code>margin-top</code> and <code>margin-bottom</code> collapse <em>with each other</em> (and then with neighbors). An "empty spacer div" with <code>margin: 40px 0</code> contributes 40px total, not 80px.</p>
+
+  <div class="pitfall">Margins <strong>never</strong> collapse: horizontally; across a BFC boundary; on floats; on absolutely positioned elements; on inline-block boxes; between flex or grid items; or when the root element is involved. If an interviewer asks "how do you stop margin collapse," the crisp answer is: <em>break adjacency (border/padding) or move one box into a different formatting context (flow-root/flex/grid/float/abs-pos)</em>.</div>
+
+  <h3>Negative margins (yes, they're spec'd behavior)</h3>
+  <p>Negative margins are legitimate layout tools, not hacks, and they behave asymmetrically — a detail that impresses when you can state it precisely:</p>
+  <ul>
+    <li><strong>Negative top/left margin</strong> pulls the element itself in that direction (it moves).</li>
+    <li><strong>Negative bottom/right margin</strong> leaves the element in place and pulls <em>following content</em> toward/over it — it effectively shrinks the space the element "reports" to the layout after itself.</li>
+    <li>On <code>width: auto</code> block boxes, negative horizontal margins <em>widen</em> the box (the used width solves the equation <code>margin + border + padding + width = containing block</code>).</li>
+  </ul>
+  <pre><code><span class="com">/* Full-bleed child inside a padded prose column — the classic use: */</span>
+.prose { max-width: 65ch; padding-inline: 1.5rem; margin-inline: auto; }
+.prose .bleed { margin-inline: -1.5rem; }
+<span class="com">/* The image cancels the parent's padding and spans the full column.
+   Because width is auto, negative margins GROW the box — no width math. */</span>
+
+<span class="com">/* Pre-gap-era gutter grid (know it to read old codebases): */</span>
+.row { display: flex; flex-wrap: wrap; margin: -8px; }
+.row &gt; * { margin: 8px; }
+<span class="com">/* The negative outer margin swallows the items' edge margins. */</span></code></pre>
+  <div class="note">Negative margins also participate in margin collapsing: when a positive and negative margin collapse, the result is their <em>sum</em> (e.g. 20px and −30px → −10px). Content overlapped by negative margins still receives pointer events per paint order — overlap bugs from negative margins are really stacking questions.</div>
+
+  <h3>Percentage padding is relative to WIDTH</h3>
+  <p>Both <code>padding-top: 10%</code> and <code>padding-left: 10%</code> resolve against the <strong>inline size (width) of the containing block</strong> — never the height. Same for percentage margins. The spec rationale: height is often not known until layout finishes (content-driven), so resolving vertical padding against height would create a circular dependency. This quirk powered the classic aspect-ratio hack:</p>
+
+  <pre><code><span class="com">/* Legacy 16:9 box (pre aspect-ratio property) */</span>
+.ratio { position: relative; padding-top: 56.25%; } <span class="com">/* 9/16 of the WIDTH */</span>
+.ratio &gt; iframe { position: absolute; inset: 0; width: 100%; height: 100%; }
+
+<span class="com">/* Modern equivalent */</span>
+.ratio-modern { aspect-ratio: 16 / 9; }</code></pre>
+
+  <h3>min-/max-width interactions</h3>
+  <p>The constraint resolution order the browser follows: compute the tentative used width from <code>width</code> (or auto), then clamp by <code>max-width</code>, then clamp by <code>min-width</code>. Crucially, <strong><code>min-width</code> wins over <code>max-width</code></strong> when they conflict:</p>
+  <pre><code>.box { width: 100px; max-width: 150px; min-width: 200px; }
+<span class="com">/* used width = 200px. min beats max beats width. */</span></code></pre>
+  <div class="senior">Remember <code>min-width</code>'s initial value is <code>auto</code>, not 0 — and in flex and grid layouts <code>auto</code> resolves to the content-based minimum size. That single spec line is the root cause of the two most famous modern layout bugs: unshrinkable flex items (<a href="#flex-min-width">§ flexbox</a>) and grid tracks blown out by a long word or wide <code>&lt;pre&gt;</code>. In non-flex/grid flow, <code>min-width: auto</code> behaves as 0.</div>
+
+  <p><code>box-sizing</code> edge cases worth naming out loud in an interview:</p>
+  <ul>
+    <li><code>min-width</code>/<code>max-width</code> respect <code>box-sizing</code> too — with <code>border-box</code> they constrain the border box.</li>
+    <li><code>box-sizing</code> is <strong>not inherited</strong>; that's why the reset targets <code>*</code> (or uses the <code>inherit</code> pattern).</li>
+    <li>Percentage <code>width</code> resolves against the containing block's <em>content box</em> width regardless of the child's box-sizing.</li>
+    <li>Replaced elements with intrinsic ratios (<code>img</code>) interact with <code>box-sizing</code> at the border-box level: <code>border-box</code> + border means the drawn image area shrinks.</li>
+  </ul>
+
+  <!-- ============================================================ -->
+  <h2 id="cascade">Specificity &amp; the cascade — internals <span class="tier tier-1">T1</span></h2>
+
+  <h3>The cascade order (what actually decides the winner)</h3>
+  <p>When multiple declarations target the same property on the same element, the browser sorts them by these criteria <strong>in order</strong> — a later criterion is only consulted to break ties in the earlier ones:</p>
+  <ol>
+    <li><strong>Origin &amp; importance:</strong> transition declarations → <code>!important</code> UA styles → <code>!important</code> user styles → <code>!important</code> author styles → animations → normal author styles → normal user styles → normal UA styles. Note <code>!important</code> <em>reverses</em> the origin order — that is why UA <code>!important</code> rules are untouchable.</li>
+    <li><strong>Cascade layers:</strong> within author styles, <code>@layer</code> order. Normal declarations: later-declared layers beat earlier ones; unlayered styles beat all layers. <code>!important</code> flips this too — earlier layers' important declarations win.</li>
+    <li><strong>Specificity</strong> of the selector.</li>
+    <li><strong>Order of appearance:</strong> last declaration wins.</li>
+  </ol>
+  <div class="senior">Scope proximity (from <code>@scope</code>) slots between specificity and source order in the current cascade spec. Also: element-attached styles (the <code>style=""</code> attribute) are modeled as a pseudo-"specificity beyond triples" — they beat any selector-based specificity but are still author-origin, so an <code>!important</code> stylesheet rule beats a normal inline style.</div>
+
+  <p>Cascade layers in practice — the architecture pattern to name-drop:</p>
+  <pre><code><span class="com">/* Declare order up front — THIS line is the whole architecture.
+   Later layers beat earlier ones (for normal declarations): */</span>
+@layer reset, vendor, tokens, components, utilities;
+
+@layer reset { * { margin: 0; box-sizing: border-box; } }
+
+<span class="com">/* Third-party CSS goes into a low layer at import time: */</span>
+@import url("datepicker.css") layer(vendor);
+
+@layer components {
+  .btn { padding: .5rem 1rem; background: var(--accent); }
+}
+
+@layer utilities {
+  <span class="com">/* A single-class utility now beats ANY selector in components,
+     regardless of specificity — no more .btn.btn.btn hacks: */</span>
+  .hidden { display: none; }
+}
+
+<span class="com">/* Unlayered styles beat all layers → app-level escape hatch. */</span></code></pre>
+  <p>Why interviewers care: layers solve the exact problem utility-class and BEM conventions solved socially — specificity ordering — but in the language itself. Being able to say "specificity only matters <em>within</em> a layer" shows you've internalized the cascade's sort order rather than memorized specificity folklore.</p>
+
+  <h3>Specificity as (a, b, c) triples</h3>
+  <p>Specificity is a <strong>three-component tuple compared lexicographically</strong> — not a base-10 number. No amount of classes ever beats one ID.</p>
+  <table>
+    <thead><tr><th>Counts as</th><th>Component</th><th>Examples</th></tr></thead>
+    <tbody>
+      <tr><td>a</td><td>ID selectors</td><td><code>#app</code></td></tr>
+      <tr><td>b</td><td>Classes, attributes, pseudo-classes</td><td><code>.btn</code>, <code>[disabled]</code>, <code>:hover</code>, <code>:nth-child(2)</code></td></tr>
+      <tr><td>c</td><td>Type selectors, pseudo-elements</td><td><code>div</code>, <code>::before</code>, <code>::marker</code></td></tr>
+      <tr><td>—</td><td>Ignored entirely</td><td><code>*</code>, combinators (<code>&gt;</code> <code>+</code> <code>~</code>), <code>:where(...)</code></td></tr>
+    </tbody>
+  </table>
+
+  <p>Worked examples — compute these out loud in an interview:</p>
+  <pre><code>nav a                      <span class="com">/* (0,0,2) */</span>
+.nav .link:hover           <span class="com">/* (0,3,0) */</span>
+#site-nav a.active         <span class="com">/* (1,1,1) */</span>
+ul li:nth-child(odd)::marker  <span class="com">/* (0,1,3)  — nth-child is b, ::marker is c */</span>
+a[href^="https"]:not(.ext) <span class="com">/* (0,2,1)  — :not() adds nothing itself,
+                              but takes the specificity of its most
+                              specific argument (.ext → one class) */</span>
+
+<span class="com">/* (0,10,0) does NOT beat (1,0,0): compare a first, 1 &gt; 0, done. */</span></code></pre>
+
+  <h3>:is() vs :where()</h3>
+  <p>Both accept a forgiving selector list and match identically. The difference is purely specificity:</p>
+  <ul>
+    <li><code>:is(...)</code> — takes the specificity of its <strong>most specific argument</strong>, even for arguments that didn't actually match. <code>:is(#hero, p) span</code> is (1,0,1) when matching a span inside a plain <code>p</code>.</li>
+    <li><code>:where(...)</code> — specificity is always <strong>zero</strong>, regardless of arguments. This is the tool for writing overridable defaults in design systems and resets.</li>
+  </ul>
+  <pre><code><span class="com">/* Design-system default any consumer can override with a bare class */</span>
+:where(.ds-button) { padding: .5rem 1rem; background: navy; }
+
+.my-button { background: teal; }   <span class="com">/* (0,1,0) beats (0,0,0) — wins */</span>
+
+<span class="com">/* Had we used .ds-button directly, consumer needs equal specificity
+   PLUS later source order — brittle. */</span></code></pre>
+
+  <h3>Inline styles and !important</h3>
+  <p>Priority ladder for author styles, low → high: selector rules → inline <code>style=""</code> → <code>!important</code> selector rules → <code>!important</code> inline styles. To override a third-party <code>!important</code> you must beat it <em>within the important lane</em>:</p>
+  <ol>
+    <li>Same importance, higher specificity: <code>#x.y!important</code> beats <code>.y!important</code>.</li>
+    <li>Same importance and specificity, later source order.</li>
+    <li>Cascade layers: put the vendor CSS in a layer; your <em>unlayered</em> normal styles beat their layered normal styles, and for important declarations an <em>earlier</em> layer wins — so layering strategy can neutralize vendor <code>!important</code>.</li>
+    <li>Last resorts: <code>style.setProperty('color', 'red', 'important')</code> from JS, or a completely different property that wins the visual fight (e.g., <code>outline</code> vs their <code>border</code>).</li>
+  </ol>
+
+  <h3>Inheritance and the four reset keywords</h3>
+  <p>Inherited by default: mostly <strong>text-ish</strong> properties — <code>color</code>, <code>font-*</code>, <code>line-height</code>, <code>letter-spacing</code>, <code>text-align</code>, <code>visibility</code>, <code>cursor</code>, <code>list-style</code>, <code>white-space</code>, <code>direction</code>. Not inherited: box/layout properties — <code>margin</code>, <code>padding</code>, <code>border</code>, <code>background</code>, <code>display</code>, <code>position</code>, <code>width</code>, <code>overflow</code>.</p>
+  <table>
+    <thead><tr><th>Keyword</th><th>Meaning</th><th>Typical use</th></tr></thead>
+    <tbody>
+      <tr><td><code>inherit</code></td><td>Take the parent's <em>computed</em> value, even for non-inherited properties</td><td><code>border-color: inherit</code>; the box-sizing reset pattern</td></tr>
+      <tr><td><code>initial</code></td><td>The property's <em>spec-defined</em> initial value — NOT the browser default (e.g. <code>display: initial</code> is <code>inline</code> even on a <code>div</code>)</td><td>Rarely what you want; a classic trick question</td></tr>
+      <tr><td><code>unset</code></td><td><code>inherit</code> if the property inherits, else <code>initial</code></td><td><code>all: unset</code> to strip a button, then rebuild (mind a11y focus styles)</td></tr>
+      <tr><td><code>revert</code></td><td>Roll back to the previous cascade origin — usually the <strong>UA stylesheet</strong> default</td><td>"Give me the browser's default look back" — what people <em>think</em> initial does</td></tr>
+      <tr><td><code>revert-layer</code></td><td>Roll back to the previous cascade <em>layer</em></td><td>Escaping a layer's override without leaving author origin</td></tr>
+    </tbody>
+  </table>
+  <div class="pitfall"><code>display: initial</code> on a <code>&lt;div&gt;</code> gives <code>inline</code>, not <code>block</code> — <code>initial</code> is the per-property spec value, blind to element type. To recover element-appropriate browser defaults, use <code>revert</code>. Interviewers plant this deliberately.</div>
+
+  <!-- ============================================================ -->
+  <h2 id="formatting-contexts">Formatting contexts <span class="tier tier-1">T1</span></h2>
+
+  <h3>Block formatting context (BFC)</h3>
+  <p>A BFC is an isolated mini-layout: an independent region in which block boxes are laid out and which <strong>does not interact with the outside</strong> for floats and margin collapsing. What establishes one (know the list):</p>
+  <ul>
+    <li>The root element (<code>&lt;html&gt;</code>)</li>
+    <li>Floats and absolutely/fixed positioned elements</li>
+    <li><code>display: flow-root</code> — the purpose-built, zero-side-effect trigger</li>
+    <li><code>overflow</code> anything other than <code>visible</code>/<code>clip</code> on a block box (<code>hidden</code>, <code>auto</code>, <code>scroll</code>)</li>
+    <li><code>display: inline-block</code>, table cells/captions</li>
+    <li><code>contain: layout | content | paint</code>, and multicol containers</li>
+    <li>Flex and grid <em>items</em> (their children lay out in a fresh context; the containers themselves establish flex/grid formatting contexts, not BFCs — same isolating effects in practice)</li>
+  </ul>
+
+  <p>What creating a BFC <strong>fixes</strong> — the two interview classics:</p>
+  <pre><code><span class="com">&lt;!-- 1. Float containment: parent collapses to zero height --&gt;</span>
+&lt;div class="clearfix-victim"&gt;
+  &lt;img class="float-left" src="pic.jpg" alt=""&gt;
+&lt;/div&gt;
+
+.float-left { float: left; }
+.clearfix-victim { display: flow-root; }
+<span class="com">/* A BFC's height includes its floats. Before flow-root, the fix was
+   the ::after clearfix or overflow:hidden (which clips). */</span>
+
+<span class="com">/* 2. Margin-collapse barrier (parent/child case from §box-model) */</span>
+.card { display: flow-root; }  <span class="com">/* child margin-top now stays inside */</span>
+
+<span class="com">/* 3. Bonus: a BFC does not wrap under an adjacent float —
+   the classic media-object left-image / non-wrapping-text layout: */</span>
+.media-body { display: flow-root; }</code></pre>
+
+  <h3>Inline formatting context quirks</h3>
+  <p><strong>Whitespace:</strong> inline-level boxes are separated by the literal whitespace in your HTML — collapsed to a single space, but a space nonetheless. The infamous "4px gap between inline-blocks" comes from the newline between tags:</p>
+  <pre><code>&lt;div class="pill-list"&gt;
+  &lt;span class="pill"&gt;One&lt;/span&gt;
+  &lt;span class="pill"&gt;Two&lt;/span&gt;    <span class="com">&lt;!-- the newline+indent collapses to
+                                       ONE space ≈ 4px at 16px font --&gt;</span>
+&lt;/div&gt;
+
+.pill { display: inline-block; background: #eef; padding: .2rem .6rem; }
+
+<span class="com">/* Visual result: pills have a mystery gap that margin: 0 can't remove —
+   it isn't margin, it's a text space between inline boxes. Fixes: */</span>
+.pill-list { display: flex; gap: .25rem; } <span class="com">/* modern: whitespace-only text
+                                              between flex items is dropped */</span>
+<span class="com">/* legacy: parent font-size: 0; or comment-joining the tags in HTML. */</span></code></pre>
+  <p><strong>Anonymous boxes:</strong> when block and inline children mix (<code>&lt;div&gt;text &lt;p&gt;para&lt;/p&gt;&lt;/div&gt;</code>), the engine wraps the loose text in an <em>anonymous block box</em> so the BFC only contains blocks. You can't select anonymous boxes — a reason "why can't I style this text without a wrapper" has no CSS answer, and a nice depth signal when explaining the box tree vs the DOM tree.</p>
+
+  <p><strong>The image baseline gap</strong> — a genuine classic. An <code>&lt;img&gt;</code> inside a div shows a few pixels of mystery space below it:</p>
+  <pre><code>&lt;div class="thumb"&gt;&lt;img src="cat.jpg" alt="Cat"&gt;&lt;/div&gt;
+
+<span class="com">/* Why: img is inline (a replaced inline box). It sits on the line box's
+   BASELINE, and the space below the baseline is reserved for descenders
+   (g, y, p) of the strut — the invisible zero-width text the line box
+   sizes itself around. The "gap" is descender space, derived from the
+   parent's font metrics and line-height. */</span>
+
+<span class="com">/* Fixes (any one): */</span>
+.thumb img { display: block; }        <span class="com">/* no line box, no baseline */</span>
+.thumb img { vertical-align: bottom; } <span class="com">/* or middle/top */</span>
+.thumb { line-height: 0; }            <span class="com">/* collapse the strut */</span></code></pre>
+
+  <p><strong>vertical-align</strong> only applies to inline-level boxes and table cells — a top-3 misconception is trying it on a block child to center it. It aligns a box within its <em>line box</em> relative to the baseline (<code>baseline | middle | top | text-bottom | 20% | -3px</code>...). <code>middle</code> aligns to baseline + half the parent's x-height — which is why icons aligned with <code>middle</code> still look slightly off next to caps-height text.</p>
+
+  <h3>Display values that matter</h3>
+  <table>
+    <thead><tr><th>Value</th><th>Outer / inner behavior</th><th>Senior notes</th></tr></thead>
+    <tbody>
+      <tr><td><code>block</code></td><td>Breaks line; fills inline size; respects width/height/margins</td><td>Full two-value form: <code>block flow</code></td></tr>
+      <tr><td><code>inline</code></td><td>Flows in text; <strong>ignores width/height</strong>; vertical padding/border paint but don't push line boxes apart; horizontal margins only</td><td>Padding overlap on inline boxes is a classic "why is my highlight overlapping" bug</td></tr>
+      <tr><td><code>inline-block</code></td><td>Flows in text but is a block container inside; respects width/height</td><td>Baseline = baseline of its last line box (or bottom margin edge if overflow ≠ visible — an alignment gotcha)</td></tr>
+      <tr><td><code>flow-root</code></td><td>Block outside, new BFC inside</td><td>The modern clearfix / margin-collapse barrier</td></tr>
+      <tr><td><code>contents</code></td><td>The element's own box vanishes; children participate in the parent's layout as if promoted</td><td>Useful to make a wrapper "transparent" to flex/grid</td></tr>
+      <tr><td><code>none</code></td><td>No box at all; removed from layout and the accessibility tree</td><td>vs <code>visibility: hidden</code> — keeps layout space, also removed from AT; vs <code>opacity: 0</code> — still focusable and clickable</td></tr>
+    </tbody>
+  </table>
+
+  <div class="pitfall"><code>display: contents</code> had a serious accessibility bug: browsers historically removed the element from the accessibility tree entirely, so <code>display: contents</code> on a <code>&lt;ul&gt;</code> or <code>&lt;button&gt;</code> destroyed list/button semantics for screen readers. Largely fixed in current engines, but still buggy on some element types — avoid it on interactive or semantically strong elements, use it on neutral <code>div</code> wrappers.</div>
+
+  <!-- ============================================================ -->
+  <h2 id="flexbox">Flexbox deep dive <span class="tier tier-1">T1</span></h2>
+
+  <h3>The axis model</h3>
+  <p>Flexbox is a <strong>one-dimensional</strong> layout: content is distributed along the <strong>main axis</strong> (set by <code>flex-direction</code>), and aligned on the perpendicular <strong>cross axis</strong>. Every "which property do I use" question resolves by asking <em>which axis am I on</em>:</p>
+  <table>
+    <thead><tr><th></th><th>Main axis</th><th>Cross axis</th></tr></thead>
+    <tbody>
+      <tr><td>Distribute space</td><td><code>justify-content</code></td><td><code>align-content</code> (multi-line only)</td></tr>
+      <tr><td>Align items</td><td>— (no justify-items in flexbox)</td><td><code>align-items</code> / per-item <code>align-self</code></td></tr>
+      <tr><td>Item sizing</td><td><code>flex-basis</code>, <code>flex-grow</code>, <code>flex-shrink</code></td><td><code>align-self: stretch</code> + height/width</td></tr>
+    </tbody>
+  </table>
+  <p>With <code>flex-direction: column</code>, everything rotates: <code>justify-content</code> is now vertical. This is also writing-mode relative — in vertical writing modes <code>row</code> runs vertically.</p>
+
+  <h3>flex-basis vs width — resolution order</h3>
+  <p>The used main size of a flex item is resolved as: <strong><code>flex-basis</code> → falls back to <code>width</code>/<code>height</code> → falls back to <code>content</code> size</strong>, then flexing (grow/shrink) adjusts from that hypothetical size, then min/max clamping applies. So <code>flex-basis</code> beats <code>width</code> when both are set (any value except <code>auto</code>; <code>flex-basis: auto</code> means "look at width").</p>
+  <pre><code>.item { flex-basis: 200px; width: 500px; }  <span class="com">/* basis wins: starts at 200px */</span>
+.item { flex-basis: auto;  width: 500px; }  <span class="com">/* auto defers → 500px */</span>
+.item { flex-basis: auto; }  <span class="com">/* no width either → content size */</span>
+.item { flex-basis: 0; }     <span class="com">/* start from zero — all space is "free" */</span></code></pre>
+
+  <p>Know the shorthands cold — they change more than one value:</p>
+  <table>
+    <thead><tr><th>Shorthand</th><th>grow shrink basis</th><th>Behavior</th></tr></thead>
+    <tbody>
+      <tr><td><code>flex: initial</code> (default)</td><td>0 1 auto</td><td>Won't grow; shrinks from content size</td></tr>
+      <tr><td><code>flex: auto</code></td><td>1 1 auto</td><td>Grows/shrinks from content size — big content gets proportionally more</td></tr>
+      <tr><td><code>flex: 1</code></td><td>1 1 <strong>0%</strong></td><td>Basis zero → <em>all</em> space distributed by grow → <strong>equal columns</strong> regardless of content</td></tr>
+      <tr><td><code>flex: none</code></td><td>0 0 auto</td><td>Fully rigid</td></tr>
+    </tbody>
+  </table>
+  <div class="senior">"Why does <code>flex: 1</code> give equal columns but <code>flex: auto</code> doesn't?" — because with basis 0 the free space is the <em>entire</em> container, split purely by grow ratios; with basis auto, only the leftover after content sizes is split, so bigger content keeps its head start. That one sentence is a strong interview answer.</div>
+
+  <h3>The grow/shrink math (worked examples)</h3>
+  <p><strong>Growing.</strong> Free space = container − Σ(hypothetical sizes). Each item gets <code>free × (its grow ÷ Σ grows)</code>.</p>
+  <pre><code>&lt;div class="row"&gt;&lt;div class="a"&gt;&lt;/div&gt;&lt;div class="b"&gt;&lt;/div&gt;&lt;div class="c"&gt;&lt;/div&gt;&lt;/div&gt;
+
+.row { display: flex; width: 800px; }
+.a { flex: 1 1 100px; }   <span class="com">/* grow 1 */</span>
+.b { flex: 2 1 100px; }   <span class="com">/* grow 2 */</span>
+.c { flex: 1 1 200px; }   <span class="com">/* grow 1 */</span>
+
+<span class="com">/* free = 800 - (100+100+200) = 400.  Σgrow = 4.  unit = 100.
+   a = 100 + 1×100 = 200
+   b = 100 + 2×100 = 300
+   c = 200 + 1×100 = 300   ✓ totals 800 */</span></code></pre>
+
+  <p><strong>Shrinking</strong> is the part candidates get wrong: shrink is weighted by <strong>shrink factor × flex-basis</strong>, not by shrink factor alone. Bigger items absorb more of the deficit — this prevents small items from shrinking to nothing first.</p>
+  <pre><code>.row { display: flex; width: 600px; }
+.a { flex: 0 1 400px; }   <span class="com">/* shrink 1, basis 400 */</span>
+.b { flex: 0 2 200px; }   <span class="com">/* shrink 2, basis 200 */</span>
+.c { flex: 0 1 200px; }   <span class="com">/* shrink 1, basis 200 */</span>
+
+<span class="com">/* overflow = (400+200+200) - 600 = 200 to remove.
+   scaled factors: a = 1×400 = 400
+                   b = 2×200 = 400
+                   c = 1×200 = 200      Σ = 1000
+   a loses 200 × 400/1000 = 80  → 320
+   b loses 200 × 400/1000 = 80  → 120
+   c loses 200 × 200/1000 = 40  → 160   ✓ totals 600 */</span></code></pre>
+  <div class="note">If clamping (min-width, content minimums) freezes an item during grow/shrink, the algorithm re-runs distribution among the remaining unfrozen items — that's why results sometimes differ from the naive one-pass math.</div>
+
+  <h3 id="flex-min-width">The min-width:auto overflow gotcha</h3>
+  <p>The #1 real-world flexbox bug: "my flex item won't shrink / <code>text-overflow: ellipsis</code> doesn't work / the layout blows out." Cause: on flex items, <code>min-width: auto</code> (the initial value) computes to the item's <strong>automatic minimum size</strong> ≈ its min-content size. So an item containing a long unbreakable string (URL, token, filename) refuses to shrink below that string's width, no matter what <code>flex-shrink</code> says.</p>
+  <pre><code>&lt;div class="chat-row"&gt;
+  &lt;img class="avatar" src="a.png" alt=""&gt;
+  &lt;div class="msg"&gt;
+    &lt;p class="ellipsis"&gt;https://example.com/very/long/unbroken/url...&lt;/p&gt;
+  &lt;/div&gt;
+&lt;/div&gt;
+
+.chat-row { display: flex; gap: .5rem; }
+.msg { flex: 1; min-width: 0; }      <span class="com">/* ← THE FIX. (or overflow: hidden) */</span>
+.ellipsis { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+<span class="com">/* Without min-width: 0, .msg's min size = the URL's min-content width →
+   it can't shrink → ellipsis never triggers and the row overflows.
+   overflow: hidden also works because it changes the automatic minimum
+   size to zero per spec. Column direction: same story with min-height. */</span></code></pre>
+
+  <h3>align-items vs align-content vs align-self</h3>
+  <ul>
+    <li><code>align-items</code> — default cross-axis alignment of items <em>within their line</em>. Initial: <code>stretch</code> (why flex children are equal height by default).</li>
+    <li><code>align-self</code> — the per-item override of align-items.</li>
+    <li><code>align-content</code> — distributes the <em>lines themselves</em> when there is more than one (needs <code>flex-wrap: wrap</code> and spare cross space). On a single-line flex container it does nothing — a favorite trick question. (It now also applies to block containers for easy vertical centering, a nice modern-CSS mention.)</li>
+  </ul>
+
+  <h3>gap, wrapping, order</h3>
+  <pre><code>.tags { display: flex; flex-wrap: wrap; gap: .5rem 1rem; } <span class="com">/* row-gap column-gap */</span></code></pre>
+  <ul>
+    <li><code>gap</code> only creates space <em>between</em> items — no first/last edge hacks or negative-margin grids needed. It also counts as used space in the shrink math.</li>
+    <li><code>flex-wrap: wrap</code> creates new lines when hypothetical sizes overflow; each line runs grow/shrink <em>independently</em> — which is why the last wrapped row of "equal" cards grows wider than the rest (fix with grid, or a max-width on items).</li>
+    <li><code>order</code> reorders <strong>visual painting only</strong>. DOM order still drives tab sequence and screen-reader order.</li>
+  </ul>
+  <div class="pitfall"><code>order</code> (and <code>flex-direction: row-reverse</code>) create a mismatch between visual order and focus order — a WCAG 2.4.3 (Focus Order) failure when the content order is meaningful. Reorder the DOM when the order matters; reserve <code>order</code> for purely presentational shuffles (e.g., responsive hero image position).</div>
+
+  <h3>Wrapping subtleties &amp; absolute children</h3>
+  <pre><code><span class="com">/* The "last row stretches" problem: wrapped equal cards, but the
+   final line has 2 items that grow to fill the whole row: */</span>
+.cards { display: flex; flex-wrap: wrap; gap: 1rem; }
+.card  { flex: 1 1 250px; }
+<span class="com">/* Each LINE runs grow independently — a 2-item last line splits the
+   row between 2 cards. Flexbox lines don't know about each other.
+   Fixes: .card { max-width: 340px; } to cap the stretch, or switch to
+   grid repeat(auto-fill, minmax(250px, 1fr)) where tracks are global. */</span></code></pre>
+  <ul>
+    <li>An <strong>absolutely positioned child of a flex container</strong> does not participate in flex layout at all — it takes no space and ignores grow/shrink — but its <em>static position</em> is resolved using the container's <code>justify-content</code>/<code>align-items</code>, a rarely known spec detail useful for badges and corner affordances.</li>
+    <li>Margins on flex items never collapse, and <code>float</code>/<code>vertical-align</code> have no effect on flex items — blockification: children of flex/grid containers have their display <em>blockified</em> (<code>inline</code> → <code>block</code>, <code>inline-flex</code> → <code>flex</code>).</li>
+    <li>Anonymous flex items: raw text directly inside a flex container gets wrapped in an anonymous item — whitespace-only runs are ignored, which is why the inline-block 4px gap disappears under flex.</li>
+  </ul>
+
+  <h3>Canonical patterns</h3>
+  <pre><code><span class="com">/* Nav bar: logo left, actions right — the auto-margin trick */</span>
+.nav { display: flex; align-items: center; gap: 1rem; }
+.nav .actions { margin-left: auto; }   <span class="com">/* auto margins eat free space
+                                          BEFORE justify-content runs */</span>
+
+<span class="com">/* Media object: fixed image, flexible non-wrapping body */</span>
+.media { display: flex; gap: 1rem; align-items: flex-start; }
+.media &gt; img { flex: none; }
+.media &gt; .body { flex: 1; min-width: 0; }
+
+<span class="com">/* Equal-height cards with footer pinned to bottom */</span>
+.cards { display: flex; gap: 1rem; }
+.card  { flex: 1; display: flex; flex-direction: column; }
+.card .cta { margin-top: auto; }   <span class="com">/* pushes itself to the bottom */</span></code></pre>
+
+  <!-- ============================================================ -->
+  <h2 id="grid">Grid deep dive <span class="tier tier-1">T1</span></h2>
+
+  <h3>Explicit vs implicit grid</h3>
+  <p><code>grid-template-columns/rows/areas</code> define the <strong>explicit</strong> grid. Anything placed outside it (more children than cells, or placement like <code>grid-row: 10</code>) forces the browser to generate <strong>implicit</strong> tracks, sized by <code>grid-auto-rows</code>/<code>grid-auto-columns</code> (default: <code>auto</code>). The classic symptom: "my extra cards are squished rows with no height" — because implicit rows defaulted to auto and you only styled the template rows.</p>
+  <pre><code>.grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  grid-auto-rows: minmax(120px, auto);  <span class="com">/* size the OVERFLOW rows too */</span>
+  gap: 1rem;
+}</code></pre>
+
+  <h3>fr and minmax()</h3>
+  <p><code>fr</code> distributes <strong>leftover</strong> space after fixed tracks, gaps, and content minimums are satisfied — it's a fraction of free space, not of the container. Crucially, <strong><code>1fr</code> is really <code>minmax(auto, 1fr)</code></strong>: the track can't shrink below its content's min-content size. That's the grid twin of the flexbox min-width:auto bug:</p>
+  <pre><code><span class="com">/* Track blowout: a &lt;pre&gt; or long URL in a 1fr column makes it wider
+   than its "fair share" and can overflow the page. */</span>
+grid-template-columns: repeat(3, 1fr);        <span class="com">/* can blow out */</span>
+grid-template-columns: repeat(3, minmax(0, 1fr));  <span class="com">/* truly equal, clampable */</span></code></pre>
+  <p><code>minmax(min, max)</code> defines a sizing range; if max &lt; min, max is ignored. <code>minmax(200px, 1fr)</code> — "at least 200px, then share leftovers" — is the backbone of responsive card grids.</p>
+
+  <h3>auto-fill vs auto-fit — the actual difference</h3>
+  <pre><code>.a { grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); }
+.b { grid-template-columns: repeat(auto-fit,  minmax(200px, 1fr)); }</code></pre>
+  <p>Both create as many ≥200px tracks as fit. They differ only when there are <strong>fewer items than tracks</strong>:</p>
+  <ul>
+    <li><code>auto-fill</code> keeps the empty tracks in place. Two cards in a 5-track 1000px grid stay ~200px each; 3 empty tracks hold the rest. Items keep a consistent size — good for dashboards where cards shouldn't balloon.</li>
+    <li><code>auto-fit</code> <strong>collapses empty tracks to 0</strong>, so the surviving tracks' <code>1fr</code> maxes absorb the freed space: two cards stretch to ~500px each. Good for "fill the row gracefully" galleries.</li>
+  </ul>
+  <p>With enough items to fill every track, they render identically — say that explicitly in interviews; it shows you know it's an edge-case distinction.</p>
+
+  <h3>grid-template-areas &amp; line-based placement</h3>
+  <pre><code><span class="com">/* App shell via named areas — self-documenting */</span>
+.shell {
+  display: grid;
+  grid-template-areas:
+    "header header"
+    "sidebar main"
+    "footer footer";
+  grid-template-columns: 240px minmax(0, 1fr);
+  grid-template-rows: auto 1fr auto;
+  min-height: 100dvh;
+}
+.shell &gt; header { grid-area: header; }
+.shell &gt; nav    { grid-area: sidebar; }
+.shell &gt; main   { grid-area: main; }
+.shell &gt; footer { grid-area: footer; }
+
+<span class="com">/* Line-based placement — negative lines count from the END
+   of the EXPLICIT grid: -1 is the last line. */</span>
+.full-bleed { grid-column: 1 / -1; }        <span class="com">/* span all columns */</span>
+.feature    { grid-row: 1 / span 2; grid-column: 2 / 4; }</code></pre>
+  <div class="note">A grid with N explicit column tracks has N+1 lines; <code>-1</code> refers to the last <em>explicit</em> line, so in the presence of implicit tracks <code>1 / -1</code> may not span everything — a subtle correctness point that lands well when mentioned.</div>
+
+  <p><strong>Named lines</strong> — the third placement vocabulary, and the cleanest way to build the popular "content column with full-bleed breakouts" page layout:</p>
+  <pre><code>.page {
+  display: grid;
+  grid-template-columns:
+    [full-start] minmax(1rem, 1fr)
+    [content-start] min(65ch, 100% - 2rem) [content-end]
+    minmax(1rem, 1fr) [full-end];
+}
+.page &gt; *          { grid-column: content; } <span class="com">/* name-pair shorthand:
+                                                content-start/content-end */</span>
+.page &gt; .full-bleed { grid-column: full; }
+
+<span class="com">/* Visual result: prose is centered at a readable measure; any element
+   tagged .full-bleed (hero image, code block) spans edge-to-edge —
+   no negative-margin hacks, works at every viewport. Also note
+   grid-template-areas auto-generates names: area "main" creates
+   main-start/main-end lines on both axes. */</span></code></pre>
+
+  <p><strong>Subgrid</strong> <span class="tier tier-2">T2</span> — a nested grid can adopt its parent's track definitions, solving the "align card internals across sibling cards" problem that neither flex nor nested grids could:</p>
+  <pre><code>.cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; }
+.card  {
+  grid-row: span 3;              <span class="com">/* occupy 3 parent rows */</span>
+  display: grid;
+  grid-template-rows: subgrid;   <span class="com">/* title / body / footer rows now
+                                    share heights ACROSS all cards */</span>
+}</code></pre>
+
+  <h3>The alignment matrix (6 properties)</h3>
+  <table>
+    <thead><tr><th></th><th>Inline axis (justify-*)</th><th>Block axis (align-*)</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Items in their cells</strong> (container sets default)</td><td><code>justify-items</code></td><td><code>align-items</code></td></tr>
+      <tr><td><strong>One item overrides</strong></td><td><code>justify-self</code></td><td><code>align-self</code></td></tr>
+      <tr><td><strong>The whole track grid inside the container</strong> (needs spare space)</td><td><code>justify-content</code></td><td><code>align-content</code></td></tr>
+    </tbody>
+  </table>
+  <p>Mnemonic: <em>items/self = content inside cells; content = the grid inside the container. justify = row direction; align = column direction.</em> Note flexbox lacks <code>justify-items/self</code> (main-axis per-item alignment is done with auto margins); grid has the full matrix.</p>
+
+  <h3>Auto-placement and dense</h3>
+  <p>The auto-placement algorithm walks the grid cursor forward, placing each item in the next slot it fits. Spanning items can leave holes. <code>grid-auto-flow: dense</code> lets the algorithm <strong>backfill</strong> those holes with later, smaller items — great for masonry-ish galleries, but it reorders visually, so the same focus-order accessibility caveat as flexbox <code>order</code> applies.</p>
+  <pre><code>.gallery {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  grid-auto-rows: 120px;
+  grid-auto-flow: dense;
+  gap: .5rem;
+}
+.gallery .wide { grid-column: span 2; }
+.gallery .tall { grid-row: span 2; }</code></pre>
+
+  <h3>Grid vs flexbox — the decision framework</h3>
+  <table>
+    <thead><tr><th>Question</th><th>Flexbox</th><th>Grid</th></tr></thead>
+    <tbody>
+      <tr><td>Dimensions</td><td>1D — a row <em>or</em> a column (wrapping rows are independent lines, not a grid)</td><td>2D — rows <em>and</em> columns must align</td></tr>
+      <tr><td>Direction of control</td><td><strong>Content-out:</strong> items' sizes drive layout; container negotiates</td><td><strong>Layout-in:</strong> you define tracks; content fits into them</td></tr>
+      <tr><td>Cross-line alignment</td><td>No — line 2 knows nothing about line 1's columns</td><td>Yes — the entire point (+ subgrid for nesting)</td></tr>
+      <tr><td>Typical use</td><td>Toolbars, nav, media object, tag lists, centering one thing</td><td>Page shells, card grids, forms, dashboards, image galleries</td></tr>
+    </tbody>
+  </table>
+  <pre><code><span class="com">/* Form layout: labels and inputs aligned across ALL rows —
+   inherently 2D, painful in flexbox, trivial in grid */</span>
+form.settings {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: .75rem 1rem;
+  align-items: center;
+}
+form.settings &gt; .full { grid-column: 1 / -1; }</code></pre>
+
+  <!-- ============================================================ -->
+  <h2 id="stacking">Positioning &amp; stacking contexts <span class="tier tier-1">T1</span></h2>
+  <p>This is the single highest-yield senior CSS topic. Expect a live-debugging question ("this modal renders under the header — why?") and be ready to narrate the mechanism.</p>
+
+  <h3>The five position values</h3>
+  <table>
+    <thead><tr><th>Value</th><th>In flow?</th><th>Offsets relative to</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><code>static</code></td><td>Yes</td><td>— (top/left ignored; no stacking via z-index)</td><td>The default</td></tr>
+      <tr><td><code>relative</code></td><td>Yes (original space preserved)</td><td>Its own normal position</td><td>Visual shift only; siblings don't move. Main job: anchor for absolute children + enable z-index</td></tr>
+      <tr><td><code>absolute</code></td><td>No</td><td>Nearest <strong>positioned</strong> ancestor's padding box (else initial containing block)</td><td>Shrink-wraps by default; <code>inset: 0</code> + auto margins = classic centering</td></tr>
+      <tr><td><code>fixed</code></td><td>No</td><td>The viewport… <em>unless an ancestor has transform/filter/etc.</em> (below)</td><td>Ignores scrolling</td></tr>
+      <tr><td><code>sticky</code></td><td>Yes</td><td>Hybrid: relative until a scroll threshold, then pinned <em>within its parent</em></td><td>Needs an offset (<code>top: 0</code>) to ever stick</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Why sticky "doesn't work" — the checklist</h3>
+  <pre><code>.toolbar { position: sticky; top: 0; }</code></pre>
+  <ol>
+    <li><strong>No offset:</strong> without <code>top/bottom/left/right</code>, sticky never engages.</li>
+    <li><strong>An ancestor with <code>overflow: hidden/auto/scroll/clip</code>:</strong> the sticky element sticks relative to its <em>nearest scroll container</em> — if that ancestor doesn't actually scroll (e.g. <code>overflow: hidden</code> added for a clearfix), the element sticks relative to a scrollport that never moves → appears dead. Debug by walking up the tree checking <code>getComputedStyle(el).overflow</code>.</li>
+    <li><strong>Parent height:</strong> sticky travel is confined to its <em>containing block (the parent)</em>. If the parent is exactly as tall as the sticky element — sticky is the only child, or the element itself stretched to fill the parent — there is zero travel range. The reliable rule: <em>the element sticks only while its parent's box is passing through the scrollport, so the parent must be taller than the sticky child</em>. Classic instance: a sticky sidebar that's a flex item. <code>align-items: stretch</code> makes the sidebar itself as tall as the row, so it can never move within it — fix with <code>align-self: flex-start</code>, which lets the sidebar keep its content height inside the tall flex line and travel within it.</li>
+    <li>Sticky table headers: put sticky on <code>th</code>, not <code>thead</code> (per-engine quirks), and beware borders with <code>border-collapse: collapse</code> not traveling with the stuck cells.</li>
+  </ol>
+
+  <h3>Containing blocks — the transform trap</h3>
+  <p>The containing block for <code>absolute</code> is the nearest ancestor with <code>position ≠ static</code>. For <code>fixed</code> it's normally the viewport. <strong>But</strong> — per the CSS Transforms and Filter Effects specs — an ancestor with any of the following becomes the containing block for absolute <em>and fixed</em> descendants:</p>
+  <ul>
+    <li><code>transform</code> or <code>translate/rotate/scale</code> (any non-none value), <code>perspective</code></li>
+    <li><code>filter</code> or <code>backdrop-filter</code> (non-none)</li>
+    <li><code>will-change: transform | filter | perspective</code></li>
+    <li><code>contain: layout | paint | strict | content</code>, and <code>container-type: size | inline-size</code> (container queries!)</li>
+  </ul>
+  <pre><code><span class="com">&lt;!-- THE interview favorite: --&gt;</span>
+&lt;div class="animated-panel"&gt;      <span class="com">&lt;!-- transform: translateX(0) from an animation --&gt;</span>
+  &lt;div class="modal"&gt;...&lt;/div&gt;    <span class="com">&lt;!-- position: fixed; inset: 0 --&gt;</span>
+&lt;/div&gt;
+
+<span class="com">/* Expected: modal covers the viewport.
+   Actual: modal is trapped inside .animated-panel, scrolls with it,
+   sized to the panel. Because the transformed ancestor is now the
+   containing block, "fixed" behaves like "absolute" inside it. */</span></code></pre>
+  <p><strong>Fixes:</strong> render the overlay outside the transformed subtree (React portal into <code>document.body</code> — this is <em>the</em> reason portals exist), remove the leftover transform after animation (beware <code>will-change</code> left on "for performance"), or use the top-layer primitives (<code>&lt;dialog&gt;.showModal()</code>, Popover API) which escape ancestor clipping and stacking entirely.</p>
+
+  <h3>Stacking contexts — the full model</h3>
+  <p>Painting order is governed by a <strong>tree of stacking contexts</strong>. Two rules carry every debugging session:</p>
+  <ol>
+    <li><code>z-index</code> only applies to <strong>positioned elements and flex/grid items</strong>. On a plain static block it's ignored.</li>
+    <li>An element's z-index competes <strong>only within its nearest ancestor stacking context</strong>. Stacking contexts are atomic: the entire subtree paints as one unit at the parent context's level. A child's <code>z-index: 999999</code> can never escape a parent context that sits at <code>z-index: 1</code>.</li>
+  </ol>
+  <p><strong>What creates a stacking context</strong> — the list to recite:</p>
+  <ul>
+    <li>Root element (<code>&lt;html&gt;</code>)</li>
+    <li><code>position: relative/absolute</code> with <code>z-index</code> ≠ auto; <code>position: fixed</code> or <code>sticky</code> (<strong>always</strong>, even with z-index auto)</li>
+    <li>Flex or grid <em>item</em> with <code>z-index</code> ≠ auto</li>
+    <li><code>opacity</code> &lt; 1</li>
+    <li><code>transform</code>, <code>translate/rotate/scale</code>, <code>filter</code>, <code>backdrop-filter</code>, <code>perspective</code>, <code>clip-path</code>, <code>mask</code> — any non-none value</li>
+    <li><code>isolation: isolate</code> (the do-nothing-but-this property)</li>
+    <li><code>will-change</code> naming any of the above; <code>contain: layout | paint</code></li>
+    <li><code>mix-blend-mode</code> ≠ normal</li>
+  </ul>
+
+  <p><strong>Paint order inside one stacking context</strong> (simplified CSS 2.2 Appendix E), bottom to top:</p>
+  <pre><code><span class="com">┌─ 7. positive z-index descendants/contexts (ascending; DOM order ties) ─ TOP
+│  6. z-index: 0 / auto positioned descendants (+ new contexts at 0)
+│  5. inline-level content (text paints above floats!)
+│  4. floats (non-positioned)
+│  3. in-flow, non-positioned block descendants (backgrounds/borders)
+│  2. negative z-index child stacking contexts
+└─ 1. this context's own background and borders ──────────────── BOTTOM</span></code></pre>
+  <p>Two practical corollaries hide in that list: <code>z-index: -1</code> puts a child <em>behind its parent's content but still above the parent's background</em> (layer 2 vs layer 1) — the decorative-blob pattern; and a positioned element with <code>z-index: auto</code> already paints above all normal-flow siblings (layer 6 vs 3) — which is why sprinkling <code>position: relative</code> alone changes overlaps.</p>
+
+  <h3>The "z-index: 9999 doesn't work" walkthrough</h3>
+  <pre><code>&lt;header class="site"&gt;...&lt;/header&gt;         <span class="com">&lt;!-- position: sticky; z-index: 10 --&gt;</span>
+&lt;main&gt;
+  &lt;section class="hero"&gt;                  <span class="com">&lt;!-- opacity: .98  ← the villain --&gt;</span>
+    &lt;div class="dropdown"&gt;...&lt;/div&gt;       <span class="com">&lt;!-- position: absolute; z-index: 9999 --&gt;</span>
+  &lt;/section&gt;
+&lt;/main&gt;
+
+<span class="com">/* Stacking tree:
+   root
+   ├─ header       → context at z:10   (sticky + z-index)
+   └─ .hero        → context at z:auto/0 (opacity &lt; 1 !)
+        └─ .dropdown  z:9999 — but only WITHIN .hero
+
+   .hero (level 0) paints below header (level 10). The dropdown is
+   sealed inside .hero, so its 9999 never competes with the header.
+   It slides UNDER the sticky header. */</span></code></pre>
+  <p><strong>Debugging method (narrate this in interviews):</strong> walk up from the "losing" element to the root; at each ancestor check the stacking-context triggers (DevTools shows "Creates stacking context" in the Layers/Elements panels; Edge and Chrome have a stacking-context inspector). Find the two <em>sibling contexts</em> that actually compete — here <code>header</code> vs <code>.hero</code> — and adjust <em>their</em> z-indexes, not the deep child's. Fix: remove the opacity, or give <code>.hero</code> <code>z-index: 20</code>… which may cause new overlaps, hence:</p>
+  <pre><code><span class="com">/* isolation: isolate — create a stacking context ON PURPOSE, with no
+   visual side effects, to stop children leaking out and fighting
+   unrelated parts of the page: */</span>
+.card { isolation: isolate; }
+<span class="com">/* Now the card's internal z-index games (badge over image, etc.)
+   can never overlap another card or the app header. Design systems
+   should isolate every self-contained composite component. */</span></code></pre>
+  <h3>The top layer — the modern escape hatch</h3>
+  <p>The <strong>top layer</strong> is a browser-managed rendering layer above the entire document — above every stacking context, immune to ancestor <code>overflow</code> clipping and transform containing blocks. Elements get promoted into it only via APIs, never via z-index:</p>
+  <pre><code>&lt;dialog id="confirm"&gt;
+  &lt;p&gt;Delete this item?&lt;/p&gt;
+  &lt;form method="dialog"&gt;&lt;button&gt;Cancel&lt;/button&gt;&lt;button value="ok"&gt;Delete&lt;/button&gt;&lt;/form&gt;
+&lt;/dialog&gt;
+&lt;script&gt;confirm.showModal(); // top layer + focus trap + inert background&lt;/script&gt;
+
+&lt;button popovertarget="menu"&gt;Options&lt;/button&gt;
+&lt;div id="menu" popover&gt;...&lt;/div&gt;  <span class="com">&lt;!-- top layer, light-dismiss, no z-index --&gt;</span>
+
+::backdrop { background: rgb(0 0 0 / .5); backdrop-filter: blur(2px); }</code></pre>
+  <p>Within the top layer, order is promotion order (last promoted paints on top). This is the architectural answer to overlay bugs: no portal, no z-index registry, no stacking-context spelunking. <code>showModal()</code> additionally makes the rest of the document <code>inert</code> — the accessibility work you'd otherwise hand-roll.</p>
+
+  <div class="senior">Tie it together for interviews: <code>transform</code> creates both a stacking context <em>and</em> a containing block for fixed/absolute descendants — which is why "I added a hover animation and my dropdown broke in two different ways" bugs cluster. And the top layer (dialog, popover, fullscreen) is why new codebases can retire the <code>z-index: 2147483647</code> folklore entirely — a strong closing point in any stacking answer.</div>
+
+  <!-- ============================================================ -->
+  <h2 id="units">Units &amp; values <span class="tier tier-2">T2</span></h2>
+
+  <table>
+    <thead><tr><th>Unit</th><th>Relative to</th><th>Use for</th></tr></thead>
+    <tbody>
+      <tr><td><code>px</code></td><td>CSS reference pixel (device-independent; scaled by devicePixelRatio and page zoom — but <strong>not</strong> by user font-size settings)</td><td>Borders, shadows, fine detail</td></tr>
+      <tr><td><code>rem</code></td><td>Root font-size</td><td>Type scale, spacing, media-query-adjacent sizing — respects user font settings</td></tr>
+      <tr><td><code>em</code></td><td>Current element's font-size (for font-size itself: the <em>parent's</em>)</td><td>Padding that scales with the component's own text (buttons, badges)</td></tr>
+      <tr><td><code>%</code></td><td>Property-specific: width→containing block width; padding/margin→containing block <strong>width</strong>; line-height→own font-size; transform→own box</td><td>Fluid layout</td></tr>
+      <tr><td><code>vw/vh</code></td><td>Viewport (largest, historically)</td><td>Hero sections, fluid type via clamp()</td></tr>
+      <tr><td><code>ch</code></td><td>Width of "0" glyph</td><td><code>max-width: 65ch</code> readable measure</td></tr>
+      <tr><td><code>ex</code>/<code>cap</code>/<code>lh</code></td><td>x-height / cap-height / line-height</td><td>Icon sizing that tracks text metrics</td></tr>
+    </tbody>
+  </table>
+
+  <p><strong>The em compounding pitfall:</strong> <code>em</code> on <code>font-size</code> multiplies through nesting:</p>
+  <pre><code>li { font-size: 0.9em; }
+<span class="com">/* &lt;ul&gt;&lt;li&gt;&lt;ul&gt;&lt;li&gt;&lt;ul&gt;&lt;li&gt; → 0.9 × 0.9 × 0.9 = 0.729em.
+   Deeply nested menus shrink toward invisibility. rem doesn't compound. */</span></code></pre>
+
+  <p><strong>Mobile viewport units — the browser-chrome problem:</strong> <code>100vh</code> was defined against the <em>largest</em> viewport (URL bar retracted), so a <code>height: 100vh</code> hero overflows on mobile Safari/Chrome with the bar visible, hiding CTAs behind the chrome. The fix trio:</p>
+  <pre><code>.hero { height: 100svh; } <span class="com">/* small viewport: chrome VISIBLE — safe, never clipped */</span>
+.hero { height: 100lvh; } <span class="com">/* large viewport: chrome retracted — old 100vh */</span>
+.hero { height: 100dvh; } <span class="com">/* dynamic: tracks the bar live — beware layout
+                             jank while it animates during scroll */</span></code></pre>
+  <p>Rule of thumb: <code>svh</code> for must-be-visible content, <code>dvh</code> for full-screen app shells (accepting resize cost), <code>lvh</code> rarely.</p>
+
+  <p><strong>Unitless line-height:</strong> always prefer <code>line-height: 1.5</code> over <code>1.5em</code>/<code>150%</code>. Unitless is inherited as a <em>ratio</em> and recomputed against each descendant's own font-size; unit-ful values inherit as a <em>computed length</em>, so a child with larger text inherits a too-small fixed line-height and lines overlap.</p>
+
+  <p><strong>currentColor:</strong> resolves to the element's own <code>color</code> — the original CSS variable. SVG icons with <code>fill: currentColor</code> automatically match surrounding text, hover states included, with zero extra CSS.</p>
+
+  <p><strong>Fluid values with clamp()</strong> — the modern replacement for stacks of font-size media queries:</p>
+  <pre><code><span class="com">/* clamp(MIN, preferred, MAX) — preferred usually mixes vw with rem
+   so the value still responds to user font-size settings and zoom: */</span>
+h1 { font-size: clamp(1.75rem, 1rem + 2.5vw, 3rem); }
+.container { padding-inline: clamp(1rem, 4vw, 3rem); }
+
+<span class="com">/* Pure-vw type (font-size: 4vw) fails WCAG 1.4.4: browser text zoom
+   can't enlarge it. The rem term in the sum keeps it zoomable. */</span></code></pre>
+  <div class="pitfall">Interview trap: "what's <code>font-size: 10vw</code>'s accessibility problem?" — it's immune to text-only zoom and user font-size preferences, capping effective scaling. Always anchor fluid type with a rem component and sane clamp bounds.</div>
+
+  <!-- ============================================================ -->
+  <h2 id="overflow">Overflow &amp; scrolling <span class="tier tier-2">T2</span></h2>
+
+  <table>
+    <thead><tr><th>Value</th><th>Behavior</th></tr></thead>
+    <tbody>
+      <tr><td><code>visible</code></td><td>Default; content paints outside the box (no scroll container)</td></tr>
+      <tr><td><code>hidden</code></td><td>Clips; still a scroll container (programmatically scrollable via <code>scrollTop</code>, scroll anchoring, focus-scroll) — and creates a BFC</td></tr>
+      <tr><td><code>clip</code></td><td>Clips hard: <strong>not</strong> a scroll container, no programmatic scrolling, cheaper; allows <code>overflow-clip-margin</code>; does <em>not</em> create a BFC</td></tr>
+      <tr><td><code>auto</code></td><td>Scrollbars only when needed</td></tr>
+      <tr><td><code>scroll</code></td><td>Scrollbars always reserved (stable layout, possibly empty gutters)</td></tr>
+    </tbody>
+  </table>
+  <div class="note">Spec quirk: <code>overflow-x: hidden; overflow-y: visible</code> is impossible — if either axis is non-visible, <code>visible</code> on the other computes to <code>auto</code>. This is why "I only wanted to clip horizontally" often breaks vertical dropdowns. <code>clip</code> per-axis actually can do it: <code>overflow-x: clip; overflow-y: visible</code> works.</div>
+
+  <p><strong>Scroll containers &amp; sticky:</strong> as covered in <a href="#stacking">§ positioning</a>, <code>position: sticky</code> binds to the nearest scroll container — any <code>overflow: hidden/auto/scroll</code> ancestor hijacks it. Grep for stray <code>overflow: hidden</code> first when sticky dies.</p>
+
+  <p><strong>overscroll-behavior</strong> — kill scroll chaining from modals/drawers into the page behind them, and disable pull-to-refresh where it fights your gestures:</p>
+  <pre><code>.drawer { overflow-y: auto; overscroll-behavior: contain; }
+<span class="com">/* When the drawer hits its end, the wheel/touch no longer scrolls body.
+   'none' also removes the rubber-band/refresh effects. */</span></code></pre>
+
+  <p><strong>Scroll snap</strong> — carousels without JS:</p>
+  <pre><code>.carousel {
+  display: flex; gap: 1rem;
+  overflow-x: auto;
+  scroll-snap-type: x mandatory;   <span class="com">/* 'proximity' = only snap when close */</span>
+  scroll-padding-inline: 1rem;     <span class="com">/* offset for sticky edges/peek */</span>
+}
+.carousel &gt; * { flex: 0 0 80%; scroll-snap-align: start; }</code></pre>
+  <p><code>mandatory</code> risks trapping content taller than the snapport (users can't reach mid-content) — prefer <code>proximity</code> for mixed-size content.</p>
+
+  <p><strong>Scrollbar awareness:</strong> classic overlay-vs-classic scrollbar difference (macOS overlays take no space; Windows classic scrollbars consume layout width — cause of "works on my Mac" 17px layout shifts, and of the <code>100vw</code>-wider-than-the-page horizontal overflow, since <code>vw</code> ignores the scrollbar).</p>
+  <pre><code><span class="com">/* Reserve the gutter so content doesn't shift when a scrollbar appears
+   (modal open/close toggling body scroll is the classic jank source): */</span>
+html { scrollbar-gutter: stable; }        <span class="com">/* or `stable both-edges` */</span>
+
+<span class="com">/* Standardized styling (Firefox first, now cross-engine): */</span>
+.pane { scrollbar-width: thin; scrollbar-color: #94a3b8 transparent; }
+
+<span class="com">/* Legacy WebKit pseudo-elements — more control, non-standard: */</span>
+.pane::-webkit-scrollbar { width: 8px; }
+.pane::-webkit-scrollbar-thumb { background: #94a3b8; border-radius: 4px; }
+
+<span class="com">/* Smooth scrolling — always motion-gated: */</span>
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+:target { scroll-margin-top: 80px; }  <span class="com">/* anchor links vs sticky header */</span></code></pre>
+
+  <!-- ============================================================ -->
+  <h2 id="selectors">Selectors — the senior tour <span class="tier tier-2">T2</span></h2>
+
+  <h3>Combinators &amp; attribute selectors</h3>
+  <pre><code>A B     <span class="com">/* descendant */</span>      A &gt; B   <span class="com">/* child */</span>
+A + B   <span class="com">/* next sibling */</span>    A ~ B   <span class="com">/* all following siblings */</span>
+
+<span class="com">/* The lobotomized owl — margin between siblings only, no first-child hacks
+   (largely superseded by gap, still great in prose flow): */</span>
+.prose &gt; * + * { margin-top: 1rem; }
+
+[href^="https://"]  <span class="com">/* starts with */</span>   [href$=".pdf"]  <span class="com">/* ends with */</span>
+[class*="col-"]     <span class="com">/* contains */</span>      [lang|="en"]    <span class="com">/* en or en-US */</span>
+[title~="new"]      <span class="com">/* whitespace-list contains word */</span>
+[data-state="open" i]  <span class="com">/* case-insensitive flag */</span></code></pre>
+
+  <h3>:nth-child vs :nth-of-type — the difference</h3>
+  <p><code>:nth-child(n)</code> counts <strong>all sibling elements</strong>, then checks whether the nth one also matches the rest of the selector. <code>:nth-of-type(n)</code> counts only siblings of the <strong>same element type</strong>.</p>
+  <pre><code>&lt;section&gt;
+  &lt;h2&gt;Title&lt;/h2&gt;
+  &lt;p&gt;one&lt;/p&gt;     <span class="com">&lt;!-- child #2, p-of-type #1 --&gt;</span>
+  &lt;p&gt;two&lt;/p&gt;     <span class="com">&lt;!-- child #3, p-of-type #2 --&gt;</span>
+&lt;/section&gt;
+
+p:nth-child(2)   { color: red; }   <span class="com">/* matches "one": it IS the 2nd child AND a p */</span>
+p:nth-child(1)   { color: red; }   <span class="com">/* matches NOTHING — 1st child is the h2 */</span>
+p:nth-of-type(1) { color: red; }   <span class="com">/* matches "one" — 1st p among p's */</span>
+
+<span class="com">/* An+B syntax: */</span>
+li:nth-child(2n+1)      <span class="com">/* odd */</span>
+li:nth-child(-n+3)      <span class="com">/* first three */</span>
+li:nth-last-child(2)    <span class="com">/* second from the end */</span>
+li:nth-child(odd of .visible)  <span class="com">/* modern: count only .visible siblings */</span></code></pre>
+
+  <h3>Pseudo-elements</h3>
+  <pre><code><span class="com">/* ::before/::after require `content` (even empty) and generate
+   inline boxes INSIDE the element (so no-go on replaced elements
+   like &lt;img&gt; or &lt;input&gt;): */</span>
+.external-link::after {
+  content: " ↗" / "";        <span class="com">/* alt text after the slash: "" hides the
+                                arrow from screen readers */</span>
+}
+.tooltip::after { content: attr(data-tip); }
+
+li::marker { color: crimson; content: "→ "; }  <span class="com">/* style bullets w/o list-style:none
+                                                  (which nukes list semantics in Safari) */</span>
+::selection { background: #1a56db; color: #fff; }
+.field::placeholder { color: #94a3b8; }
+p::first-line { font-variant: small-caps; }</code></pre>
+  <div class="note">Generated content lives in the layout but has patchy accessibility exposure — never put load-bearing content only in <code>content:</code>. Also: single vs double colons — <code>:before</code> is legacy CSS2 syntax; write <code>::before</code>; pseudo-<em>classes</em> keep one colon.</div>
+
+  <h3>UI-state pseudo-classes</h3>
+  <ul>
+    <li><code>:focus-within</code> — matches an ancestor when any descendant has focus. Powers "highlight the whole form row / keep the dropdown open while its items are focused" without JS.</li>
+    <li><code>:focus-visible</code> — focus that the browser heuristically attributes to keyboard/programmatic navigation, not mouse clicks. The modern pattern: <code>:focus { outline: none }</code> is an accessibility failure by itself; instead <code>:focus-visible { outline: 2px solid }</code> gives keyboard users rings without flashing them at mouse users.</li>
+    <li><code>:disabled</code> / <code>:enabled</code> — matches actual disabled state (better than <code>[disabled]</code>, which misses fieldset-inherited disabling).</li>
+    <li><code>:checked</code> — and the classic <strong>checkbox hack</strong>: hidden checkbox + label as toggle, sibling combinator reveals content. Historic no-JS accordion/menu trick — know it, and know its a11y costs (no aria-expanded, weird semantics); today <code>&lt;details&gt;</code> or the Popover API is the right tool.</li>
+  </ul>
+  <pre><code>&lt;input type="checkbox" id="nav-toggle" class="visually-hidden-checkbox"&gt;
+&lt;label for="nav-toggle"&gt;Menu&lt;/label&gt;
+&lt;nav class="menu"&gt;...&lt;/nav&gt;
+
+#nav-toggle:checked ~ .menu { display: block; }
+.menu { display: none; }
+
+<span class="com">/* :has() — the "parent selector" — makes most checkbox hacks obsolete
+   and enables state-driven styling anywhere: */</span>
+.form-row:has(input:invalid:not(:focus)) { border-color: crimson; }
+body:has(dialog[open]) { overflow: hidden; }  <span class="com">/* scroll-lock */</span></code></pre>
+
+  <!-- ============================================================ -->
+  <h2 id="media">Media queries beyond width <span class="tier tier-3">T3</span></h2>
+
+  <pre><code><span class="com">/* User preference queries — table-stakes for product polish: */</span>
+@media (prefers-color-scheme: dark)  { :root { --bg: #0f172a; --fg: #e2e8f0; } }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .01ms !important;
+    transition-duration: .01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+@media (prefers-contrast: more) { :root { --border: #000; } }
+
+<span class="com">/* Input capability — the RIGHT way to "detect touch": don't detect
+   touch, detect the primary pointer's precision and hover ability: */</span>
+@media (hover: hover) and (pointer: fine)   { <span class="com">/* mouse/trackpad: hover UI ok */</span> }
+@media (hover: none)  and (pointer: coarse) { <span class="com">/* touch: bigger targets (≥44px),
+                                                 no hover-only affordances */</span> }
+@media (any-hover: hover) { <span class="com">/* SOME input can hover (touch laptop + mouse) */</span> }
+
+<span class="com">/* Modern range syntax: */</span>
+@media (400px &lt;= width &lt; 900px) { ... }</code></pre>
+  <div class="pitfall">Never gate functionality on hover alone — a hybrid Windows laptop matches <code>pointer: fine</code> yet the user may be touching. <code>hover</code>/<code>pointer</code> report the <em>primary</em> input; use <code>any-hover</code>/<code>any-pointer</code> for capability union, and always keep a click/tap path.</div>
+
+  <p><strong>Print stylesheets</strong> — a 10-minute investment interviewers occasionally probe as a "care about the platform" signal:</p>
+  <pre><code>@media print {
+  nav, aside, .ads, video { display: none; }
+  a[href^="http"]::after { content: " (" attr(href) ")"; font-size: .85em; }
+  details { display: block; }            <span class="com">/* expand collapsed content */</span>
+  .card, pre, table { break-inside: avoid; }
+  h2 { break-after: avoid; }             <span class="com">/* keep headings with content */</span>
+  @page { margin: 2cm; }
+}
+<span class="com">/* Backgrounds are stripped by default when printing —
+   print-color-adjust: exact opts critical elements back in. */</span></code></pre>
+
+  <p><strong>Responsive images in CSS:</strong> <code>background-image: image-set("hero.avif" type("image/avif") 1x, "hero@2x.avif" 2x)</code> is the CSS analog of <code>srcset</code> — resolution/format selection for backgrounds. For content images, HTML <code>srcset/sizes/&lt;picture&gt;</code> remains the right layer (browser preloader can act before CSSOM exists) — full treatment in tutorial 17 (Performance).</p>
+
+  <!-- ============================================================ -->
+  <h2 id="qa">Interview Q&amp;A</h2>
+
+  <details class="qa"><summary>Walk me through why <code>* { box-sizing: border-box }</code> is a near-universal reset.</summary><div class="answer"><p>"The initial value, <code>content-box</code>, makes <code>width</code> mean the content area only, so padding and border are added on top — <code>width: 50% + padding</code> overflows a two-column layout. <code>border-box</code> makes declared width equal the visible box, so percentages, padding, and borders compose predictably; it also matches how form controls already behave in UA stylesheets. It's applied with <code>*</code> plus <code>::before/::after</code> because <code>box-sizing</code> doesn't inherit; a variant sets it on <code>html</code> and inherits it everywhere so components can opt out subtree-wide."</p></div></details>
+
+  <details class="qa"><summary>My card's background starts below where I expect, and the child heading's margin appears outside the card. What's happening?</summary><div class="answer"><p>"Parent–child margin collapsing. The child's <code>margin-top</code> is adjoining the parent's <code>margin-top</code> — nothing (border, padding, inline content, clearance) separates their top edges — so per spec they collapse into a single margin that effectively acts on the parent. Fixes: add <code>padding-top</code> or <code>border-top</code> to the parent to break adjacency, or give the parent a new formatting context — <code>display: flow-root</code> is the side-effect-free option; making it flex or grid also works because flex/grid item margins never collapse."</p></div></details>
+
+  <details class="qa"><summary>Exactly when do margins collapse, and what's the resulting size?</summary><div class="answer"><p>"Only vertical margins of block-level boxes in normal flow within the same BFC: adjacent siblings, parent with first/last child when no border/padding/content separates them, and an empty block's own top and bottom margins. The collapsed margin is the max of the positives; with negatives involved it's the largest positive plus the most negative (so two negatives give the more negative one). Never across BFC boundaries, never for floats, abs-pos, inline-blocks, or flex/grid items, never horizontally."</p></div></details>
+
+  <details class="qa"><summary>What is <code>padding-top: 56.25%</code> doing in old aspect-ratio hacks?</summary><div class="answer"><p>"Percentage padding — including vertical — resolves against the containing block's <em>width</em>, because height may not be known yet and the spec avoids the circular dependency. So padding-top of 56.25% creates a box whose height is 9/16 of its width: a 16:9 frame. Content then goes in an absolutely positioned child filling the box. Today <code>aspect-ratio: 16/9</code> replaces the whole trick."</p></div></details>
+
+  <details class="qa"><summary>Explain the full cascade order, not just specificity.</summary><div class="answer"><p>"The cascade sorts by criteria in order: first origin and importance — important UA beats important user beats important author, then animations, then normal author, user, UA; note <code>!important</code> inverts origin order. Within author styles, cascade layers apply: unlayered beats layered for normal declarations, and later layers beat earlier ones — flipped for important. Only then specificity, and finally source order. Specificity is genuinely the third tiebreaker, which surprises people who treat it as the whole story."</p></div></details>
+
+  <details class="qa"><summary>Compute the specificity of <code>#nav ul li.active a:hover::before</code> and compare with <code>[id="nav"] .active a</code>.</summary><div class="answer"><p>"First: one ID (a=1); one class + one pseudo-class (b=2); ul, li, a, and ::before (c=4) → (1,2,4). Second: <code>[id="nav"]</code> is an <em>attribute</em> selector — b, not a! — plus <code>.active</code>, so b=2, plus <code>a</code> c=1 → (0,2,1). (1,2,4) wins on the first component. The attribute-selector-for-ID trick is a real technique to reference an ID at class-level specificity."</p></div></details>
+
+  <details class="qa"><summary>When would you use <code>:where()</code> over <code>:is()</code>?</summary><div class="answer"><p>"They match identically, but <code>:is()</code> contributes the specificity of its most specific argument while <code>:where()</code> contributes zero. I use <code>:where()</code> for library/reset/default styles so any consumer selector — even a bare class — overrides them without specificity wars; <code>:is()</code> when I just want grouping ergonomics and normal specificity, e.g. <code>:is(h1,h2,h3) code</code>. One trap: <code>:is(#a, .b)</code> is ID-level specificity even when it matched via <code>.b</code>."</p></div></details>
+
+  <details class="qa"><summary>A third-party stylesheet uses <code>!important</code>. Rank your options to override it.</summary><div class="answer"><p>"Within the important lane: my own <code>!important</code> with higher specificity, or with equal specificity and later source order. Cleaner: cascade layers. For <em>normal</em> declarations, unlayered styles beat layered ones — so importing vendor CSS into <code>@layer vendor</code> lets my plain unlayered styles win without any specificity contest. For <em>important</em> declarations the layer order inverts: an <em>earlier</em> layer's important declarations beat a later layer's — so if I declare <code>@layer overrides, vendor;</code> and put my important rules in <code>overrides</code> (declared first), they beat the vendor's importants. Last resorts: <code>el.style.setProperty(prop, val, 'important')</code> from JS. And I'd flag the smell: recurring important-wars mean the codebase needs a layering strategy, not bigger hammers."</p></div></details>
+
+  <details class="qa"><summary>What's the difference between <code>initial</code>, <code>unset</code>, and <code>revert</code>?</summary><div class="answer"><p>"<code>initial</code> is the per-property spec default — element-blind, so <code>display: initial</code> on a div is <code>inline</code>. <code>unset</code> means <code>inherit</code> for inherited properties, <code>initial</code> otherwise — what <code>all: unset</code> uses to strip an element. <code>revert</code> rolls back to the previous origin, usually the UA stylesheet, so it restores the <em>browser's</em> element-appropriate default — what people usually actually want. <code>revert-layer</code> does the same one cascade layer up."</p></div></details>
+
+  <details class="qa"><summary>What is a BFC, what creates one, and name two bugs it fixes.</summary><div class="answer"><p>"A block formatting context is an isolated layout region: floats inside don't affect outside, margins don't collapse across its boundary, and it doesn't overlap external floats. Created by the root element, floats, absolute positioning, <code>overflow</code> other than visible/clip, <code>inline-block</code>, table cells, <code>contain: layout/paint</code>, and — purpose-built — <code>display: flow-root</code>. It fixes (1) float containment: a parent of floats collapses to zero height unless it's a BFC; (2) parent–child margin collapse: a BFC boundary is a collapse barrier; and (3) it enables the media-object pattern since a BFC won't wrap under an adjacent float."</p></div></details>
+
+  <details class="qa"><summary>There's a mysterious gap under an image inside a div. Why, and name three fixes.</summary><div class="answer"><p>"Because <code>img</code> is a replaced <em>inline</em> element, it sits on the text baseline of its line box, and the line box reserves descender space below the baseline based on the parent's font metrics. That descender space is the gap. Fixes: <code>display: block</code> on the image (no line box at all), <code>vertical-align: bottom/middle</code> (leave the baseline), or <code>line-height: 0</code>/<code>font-size: 0</code> on the parent (collapse the strut). I default to <code>display: block</code> for standalone images."</p></div></details>
+
+  <details class="qa"><summary>Compute the final widths: container 600px, items with <code>flex: 1 1 300px</code>, <code>flex: 1 1 200px</code>, <code>flex: 1 1 300px</code>.</summary><div class="answer"><p>"Total basis 800 vs 600 → shrink by 200. Shrink is weighted by shrink-factor × basis: 300, 200, 300, sum 800. Item1 loses 200×300/800 = 75 → 225. Item2 loses 200×200/800 = 50 → 150. Item3 → 225. Check: 225+150+225 = 600. The key sentence: shrink weights by factor <em>times basis</em>, so larger items give up proportionally more — unlike grow, which weights by factor alone. And in reality content minimums might clamp an item, triggering redistribution."</p></div></details>
+
+  <details class="qa"><summary>Why doesn't <code>text-overflow: ellipsis</code> work on my flex item, and why does <code>min-width: 0</code> fix it?</summary><div class="answer"><p>"Flex items have <code>min-width: auto</code>, which resolves to the content-based minimum size — roughly the min-content width. The long unbreakable text sets a floor below which the item cannot shrink, so it never becomes narrower than the text and ellipsis never triggers; the row overflows instead. <code>min-width: 0</code> removes the floor; <code>overflow: hidden</code> on the item also works because per spec a non-visible overflow zeroes the automatic minimum. Same mechanism vertically with <code>min-height</code> in column direction, and the same idea in grid where <code>1fr</code> is really <code>minmax(auto, 1fr)</code> — hence <code>minmax(0, 1fr)</code>."</p></div></details>
+
+  <details class="qa"><summary>Difference between <code>align-items</code> and <code>align-content</code> in flexbox?</summary><div class="answer"><p>"<code>align-items</code> aligns items within their flex line on the cross axis — default stretch, which is why flex children are equal height. <code>align-content</code> distributes the <em>lines</em> within the container when there are multiple lines and spare cross space — so it does nothing on a single-line (non-wrapping) container, which is the trap in the question. <code>align-self</code> is the per-item override of align-items."</p></div></details>
+
+  <details class="qa"><summary><code>flex: 1</code> vs <code>flex: auto</code> — when do they render differently?</summary><div class="answer"><p>"<code>flex: 1</code> = <code>1 1 0%</code>: basis zero, so the whole container is free space and grow ratios alone decide sizes — equal columns regardless of content. <code>flex: auto</code> = <code>1 1 auto</code>: items start at content size, only leftover space is shared, so content-heavy items end up bigger. Different whenever contents differ. Also worth saying: bare <code>flex: 1</code> sets shrink to 1 and basis to 0%, so never set grow via longhand alone and expect the shorthand's defaults."</p></div></details>
+
+  <details class="qa"><summary>Explain <code>auto-fill</code> vs <code>auto-fit</code>.</summary><div class="answer"><p>"Both, inside <code>repeat()</code> with a minmax track, create as many tracks as fit the container. They diverge only when items don't fill all tracks: <code>auto-fill</code> keeps empty tracks, so items stay at their track size and empty space remains as ghost columns; <code>auto-fit</code> collapses empty tracks to zero, letting the <code>1fr</code> maxes of occupied tracks absorb the space, so few items stretch wide. Dashboard cards with stable sizes → auto-fill; gallery that should always fill the row → auto-fit."</p></div></details>
+
+  <details class="qa"><summary>Why can a grid column with <code>1fr</code> still overflow, and what's the fix?</summary><div class="answer"><p>"Because <code>1fr</code> is spec-defined as <code>minmax(auto, 1fr)</code> — the auto minimum means the track can't shrink below its content's min-content size. A wide <code>&lt;pre&gt;</code>, table, or unbroken string forces the track wider than its fair share, overflowing the container. Fix: <code>minmax(0, 1fr)</code> for the track, or <code>min-width: 0</code> / <code>overflow: hidden</code> / <code>word-break</code> on the item. This is the grid version of the flexbox min-width:auto gotcha — same spec concept, automatic minimum size."</p></div></details>
+
+  <details class="qa"><summary>How do you choose grid vs flexbox?</summary><div class="answer"><p>"Two axes of judgment. Dimensionality: flexbox is 1D — a row or column where wrapped lines are independent; grid is 2D — rows and columns that must align. Control direction: flexbox is content-out — item sizes drive the negotiation; grid is layout-in — I define tracks and content conforms. So: toolbar, media object, tag cloud, centering → flex. Page shell, card grid where row 2 aligns with row 1, forms, anything needing cross-row alignment → grid. And they compose: grid for the shell, flex inside components. Subgrid now covers the 'align internals across cards' case that used to be unsolvable."</p></div></details>
+
+  <details class="qa"><summary>My <code>position: fixed</code> modal is trapped inside a panel instead of covering the viewport. Debug it.</summary><div class="answer"><p>"Some ancestor has a <code>transform</code>, <code>filter</code>, <code>backdrop-filter</code>, <code>perspective</code>, <code>will-change: transform</code>, or <code>contain: layout/paint</code> — per the Transforms/Filters specs any of those makes that ancestor the containing block for fixed descendants, so 'fixed' degrades to absolute-within-the-panel. Common culprits: a leftover <code>transform: translateX(0)</code> from a slide-in animation, or <code>will-change</code> left on for performance. I'd walk up the tree in DevTools checking computed styles for those properties. Fixes: portal the modal to <code>document.body</code> — this is literally why React portals exist — remove the transform after the animation ends, or use <code>&lt;dialog&gt;.showModal()</code>/popover, which render in the top layer and are immune to ancestor containing blocks and stacking contexts."</p></div></details>
+
+  <details class="qa"><summary>z-index: 999999 isn't working. Give me your debugging monologue.</summary><div class="answer"><p>"First: is the element positioned or a flex/grid item? z-index is ignored on static block elements. Second — the real issue — z-index only competes <em>within the nearest ancestor stacking context</em>, and stacking contexts are atomic. I walk up from my element looking for context creators: positioned + z-index, opacity &lt; 1, transform, filter, will-change, isolation, mix-blend-mode, contain: paint, or fixed/sticky position. Say I find the parent section has <code>opacity: .98</code> — that seals my element inside a context whose own level is what actually competes with the header's context. The fix happens at the level where the two sibling contexts meet: raise the section's z-index or remove the opacity — not inflate the child's number. And to prevent the class of bug, <code>isolation: isolate</code> on composite components deliberately scopes their internal z-index games. Long-term, top-layer primitives (dialog, popover) end the arms race for overlays."</p></div></details>
+
+  <details class="qa"><summary>What creates a stacking context? List as many triggers as you can.</summary><div class="answer"><p>"Root element; positioned (relative/absolute) with non-auto z-index; fixed or sticky positioning unconditionally; flex/grid items with non-auto z-index; opacity below 1; any transform, translate/rotate/scale, filter, backdrop-filter, perspective, clip-path, or mask; isolation: isolate; mix-blend-mode other than normal; will-change naming any such property; contain: layout or paint; and top-layer elements. The pattern: anything that forces the subtree to composite as a unit."</p></div></details>
+
+  <details class="qa"><summary>Why might <code>position: sticky</code> silently do nothing? Three distinct causes.</summary><div class="answer"><p>"One: no inset — sticky needs <code>top/bottom/left/right</code> to know its stick threshold. Two: an ancestor with non-visible overflow becomes the scroll container it sticks within; if that ancestor doesn't scroll (overflow: hidden used for clipping), the sticky element never moves relative to it — appears broken. Three: the parent (containing block) is no taller than the sticky element, so there's no travel range — common when the sticky element is the only child, or a stretched flex sibling situation misleads you; the element only sticks while its parent's box intersects the scrollport. Bonus: in tables, apply sticky to <code>th</code> cells, not <code>thead</code>."</p></div></details>
+
+  <details class="qa"><summary><code>em</code> vs <code>rem</code> — and why unitless <code>line-height</code>?</summary><div class="answer"><p>"<code>rem</code> is relative to the root font-size — predictable, respects user font settings, no compounding; my default for type and spacing scales. <code>em</code> is relative to the element's own font-size (parent's, when sizing font-size itself), so nested em font-sizes multiply — 0.9em three levels deep is 0.729× — but that self-reference is exactly right for component-relative padding, like a button whose padding scales with its label. Line-height should be unitless because a unitless value inherits as a ratio recomputed per descendant font-size, whereas <code>1.5em</code>/<code>150%</code> inherits as a fixed computed length, so larger-text children get cramped, overlapping lines."</p></div></details>
+
+  <details class="qa"><summary>Why is <code>height: 100vh</code> broken on mobile and what replaced it?</summary><div class="answer"><p>"Historically <code>vh</code> was defined against the largest viewport — URL bar retracted — so with the bar visible, 100vh is taller than the visible area and bottom content (CTAs, input bars) hides behind browser chrome. The viewport-unit trio fixes it: <code>svh</code> = small viewport (chrome visible, always safe), <code>lvh</code> = large (the old behavior), <code>dvh</code> = dynamic, tracking the chrome live at the cost of layout resizes during scroll. Rule: svh for must-see content, dvh for app shells, and pair with <code>env(safe-area-inset-*)</code> on notched devices."</p></div></details>
+
+  <details class="qa"><summary><code>:nth-child</code> vs <code>:nth-of-type</code>?</summary><div class="answer"><p>"<code>p:nth-child(2)</code> asks: is this element the second child of its parent, counting <em>every</em> element, and is it a <code>p</code>? Both must hold, so a heading occupying slot 1 shifts everything. <code>p:nth-of-type(2)</code> counts only <code>p</code> siblings — second paragraph regardless of what's interleaved. The modern escape hatch is <code>:nth-child(2 of .item)</code>, which counts only matching siblings with full selector specificity control."</p></div></details>
+
+  <details class="qa"><summary>How do you correctly style focus without harming accessibility?</summary><div class="answer"><p>"Never bare <code>:focus { outline: none }</code> — that blinds keyboard users. Use <code>:focus-visible</code> for the ring: browsers apply it for keyboard and programmatic focus but not most mouse clicks, so keyboard users get a clear indicator and mouse users don't get flashes. Keep a fallback <code>:focus</code> style for older engines, ensure 3:1 contrast for the indicator, and prefer <code>outline</code> + <code>outline-offset</code> over box-shadow since outline survives <code>overflow: hidden</code> clipping better and respects forced-colors mode."</p></div></details>
+
+  <details class="qa"><summary>How would you detect a touch device in CSS, and what's wrong with the question?</summary><div class="answer"><p>"The premise is wrong — devices are hybrids, so I detect <em>capabilities</em>, not device classes. <code>@media (hover: none) and (pointer: coarse)</code> targets a primary input that can't hover and is imprecise — style for bigger touch targets and no hover-dependent UI there. <code>(hover: hover) and (pointer: fine)</code> enables hover affordances. <code>any-hover/any-pointer</code> report whether <em>any</em> attached input has the capability, for hybrids like touch laptops. And regardless of the query, hover must never be the only path to functionality."</p></div></details>
+
+  <!-- ============================================================ -->
+  <h2 id="exercises">Hands-on exercises</h2>
+
+  <div class="exercise">
+    <h4>Exercise 1 — The centering zoo</h4>
+    <p>Center a child <code>div</code> horizontally <em>and</em> vertically inside a 400px-tall parent, in <strong>five different ways</strong>: (a) grid one-liner, (b) flexbox, (c) absolute + transform, (d) absolute + auto margins, (e) the modern block-layout way with no flex/grid at all. State one limitation of each.</p>
+    <details><summary>Solution</summary>
+<pre><code><span class="com">/* (a) Grid — tersest */</span>
+.parent { display: grid; place-items: center; }
+<span class="com">/* limitation: all direct children get centered; grid context may
+   not be wanted if children need normal flow */</span>
+
+<span class="com">/* (b) Flexbox */</span>
+.parent { display: flex; justify-content: center; align-items: center; }
+<span class="com">/* limitation: multiple children line up in a row; anonymous flex
+   items around text can surprise */</span>
+
+<span class="com">/* (c) Absolute + transform — works with unknown child size */</span>
+.parent { position: relative; }
+.child  { position: absolute; top: 50%; left: 50%;
+          transform: translate(-50%, -50%); }
+<span class="com">/* limitations: out of flow (parent won't size to child);
+   transform creates a stacking context AND a containing block
+   for fixed descendants; half-pixel blur possible */</span>
+
+<span class="com">/* (d) Absolute + auto margins — needs inset:0 */</span>
+.parent { position: relative; }
+.child  { position: absolute; inset: 0; margin: auto;
+          width: max-content; height: max-content; }
+<span class="com">/* limitation: needs a resolvable child size (explicit or max-content) */</span>
+
+<span class="com">/* (e) Modern block layout — no new formatting context needed */</span>
+.parent { align-content: center; text-align: center; }
+.child  { display: inline-block; }
+<span class="com">/* align-content now applies to plain block containers (2024+ engines);
+   limitation: newer browsers only — know the support story */</span></code></pre>
+    </details>
+  </div>
+
+  <div class="exercise">
+    <h4>Exercise 2 — Holy grail, twice</h4>
+    <p>Build the holy grail layout — header, footer, 3 columns (nav 200px / fluid main / aside 240px), footer pinned to the bottom on short pages, columns equal height — once with <strong>grid</strong> and once with <strong>flexbox</strong>. Then answer: which parts were harder in flexbox, and why does the main column need <code>minmax(0, 1fr)</code> in the grid version?</p>
+    <details><summary>Solution</summary>
+<pre><code><span class="com">/* GRID — the natural fit */</span>
+body {
+  display: grid; min-height: 100dvh;
+  grid-template: "header header header" auto
+                 "nav    main   aside"  1fr
+                 "footer footer footer" auto
+               / 200px minmax(0, 1fr) 240px;
+}
+header { grid-area: header; }  nav { grid-area: nav; }
+main   { grid-area: main; }    aside { grid-area: aside; }
+footer { grid-area: footer; }
+
+@media (max-width: 700px) {
+  body { grid-template: "header" "nav" "main" "aside" "footer" / 1fr;
+         grid-template-rows: auto auto 1fr auto auto; }
+}
+
+<span class="com">/* FLEXBOX — needs nesting */</span>
+body { display: flex; flex-direction: column; min-height: 100dvh; }
+.middle { display: flex; flex: 1; }
+nav   { flex: 0 0 200px; }
+main  { flex: 1; min-width: 0; }   <span class="com">/* the classic fix again */</span>
+aside { flex: 0 0 240px; }
+
+<span class="com">/* Answers: flexbox needs an extra wrapper (.middle) because it's 1D;
+   equal-height columns come free from align-items: stretch, but the
+   2D header/footer relationship needs the column-direction outer flex.
+   minmax(0,1fr) on main: 1fr = minmax(auto,1fr); wide content (code
+   blocks, tables) would otherwise set a min-content floor and push
+   the aside off-screen. */</span></code></pre>
+    </details>
+  </div>
+
+  <div class="exercise">
+    <h4>Exercise 3 — Sticky footer + sticky header, no bugs</h4>
+    <p>Page with a header that sticks on scroll, a footer that sits at the viewport bottom on short pages (but flows normally on long pages), and a main area with a code block that must not cause horizontal page overflow. Then: add <code>overflow-x: hidden</code> to <code>body</code> and explain what breaks.</p>
+    <details><summary>Solution</summary>
+<pre><code>body { min-height: 100dvh; display: flex; flex-direction: column; margin: 0; }
+header { position: sticky; top: 0; z-index: 10; background: #fff; }
+main   { flex: 1; min-width: 0; }        <span class="com">/* sticky-footer core: flex:1 */</span>
+main pre { overflow-x: auto; }           <span class="com">/* scroll the code, not the page */</span>
+footer { margin-top: auto; }             <span class="com">/* belt-and-suspenders w/ flex:1 */</span>
+
+<span class="com">/* What breaks with body { overflow-x: hidden }:
+   1. body becomes a scroll container → position: sticky on header now
+      binds to BODY's scrollport instead of the viewport. In practice
+      browsers propagate body overflow to the viewport unless html ALSO
+      has non-visible overflow — so the trap fully fires with
+      html { overflow-x: hidden } too, a very common "fix" for
+      horizontal scroll. Sticky dies silently.
+   2. overflow-x: hidden forces overflow-y to compute to auto —
+      you may get an unexpected vertical scroll container.
+   Correct fix for stray horizontal overflow: find the overflowing
+   element (min-width floors, 100vw + scrollbar, unbroken strings)
+   or use overflow-x: clip, which is NOT a scroll container and
+   leaves sticky alone. */</span></code></pre>
+    </details>
+  </div>
+
+  <div class="exercise">
+    <h4>Exercise 4 — Masonry-ish gallery with dense packing</h4>
+    <p>Build a responsive image gallery: columns auto-generate at ≥160px, rows are 100px units, some items span 2 columns and/or 2 rows, and gaps left by spanning items get backfilled. No media queries. Then explain why this is "masonry-ish" and not true masonry, and note the a11y caveat.</p>
+    <details><summary>Solution</summary>
+<pre><code>.gallery {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  grid-auto-rows: 100px;
+  grid-auto-flow: row dense;    <span class="com">/* backfill holes */</span>
+  gap: 8px;
+}
+.gallery &gt; * { overflow: hidden; border-radius: 8px; }
+.gallery img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.gallery .wide { grid-column: span 2; }
+.gallery .tall { grid-row: span 2; }
+.gallery .big  { grid-column: span 2; grid-row: span 2; }
+
+<span class="com">/* Why not true masonry: every item still snaps to fixed row tracks —
+   items don't pack directly under the item above at arbitrary heights
+   the way Pinterest columns do. True masonry needs the proposed
+   grid-template-rows: masonry / display: masonry, or JS/columns hacks
+   (CSS columns reorder content top-to-bottom per column — bad for
+   reading order). A11y caveat: `dense` reorders items visually while
+   DOM/tab order is unchanged — fine for non-sequential image grids,
+   wrong for content with meaningful order. */</span></code></pre>
+    </details>
+  </div>
+
+  <div class="exercise">
+    <h4>Exercise 5 — The stacking-context escape room</h4>
+    <p>Given this structure, the tooltip must render above the page header. You may not move elements in the DOM and may not remove the animation. Fix it and explain every step.</p>
+<pre><code>&lt;header class="app-header"&gt;...&lt;/header&gt;   <span class="com">&lt;!-- sticky; z-index: 100 --&gt;</span>
+&lt;ul class="results"&gt;
+  &lt;li class="result-card"&gt;                <span class="com">&lt;!-- animation leaves transform: none? NO:
+                                              card has transform: translateY(0)
+                                              and opacity: .999 from a fade-in --&gt;</span>
+    &lt;button&gt;Info&lt;/button&gt;
+    &lt;div class="tooltip"&gt;...&lt;/div&gt;        <span class="com">&lt;!-- absolute; z-index: 10000 --&gt;</span>
+  &lt;/li&gt;
+&lt;/ul&gt;</code></pre>
+    <details><summary>Solution</summary>
+<pre><code><span class="com">/* Diagnosis: .result-card has transform + opacity &lt; 1 → it IS a
+   stacking context at level auto/0. The tooltip's z-index: 10000 only
+   ranks it inside the card. The card's context (0) paints below the
+   header's context (100). Also: the transform makes the card the
+   containing block for any fixed-position tooltip strategy.
+
+   Fix without moving DOM or killing the animation: */</span>
+
+<span class="com">/* 1. End the animation in a state with NO lingering context triggers:
+      animate with a keyframes fill-mode that lands on identity, then
+      remove residual properties — opacity must end at exactly 1 and
+      transform must be `none` after the animation (animation-fill-mode:
+      none, or a JS animationend cleanup). While animating, the tooltip
+      can't escape — acceptable, tooltips don't open mid-fade-in. */</span>
+.result-card { animation: fade-in .3s ease-out; }
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: none; }   <span class="com">/* and no styles OUTSIDE the
+                                              animation setting transform/opacity */</span>
+}
+
+<span class="com">/* 2. If the card must keep a transform (hover lift), the only
+      CSS-side lever left is raising the whole card's context above
+      the header while the tooltip is open: */</span>
+.result-card:has(.tooltip.open) { z-index: 101; position: relative; }
+<span class="com">/* :has() flips the card's context level only when needed, so cards
+   don't permanently stack over the sticky header while scrolling. */</span>
+
+<span class="com">/* 3. The robust architectural answer: top layer. Make the tooltip a
+      popover — it escapes ALL ancestor stacking contexts and
+      containing blocks, no z-index at all: */</span>
+&lt;button popovertarget="tip1"&gt;Info&lt;/button&gt;
+&lt;div id="tip1" popover&gt;...&lt;/div&gt;
+<span class="com">/* (Anchor positioning or JS keeps it attached to the button.)
+   In an interview, walking through 1 → 2 → 3 shows mechanism,
+   pragmatism, and platform knowledge in that order. */</span></code></pre>
+    </details>
+  </div>
+
+  <div class="exercise">
+    <h4>Exercise 6 — Flex math on paper</h4>
+    <p>No browser allowed. Container: 1000px, <code>gap: 20px</code>, three items: A <code>flex: 2 1 200px</code>, B <code>flex: 1 2 300px</code>, C <code>flex: 1 1 100px; max-width: 220px</code>. Compute the final widths, including the clamp-and-redistribute step.</p>
+    <details><summary>Solution</summary>
+<pre><code><span class="com">/* Space for items = 1000 − 2 gaps (40) = 960.
+   Σ basis = 200+300+100 = 600 → free space = 360 → GROW phase.
+   Σ grow = 2+1+1 = 4 → unit = 90.
+   Tentative: A = 200+180 = 380, B = 300+90 = 390, C = 100+90 = 190.
+
+   Clamping: C's max-width is 220 — tentative 190 &lt; 220, no violation.
+   (Had C's tentative been &gt; 220, we'd freeze C at 220 and re-run:
+   remaining free = 360 − 120 = 240 split A:B = 2:1 → A 360, B 380.)
+
+   Final: A = 380px, B = 390px, C = 190px.  380+390+190+40 = 1000 ✓
+   Note B's shrink: 2 was irrelevant — we were in the grow phase;
+   shrink only matters when Σbasis exceeds the container. Spotting
+   that red herring is exactly what the interviewer wants. */</span></code></pre>
+    </details>
+  </div>
+
+  <nav class="page-nav">
+    <a href="01-html-accessibility.html">← Prev: HTML &amp; Accessibility</a>
+    <a href="03-css-modern-architecture.html">Next: Modern CSS &amp; Architecture →</a>
+  </nav>
+</main>
+</body>
+</html>

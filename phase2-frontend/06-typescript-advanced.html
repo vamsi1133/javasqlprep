@@ -1,0 +1,1109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>06 — TypeScript Advanced | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container">
+    <div class="breadcrumb"><a href="index.html">← Course Home</a></div>
+    <h1>06 — TypeScript Advanced</h1>
+    <p>The type-system mechanics behind the syntax you use daily — generics, narrowing, mapped/conditional types, and typing React the way library authors do</p>
+  </div>
+</header>
+
+<main class="container">
+
+  <h2>Why interviewers ask this</h2>
+  <p>Every senior frontend candidate claims TypeScript on their resume, so interviewers don't ask "what is an interface." They probe whether you understand <strong>how the type system works</strong> — because that predicts whether you can design a library API, debug a cryptic 40-line type error, review a junior's <code>as any</code>, and articulate the trade-offs TS deliberately makes (it is <em>intentionally unsound</em> in specific places for ergonomics). The interview signals they're fishing for:</p>
+  <ul>
+    <li><strong>Mental model</strong> — do you know TS is structural, that types are erased at runtime, and what that implies?</li>
+    <li><strong>Type-level programming</strong> — can you implement <code>Pick</code>, <code>ReturnType</code>, or extract route params from a string literal? (FAANG and TS-heavy startups love live type-challenges.)</li>
+    <li><strong>Applied React typing</strong> — discriminated-union reducers, generic components, extending native element props. This is where 7 years of experience should show.</li>
+    <li><strong>Judgment</strong> — when <code>as</code> is acceptable, why <code>satisfies</code> exists, which strict flags you'd turn on and why.</li>
+  </ul>
+  <div class="note">A recurring theme in strong answers: TS constantly trades <strong>soundness for ergonomics</strong> (bivariant methods, excess property checks only on fresh literals, <code>any</code> existing at all). Naming the trade-off — not just the rule — is what reads as senior.</div>
+
+  <div class="toc">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#mental-model">Type-system mental model: structural, inference, unknown/any/never, void</a></li>
+      <li><a href="#interface-vs-type">Interfaces vs type aliases — the real differences</a></li>
+      <li><a href="#generics">Generics deep: inference, constraints, variance</a></li>
+      <li><a href="#narrowing">Narrowing &amp; discriminated unions — the workhorse</a></li>
+      <li><a href="#utility-types">Utility types — how they're built, not just the list</a></li>
+      <li><a href="#mapped-types">Mapped types &amp; key remapping</a></li>
+      <li><a href="#conditional-types">Conditional types, infer &amp; template literal types</a></li>
+      <li><a href="#satisfies">satisfies, as const, and assertion discipline</a></li>
+      <li><a href="#typing-react">Typing React properly</a></li>
+      <li><a href="#config">Compiler config &amp; ecosystem: strict flags, .d.ts, who transpiles</a></li>
+      <li><a href="#trivia">Advanced trivia: overloads, this, variadic tuples, decorators</a></li>
+      <li><a href="#qa">Interview Q&amp;A</a></li>
+      <li><a href="#drills">Type-challenge drills</a></li>
+    </ol>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="mental-model">1. Type-system mental model <span class="tier tier-1">T1</span></h2>
+
+  <h3>Structural typing ("duck typing, but checked")</h3>
+  <p>TypeScript decides compatibility by <strong>shape</strong>, not by name. If a value has at least the members a type requires, it's assignable — no <code>implements</code>, no inheritance chain needed. This is the opposite of nominal systems (Java, C#, Rust) where the declared name is the identity.</p>
+  <pre><code><span class="kw">interface</span> <span class="typ">Point</span> { x: <span class="typ">number</span>; y: <span class="typ">number</span>; }
+
+<span class="kw">class</span> <span class="typ">Vector</span> {          <span class="com">// never mentions Point</span>
+  <span class="kw">constructor</span>(<span class="kw">public</span> x: <span class="typ">number</span>, <span class="kw">public</span> y: <span class="typ">number</span>) {}
+}
+
+<span class="kw">function</span> len(p: <span class="typ">Point</span>) { <span class="kw">return</span> Math.hypot(p.x, p.y); }
+
+len(<span class="kw">new</span> <span class="typ">Vector</span>(<span class="num">3</span>, <span class="num">4</span>));       <span class="com">// ✅ fine — same shape</span>
+len({ x: <span class="num">3</span>, y: <span class="num">4</span> });          <span class="com">// ✅ fine — a plain object works too</span></code></pre>
+  <p><strong>Consequence:</strong> two types that mean different things but share a shape are interchangeable — <code>UserId</code> and <code>OrderId</code> both being <code>string</code> means you can pass one where the other is expected and TS won't blink. When you genuinely need nominal behavior, the idiom is a <strong>branded type</strong>:</p>
+  <pre><code><span class="kw">type</span> <span class="typ">UserId</span>  = <span class="typ">string</span> &amp; { <span class="kw">readonly</span> __brand: <span class="str">'UserId'</span> };
+<span class="kw">type</span> <span class="typ">OrderId</span> = <span class="typ">string</span> &amp; { <span class="kw">readonly</span> __brand: <span class="str">'OrderId'</span> };
+
+<span class="com">// One controlled "blessing" point — the only place `as` appears:</span>
+<span class="kw">function</span> toUserId(raw: <span class="typ">string</span>): <span class="typ">UserId</span> {
+  <span class="com">// validate here (regex, lookup, ...)</span>
+  <span class="kw">return</span> raw <span class="kw">as</span> <span class="typ">UserId</span>;
+}
+
+<span class="kw">function</span> getUser(id: <span class="typ">UserId</span>) { <span class="com">/* ... */</span> }
+
+<span class="kw">declare const</span> orderId: <span class="typ">OrderId</span>;
+getUser(orderId);            <span class="com">// ❌ error — brands don't match</span>
+getUser(<span class="str">'123'</span>);              <span class="com">// ❌ error — plain string lacks the brand</span>
+getUser(toUserId(<span class="str">'123'</span>));    <span class="com">// ✅</span></code></pre>
+  <div class="senior">The brand property never exists at runtime — it's a compile-time-only intersection. That's the whole point: you're simulating nominal typing inside a structural system with zero runtime cost. Libraries like Zod expose <code>z.string().brand&lt;'UserId'&gt;()</code> for exactly this. Mentioning "we branded IDs/currency amounts to stop unit-mixing bugs at compile time" is a great real-world flex.</div>
+
+  <h3>Inference &amp; widening: const vs let, and <code>as const</code></h3>
+  <p>TS infers the <em>narrowest useful</em> type, then <strong>widens</strong> literals depending on mutability. A <code>let</code> can be reassigned, so a literal widens to its base type; a <code>const</code> binding can't, so the literal type is kept:</p>
+  <pre><code><span class="kw">let</span>   a = <span class="str">'hello'</span>;   <span class="com">// string          (widened — could be reassigned)</span>
+<span class="kw">const</span> b = <span class="str">'hello'</span>;   <span class="com">// 'hello'         (literal — binding is immutable)</span>
+
+<span class="com">// BUT object properties are mutable even under const:</span>
+<span class="kw">const</span> req = { url: <span class="str">'/api'</span>, method: <span class="str">'GET'</span> };
+<span class="com">// { url: string; method: string }  ← method widened!</span>
+
+fetchIt(req.url, req.method);
+<span class="com">// ❌ if fetchIt wants method: 'GET' | 'POST' — string isn't assignable</span>
+
+<span class="com">// `as const` freezes the whole tree — deeply:</span>
+<span class="kw">const</span> req2 = { url: <span class="str">'/api'</span>, method: <span class="str">'GET'</span>, tags: [<span class="str">'a'</span>, <span class="str">'b'</span>] } <span class="kw">as const</span>;
+<span class="com">// {</span>
+<span class="com">//   readonly url: '/api';</span>
+<span class="com">//   readonly method: 'GET';</span>
+<span class="com">//   readonly tags: readonly ['a', 'b'];   ← tuple, not string[]</span>
+<span class="com">// }</span></code></pre>
+  <p><code>as const</code> does three things at once: keeps every literal as a literal type, makes every property <code>readonly</code>, and turns arrays into <code>readonly</code> tuples — <em>recursively</em>. It's the foundation of config-object patterns and of deriving union types from data:</p>
+  <pre><code><span class="kw">const</span> ROLES = [<span class="str">'admin'</span>, <span class="str">'editor'</span>, <span class="str">'viewer'</span>] <span class="kw">as const</span>;
+<span class="kw">type</span> <span class="typ">Role</span> = <span class="kw">typeof</span> ROLES[<span class="typ">number</span>];   <span class="com">// 'admin' | 'editor' | 'viewer'</span>
+<span class="com">// Single source of truth: the runtime array AND the type stay in sync.</span></code></pre>
+
+  <h3>Excess property checks — why fresh object literals are special</h3>
+  <p>Structural typing says "extra properties are fine." But TS makes one deliberate exception: when an <strong>object literal is assigned directly</strong> ("fresh" literal) to a typed target, unknown properties are errors. It's a lint-like typo catcher layered on top of structural rules — and it's the classic "why does this error here but not there?" confusion:</p>
+  <pre><code><span class="kw">interface</span> <span class="typ">Options</span> { title: <span class="typ">string</span>; width?: <span class="typ">number</span>; }
+
+configure({ title: <span class="str">'Hi'</span>, widht: <span class="num">100</span> });
+<span class="com">// ❌ 'widht' does not exist in type Options — fresh literal → checked</span>
+
+<span class="kw">const</span> opts = { title: <span class="str">'Hi'</span>, widht: <span class="num">100</span> };
+configure(opts);
+<span class="com">// ✅ compiles! opts's type is { title: string; widht: number } —</span>
+<span class="com">// structurally a valid Options (has title). Freshness was lost</span>
+<span class="com">// the moment it got its own inferred type.</span></code></pre>
+  <div class="pitfall">Excess property checking is <strong>not</strong> a guarantee that objects have no extra keys. Any indirection (intermediate variable, function return, spread through a wider type) bypasses it. If your logic depends on "no extra keys" (e.g., building a DB row), you need runtime validation — the type system will not enforce closed objects.</div>
+
+  <h3><code>unknown</code> vs <code>any</code> vs <code>never</code></h3>
+  <table>
+    <thead><tr><th></th><th><code>any</code></th><th><code>unknown</code></th><th><code>never</code></th></tr></thead>
+    <tbody>
+      <tr><td>Set-theory reading</td><td>Opt out of the set model entirely</td><td>Top type — the set of <em>all</em> values</td><td>Bottom type — the <em>empty</em> set</td></tr>
+      <tr><td>What can you assign <em>to</em> it?</td><td>Anything</td><td>Anything</td><td>Nothing (except <code>never</code>)</td></tr>
+      <tr><td>What can you assign it <em>to</em>?</td><td>Anything (this is the dangerous direction)</td><td>Only <code>unknown</code>/<code>any</code> — must narrow first</td><td>Everything (vacuously)</td></tr>
+      <tr><td>Operations allowed</td><td>All — checking is disabled and it's <strong>contagious</strong> through inference</td><td>Almost none until narrowed (<code>typeof</code>, <code>instanceof</code>, predicate…)</td><td>N/A — no value ever has this type</td></tr>
+      <tr><td>Use for</td><td>Migration escape hatch; last resort</td><td>External input: <code>JSON.parse</code>, <code>catch</code>, message events, API bodies</td><td>Exhaustiveness checks, unreachable code, filtering in conditional types</td></tr>
+    </tbody>
+  </table>
+  <pre><code><span class="kw">function</span> handle(payload: <span class="kw">unknown</span>) {
+  payload.toUpperCase();                     <span class="com">// ❌ must narrow first</span>
+  <span class="kw">if</span> (<span class="kw">typeof</span> payload === <span class="str">'string'</span>) {
+    payload.toUpperCase();                   <span class="com">// ✅ narrowed to string</span>
+  }
+}
+
+<span class="com">// never = "this cannot happen" — the compiler enforces it:</span>
+<span class="kw">function</span> assertNever(x: <span class="kw">never</span>): <span class="kw">never</span> {
+  <span class="kw">throw new</span> <span class="typ">Error</span>(<span class="str">`Unexpected: ${JSON.stringify(x)}`</span>);
+}</code></pre>
+  <div class="senior"><code>unknown</code> is "I don't know what this is, and I want the compiler to force me to find out." <code>any</code> is "stop checking." A senior answer also notes <code>never</code> appears <em>organically</em>: an exhausted union narrows to <code>never</code>, <code>Exclude&lt;T, T&gt;</code> is <code>never</code>, and a <code>never</code> in a union simply vanishes (<code>string | never</code> = <code>string</code>) — that vanishing is what makes key-filtering mapped types work.</div>
+
+  <h3><code>void</code> quirks — why <code>forEach(x =&gt; arr.push(x))</code> works</h3>
+  <p><code>void</code> in a <em>return-type position of a function type</em> doesn't mean "returns nothing" — it means "the caller promises to ignore the return value." So a function that returns something is assignable to a <code>() =&gt; void</code> signature:</p>
+  <pre><code><span class="kw">type</span> <span class="typ">Callback</span> = () =&gt; <span class="kw">void</span>;
+<span class="kw">const</span> cb: <span class="typ">Callback</span> = () =&gt; <span class="num">42</span>;   <span class="com">// ✅ legal! return value will be ignored</span>
+
+<span class="com">// This rule is WHY this compiles — push returns a number:</span>
+<span class="kw">const</span> src = [<span class="num">1</span>, <span class="num">2</span>, <span class="num">3</span>];
+<span class="kw">const</span> out: <span class="typ">number</span>[] = [];
+src.forEach(x =&gt; out.push(x));   <span class="com">// forEach cb is (…) => void; push returns number — fine</span>
+
+<span class="com">// But a function you DECLARE with `: void` cannot return a value:</span>
+<span class="kw">function</span> log(msg: <span class="typ">string</span>): <span class="kw">void</span> {
+  <span class="kw">return</span> msg;                    <span class="com">// ❌ error inside a literal void annotation</span>
+}</code></pre>
+  <div class="pitfall">This leniency has a real gotcha: <code>onSelect?: () =&gt; void</code> happily accepts an async function <code>async () =&gt; {…}</code> (returns <code>Promise&lt;void&gt;</code>). The promise is silently ignored — unhandled rejections disappear. If you care about awaiting or error propagation, type it <code>() =&gt; void | Promise&lt;void&gt;</code> and handle both.</div>
+
+  <!-- ============================================================ -->
+  <h2 id="interface-vs-type">2. Interfaces vs type aliases — the real differences <span class="tier tier-1">T1</span></h2>
+  <p>The mid-level answer is "they're mostly the same." The senior answer names the actual mechanical differences and gives a policy.</p>
+
+  <table>
+    <thead><tr><th>Dimension</th><th><code>interface</code></th><th><code>type</code> alias</th></tr></thead>
+    <tbody>
+      <tr><td>Can express</td><td>Object shapes, function shapes, and can be implemented by classes</td><td><strong>Everything</strong>: unions, intersections, tuples, primitives, mapped, conditional, template literals</td></tr>
+      <tr><td>Declaration merging</td><td>✅ Multiple declarations with the same name merge (this is how <code>declare global</code> augmentation and lib patching work)</td><td>❌ Duplicate name = error</td></tr>
+      <tr><td>Extension</td><td><code>extends</code> — checked at declaration; conflicting member types are an <strong>immediate error</strong></td><td><code>&amp;</code> intersection — conflicts don't error at the definition; a conflicting property silently becomes <code>never</code> and blows up at use sites</td></tr>
+      <tr><td>Error messages / display</td><td>Keeps its name in errors and hovers (<code>Type 'X' is not assignable to 'Props'</code>)</td><td>Often inlined/expanded in errors — walls of structure for complex aliases</td></tr>
+      <tr><td>Compiler caching</td><td>Named <code>extends</code> relationships are cached by name</td><td>Intersections are recomputed structurally; on <em>huge</em> codebases this can matter — but for app code the "interfaces are faster" claim is a micro-optimization, not a reason</td></tr>
+    </tbody>
+  </table>
+
+  <pre><code><span class="com">// Declaration merging — the superpower AND the footgun:</span>
+<span class="kw">interface</span> <span class="typ">Window</span> { analytics: <span class="typ">AnalyticsClient</span>; }   <span class="com">// augments the global Window</span>
+
+<span class="com">// Intersection conflict is silent at definition…</span>
+<span class="kw">type</span> <span class="typ">A</span> = { x: <span class="typ">string</span> };
+<span class="kw">type</span> <span class="typ">B</span> = { x: <span class="typ">number</span> };
+<span class="kw">type</span> <span class="typ">AB</span> = <span class="typ">A</span> &amp; <span class="typ">B</span>;        <span class="com">// compiles; AB['x'] is never</span>
+<span class="kw">const</span> ab: <span class="typ">AB</span> = { x: <span class="num">1</span> }; <span class="com">// ❌ number not assignable to never — confusing error, far away</span>
+
+<span class="com">// interface extends catches it at the source:</span>
+<span class="kw">interface</span> <span class="typ">C</span> <span class="kw">extends</span> <span class="typ">A</span> { x: <span class="typ">number</span>; }  <span class="com">// ❌ error right here</span></code></pre>
+
+  <div class="senior"><strong>The policy I'd state in an interview:</strong> use <code>interface</code> for object shapes that form a public contract (props of a published component, plugin APIs — merging lets consumers augment them; names survive in errors). Use <code>type</code> for everything an interface literally cannot express: unions, discriminated unions, mapped/conditional results, tuples. Within a team, consistency beats the choice itself — and note that declaration merging is a reason some teams <em>ban</em> interfaces for internal code: a duplicate name silently merges instead of erroring.</div>
+
+  <!-- ============================================================ -->
+  <h2 id="generics">3. Generics deep <span class="tier tier-1">T1</span></h2>
+
+  <h3>Type parameters are inferred from arguments</h3>
+  <p>A generic function is a function whose type is completed <em>per call site</em>. You almost never pass type arguments explicitly — inference fills them from the values:</p>
+  <pre><code><span class="kw">function</span> identity&lt;<span class="typ">T</span>&gt;(value: <span class="typ">T</span>): <span class="typ">T</span> {
+  <span class="kw">return</span> value;
+}
+
+<span class="kw">const</span> n = identity(<span class="num">42</span>);        <span class="com">// T inferred as 42 (literal in const position)</span>
+<span class="kw">const</span> s = identity(<span class="str">'hi'</span>);      <span class="com">// T = 'hi'</span>
+<span class="kw">const</span> u = identity&lt;<span class="typ">string</span>&gt;(<span class="str">'hi'</span>); <span class="com">// explicit — only when inference can't see it</span>
+
+<span class="com">// "Return what you're given" — generics preserve the RELATIONSHIP</span>
+<span class="com">// between input and output. Compare:</span>
+<span class="kw">function</span> firstBad(arr: <span class="kw">any</span>[]): <span class="kw">any</span> { <span class="kw">return</span> arr[<span class="num">0</span>]; }      <span class="com">// type info destroyed</span>
+<span class="kw">function</span> first&lt;<span class="typ">T</span>&gt;(arr: <span class="typ">T</span>[]): <span class="typ">T</span> | <span class="kw">undefined</span> { <span class="kw">return</span> arr[<span class="num">0</span>]; } <span class="com">// preserved</span></code></pre>
+  <div class="note">If a type parameter appears only <em>once</em> in a signature, it's usually pointless — <code>function log&lt;T&gt;(x: T): void</code> gains nothing over <code>unknown</code>. Generics earn their keep by <strong>relating</strong> two or more positions (arg↔return, arg↔arg).</div>
+
+  <h3>Constraints, defaults, and the keyof pattern</h3>
+  <pre><code><span class="com">// Constraint: T must have .length — inside the body you can use it</span>
+<span class="kw">function</span> longest&lt;<span class="typ">T</span> <span class="kw">extends</span> { length: <span class="typ">number</span> }&gt;(a: <span class="typ">T</span>, b: <span class="typ">T</span>): <span class="typ">T</span> {
+  <span class="kw">return</span> a.length &gt;= b.length ? a : b;
+}
+longest([<span class="num">1</span>, <span class="num">2</span>], [<span class="num">3</span>]);      <span class="com">// ✅ arrays have length</span>
+longest(<span class="num">10</span>, <span class="num">20</span>);           <span class="com">// ❌ number has no length</span>
+
+<span class="com">// Default type parameters — like default function args:</span>
+<span class="kw">interface</span> <span class="typ">ApiResponse</span>&lt;<span class="typ">TData</span> = <span class="kw">unknown</span>&gt; {
+  status: <span class="typ">number</span>;
+  data: <span class="typ">TData</span>;
+}
+<span class="kw">const</span> r: <span class="typ">ApiResponse</span> = { status: <span class="num">200</span>, data: <span class="kw">null</span> }; <span class="com">// TData falls back to unknown</span></code></pre>
+  <p>The single most-asked generic signature in interviews — walk through every piece:</p>
+  <pre><code><span class="kw">function</span> get&lt;<span class="typ">T</span>, <span class="typ">K</span> <span class="kw">extends keyof</span> <span class="typ">T</span>&gt;(obj: <span class="typ">T</span>, key: <span class="typ">K</span>): <span class="typ">T</span>[<span class="typ">K</span>] {
+  <span class="kw">return</span> obj[key];
+}
+
+<span class="kw">const</span> user = { id: <span class="num">1</span>, name: <span class="str">'Ada'</span>, admin: <span class="kw">true</span> };
+<span class="kw">const</span> name  = get(user, <span class="str">'name'</span>);   <span class="com">// string  — K = 'name', T[K] = string</span>
+<span class="kw">const</span> admin = get(user, <span class="str">'admin'</span>);  <span class="com">// boolean</span>
+get(user, <span class="str">'email'</span>);                <span class="com">// ❌ '"email"' not assignable to keyof T</span></code></pre>
+  <ul>
+    <li><code>T</code> is inferred from <code>obj</code> → <code>{ id: number; name: string; admin: boolean }</code>.</li>
+    <li><code>K extends keyof T</code> constrains <code>K</code> to the union <code>'id' | 'name' | 'admin'</code>; passing a string literal infers <code>K</code> as that <em>exact literal</em>, not <code>string</code>.</li>
+    <li><code>T[K]</code> is an <strong>indexed access type</strong> — "the type of property K on T." Because K is the literal <code>'name'</code>, the return type is precisely <code>string</code>, not a union of all value types.</li>
+  </ul>
+
+  <h3>Generic functions vs generic types</h3>
+  <pre><code><span class="com">// Generic TYPE: parameterized shape — caller supplies T when naming it</span>
+<span class="kw">type</span> <span class="typ">Result</span>&lt;<span class="typ">T</span>, <span class="typ">E</span> = <span class="typ">Error</span>&gt; =
+  | { ok: <span class="kw">true</span>;  value: <span class="typ">T</span> }
+  | { ok: <span class="kw">false</span>; error: <span class="typ">E</span> };
+
+<span class="com">// Generic FUNCTION TYPE: T is bound at CALL time, not at declaration —</span>
+<span class="com">// note where the &lt;T&gt; sits:</span>
+<span class="kw">type</span> <span class="typ">Mapper</span> = &lt;<span class="typ">T</span>, <span class="typ">U</span>&gt;(items: <span class="typ">T</span>[], fn: (t: <span class="typ">T</span>) =&gt; <span class="typ">U</span>) =&gt; <span class="typ">U</span>[];
+<span class="com">// vs type MapperOf&lt;T, U&gt; = (items: T[], fn: …) =&gt; U[]  — bound when the type is used</span></code></pre>
+
+  <h3>Variance — the soundness question <span class="tier tier-2">T2</span></h3>
+  <p>"Is <code>Array&lt;Dog&gt;</code> assignable to <code>Array&lt;Animal&gt;</code>?" In TS: <strong>yes — and that's deliberately unsound.</strong></p>
+  <pre><code><span class="kw">interface</span> <span class="typ">Animal</span> { name: <span class="typ">string</span> }
+<span class="kw">interface</span> <span class="typ">Dog</span> <span class="kw">extends</span> <span class="typ">Animal</span> { bark(): <span class="kw">void</span> }
+<span class="kw">interface</span> <span class="typ">Cat</span> <span class="kw">extends</span> <span class="typ">Animal</span> { meow(): <span class="kw">void</span> }
+
+<span class="kw">const</span> dogs: <span class="typ">Dog</span>[] = [];
+<span class="kw">const</span> animals: <span class="typ">Animal</span>[] = dogs;   <span class="com">// ✅ allowed (covariant) — reads are safe…</span>
+animals.push({ name: <span class="str">'Felix'</span>, meow() {} } <span class="kw">as</span> <span class="typ">Cat</span>); <span class="com">// …writes are NOT</span>
+dogs[<span class="num">0</span>].bark();                    <span class="com">// 💥 runtime error, zero compile errors</span></code></pre>
+  <p><strong>Why TS allows it:</strong> a mutable <code>Array&lt;T&gt;</code> is read (covariant position) <em>and</em> written (contravariant position), so soundness demands invariance — which would reject tons of perfectly reasonable read-only usage. TS chose ergonomics. Mechanically, this works because <strong>methods declared with shorthand syntax are checked bivariantly</strong>, even under <code>strictFunctionTypes</code>:</p>
+  <pre><code><span class="com">// strictFunctionTypes makes standalone function types contravariant in params:</span>
+<span class="kw">type</span> <span class="typ">Handler</span> = (a: <span class="typ">Animal</span>) =&gt; <span class="kw">void</span>;
+<span class="kw">const</span> h: <span class="typ">Handler</span> = (d: <span class="typ">Dog</span>) =&gt; d.bark();   <span class="com">// ❌ rejected — correctly!</span>
+<span class="com">// (a Dog-handler can't safely receive an arbitrary Animal)</span>
+
+<span class="com">// …but METHOD syntax stays bivariant on purpose:</span>
+<span class="kw">interface</span> <span class="typ">Emitter</span> { on(cb: (a: <span class="typ">Animal</span>) =&gt; <span class="kw">void</span>): <span class="kw">void</span> }   <span class="com">// method — bivariant</span>
+<span class="kw">interface</span> <span class="typ">Emitter2</span> { on: (cb: (a: <span class="typ">Animal</span>) =&gt; <span class="kw">void</span>) =&gt; <span class="kw">void</span> } <span class="com">// property — strict</span></code></pre>
+  <div class="senior">The intuition to recite: <strong>outputs are covariant, inputs are contravariant</strong>. A producer of Dogs is a valid producer of Animals; a consumer of Animals is a valid consumer of Dogs. Arrays are both, so treating them covariantly is a hole — the same hole Java has with arrays. If you want safety, accept <code>readonly T[]</code> in signatures: read-only means covariance actually is sound, and callers can pass mutable arrays into it for free.</div>
+
+  <!-- ============================================================ -->
+  <h2 id="narrowing">4. Narrowing &amp; control-flow analysis <span class="tier tier-1">T1</span></h2>
+  <p>TS re-types a variable <em>per code location</em> based on the checks you've performed — control-flow analysis. The built-in guards:</p>
+  <pre><code><span class="kw">function</span> fmt(v: <span class="typ">string</span> | <span class="typ">number</span> | <span class="typ">Date</span> | <span class="kw">null</span>, other: <span class="str">'a'</span> | <span class="str">'b'</span>) {
+  <span class="kw">if</span> (v === <span class="kw">null</span>) <span class="kw">return</span> <span class="str">'—'</span>;              <span class="com">// equality narrowing: v is string|number|Date</span>
+  <span class="kw">if</span> (<span class="kw">typeof</span> v === <span class="str">'string'</span>) <span class="kw">return</span> v.trim();  <span class="com">// typeof guard</span>
+  <span class="kw">if</span> (v <span class="kw">instanceof</span> <span class="typ">Date</span>) <span class="kw">return</span> v.toISOString(); <span class="com">// instanceof guard</span>
+  <span class="kw">return</span> v.toFixed(<span class="num">2</span>);                     <span class="com">// only number remains</span>
+}
+
+<span class="com">// `in` guard — for plain object shapes:</span>
+<span class="kw">type</span> <span class="typ">Square</span> = { size: <span class="typ">number</span> };
+<span class="kw">type</span> <span class="typ">Rect</span>   = { width: <span class="typ">number</span>; height: <span class="typ">number</span> };
+<span class="kw">function</span> area(s: <span class="typ">Square</span> | <span class="typ">Rect</span>) {
+  <span class="kw">return</span> <span class="str">'size'</span> <span class="kw">in</span> s ? s.size ** <span class="num">2</span> : s.width * s.height;
+}
+
+<span class="com">// Truthiness narrowing — beware falsy-but-valid values:</span>
+<span class="kw">function</span> pad(n?: <span class="typ">number</span>) {
+  <span class="kw">if</span> (!n) <span class="kw">return</span> DEFAULT;   <span class="com">// ⚠️ also swallows 0! use n === undefined</span>
+}</code></pre>
+
+  <h3>Discriminated unions — the workhorse of app TypeScript</h3>
+  <p>A union of object types sharing one <strong>literal-typed discriminant</strong> property. Check the discriminant, and TS narrows to exactly one branch. This is <em>the</em> pattern for async state, reducer actions, API results, and form states:</p>
+  <pre><code><span class="kw">type</span> <span class="typ">RequestState</span>&lt;<span class="typ">T</span>&gt; =
+  | { status: <span class="str">'idle'</span> }
+  | { status: <span class="str">'loading'</span> }
+  | { status: <span class="str">'success'</span>; data: <span class="typ">T</span> }
+  | { status: <span class="str">'error'</span>;   error: <span class="typ">Error</span> };
+
+<span class="kw">function</span> render(state: <span class="typ">RequestState</span>&lt;<span class="typ">User</span>[]&gt;) {
+  <span class="kw">switch</span> (state.status) {
+    <span class="kw">case</span> <span class="str">'idle'</span>:    <span class="kw">return</span> <span class="kw">null</span>;
+    <span class="kw">case</span> <span class="str">'loading'</span>: <span class="kw">return</span> spinner();
+    <span class="kw">case</span> <span class="str">'success'</span>: <span class="kw">return</span> list(state.data);    <span class="com">// data exists ONLY here</span>
+    <span class="kw">case</span> <span class="str">'error'</span>:   <span class="kw">return</span> alert(state.error.message);
+    <span class="kw">default</span>:        <span class="kw">return</span> assertNever(state);   <span class="com">// exhaustiveness — see below</span>
+  }
+}</code></pre>
+  <p><strong>Why this beats optional fields.</strong> The naive alternative:</p>
+  <pre><code><span class="com">// ❌ The "bag of optionals" — every impossible state is representable:</span>
+<span class="kw">interface</span> <span class="typ">BadState</span>&lt;<span class="typ">T</span>&gt; {
+  loading: <span class="typ">boolean</span>;
+  data?: <span class="typ">T</span>;
+  error?: <span class="typ">Error</span>;
+}
+<span class="com">// loading:true AND data set? error AND data both set? data undefined on</span>
+<span class="com">// success? The compiler can't rule any of it out, so every consumer</span>
+<span class="com">// defensively if-checks everything — or worse, uses data! assertions.</span></code></pre>
+  <p>The discriminated union <strong>makes illegal states unrepresentable</strong>: <code>data</code> cannot exist without <code>status: 'success'</code>, the compiler proves you handled every state, and adding a <code>'refreshing'</code> state produces compile errors at every unhandled switch — a to-do list generated by the compiler.</p>
+
+  <h3>Custom type predicates &amp; assertion functions</h3>
+  <pre><code><span class="com">// Type predicate: the return type `arg is T` teaches the narrower.</span>
+<span class="kw">function</span> isSuccess&lt;<span class="typ">T</span>&gt;(s: <span class="typ">RequestState</span>&lt;<span class="typ">T</span>&gt;): s <span class="kw">is</span> { status: <span class="str">'success'</span>; data: <span class="typ">T</span> } {
+  <span class="kw">return</span> s.status === <span class="str">'success'</span>;
+}
+
+<span class="com">// Predicates power .filter() narrowing:</span>
+<span class="kw">const</span> values = [<span class="num">1</span>, <span class="kw">null</span>, <span class="num">2</span>, <span class="kw">undefined</span>, <span class="num">3</span>];
+<span class="kw">const</span> nums = values.filter((v): v <span class="kw">is</span> <span class="typ">number</span> =&gt; v != <span class="kw">null</span>); <span class="com">// number[]</span>
+
+<span class="com">// Assertion function: narrows the REST of the scope, or throws.</span>
+<span class="kw">function</span> assertIsUser(v: <span class="kw">unknown</span>): <span class="kw">asserts</span> v <span class="kw">is</span> <span class="typ">User</span> {
+  <span class="kw">if</span> (<span class="kw">typeof</span> v !== <span class="str">'object'</span> || v === <span class="kw">null</span> || !(<span class="str">'id'</span> <span class="kw">in</span> v)) {
+    <span class="kw">throw new</span> <span class="typ">Error</span>(<span class="str">'Not a User'</span>);
+  }
+}
+
+<span class="kw">function</span> load(raw: <span class="kw">unknown</span>) {
+  assertIsUser(raw);
+  raw.id;              <span class="com">// ✅ raw is User from here down</span>
+}</code></pre>
+  <div class="pitfall">A type predicate is a <strong>promise you make, not one the compiler checks</strong>. <code>function isString(x: unknown): x is string { return typeof x === 'number' }</code> compiles fine and poisons every call site. Treat predicate bodies with the same suspicion as <code>as</code> — they carry unchecked responsibility. (TS 5.5 does <em>infer</em> predicates for simple boolean-returning functions, which removes the hand-written risk for easy cases.)</div>
+
+  <h3>Exhaustiveness — never and the satisfies trick</h3>
+  <pre><code><span class="com">// Classic: a default branch that only type-checks if the union is exhausted.</span>
+<span class="kw">function</span> assertNever(x: <span class="kw">never</span>): <span class="kw">never</span> {
+  <span class="kw">throw new</span> <span class="typ">Error</span>(<span class="str">`Unhandled case: ${JSON.stringify(x)}`</span>);
+}
+<span class="com">// If you add {status:'refreshing'} to the union, `state` in the default</span>
+<span class="com">// branch is 'refreshing'-typed, not never → compile error where you forgot it.</span>
+
+<span class="com">// Expression-position alternative (no helper needed):</span>
+<span class="kw">switch</span> (state.status) {
+  <span class="com">/* …all cases with returns… */</span>
+  <span class="kw">default</span>:
+    state <span class="kw">satisfies never</span>;   <span class="com">// errors unless every member was handled</span>
+    <span class="kw">throw new</span> <span class="typ">Error</span>(<span class="str">'unreachable'</span>);
+}</code></pre>
+
+  <!-- ============================================================ -->
+  <h2 id="utility-types">5. Utility types — how they're built <span class="tier tier-1">T1</span></h2>
+  <p>Interviewers rarely ask "what does Partial do." They ask "<strong>implement</strong> Partial" — because each built-in utility is a two-line showcase of one type-system feature. Know the implementation and you know the feature.</p>
+
+  <table>
+    <thead><tr><th>Utility</th><th>Implementation</th><th>Feature it demonstrates</th></tr></thead>
+    <tbody>
+      <tr><td><code>Partial&lt;T&gt;</code></td><td><code>{ [K in keyof T]?: T[K] }</code></td><td>Mapped type + adding <code>?</code> modifier</td></tr>
+      <tr><td><code>Required&lt;T&gt;</code></td><td><code>{ [K in keyof T]-?: T[K] }</code></td><td>Removing a modifier with <code>-</code></td></tr>
+      <tr><td><code>Readonly&lt;T&gt;</code></td><td><code>{ readonly [K in keyof T]: T[K] }</code></td><td>Adding <code>readonly</code></td></tr>
+      <tr><td><code>Pick&lt;T, K&gt;</code></td><td><code>{ [P in K]: T[P] }</code> with <code>K extends keyof T</code></td><td>Mapping over a supplied key union + indexed access</td></tr>
+      <tr><td><code>Omit&lt;T, K&gt;</code></td><td><code>Pick&lt;T, Exclude&lt;keyof T, K&gt;&gt;</code></td><td>Composition of utilities</td></tr>
+      <tr><td><code>Record&lt;K, V&gt;</code></td><td><code>{ [P in K]: V }</code> with <code>K extends keyof any</code></td><td><code>keyof any</code> = <code>string | number | symbol</code></td></tr>
+      <tr><td><code>Exclude&lt;T, U&gt;</code></td><td><code>T extends U ? never : T</code></td><td><strong>Distributive</strong> conditional over a union</td></tr>
+      <tr><td><code>Extract&lt;T, U&gt;</code></td><td><code>T extends U ? T : never</code></td><td>Same, keeping matches</td></tr>
+      <tr><td><code>NonNullable&lt;T&gt;</code></td><td><code>T &amp; {}</code> (modern) / <code>T extends null | undefined ? never : T</code></td><td>Intersection filtering</td></tr>
+      <tr><td><code>ReturnType&lt;T&gt;</code></td><td><code>T extends (...a: any) =&gt; infer R ? R : never</code></td><td><code>infer</code> in return position</td></tr>
+      <tr><td><code>Parameters&lt;T&gt;</code></td><td><code>T extends (...a: infer P) =&gt; any ? P : never</code></td><td><code>infer</code> of a tuple in param position</td></tr>
+      <tr><td><code>Awaited&lt;T&gt;</code></td><td>recursive <code>infer</code> over thenables (see drills)</td><td>Recursion + <code>infer</code></td></tr>
+    </tbody>
+  </table>
+
+  <p>Watch <strong>distributivity</strong> in action — it's why <code>Exclude</code> works at all:</p>
+  <pre><code><span class="kw">type</span> <span class="typ">MyExclude</span>&lt;<span class="typ">T</span>, <span class="typ">U</span>&gt; = <span class="typ">T</span> <span class="kw">extends</span> <span class="typ">U</span> ? <span class="kw">never</span> : <span class="typ">T</span>;
+
+<span class="kw">type</span> <span class="typ">X</span> = <span class="typ">MyExclude</span>&lt;<span class="str">'a'</span> | <span class="str">'b'</span> | <span class="str">'c'</span>, <span class="str">'a'</span>&gt;;
+<span class="com">// The union DISTRIBUTES — the conditional runs per member:</span>
+<span class="com">//   ('a' extends 'a' ? never : 'a')   → never</span>
+<span class="com">// | ('b' extends 'a' ? never : 'b')   → 'b'</span>
+<span class="com">// | ('c' extends 'a' ? never : 'c')   → 'c'</span>
+<span class="com">// never | 'b' | 'c'  →  'b' | 'c'   (never vanishes from unions)</span></code></pre>
+
+  <p>String-manipulation intrinsics — implemented inside the compiler, used constantly with template literal types:</p>
+  <pre><code><span class="kw">type</span> <span class="typ">A</span> = <span class="typ">Uppercase</span>&lt;<span class="str">'click'</span>&gt;;    <span class="com">// 'CLICK'</span>
+<span class="kw">type</span> <span class="typ">B</span> = <span class="typ">Lowercase</span>&lt;<span class="str">'GET'</span>&gt;;      <span class="com">// 'get'</span>
+<span class="kw">type</span> <span class="typ">C</span> = <span class="typ">Capitalize</span>&lt;<span class="str">'click'</span>&gt;;   <span class="com">// 'Click'</span>
+<span class="kw">type</span> <span class="typ">D</span> = <span class="typ">Uncapitalize</span>&lt;<span class="str">'OnClick'</span>&gt;; <span class="com">// 'onClick'</span></code></pre>
+
+  <!-- ============================================================ -->
+  <h2 id="mapped-types">6. Mapped types &amp; key remapping <span class="tier tier-2">T2</span></h2>
+  <p>A mapped type is a <strong>for-loop over keys</strong>: <code>[K in KeyUnion]</code> introduces a type variable <code>K</code> ranging over each member, and the right side computes the value type — where <code>T[K]</code> gives you the original property type.</p>
+  <pre><code><span class="kw">type</span> <span class="typ">Flags</span>&lt;<span class="typ">T</span>&gt; = { [<span class="typ">K</span> <span class="kw">in keyof</span> <span class="typ">T</span>]: <span class="typ">boolean</span> };      <span class="com">// same keys, all boolean</span>
+<span class="kw">type</span> <span class="typ">Clone</span>&lt;<span class="typ">T</span>&gt; = { [<span class="typ">K</span> <span class="kw">in keyof</span> <span class="typ">T</span>]: <span class="typ">T</span>[<span class="typ">K</span>] };         <span class="com">// homomorphic copy —</span>
+<span class="com">// mapping over `keyof T` preserves ?, readonly, and doc comments per key</span>
+
+<span class="com">// Modifiers: + adds (default), - removes:</span>
+<span class="kw">type</span> <span class="typ">Mutable</span>&lt;<span class="typ">T</span>&gt;  = { -<span class="kw">readonly</span> [<span class="typ">K</span> <span class="kw">in keyof</span> <span class="typ">T</span>]: <span class="typ">T</span>[<span class="typ">K</span>] };
+<span class="kw">type</span> <span class="typ">Concrete</span>&lt;<span class="typ">T</span>&gt; = { [<span class="typ">K</span> <span class="kw">in keyof</span> <span class="typ">T</span>]-?: <span class="typ">T</span>[<span class="typ">K</span>] };   <span class="com">// = Required</span></code></pre>
+
+  <h3>Key remapping with <code>as</code> — rename, prefix, filter</h3>
+  <pre><code><span class="com">// The interview favorite — derive a getters API from a data model:</span>
+<span class="kw">type</span> <span class="typ">Getters</span>&lt;<span class="typ">T</span>&gt; = {
+  [<span class="typ">K</span> <span class="kw">in keyof</span> <span class="typ">T</span> <span class="kw">as</span> <span class="str">`get${Capitalize&lt;string &amp; K&gt;}`</span>]: () =&gt; <span class="typ">T</span>[<span class="typ">K</span>];
+};
+
+<span class="kw">interface</span> <span class="typ">User</span> { id: <span class="typ">number</span>; name: <span class="typ">string</span>; }
+<span class="kw">type</span> <span class="typ">UserGetters</span> = <span class="typ">Getters</span>&lt;<span class="typ">User</span>&gt;;
+<span class="com">// { getId: () =&gt; number; getName: () =&gt; string }</span>
+<span class="com">// `string &amp; K` filters out symbol keys — template literals need strings.</span>
+
+<span class="com">// Remapping to `never` DELETES a key — conditional filtering:</span>
+<span class="kw">type</span> <span class="typ">OnlyMethods</span>&lt;<span class="typ">T</span>&gt; = {
+  [<span class="typ">K</span> <span class="kw">in keyof</span> <span class="typ">T</span> <span class="kw">as</span> <span class="typ">T</span>[<span class="typ">K</span>] <span class="kw">extends</span> (...args: <span class="kw">any</span>) =&gt; <span class="kw">any</span> ? <span class="typ">K</span> : <span class="kw">never</span>]: <span class="typ">T</span>[<span class="typ">K</span>];
+};
+
+<span class="com">// Mapping over an arbitrary union (not keyof) — builds objects from strings:</span>
+<span class="kw">type</span> <span class="typ">Feature</span> = <span class="str">'darkMode'</span> | <span class="str">'newNav'</span> | <span class="str">'betaSearch'</span>;
+<span class="kw">type</span> <span class="typ">FeatureFlags</span> = { [<span class="typ">F</span> <span class="kw">in</span> <span class="typ">Feature</span>]: { enabled: <span class="typ">boolean</span>; rollout: <span class="typ">number</span> } };</code></pre>
+  <div class="note">A mapped type of the exact form <code>{ [K in keyof T] …: X }</code> is called <strong>homomorphic</strong> — TS knows it's a structure-preserving map over T, so it carries over <code>?</code>/<code>readonly</code> modifiers and even maps over arrays/tuples sensibly (this is why <code>Readonly&lt;string[]&gt;</code> is <code>readonly string[]</code>, not an object with array keys).</div>
+
+  <!-- ============================================================ -->
+  <h2 id="conditional-types">7. Conditional types, infer &amp; template literals <span class="tier tier-2">T2</span></h2>
+
+  <h3>The basics: type-level if/else</h3>
+  <pre><code><span class="kw">type</span> <span class="typ">IsString</span>&lt;<span class="typ">T</span>&gt; = <span class="typ">T</span> <span class="kw">extends</span> <span class="typ">string</span> ? <span class="kw">true</span> : <span class="kw">false</span>;
+<span class="kw">type</span> <span class="typ">A</span> = <span class="typ">IsString</span>&lt;<span class="str">'hi'</span>&gt;;   <span class="com">// true</span>
+<span class="kw">type</span> <span class="typ">B</span> = <span class="typ">IsString</span>&lt;<span class="num">42</span>&gt;;     <span class="com">// false</span></code></pre>
+
+  <h3>Distribution over unions — and the tuple trick to stop it</h3>
+  <p>When the checked type is a <strong>naked type parameter</strong>, the conditional automatically distributes over each union member. Usually that's what you want (<code>Exclude</code>); sometimes it isn't:</p>
+  <pre><code><span class="kw">type</span> <span class="typ">ToArray</span>&lt;<span class="typ">T</span>&gt; = <span class="typ">T</span> <span class="kw">extends</span> <span class="kw">any</span> ? <span class="typ">T</span>[] : <span class="kw">never</span>;
+<span class="kw">type</span> <span class="typ">R1</span> = <span class="typ">ToArray</span>&lt;<span class="typ">string</span> | <span class="typ">number</span>&gt;;
+<span class="com">// string[] | number[]   ← ran once per member (distributed)</span>
+
+<span class="com">// Wrap both sides in a one-tuple → no longer "naked" → no distribution:</span>
+<span class="kw">type</span> <span class="typ">ToArrayAll</span>&lt;<span class="typ">T</span>&gt; = [<span class="typ">T</span>] <span class="kw">extends</span> [<span class="kw">any</span>] ? <span class="typ">T</span>[] : <span class="kw">never</span>;
+<span class="kw">type</span> <span class="typ">R2</span> = <span class="typ">ToArrayAll</span>&lt;<span class="typ">string</span> | <span class="typ">number</span>&gt;;
+<span class="com">// (string | number)[]   ← evaluated once for the whole union</span>
+
+<span class="com">// Classic bug this explains — IsNever must use the tuple trick:</span>
+<span class="kw">type</span> <span class="typ">IsNeverBad</span>&lt;<span class="typ">T</span>&gt; = <span class="typ">T</span> <span class="kw">extends never</span> ? <span class="kw">true</span> : <span class="kw">false</span>;
+<span class="kw">type</span> <span class="typ">N1</span> = <span class="typ">IsNeverBad</span>&lt;<span class="kw">never</span>&gt;;  <span class="com">// never! (distributing over the empty union = nothing runs)</span>
+<span class="kw">type</span> <span class="typ">IsNever</span>&lt;<span class="typ">T</span>&gt; = [<span class="typ">T</span>] <span class="kw">extends</span> [<span class="kw">never</span>] ? <span class="kw">true</span> : <span class="kw">false</span>;
+<span class="kw">type</span> <span class="typ">N2</span> = <span class="typ">IsNever</span>&lt;<span class="kw">never</span>&gt;;     <span class="com">// true ✅</span></code></pre>
+
+  <h3><code>infer</code> — pattern matching for types</h3>
+  <p><code>infer R</code> declares a type variable <em>inside the extends pattern</em> and lets TS solve for it. It works in any structural position — return type, parameters, array elements, tuple slots, template literal segments:</p>
+  <pre><code><span class="com">// Return position:</span>
+<span class="kw">type</span> <span class="typ">MyReturnType</span>&lt;<span class="typ">T</span>&gt; = <span class="typ">T</span> <span class="kw">extends</span> (...args: <span class="kw">any</span>[]) =&gt; <span class="kw">infer</span> <span class="typ">R</span> ? <span class="typ">R</span> : <span class="kw">never</span>;
+
+<span class="com">// Parameter position (infers the whole tuple):</span>
+<span class="kw">type</span> <span class="typ">MyParameters</span>&lt;<span class="typ">T</span>&gt; = <span class="typ">T</span> <span class="kw">extends</span> (...args: <span class="kw">infer</span> <span class="typ">P</span>) =&gt; <span class="kw">any</span> ? <span class="typ">P</span> : <span class="kw">never</span>;
+
+<span class="com">// Element position:</span>
+<span class="kw">type</span> <span class="typ">ElementOf</span>&lt;<span class="typ">T</span>&gt; = <span class="typ">T</span> <span class="kw">extends</span> (<span class="kw">infer</span> <span class="typ">E</span>)[] ? <span class="typ">E</span> : <span class="kw">never</span>;
+
+<span class="com">// Tuple slots + rest:</span>
+<span class="kw">type</span> <span class="typ">First</span>&lt;<span class="typ">T</span> <span class="kw">extends</span> <span class="kw">readonly</span> <span class="kw">unknown</span>[]&gt; =
+  <span class="typ">T</span> <span class="kw">extends readonly</span> [<span class="kw">infer</span> <span class="typ">F</span>, ...<span class="kw">unknown</span>[]] ? <span class="typ">F</span> : <span class="kw">never</span>;
+<span class="kw">type</span> <span class="typ">Last</span>&lt;<span class="typ">T</span> <span class="kw">extends</span> <span class="kw">readonly</span> <span class="kw">unknown</span>[]&gt; =
+  <span class="typ">T</span> <span class="kw">extends readonly</span> [...<span class="kw">unknown</span>[], <span class="kw">infer</span> <span class="typ">L</span>] ? <span class="typ">L</span> : <span class="kw">never</span>;
+
+<span class="com">// Recursion — unwrap nested promises (simplified Awaited):</span>
+<span class="kw">type</span> <span class="typ">MyAwaited</span>&lt;<span class="typ">T</span>&gt; = <span class="typ">T</span> <span class="kw">extends</span> <span class="typ">PromiseLike</span>&lt;<span class="kw">infer</span> <span class="typ">U</span>&gt; ? <span class="typ">MyAwaited</span>&lt;<span class="typ">U</span>&gt; : <span class="typ">T</span>;
+<span class="kw">type</span> <span class="typ">W</span> = <span class="typ">MyAwaited</span>&lt;<span class="typ">Promise</span>&lt;<span class="typ">Promise</span>&lt;<span class="typ">string</span>&gt;&gt;&gt;;   <span class="com">// string</span></code></pre>
+
+  <h3>Template literal types — the showstopper demo</h3>
+  <p>String literal types can be composed and <em>pattern-matched</em>. The demo that lands hardest in interviews: type-safe route params, exactly like typed routers (TanStack Router, tRPC) do it:</p>
+  <pre><code><span class="kw">type</span> <span class="typ">ExtractParams</span>&lt;<span class="typ">Path</span> <span class="kw">extends</span> <span class="typ">string</span>&gt; =
+  <span class="typ">Path</span> <span class="kw">extends</span> <span class="str">`${infer _Pre}:${infer Param}/${infer Rest}`</span>
+    ? { [<span class="typ">K</span> <span class="kw">in</span> <span class="typ">Param</span>]: <span class="typ">string</span> } &amp; <span class="typ">ExtractParams</span>&lt;<span class="typ">Rest</span>&gt;
+    : <span class="typ">Path</span> <span class="kw">extends</span> <span class="str">`${infer _Pre}:${infer Param}`</span>
+      ? { [<span class="typ">K</span> <span class="kw">in</span> <span class="typ">Param</span>]: <span class="typ">string</span> }
+      : {};
+
+<span class="kw">type</span> <span class="typ">P</span> = <span class="typ">ExtractParams</span>&lt;<span class="str">'/users/:id/posts/:postId'</span>&gt;;
+<span class="com">// { id: string } &amp; { postId: string }</span>
+
+<span class="kw">function</span> navigate&lt;<span class="typ">Path</span> <span class="kw">extends</span> <span class="typ">string</span>&gt;(path: <span class="typ">Path</span>, params: <span class="typ">ExtractParams</span>&lt;<span class="typ">Path</span>&gt;) { <span class="com">/* … */</span> }
+
+navigate(<span class="str">'/users/:id/posts/:postId'</span>, { id: <span class="str">'1'</span>, postId: <span class="str">'9'</span> }); <span class="com">// ✅</span>
+navigate(<span class="str">'/users/:id/posts/:postId'</span>, { id: <span class="str">'1'</span> });               <span class="com">// ❌ postId missing</span></code></pre>
+  <p>How the match works on <code>'/users/:id/posts/:postId'</code>: TS solves the first pattern with <code>_Pre = '/users/'</code>, <code>Param = 'id'</code> (earlier <code>infer</code> holes match as little as possible up to the next literal), <code>Rest = 'posts/:postId'</code>. Recursion on <code>Rest</code> hits the second pattern → <code>{ postId: string }</code>. Intersect and done.</p>
+  <pre><code><span class="com">// Event-name mapping — the other classic:</span>
+<span class="kw">type</span> <span class="typ">DomEvent</span>&lt;<span class="typ">T</span> <span class="kw">extends</span> <span class="typ">string</span>&gt; = <span class="typ">T</span> <span class="kw">extends</span> <span class="str">`on${infer E}`</span> ? <span class="typ">Lowercase</span>&lt;<span class="typ">E</span>&gt; : <span class="kw">never</span>;
+<span class="kw">type</span> <span class="typ">E1</span> = <span class="typ">DomEvent</span>&lt;<span class="str">'onClick'</span>&gt;;   <span class="com">// 'click'</span>
+
+<span class="com">// …and the reverse, generating handler props from an event map:</span>
+<span class="kw">type</span> <span class="typ">HandlerProps</span>&lt;<span class="typ">T</span>&gt; = {
+  [<span class="typ">K</span> <span class="kw">in keyof</span> <span class="typ">T</span> &amp; <span class="typ">string</span> <span class="kw">as</span> <span class="str">`on${Capitalize&lt;K&gt;}`</span>]: (payload: <span class="typ">T</span>[<span class="typ">K</span>]) =&gt; <span class="kw">void</span>;
+};
+<span class="kw">type</span> <span class="typ">H</span> = <span class="typ">HandlerProps</span>&lt;{ click: <span class="typ">MouseEvent</span>; focus: <span class="typ">FocusEvent</span> }&gt;;
+<span class="com">// { onClick: (payload: MouseEvent) =&gt; void; onFocus: (payload: FocusEvent) =&gt; void }</span></code></pre>
+
+  <!-- ============================================================ -->
+  <h2 id="satisfies">8. <code>satisfies</code>, <code>as const</code>, and assertion discipline <span class="tier tier-2">T2</span></h2>
+
+  <h3>The problem <code>satisfies</code> solves</h3>
+  <p>Before TS 4.9 you had two bad options for "check this object against a type but keep its precise inferred type":</p>
+  <pre><code><span class="kw">type</span> <span class="typ">RouteConfig</span> = <span class="typ">Record</span>&lt;<span class="typ">string</span>, <span class="typ">string</span> | { path: <span class="typ">string</span>; lazy: <span class="typ">boolean</span> }&gt;;
+
+<span class="com">// Option 1 — annotation: validated ✅ but WIDENED ❌</span>
+<span class="kw">const</span> routes1: <span class="typ">RouteConfig</span> = {
+  home: <span class="str">'/'</span>,
+  admin: { path: <span class="str">'/admin'</span>, lazy: <span class="kw">true</span> },
+};
+routes1.home.toUpperCase();   <span class="com">// ❌ home is string | {…} — TS forgot which</span>
+routes1.tpyo;                 <span class="com">// no error — Record&lt;string,…&gt; allows any key</span>
+
+<span class="com">// Option 2 — `as`: narrow ✅ but UNCHECKED ❌ (it's an assertion, not a check)</span>
+<span class="kw">const</span> routes2 = {
+  home: <span class="str">'/'</span>,
+  admin: { path: <span class="str">'/admin'</span>, lazy: <span class="str">'yes'</span> },   <span class="com">// bug sails through</span>
+} <span class="kw">as</span> <span class="typ">RouteConfig</span>;
+
+<span class="com">// satisfies — validated ✅ AND narrow inference preserved ✅</span>
+<span class="kw">const</span> routes = {
+  home: <span class="str">'/'</span>,
+  admin: { path: <span class="str">'/admin'</span>, lazy: <span class="kw">true</span> },
+} <span class="kw">satisfies</span> <span class="typ">RouteConfig</span>;
+
+routes.home.toUpperCase();    <span class="com">// ✅ TS knows home is a string</span>
+routes.admin.lazy;            <span class="com">// ✅ boolean</span>
+routes.tpyo;                  <span class="com">// ❌ error — the inferred type has exact keys</span></code></pre>
+  <p>Rule of thumb: <code>satisfies</code> = "prove this expression is assignable to T, then <strong>keep the inferred type</strong>, not T." Perfect for config objects, theme tokens, route maps, i18n dictionaries — anywhere you want validation without losing key-level precision. It also pairs with <code>as const</code>:</p>
+  <pre><code><span class="kw">const</span> theme = {
+  primary: <span class="str">'#1a56db'</span>,
+  spacing: [<span class="num">4</span>, <span class="num">8</span>, <span class="num">16</span>] ,
+} <span class="kw">as const satisfies</span> <span class="typ">Theme</span>;
+<span class="com">// literal types + readonly (as const) AND validated against Theme (satisfies)</span></code></pre>
+
+  <h3>Assertion discipline — <code>as</code> is a lie you tell the compiler</h3>
+  <ul>
+    <li><code>as</code> performs <strong>no runtime conversion and no check</strong> — it overrides the checker's opinion. Every <code>as</code> is a place where the type system is only as correct as you are.</li>
+    <li>TS only permits assertions between <em>overlapping</em> types; to jump between unrelated types you must launder through unknown: <code>value as unknown as Target</code>. The double assertion is a deliberate speed bump — treat needing it as a design smell.</li>
+    <li><strong>Acceptable uses:</strong> DOM lookups you can vouch for (<code>document.getElementById('app') as HTMLDivElement</code> — though a null check + instanceof is better), test fixtures, the single blessed constructor of a branded type, working around known lib-type gaps (comment why!).</li>
+    <li><strong>Prefer instead:</strong> narrowing, type predicates, <code>satisfies</code>, generics, or runtime validation (Zod et al.) at trust boundaries.</li>
+  </ul>
+  <div class="pitfall"><code>as any</code> in a return position is the worst variant: it silently infects every downstream consumer via inference, and no error will ever point back at it. If you must lie, lie as locally and loudly as possible.</div>
+
+  <!-- ============================================================ -->
+  <h2 id="typing-react">9. Typing React properly <span class="tier tier-1">T1</span></h2>
+
+  <h3>Props: children, optionality, and extending native elements</h3>
+  <pre><code><span class="kw">interface</span> <span class="typ">CardProps</span> {
+  title: <span class="typ">string</span>;                    <span class="com">// required</span>
+  footer?: <span class="typ">React.ReactNode</span>;         <span class="com">// optional — anything renderable</span>
+  children: <span class="typ">React.ReactNode</span>;        <span class="com">// explicit since React 18 types —</span>
+}                                   <span class="com">// FC no longer implies children</span>
+
+<span class="com">// ReactNode vs ReactElement vs JSX.Element:</span>
+<span class="com">//  ReactNode    = everything renderable: elements, string, number,</span>
+<span class="com">//                 boolean/null/undefined, iterables — use for children/slots</span>
+<span class="com">//  ReactElement = specifically the object createElement/JSX produces</span>
+<span class="com">//  JSX.Element  ≈ ReactElement with any-props — what a JSX expression is typed as</span></code></pre>
+  <p><strong>The design-system pattern</strong> — your Button should accept everything a real <code>&lt;button&gt;</code> does without you re-declaring 200 attributes:</p>
+  <pre><code><span class="kw">type</span> <span class="typ">ButtonProps</span> = <span class="typ">React.ComponentPropsWithoutRef</span>&lt;<span class="str">'button'</span>&gt; &amp; {
+  variant?: <span class="str">'primary'</span> | <span class="str">'ghost'</span> | <span class="str">'danger'</span>;
+  loading?: <span class="typ">boolean</span>;
+};
+
+<span class="kw">function</span> <span class="typ">Button</span>({ variant = <span class="str">'primary'</span>, loading, disabled, ...rest }: <span class="typ">ButtonProps</span>) {
+  <span class="kw">return</span> (
+    &lt;button
+      {...rest}
+      disabled={disabled || loading}
+      className={<span class="str">`btn btn-${variant}`</span>}
+    /&gt;
+  );
+}
+<span class="com">// Consumers get onClick, type, aria-*, data-* … all typed, for free.</span>
+<span class="com">// Wrapping another component instead? ComponentPropsWithoutRef&lt;typeof Input&gt;.</span>
+<span class="com">// Need to expose the ref too? ComponentPropsWithRef&lt;'button'&gt;.</span></code></pre>
+  <div class="senior">If your custom prop collides with a native one (e.g. your own <code>size</code> vs the native <code>size</code> attribute), omit it first: <code>Omit&lt;ComponentPropsWithoutRef&lt;'button'&gt;, 'size'&gt; &amp; { size: 'sm' | 'lg' }</code>. Knowing this collision-and-omit dance is a strong design-system signal.</div>
+
+  <h3>Typing hooks</h3>
+  <pre><code><span class="com">// useState — inference from the initial value is usually enough:</span>
+<span class="kw">const</span> [count, setCount] = useState(<span class="num">0</span>);            <span class="com">// number</span>
+
+<span class="com">// …but supply the type when the initial value doesn't cover the union:</span>
+<span class="kw">const</span> [user, setUser] = useState&lt;<span class="typ">User</span> | <span class="kw">null</span>&gt;(<span class="kw">null</span>);
+<span class="kw">const</span> [status, setStatus] =
+  useState&lt;<span class="str">'idle'</span> | <span class="str">'saving'</span> | <span class="str">'saved'</span>&gt;(<span class="str">'idle'</span>);
+<span class="com">// Without the annotation, status would be typed 'idle' forever —</span>
+<span class="com">// setStatus('saving') would be an error.</span></code></pre>
+  <p><strong>useRef and the null story.</strong> The two ref use-cases get different shapes on purpose:</p>
+  <pre><code><span class="com">// DOM ref: YOU never write .current — React does. Initialize with null:</span>
+<span class="kw">const</span> inputRef = useRef&lt;<span class="typ">HTMLInputElement</span>&gt;(<span class="kw">null</span>);
+&lt;input ref={inputRef} /&gt;
+inputRef.current?.focus();        <span class="com">// current: HTMLInputElement | null</span>
+
+<span class="com">// Mutable instance variable: you own .current — give it a real initial value:</span>
+<span class="kw">const</span> timerRef = useRef&lt;<span class="typ">number</span> | <span class="kw">undefined</span>&gt;(<span class="kw">undefined</span>);
+timerRef.current = window.setTimeout(tick, <span class="num">1000</span>);   <span class="com">// writable, fine</span></code></pre>
+  <p>Historically the types had three overloads: <code>useRef&lt;T&gt;(null)</code> with T not including null returned <code>RefObject&lt;T&gt;</code> (readonly-ish <code>current</code>), while an initial value of the full type returned <code>MutableRefObject&lt;T&gt;</code>. React 19's types simplified this — <code>useRef</code> now requires an argument and always returns a mutable <code>RefObject&lt;T | null&gt;</code>-style shape; the RefObject/MutableRefObject split is being phased out. Know both stories: legacy codebases show the old one.</p>
+
+  <p><strong>useReducer with discriminated-union actions</strong> — the canonical senior answer for "type a reducer":</p>
+  <pre><code><span class="kw">interface</span> <span class="typ">CartState</span> {
+  items: { id: <span class="typ">string</span>; qty: <span class="typ">number</span> }[];
+  discountCode: <span class="typ">string</span> | <span class="kw">null</span>;
+}
+
+<span class="kw">type</span> <span class="typ">CartAction</span> =
+  | { type: <span class="str">'add'</span>;    id: <span class="typ">string</span> }
+  | { type: <span class="str">'remove'</span>; id: <span class="typ">string</span> }
+  | { type: <span class="str">'setQty'</span>; id: <span class="typ">string</span>; qty: <span class="typ">number</span> }
+  | { type: <span class="str">'applyDiscount'</span>; code: <span class="typ">string</span> }
+  | { type: <span class="str">'clear'</span> };
+
+<span class="kw">function</span> cartReducer(state: <span class="typ">CartState</span>, action: <span class="typ">CartAction</span>): <span class="typ">CartState</span> {
+  <span class="kw">switch</span> (action.type) {
+    <span class="kw">case</span> <span class="str">'add'</span>:
+      <span class="kw">return</span> { ...state, items: [...state.items, { id: action.id, qty: <span class="num">1</span> }] };
+    <span class="kw">case</span> <span class="str">'remove'</span>:
+      <span class="kw">return</span> { ...state, items: state.items.filter(i =&gt; i.id !== action.id) };
+    <span class="kw">case</span> <span class="str">'setQty'</span>:
+      <span class="kw">return</span> { ...state, items: state.items.map(i =&gt;
+        i.id === action.id ? { ...i, qty: action.qty } : i) };  <span class="com">// qty exists ONLY here</span>
+    <span class="kw">case</span> <span class="str">'applyDiscount'</span>:
+      <span class="kw">return</span> { ...state, discountCode: action.code };
+    <span class="kw">case</span> <span class="str">'clear'</span>:
+      <span class="kw">return</span> { items: [], discountCode: <span class="kw">null</span> };
+    <span class="kw">default</span>:
+      <span class="kw">return</span> assertNever(action);   <span class="com">// add an action type → compiler lists gaps</span>
+  }
+}
+
+<span class="kw">const</span> [state, dispatch] = useReducer(cartReducer, { items: [], discountCode: <span class="kw">null</span> });
+dispatch({ type: <span class="str">'setQty'</span>, id: <span class="str">'a'</span>, qty: <span class="num">2</span> }); <span class="com">// ✅ payload checked per action type</span>
+dispatch({ type: <span class="str">'setQty'</span>, id: <span class="str">'a'</span> });          <span class="com">// ❌ qty required for 'setQty'</span></code></pre>
+
+  <h3>Event types — React vs native</h3>
+  <pre><code><span class="kw">function</span> <span class="typ">Form</span>() {
+  <span class="kw">const</span> onChange = (e: <span class="typ">React.ChangeEvent</span>&lt;<span class="typ">HTMLInputElement</span>&gt;) =&gt; {
+    e.target.value;               <span class="com">// string — target is typed via the generic</span>
+  };
+  <span class="kw">const</span> onSubmit = (e: <span class="typ">React.FormEvent</span>&lt;<span class="typ">HTMLFormElement</span>&gt;) =&gt; {
+    e.preventDefault();
+  };
+  <span class="kw">const</span> onClick = (e: <span class="typ">React.MouseEvent</span>&lt;<span class="typ">HTMLButtonElement</span>&gt;) =&gt; {
+    e.currentTarget.disabled = <span class="kw">true</span>;  <span class="com">// currentTarget = the generic's element</span>
+  };
+  <span class="com">/* … */</span>
+}</code></pre>
+  <div class="pitfall">React's <code>MouseEvent</code> / <code>KeyboardEvent</code> are <strong>SyntheticEvent wrappers</strong>, not the DOM globals of the same name. Annotating a handler with the bare global <code>MouseEvent</code> "works" until you pass it to JSX and get a baffling mismatch. Conversely, in a manual <code>addEventListener</code> you need the native types. Also: <code>e.target</code> is typed loosely (<code>EventTarget</code>) because it can be any descendant; <code>e.currentTarget</code> is the precisely-typed element the handler is attached to — prefer it.</div>
+
+  <h3>Generic components — the typed <code>Select&lt;T&gt;</code></h3>
+  <pre><code><span class="kw">interface</span> <span class="typ">SelectProps</span>&lt;<span class="typ">T</span>&gt; {
+  options: <span class="kw">readonly</span> <span class="typ">T</span>[];
+  value: <span class="typ">T</span> | <span class="kw">null</span>;
+  onChange: (value: <span class="typ">T</span>) =&gt; <span class="kw">void</span>;
+  getKey: (option: <span class="typ">T</span>) =&gt; <span class="typ">string</span>;
+  renderOption?: (option: <span class="typ">T</span>) =&gt; <span class="typ">React.ReactNode</span>;
+}
+
+<span class="com">// A generic FUNCTION component — T binds per usage site:</span>
+<span class="kw">function</span> <span class="typ">Select</span>&lt;<span class="typ">T</span>&gt;({ options, value, onChange, getKey, renderOption }: <span class="typ">SelectProps</span>&lt;<span class="typ">T</span>&gt;) {
+  <span class="kw">return</span> (
+    &lt;ul role=<span class="str">"listbox"</span>&gt;
+      {options.map(opt =&gt; (
+        &lt;li key={getKey(opt)} onClick={() =&gt; onChange(opt)}
+            aria-selected={value !== <span class="kw">null</span> &amp;&amp; getKey(opt) === getKey(value)}&gt;
+          {renderOption ? renderOption(opt) : getKey(opt)}
+        &lt;/li&gt;
+      ))}
+    &lt;/ul&gt;
+  );
+}
+
+<span class="com">// T is inferred as User from the props — onChange's arg is a User:</span>
+&lt;<span class="typ">Select</span>
+  options={users}
+  value={selected}
+  onChange={u =&gt; setSelected(u)}    <span class="com">// u: User ✅</span>
+  getKey={u =&gt; u.id}
+/&gt;</code></pre>
+  <div class="note">Don't type generic components as <code>React.FC</code> — <code>const Select: React.FC&lt;SelectProps&lt;T&gt;&gt;</code> has nowhere to declare T. A plain generic function declaration is the way. (In .tsx files, a generic <em>arrow</em> function needs the <code>&lt;T,&gt;</code> trailing-comma trick to disambiguate from JSX — another reason to prefer <code>function</code>.)</div>
+
+  <h3>Refs to components: forwardRef, and React 19's simplification</h3>
+  <pre><code><span class="com">// Pre-React-19 — forwardRef&lt;RefElement, Props&gt; (note the order: ref first!):</span>
+<span class="kw">const</span> <span class="typ">FancyInput</span> = <span class="typ">React</span>.forwardRef&lt;<span class="typ">HTMLInputElement</span>, { label: <span class="typ">string</span> }&gt;(
+  ({ label }, ref) =&gt; (
+    &lt;label&gt;{label}&lt;input ref={ref} /&gt;&lt;/label&gt;
+  )
+);
+
+<span class="com">// React 19 — ref is just a prop; forwardRef is no longer needed:</span>
+<span class="kw">function</span> <span class="typ">FancyInput19</span>({ label, ref }: { label: <span class="typ">string</span>; ref?: <span class="typ">React.Ref</span>&lt;<span class="typ">HTMLInputElement</span>&gt; }) {
+  <span class="kw">return</span> &lt;label&gt;{label}&lt;input ref={ref} /&gt;&lt;/label&gt;;
+}</code></pre>
+
+  <h3>Context — the null-check pattern</h3>
+  <pre><code><span class="kw">interface</span> <span class="typ">AuthContextValue</span> {
+  user: <span class="typ">User</span> | <span class="kw">null</span>;
+  login: (email: <span class="typ">string</span>) =&gt; <span class="typ">Promise</span>&lt;<span class="kw">void</span>&gt;;
+  logout: () =&gt; <span class="kw">void</span>;
+}
+
+<span class="com">// No sensible default exists → default to null, and gate access via a hook:</span>
+<span class="kw">const</span> <span class="typ">AuthContext</span> = createContext&lt;<span class="typ">AuthContextValue</span> | <span class="kw">null</span>&gt;(<span class="kw">null</span>);
+
+<span class="kw">export function</span> useAuth(): <span class="typ">AuthContextValue</span> {
+  <span class="kw">const</span> ctx = useContext(<span class="typ">AuthContext</span>);
+  <span class="kw">if</span> (ctx === <span class="kw">null</span>) {
+    <span class="kw">throw new</span> <span class="typ">Error</span>(<span class="str">'useAuth must be used inside &lt;AuthProvider&gt;'</span>);
+  }
+  <span class="kw">return</span> ctx;   <span class="com">// narrowed — consumers never see null</span>
+}</code></pre>
+  <p>Why this beats <code>createContext&lt;AuthContextValue&gt;({} as AuthContextValue)</code>: the assertion version silently hands out a broken empty object when the provider is missing (runtime undefined-method crashes far from the cause); the null-check version fails fast with an actionable message and gives every consumer a non-nullable type.</p>
+
+  <h3>Children as a function (render prop)</h3>
+  <pre><code><span class="kw">interface</span> <span class="typ">ListProps</span>&lt;<span class="typ">T</span>&gt; {
+  items: <span class="kw">readonly</span> <span class="typ">T</span>[];
+  children: (item: <span class="typ">T</span>, index: <span class="typ">number</span>) =&gt; <span class="typ">React.ReactNode</span>;   <span class="com">// children IS the function</span>
+}
+<span class="kw">function</span> <span class="typ">List</span>&lt;<span class="typ">T</span>&gt;({ items, children }: <span class="typ">ListProps</span>&lt;<span class="typ">T</span>&gt;) {
+  <span class="kw">return</span> &lt;ul&gt;{items.map((it, i) =&gt; &lt;li key={i}&gt;{children(it, i)}&lt;/li&gt;)}&lt;/ul&gt;;
+}
+
+&lt;<span class="typ">List</span> items={users}&gt;{(u) =&gt; &lt;strong&gt;{u.name}&lt;/strong&gt;}&lt;/<span class="typ">List</span>&gt;  <span class="com">// u: User</span></code></pre>
+
+  <!-- ============================================================ -->
+  <h2 id="config">10. Compiler config &amp; ecosystem <span class="tier tier-2">T2</span></h2>
+
+  <h3>The strict family — know what each flag catches</h3>
+  <table>
+    <thead><tr><th>Flag</th><th>What it catches</th></tr></thead>
+    <tbody>
+      <tr><td><code>strict</code></td><td>Umbrella that enables the family below (and picks up new strict flags in future TS versions — turning it on is the baseline expectation).</td></tr>
+      <tr><td><code>strictNullChecks</code></td><td><code>null</code>/<code>undefined</code> stop being members of every type. Without it, <code>const s: string = null</code> compiles — effectively no null safety at all. The single most important flag.</td></tr>
+      <tr><td><code>strictFunctionTypes</code></td><td>Contravariant parameter checks for function <em>types</em> (methods stay bivariant — see variance section).</td></tr>
+      <tr><td><code>noImplicitAny</code></td><td>Unannotated params/vars that TS can't infer become errors instead of silent <code>any</code>.</td></tr>
+      <tr><td><code>strictPropertyInitialization</code></td><td>Class fields must be definitely assigned in the constructor (or use <code>!</code> deliberately).</td></tr>
+      <tr><td><code>useUnknownInCatchVariables</code></td><td><code>catch (e)</code> types <code>e</code> as <code>unknown</code>, not <code>any</code> — because <em>anything</em> can be thrown in JS. Forces <code>if (e instanceof Error)</code> before <code>.message</code>.</td></tr>
+      <tr><td><code>noUncheckedIndexedAccess</code> <em>(not in strict!)</em></td><td>Indexing with a non-literal key — <code>arr[i]</code>, <code>record[key]</code> — yields <code>T | undefined</code>. Catches a huge class of real bugs; opt in explicitly.</td></tr>
+    </tbody>
+  </table>
+  <pre><code><span class="com">// noUncheckedIndexedAccess in practice:</span>
+<span class="kw">const</span> scores: <span class="typ">Record</span>&lt;<span class="typ">string</span>, <span class="typ">number</span>&gt; = {};
+<span class="kw">const</span> s = scores[<span class="str">'alice'</span>];   <span class="com">// number | undefined (flag on) vs number (flag off — a lie!)</span>
+
+<span class="kw">try</span> { risky(); } <span class="kw">catch</span> (e) {
+  <span class="com">// e: unknown under strict — narrow before use:</span>
+  <span class="kw">const</span> message = e <span class="kw">instanceof</span> <span class="typ">Error</span> ? e.message : <span class="typ">String</span>(e);
+}</code></pre>
+
+  <h3>Declaration files &amp; module declarations</h3>
+  <pre><code><span class="com">// A .d.ts file contains ONLY types — no runtime output. Sources:</span>
+<span class="com">//  1. Generated from your code:  "declaration": true → dist/index.d.ts</span>
+<span class="com">//  2. Shipped by libraries ("types" field) or @types/* (DefinitelyTyped)</span>
+<span class="com">//  3. Hand-written ambient declarations for untyped things:</span>
+
+<span class="com">// globals.d.ts — ambient (no import/export → global scope):</span>
+<span class="kw">declare const</span> __APP_VERSION__: <span class="typ">string</span>;      <span class="com">// injected by the bundler</span>
+
+<span class="com">// Untyped npm package — minimum viable typing:</span>
+<span class="kw">declare module</span> <span class="str">'legacy-carousel'</span> {
+  <span class="kw">export function</span> init(el: <span class="typ">HTMLElement</span>, opts?: { speed?: <span class="typ">number</span> }): <span class="kw">void</span>;
+}
+
+<span class="com">// Non-code imports the bundler handles:</span>
+<span class="kw">declare module</span> <span class="str">'*.svg'</span> {
+  <span class="kw">const</span> url: <span class="typ">string</span>;
+  <span class="kw">export default</span> url;
+}
+
+<span class="com">// Module vs ambient: the moment a .d.ts has a top-level import/export,</span>
+<span class="com">// it becomes a MODULE and its declarations stop being global — the classic</span>
+<span class="com">// "my declare global stopped working" bug. Inside a module, use:</span>
+<span class="kw">declare global</span> { <span class="kw">interface</span> <span class="typ">Window</span> { analytics: <span class="typ">unknown</span>; } }
+<span class="kw">export</span> {};</code></pre>
+  <p><strong>Triple-slash directives</strong> (<code>/// &lt;reference types="vite/client" /&gt;</code>) are the legacy way to pull ambient types into scope — you'll still see them in <code>vite-env.d.ts</code>; in normal code, <code>tsconfig types</code>/imports supersede them. <strong>Module resolution</strong>: know that <code>"moduleResolution": "bundler"</code> is the modern setting for bundled apps (matches how Vite/esbuild resolve, supports <code>exports</code> maps without file extensions), while <code>"nodenext"</code> is for code actually run by Node.</p>
+
+  <h3>Types don't exist at runtime — who compiles what</h3>
+  <p>The dominant modern setup splits responsibilities: <strong>esbuild/swc/babel strip types and emit JS</strong> (fast, per-file, no type knowledge), while <strong><code>tsc --noEmit</code> runs in CI/editor as a pure type checker</strong>. This works because erasing types is a per-file syntactic operation — with two infamous exceptions:</p>
+  <pre><code><span class="com">// enum EMITS runtime code — it isn't erasable:</span>
+<span class="kw">enum</span> <span class="typ">Status</span> { Active, Archived }
+<span class="com">// → var Status; (function (Status) { … })(Status || (Status = {}));</span>
+
+<span class="com">// const enum is WORSE for transpilers: values are inlined at use sites,</span>
+<span class="com">// which requires cross-file type information — exactly what per-file</span>
+<span class="com">// transpilers (esbuild/swc/babel, isolatedModules) don't have. Avoid.</span>
+<span class="kw">const enum</span> <span class="typ">Dir</span> { Up, Down }
+<span class="kw">const</span> d = <span class="typ">Dir</span>.Up;   <span class="com">// tsc inlines to `0`; a per-file transpiler may just break</span>
+
+<span class="com">// The erasable alternative — union + const object:</span>
+<span class="kw">const</span> <span class="typ">STATUS</span> = { Active: <span class="str">'active'</span>, Archived: <span class="str">'archived'</span> } <span class="kw">as const</span>;
+<span class="kw">type</span> <span class="typ">Status</span> = <span class="kw">typeof</span> <span class="typ">STATUS</span>[<span class="kw">keyof typeof</span> <span class="typ">STATUS</span>]; <span class="com">// 'active' | 'archived'</span></code></pre>
+  <div class="senior">The ecosystem is converging on <strong>erasable-only TypeScript</strong>: Node's built-in type stripping runs .ts files by deleting types only (no enums, no namespaces-with-values, no constructor parameter properties), and TS 5.8 added <code>erasableSyntaxOnly</code> to enforce that subset at compile time. Being able to say "we enable isolatedModules + erasableSyntaxOnly so any tool — esbuild, swc, Node itself — can strip our types" is a very current, very senior answer. And the umbrella point: <strong>types are erased</strong>, so <code>x instanceof MyInterface</code> is impossible, type guards must check runtime evidence, and API-boundary validation needs a runtime schema (Zod/Valibot) — from which you <em>derive</em> the static type (<code>z.infer</code>) so the two can't drift.</div>
+
+  <!-- ============================================================ -->
+  <h2 id="trivia">11. Advanced trivia — awareness level <span class="tier tier-3">T3</span></h2>
+
+  <h3>Function overloads vs unions</h3>
+  <pre><code><span class="com">// Overloads shine when the RETURN type depends on the ARG type:</span>
+<span class="kw">function</span> createEl(tag: <span class="str">'img'</span>): <span class="typ">HTMLImageElement</span>;
+<span class="kw">function</span> createEl(tag: <span class="str">'a'</span>): <span class="typ">HTMLAnchorElement</span>;
+<span class="kw">function</span> createEl(tag: <span class="typ">string</span>): <span class="typ">HTMLElement</span> {   <span class="com">// implementation signature —</span>
+  <span class="kw">return</span> document.createElement(tag);            <span class="com">// NOT callable itself, must be</span>
+}                                                 <span class="com">// compatible with all overloads</span>
+
+<span class="kw">const</span> img = createEl(<span class="str">'img'</span>);   <span class="com">// HTMLImageElement — resolved top-down, first match wins</span>
+
+<span class="com">// But prefer a union/generic when args are independent — overloads multiply:</span>
+<span class="kw">function</span> pad(v: <span class="typ">string</span> | <span class="typ">number</span>): <span class="typ">string</span> { <span class="com">/* one signature, done */</span> <span class="kw">return</span> <span class="typ">String</span>(v); }</code></pre>
+  <ul>
+    <li><strong>Implementation-signature rule:</strong> the body's signature is invisible to callers; only the overload list is public. Order matters — put the most specific first.</li>
+    <li>Conditional return types or generics with <code>extends</code> constraints can often replace overloads and compose better; overloads read better when the arg→return mapping is a small finite table.</li>
+  </ul>
+
+  <h3><code>this</code> typing</h3>
+  <pre><code><span class="com">// A fake first parameter that only constrains the call context — erased in JS:</span>
+<span class="kw">function</span> onClickHandler(<span class="kw">this</span>: <span class="typ">HTMLButtonElement</span>, ev: <span class="typ">MouseEvent</span>) {
+  <span class="kw">this</span>.disabled = <span class="kw">true</span>;   <span class="com">// this is typed!</span>
+}
+<span class="com">// ThisParameterType&lt;typeof onClickHandler&gt; → HTMLButtonElement</span>
+<span class="com">// OmitThisParameter&lt;…&gt; strips it. `this: void` forbids this-usage entirely.</span></code></pre>
+
+  <h3>Recursion limits, variadic tuples, decorators</h3>
+  <ul>
+    <li><strong>Recursion depth:</strong> conditional-type instantiation depth is capped (~100 for general recursion; tail-recursive conditional types get elevated limits ~1000). Deeply recursive string parsers hit "Type instantiation is excessively deep" — restructure to be tail-recursive with an accumulator.</li>
+    <li><strong>Variadic tuple types:</strong> spreads inside tuple types — <code>type Concat&lt;A extends unknown[], B extends unknown[]&gt; = [...A, ...B]</code>, <code>type Shift&lt;T&gt; = T extends [unknown, ...infer Rest] ? Rest : never</code>. They're what make typed <code>pipe()</code>/<code>curry()</code> and <code>Parameters</code>-surgery possible.</li>
+    <li><strong>Decorators status:</strong> two incompatible worlds — legacy <code>experimentalDecorators</code> (Angular, old NestJS/TypeORM ecosystems, param decorators, works with <code>emitDecoratorMetadata</code>) vs the TC39 <strong>standard decorators</strong> shipped in TS 5.0 (no flag needed, different API, no param decorators). Know which one a codebase uses before touching them.</li>
+  </ul>
+
+  <!-- ============================================================ -->
+  <h2 id="qa">Interview Q&amp;A</h2>
+  <p>Answer out loud before expanding. Each model answer includes the "why" an interviewer is listening for.</p>
+
+  <details class="qa"><summary>Is TypeScript's type system sound? What does your answer imply?</summary>
+    <div class="answer"><p>No — deliberately. Soundness means "if it type-checks, no type error can occur at runtime," and TS explicitly trades that for ergonomics and JS interop. Known unsound spots: <code>any</code>, type assertions, covariant mutable arrays (<code>Dog[]</code> → <code>Animal[]</code>), bivariant method parameters, non-fresh excess properties, unchecked indexed access (without the flag), and <code>Function.bind</code>-era holes. Implication: TS is a bug-catching and design tool, not a security boundary — runtime validation is still required at trust boundaries (network, storage, user input). Interviewers listen for whether you frame this as a <em>deliberate trade-off</em> rather than a flaw.</p></div>
+  </details>
+
+  <details class="qa"><summary>Explain structural typing and one problem it causes in a large app.</summary>
+    <div class="answer"><p>Compatibility is by shape, not name: any value with the required members is assignable. Problem: semantically distinct types with identical shapes are interchangeable — <code>UserId</code>, <code>OrderId</code>, and <code>SessionToken</code> all being <code>string</code> means the compiler can't stop you swapping them. Fix: branded types (<code>string &amp; { __brand: 'UserId' }</code>) with one blessed constructor function, giving nominal behavior at zero runtime cost. Bonus: mention that structural typing is also why extra properties are generally fine and why mocking in tests is so easy.</p></div>
+  </details>
+
+  <details class="qa"><summary>Why does <code>{ title: 'x', widht: 1 }</code> error when passed inline, but not via a variable?</summary>
+    <div class="answer"><p>Excess property checks apply only to <strong>fresh object literals</strong> — literals assigned directly to a typed target. It's an intentional lint layered onto structural typing to catch typos and misplaced options. Once the literal is bound to a variable, it gets its own inferred type (<code>{ title: string; widht: number }</code>), freshness is gone, and plain structural compatibility takes over — extra members are allowed. Senior addition: therefore TS objects are never "closed"; if extra keys are actually harmful (spreading into a DB row), enforce at runtime.</p></div>
+  </details>
+
+  <details class="qa"><summary>unknown vs any — give a concrete rule for when each appears in your code.</summary>
+    <div class="answer"><p><code>unknown</code> is the type-safe top type: anything assigns to it, but you can't use it until you narrow — so it appears wherever data enters the system: <code>JSON.parse</code> results, <code>catch (e)</code>, <code>postMessage</code> payloads, generic defaults. <code>any</code> disables checking in both directions <em>and is contagious through inference</em> — every expression it touches degrades. Legitimate <code>any</code>: incremental migration seams and rare type-system dead-ends, ideally confined and commented. Rule: "if I'd have to check it before using it anyway, it's <code>unknown</code>; <code>any</code> means I've decided not to know."</p></div>
+  </details>
+
+  <details class="qa"><summary>Why does <code>numbers.forEach(n =&gt; results.push(n))</code> compile when the callback should return void?</summary>
+    <div class="answer"><p>Because <code>void</code> in a function-<em>type's</em> return position means "the caller ignores the return value," not "must return nothing." A <code>(x) =&gt; number</code> is assignable to <code>(x) =&gt; void</code>. This is deliberate: without it, every concise-arrow callback returning an expression (<code>push</code> returns the new length) would need braces. Contrast: a function you <em>declare</em> with an explicit <code>: void</code> annotation can't <code>return value</code> in its body. Gotcha worth volunteering: <code>() =&gt; void</code> silently accepts async functions, orphaning their promises.</p></div>
+  </details>
+
+  <details class="qa"><summary>Interface vs type — your actual policy, with the mechanical reasons.</summary>
+    <div class="answer"><p>Mechanics: interfaces support declaration merging (needed for global/module augmentation, risky internally), keep their name in error messages, and <code>extends</code> errors immediately on member conflicts; type aliases can express unions, tuples, mapped/conditional/template-literal types — which interfaces can't at all — but <code>&amp;</code> intersections resolve conflicts to <code>never</code> silently. Performance differences (cached named extends vs recomputed intersections) exist but only matter at huge scale. Policy: interfaces for public object contracts and anything classes implement or consumers may augment; type aliases for unions and computed types; team consistency above all.</p></div>
+  </details>
+
+  <details class="qa"><summary>Walk through <code>function get&lt;T, K extends keyof T&gt;(obj: T, key: K): T[K]</code>.</summary>
+    <div class="answer"><p>Two related type parameters: <code>T</code> infers from the object argument; <code>K extends keyof T</code> constrains the key to the union of T's literal key names — and because the argument is a string literal, K infers as that exact literal, not <code>string</code>. The return type <code>T[K]</code> is an indexed access: the type of that specific property. Net effect: invalid keys are compile errors, and the return type is exact per call site (<code>get(user, 'name')</code> → <code>string</code>). This signature demonstrates the core value of generics: <em>relating</em> input types to output types instead of erasing the relationship with <code>any</code>.</p></div>
+  </details>
+
+  <details class="qa"><summary>Is <code>Array&lt;Dog&gt;</code> assignable to <code>Array&lt;Animal&gt;</code>? Should it be?</summary>
+    <div class="answer"><p>It is (covariant), and strictly it shouldn't be for mutable arrays: after <code>const animals: Animal[] = dogs</code>, <code>animals.push(cat)</code> corrupts <code>dogs</code> with zero compile errors. Sound behavior would be invariance, but that rejects vast amounts of safe read-only code, so TS chose ergonomics — mechanically enabled by method parameters being bivariant even under <code>strictFunctionTypes</code> (which only makes standalone function <em>types</em> contravariant). Practical mitigation: accept <code>readonly T[]</code> in function signatures — covariance is genuinely sound for reads, and mutable arrays are assignable to readonly ones.</p></div>
+  </details>
+
+  <details class="qa"><summary>Design the state type for a data-fetching component. Defend it.</summary>
+    <div class="answer"><p>A discriminated union: <code>{status:'idle'} | {status:'loading'} | {status:'success'; data:T} | {status:'error'; error:Error}</code>. Defense: (1) illegal states are unrepresentable — <code>data</code> can't coexist with <code>'error'</code>, unlike the <code>{loading, data?, error?}</code> bag where <code>2^n</code> combinations exist and most are nonsense; (2) narrowing on <code>status</code> gives typed access per branch with no <code>!</code> assertions; (3) exhaustiveness via a <code>never</code> default means adding a state produces compile errors at every unhandled site. This is "parse, don't validate" thinking applied to UI state — and the same shape TanStack Query exposes.</p></div>
+  </details>
+
+  <details class="qa"><summary>What responsibility do custom type predicates carry?</summary>
+    <div class="answer"><p><code>arg is T</code> is trusted, not verified: the compiler believes your boolean means what the signature claims. A wrong predicate body silently poisons every call site with incorrect narrowing — it's an assertion wearing a function costume. Mitigations: keep predicate bodies trivial and property-complete, colocate them with the type so shape changes are reviewed together, generate them from runtime schemas (Zod's <code>safeParse</code>), and note TS 5.5 now <em>infers</em> predicates for simple boolean returns, eliminating the hand-written gap for easy cases. Same story for assertion functions (<code>asserts arg is T</code>), which additionally must throw on failure.</p></div>
+  </details>
+
+  <details class="qa"><summary>How do you make the compiler tell you about unhandled switch cases?</summary>
+    <div class="answer"><p>Exhaustiveness via <code>never</code>: in the <code>default</code> branch, pass the discriminated value to <code>assertNever(x: never): never</code> — if all cases are handled, the value has narrowed to <code>never</code> and it compiles; add a union member and the default branch sees the new type, which isn't assignable to <code>never</code> → compile error at every incomplete switch. Modern alternative without a helper: <code>state satisfies never;</code> in the default branch. Also mention <code>noFallthroughCasesInSwitch</code> and that if the function returns a value, the return-type check often catches gaps too — but the <code>never</code> pattern works even for <code>void</code> functions.</p></div>
+  </details>
+
+  <details class="qa"><summary>Implement <code>Omit</code> from scratch and explain each piece.</summary>
+    <div class="answer"><p><code>type MyOmit&lt;T, K extends keyof any&gt; = Pick&lt;T, Exclude&lt;keyof T, K&gt;&gt;</code>. <code>keyof T</code> yields the key union; <code>Exclude</code> is a distributive conditional (<code>T extends U ? never : T</code>) that runs per key and drops the excluded ones (returned <code>never</code>s vanish from the union); <code>Pick</code> maps over what's left: <code>{ [P in Keys]: T[P] }</code>. Note <code>K extends keyof any</code> (i.e., <code>string | number | symbol</code>) rather than <code>keyof T</code> — matching the built-in, which permits omitting keys not on T. Mention you could inline it with key remapping: <code>{ [P in keyof T as P extends K ? never : P]: T[P] }</code>.</p></div>
+  </details>
+
+  <details class="qa"><summary>What is a distributive conditional type, and how do you turn distribution off?</summary>
+    <div class="answer"><p>When the checked type in <code>T extends U ? X : Y</code> is a <em>naked</em> type parameter and T is instantiated with a union, the conditional maps over each member and unions the results — <code>ToArray&lt;string | number&gt;</code> = <code>string[] | number[]</code>. It's what makes <code>Exclude</code>/<code>Extract</code>/<code>NonNullable</code> one-liners. Disable by de-nakedifying both sides: <code>[T] extends [U] ? … </code> — the tuple wrapper makes it a single structural comparison, giving <code>(string | number)[]</code>. Killer detail: <code>never</code> is the empty union, so a distributive conditional over <code>never</code> evaluates zero branches and returns <code>never</code> — which is why <code>IsNever</code> requires the tuple trick.</p></div>
+  </details>
+
+  <details class="qa"><summary>What does <code>infer</code> do, and where can it appear?</summary>
+    <div class="answer"><p><code>infer R</code> declares a fresh type variable inside an <code>extends</code> pattern and asks the compiler to solve for it during the match — pattern matching at the type level. It can sit in any structural position: return type (<code>ReturnType</code>), parameter tuple (<code>Parameters</code>), array element, specific tuple slots including alongside rests (<code>[infer First, ...infer Rest]</code>), promise payload (<code>Awaited</code>), and template-literal segments (<code>`on${infer E}`</code>). Since TS 4.7 you can constrain it inline: <code>infer S extends string</code>. It only exists within the true branch of the conditional where it was declared.</p></div>
+  </details>
+
+  <details class="qa"><summary>satisfies vs a type annotation vs <code>as</code> — what does each do to the type?</summary>
+    <div class="answer"><p>Annotation (<code>const x: T = …</code>): checks assignability, then the variable's type <em>is T</em> — you lose the narrower inferred type (which keys exist, literal values). Assertion (<code>as T</code>): no meaningful check — it overrides the compiler, so bugs pass. <code>satisfies T</code>: full assignability check, but the expression <em>keeps its inferred type</em> — validation plus precision. Canonical use: config/theme/route objects where you want "conforms to the schema" and "<code>routes.home</code> is specifically a string" simultaneously. Combine with <code>as const</code> for readonly literal trees that are still schema-validated.</p></div>
+  </details>
+
+  <details class="qa"><summary>Type a Button that accepts all native button props plus a <code>variant</code>.</summary>
+    <div class="answer"><p><code>type ButtonProps = React.ComponentPropsWithoutRef&lt;'button'&gt; &amp; { variant?: 'primary' | 'ghost' }</code>, destructure <code>variant</code> and spread the rest onto <code>&lt;button&gt;</code>. Why this over <code>ButtonHTMLAttributes&lt;HTMLButtonElement&gt;</code>: nearly equivalent, but <code>ComponentPropsWithoutRef</code> also works uniformly for <em>components</em> (<code>ComponentPropsWithoutRef&lt;typeof Input&gt;</code>), so it's the one idiom to remember. Follow-ups to preempt: use <code>ComponentPropsWithRef</code>/forwardRef (or React 19 ref-prop) if refs must pass through; <code>Omit</code> native props that collide with your custom ones (<code>size</code>, <code>color</code>).</p></div>
+  </details>
+
+  <details class="qa"><summary>Why <code>useRef&lt;HTMLInputElement&gt;(null)</code> — what's the null story?</summary>
+    <div class="answer"><p>The ref starts as null because the DOM node doesn't exist until after commit, and React (not you) writes <code>.current</code>. Historically, the null-initialized overload returned <code>RefObject&lt;T&gt;</code> (with <code>current: T | null</code>, treated as read-only for your code), while <code>useRef&lt;number | undefined&gt;(undefined)</code>-style calls returned <code>MutableRefObject</code> for instance-variable use (timer ids, previous values) that you write yourself. React 19's types simplify this: <code>useRef</code> requires an argument and the MutableRefObject/RefObject split is collapsed — refs are just mutable objects. Either way, the two <em>use-cases</em> (DOM ref vs mutable box) remain the concept to articulate.</p></div>
+  </details>
+
+  <details class="qa"><summary>Why type reducer actions as a discriminated union instead of <code>{type: string; payload?: any}</code>?</summary>
+    <div class="answer"><p>The union <code>{type:'setQty'; id:string; qty:number} | {type:'clear'} | …</code> gives: (1) <code>dispatch</code> rejects unknown action types and wrong/missing payloads at the call site; (2) inside the reducer, switching on <code>type</code> narrows so each branch sees exactly its payload — no <code>payload as</code> casts; (3) exhaustiveness via <code>never</code> means new actions can't be silently unhandled. The loose version erases all three: any string dispatches, payload is untyped everywhere, refactors don't propagate. This is Redux Toolkit's model too — <code>createSlice</code> generates precisely-typed action creators for the same reason.</p></div>
+  </details>
+
+  <details class="qa"><summary>Why does <code>createContext&lt;T | null&gt;(null)</code> + a throwing custom hook beat <code>createContext({} as T)</code>?</summary>
+    <div class="answer"><p>Contexts often have no sensible default — the real value comes from a provider. <code>{} as T</code> lies: with a missing provider, consumers receive an empty object typed as fully-populated, and you crash later on <code>ctx.login is not a function</code>, far from the cause. <code>null</code> default + <code>useAuth()</code> that throws "must be used inside AuthProvider" fails fast with an actionable message at the exact misuse — and the hook's null check narrows, so every consumer gets a clean non-nullable type. Bonus: the custom hook is also the seam for selecting/memoizing and for swapping implementation in tests.</p></div>
+  </details>
+
+  <details class="qa"><summary>What do <code>strictNullChecks</code> and <code>noUncheckedIndexedAccess</code> each catch? Which isn't in <code>strict</code>?</summary>
+    <div class="answer"><p><code>strictNullChecks</code>: removes null/undefined from every type's domain, so possibly-absent values must be modeled (<code>T | null</code>) and narrowed before use — without it TS provides essentially no null safety. <code>noUncheckedIndexedAccess</code>: makes dynamic indexing (<code>arr[i]</code>, <code>record[key]</code>) return <code>T | undefined</code>, reflecting reality — it is <strong>not</strong> part of <code>strict</code> and must be enabled explicitly, which is a favorite gotcha question. It's noisy on array-heavy code (hence excluded from strict) but catches real out-of-bounds and missing-key bugs; idioms like <code>.at(i)</code>, destructuring with defaults, and <code>in</code>-checks keep it livable.</p></div>
+  </details>
+
+  <details class="qa"><summary>Your build uses esbuild/swc. What role does <code>tsc</code> still play, and what syntax becomes problematic?</summary>
+    <div class="answer"><p>esbuild/swc strip types file-by-file with no cross-file type knowledge — fast, but zero checking. <code>tsc --noEmit</code> runs in CI and the editor as the actual type checker; the contract is <code>isolatedModules</code>, which flags anything unsafely transpilable per-file (e.g., re-exporting types without <code>export type</code>). Problematic syntax: <code>const enum</code> (inlining needs cross-file info), <code>enum</code> and namespaces (emit runtime code — types are supposed to erase), <code>emitDecoratorMetadata</code>. Trend: <code>erasableSyntaxOnly</code> (TS 5.8) bans all non-erasable syntax so even Node's native type stripping can run the code. Punchline: types don't exist at runtime, so checking and transpiling are genuinely separable jobs.</p></div>
+  </details>
+
+  <details class="qa"><summary>When are function overloads better than a union parameter?</summary>
+    <div class="answer"><p>When the <em>return type depends on which argument shape was passed</em>, and the mapping is a small finite table: <code>createEl('img') → HTMLImageElement</code>, <code>getConfig(key) → typeof config[key]</code>, or different arities (<code>fetchUser(id)</code> vs <code>fetchUser(id, opts)</code>). A single union signature returns the same (union) type regardless of input, forcing callers to narrow. Rules to recite: overloads resolve top-down (most specific first); the implementation signature is invisible to callers and must be compatible with every overload; and for many cases a generic with a conditional return type (or <code>K extends keyof Map</code> lookup) scales better than an overload list.</p></div>
+  </details>
+
+  <details class="qa"><summary>How would you type a function so <code>getEventName('onClick')</code> returns the literal <code>'click'</code>?</summary>
+    <div class="answer"><p>Generic over the string literal + template-literal conditional: <code>function getEventName&lt;T extends string&gt;(name: T): T extends `on${infer E}` ? Lowercase&lt;E&gt; : never</code> — with the implementation doing the runtime lowercase/slice and, realistically, one localized <code>as</code> cast to the conditional return type (conditional return types generally can't be verified against the body; that's a known TS limitation worth naming). The pattern — literal type parameter in, template-literal pattern match, intrinsic string type out — is the same machinery behind typed <code>document.querySelector</code>, tRPC paths, and route-param extraction.</p></div>
+  </details>
+
+  <details class="qa"><summary>The compiler says "Type instantiation is excessively deep and possibly infinite." What's happening?</summary>
+    <div class="answer"><p>A recursive conditional/mapped type exceeded the instantiation depth cap (~50–100 nested instantiations; tail-recursive conditional types get an elevated ~1000 limit). Common causes: type-level string parsing character-by-character on long inputs, recursive tuple building, or accidental infinite recursion (no terminating branch). Fixes: make the recursion tail-recursive with an accumulator parameter (TS specifically optimizes conditional types whose recursive call is the entire branch result), chunk the work (match multiple characters per step), simplify the type, or accept a coarser type and validate at runtime. Recognizing this proves you've actually pushed the type system, not just read about it.</p></div>
+  </details>
+
+  <details class="qa"><summary>Where do you still need runtime validation despite full strict-mode TypeScript, and why?</summary>
+    <div class="answer"><p>At every trust boundary: HTTP/GraphQL responses, <code>JSON.parse</code>, localStorage, URL/query params, postMessage, env vars, webhooks, user file uploads. Why: types are erased — an <code>as User</code> or a generic <code>fetchJson&lt;User&gt;()</code> is a promise the compiler can't keep, because the data arrives at runtime where no types exist. The modern pattern is schema-first: define a Zod/Valibot schema, <code>parse</code> at the boundary (fail fast with good errors), and derive the static type via <code>z.infer</code> so runtime and compile-time views can never drift. Inside the validated core, the type system's guarantees then actually hold.</p></div>
+  </details>
+
+  <!-- ============================================================ -->
+  <h2 id="drills">Type-challenge drills</h2>
+  <p>Implement each in a scratch file or the TS Playground <em>before</em> expanding the solution. These are the exact style of live type-puzzles TS-heavy interviews use. Verify with the provided test lines — they should type-check (or fail) as annotated.</p>
+
+  <div class="exercise">
+    <h4>Drill 1 — <code>MyPick&lt;T, K&gt;</code></h4>
+    <p>Reimplement <code>Pick</code>: select a subset of keys from T. <code>MyPick&lt;Todo, 'title' | 'done'&gt;</code> → <code>{ title: string; done: boolean }</code>. Invalid keys must be a compile error.</p>
+    <details>
+      <summary>Solution &amp; explanation</summary>
+      <pre><code><span class="kw">type</span> <span class="typ">MyPick</span>&lt;<span class="typ">T</span>, <span class="typ">K</span> <span class="kw">extends keyof</span> <span class="typ">T</span>&gt; = {
+  [<span class="typ">P</span> <span class="kw">in</span> <span class="typ">K</span>]: <span class="typ">T</span>[<span class="typ">P</span>];
+};
+
+<span class="com">// tests</span>
+<span class="kw">interface</span> <span class="typ">Todo</span> { title: <span class="typ">string</span>; done: <span class="typ">boolean</span>; created: <span class="typ">Date</span> }
+<span class="kw">type</span> <span class="typ">T1</span> = <span class="typ">MyPick</span>&lt;<span class="typ">Todo</span>, <span class="str">'title'</span> | <span class="str">'done'</span>&gt;;   <span class="com">// { title: string; done: boolean }</span>
+<span class="kw">type</span> <span class="typ">T2</span> = <span class="typ">MyPick</span>&lt;<span class="typ">Todo</span>, <span class="str">'nope'</span>&gt;;              <span class="com">// ❌ error, as required</span></code></pre>
+      <p>Three features in one line: the <strong>constraint</strong> <code>K extends keyof T</code> rejects invalid keys at the call site; the <strong>mapped type</strong> <code>[P in K]</code> iterates the supplied union (not all of <code>keyof T</code>); the <strong>indexed access</strong> <code>T[P]</code> looks up each original value type. Because the map iterates <code>K</code> directly, only requested keys appear.</p>
+    </details>
+  </div>
+
+  <div class="exercise">
+    <h4>Drill 2 — <code>MyReturnType&lt;T&gt;</code></h4>
+    <p>Reimplement <code>ReturnType</code> without using it. Must handle <code>(x: number) =&gt; string</code> and functions with any arg list.</p>
+    <details>
+      <summary>Solution &amp; explanation</summary>
+      <pre><code><span class="kw">type</span> <span class="typ">MyReturnType</span>&lt;<span class="typ">T</span>&gt; =
+  <span class="typ">T</span> <span class="kw">extends</span> (...args: <span class="kw">any</span>[]) =&gt; <span class="kw">infer</span> <span class="typ">R</span> ? <span class="typ">R</span> : <span class="kw">never</span>;
+
+<span class="com">// tests</span>
+<span class="kw">type</span> <span class="typ">R1</span> = <span class="typ">MyReturnType</span>&lt;() =&gt; <span class="typ">number</span>&gt;;                 <span class="com">// number</span>
+<span class="kw">type</span> <span class="typ">R2</span> = <span class="typ">MyReturnType</span>&lt;(s: <span class="typ">string</span>) =&gt; <span class="typ">Promise</span>&lt;<span class="typ">boolean</span>&gt;&gt;; <span class="com">// Promise&lt;boolean&gt;</span>
+<span class="kw">type</span> <span class="typ">R3</span> = <span class="typ">MyReturnType</span>&lt;<span class="typ">string</span>&gt;;                        <span class="com">// never (not a function)</span></code></pre>
+      <p><code>infer R</code> in the return position asks the compiler to solve for the return type during the match. The params must be <code>...args: any[]</code>: parameters are <strong>contravariant</strong>, so <code>unknown[]</code> would fail to match functions with specific parameter types (a <code>(s: string) =&gt; …</code> is not assignable to <code>(...args: unknown[]) =&gt; …</code>) — <code>any</code> deliberately turns that check off. Volunteering that params-vs-<code>any</code> subtlety is exactly the depth interviewers hope for.</p>
+    </details>
+  </div>
+
+  <div class="exercise">
+    <h4>Drill 3 — <code>DeepReadonly&lt;T&gt;</code></h4>
+    <p>Make every property readonly <em>recursively</em>, leaving functions untouched. <code>Readonly&lt;T&gt;</code> is shallow — nested objects stay mutable.</p>
+    <details>
+      <summary>Solution &amp; explanation</summary>
+      <pre><code><span class="kw">type</span> <span class="typ">DeepReadonly</span>&lt;<span class="typ">T</span>&gt; = {
+  <span class="kw">readonly</span> [<span class="typ">K</span> <span class="kw">in keyof</span> <span class="typ">T</span>]:
+    <span class="typ">T</span>[<span class="typ">K</span>] <span class="kw">extends</span> (...args: <span class="kw">any</span>[]) =&gt; <span class="kw">any</span>
+      ? <span class="typ">T</span>[<span class="typ">K</span>]                       <span class="com">// leave functions alone</span>
+      : <span class="typ">T</span>[<span class="typ">K</span>] <span class="kw">extends</span> <span class="typ">object</span>
+        ? <span class="typ">DeepReadonly</span>&lt;<span class="typ">T</span>[<span class="typ">K</span>]&gt;       <span class="com">// recurse into objects (incl. arrays)</span>
+        : <span class="typ">T</span>[<span class="typ">K</span>];                    <span class="com">// primitives as-is</span>
+};
+
+<span class="com">// tests</span>
+<span class="kw">type</span> <span class="typ">D</span> = <span class="typ">DeepReadonly</span>&lt;{ a: { b: <span class="typ">number</span>[] }; f: () =&gt; <span class="kw">void</span> }&gt;;
+<span class="kw">declare const</span> d: <span class="typ">D</span>;
+d.a = { b: [] };      <span class="com">// ❌ readonly</span>
+d.a.b[<span class="num">0</span>] = <span class="num">1</span>;         <span class="com">// ❌ readonly (homomorphic map over the array)</span>
+d.f();                <span class="com">// ✅ still callable</span></code></pre>
+      <p>Key ideas: the <code>readonly</code> modifier applies at each level while recursion carries it downward; functions must be excluded <em>before</em> the <code>object</code> test (functions are objects — mapping over one would destroy its call signature); and because <code>{ [K in keyof T] … }</code> is homomorphic, arrays/tuples map elementwise into <code>readonly</code> arrays instead of degrading into keyed objects. Nuance to mention: naive recursion doesn't special-case <code>Map</code>/<code>Set</code>/<code>Date</code> — production versions add branches for them.</p>
+    </details>
+  </div>
+
+  <div class="exercise">
+    <h4>Drill 4 — <code>TupleToUnion&lt;T&gt;</code></h4>
+    <p><code>TupleToUnion&lt;['a', 'b', 1]&gt;</code> → <code>'a' | 'b' | 1</code>. Should also work for <code>as const</code> (readonly) tuples.</p>
+    <details>
+      <summary>Solution &amp; explanation</summary>
+      <pre><code><span class="kw">type</span> <span class="typ">TupleToUnion</span>&lt;<span class="typ">T</span> <span class="kw">extends readonly unknown</span>[]&gt; = <span class="typ">T</span>[<span class="typ">number</span>];
+
+<span class="com">// tests</span>
+<span class="kw">type</span> <span class="typ">U1</span> = <span class="typ">TupleToUnion</span>&lt;[<span class="str">'a'</span>, <span class="str">'b'</span>, <span class="num">1</span>]&gt;;              <span class="com">// 'a' | 'b' | 1</span>
+<span class="kw">const</span> arr = [<span class="str">'x'</span>, <span class="str">'y'</span>] <span class="kw">as const</span>;
+<span class="kw">type</span> <span class="typ">U2</span> = <span class="typ">TupleToUnion</span>&lt;<span class="kw">typeof</span> arr&gt;;               <span class="com">// 'x' | 'y'</span></code></pre>
+      <p>One-liner via <strong>indexed access with an index-type</strong>: <code>T[number]</code> means "the type you get indexing T with any number" — for a tuple, the union of all element types. The <code>readonly unknown[]</code> constraint is what accepts <code>as const</code> tuples (readonly arrays are the wider set; mutable arrays are assignable to them, not vice versa). This is the same idiom as the earlier <code>typeof ROLES[number]</code> single-source-of-truth pattern. An equivalent <code>infer</code>-based recursive solution exists, but reaching for <code>T[number]</code> first shows fluency.</p>
+    </details>
+  </div>
+
+  <div class="exercise">
+    <h4>Drill 5 — <code>MyAwaited&lt;T&gt;</code></h4>
+    <p>Unwrap a promise type — including <em>nested</em> promises and thenables: <code>MyAwaited&lt;Promise&lt;Promise&lt;string&gt;&gt;&gt;</code> → <code>string</code>.</p>
+    <details>
+      <summary>Solution &amp; explanation</summary>
+      <pre><code><span class="kw">type</span> <span class="typ">MyAwaited</span>&lt;<span class="typ">T</span>&gt; =
+  <span class="typ">T</span> <span class="kw">extends</span> <span class="typ">PromiseLike</span>&lt;<span class="kw">infer</span> <span class="typ">U</span>&gt;
+    ? <span class="typ">MyAwaited</span>&lt;<span class="typ">U</span>&gt;        <span class="com">// recurse — U might itself be a promise</span>
+    : <span class="typ">T</span>;
+
+<span class="com">// tests</span>
+<span class="kw">type</span> <span class="typ">A1</span> = <span class="typ">MyAwaited</span>&lt;<span class="typ">Promise</span>&lt;<span class="typ">string</span>&gt;&gt;;                    <span class="com">// string</span>
+<span class="kw">type</span> <span class="typ">A2</span> = <span class="typ">MyAwaited</span>&lt;<span class="typ">Promise</span>&lt;<span class="typ">Promise</span>&lt;<span class="typ">number</span>&gt;&gt;&gt;;           <span class="com">// number</span>
+<span class="kw">type</span> <span class="typ">A3</span> = <span class="typ">MyAwaited</span>&lt;<span class="typ">boolean</span>&gt;;                            <span class="com">// boolean (passthrough)</span>
+<span class="kw">type</span> <span class="typ">A4</span> = <span class="typ">MyAwaited</span>&lt;{ then(cb: (v: <span class="num">42</span>) =&gt; <span class="kw">void</span>): <span class="kw">void</span> }&gt;; <span class="com">// 42 (thenable!)</span></code></pre>
+      <p>Two deliberate choices: <strong><code>PromiseLike</code></strong>, not <code>Promise</code> — it only requires <code>then</code>, so custom thenables (which <code>await</code> genuinely unwraps at runtime) are handled, matching real semantics; and <strong>recursion</strong>, because <code>await</code> flattens nested promises. The base case is the false branch returning <code>T</code> unchanged. The real built-in <code>Awaited</code> adds edge handling for <code>null | undefined</code> and malformed <code>then</code>, but this captures the mechanism interviewers want.</p>
+    </details>
+  </div>
+
+  <div class="exercise">
+    <h4>Drill 6 — <code>First&lt;T&gt;</code> and <code>Last&lt;T&gt;</code></h4>
+    <p>Get the first and last element types of a tuple. <code>First&lt;[]&gt;</code> must be <code>never</code>.</p>
+    <details>
+      <summary>Solution &amp; explanation</summary>
+      <pre><code><span class="kw">type</span> <span class="typ">First</span>&lt;<span class="typ">T</span> <span class="kw">extends readonly unknown</span>[]&gt; =
+  <span class="typ">T</span> <span class="kw">extends readonly</span> [<span class="kw">infer</span> <span class="typ">F</span>, ...<span class="kw">infer</span> _<span class="typ">Rest</span>] ? <span class="typ">F</span> : <span class="kw">never</span>;
+
+<span class="kw">type</span> <span class="typ">Last</span>&lt;<span class="typ">T</span> <span class="kw">extends readonly unknown</span>[]&gt; =
+  <span class="typ">T</span> <span class="kw">extends readonly</span> [...<span class="kw">infer</span> _<span class="typ">Init</span>, <span class="kw">infer</span> <span class="typ">L</span>] ? <span class="typ">L</span> : <span class="kw">never</span>;
+
+<span class="com">// tests</span>
+<span class="kw">type</span> <span class="typ">F1</span> = <span class="typ">First</span>&lt;[<span class="str">'a'</span>, <span class="str">'b'</span>, <span class="str">'c'</span>]&gt;;  <span class="com">// 'a'</span>
+<span class="kw">type</span> <span class="typ">F2</span> = <span class="typ">First</span>&lt;[]&gt;;               <span class="com">// never — empty tuple fails the pattern</span>
+<span class="kw">type</span> <span class="typ">L1</span> = <span class="typ">Last</span>&lt;[<span class="num">1</span>, <span class="num">2</span>, <span class="num">3</span>]&gt;;         <span class="com">// 3</span></code></pre>
+      <p>This is <strong>variadic tuple pattern matching</strong>: <code>[infer F, ...infer Rest]</code> requires at least one element, so the empty tuple falls to the false branch — the <code>never</code> comes for free rather than needing a special case. Note <code>infer</code> can sit <em>after</em> a rest too (<code>[...Init, infer L]</code>), which is impossible in runtime JS destructuring — the type language is more expressive here. Alternative for First: <code>T extends [] ? never : T[0]</code>; the naive <code>T[0]</code> alone would be <code>undefined</code>-ish/wrong for the empty tuple.</p>
+    </details>
+  </div>
+
+  <div class="exercise">
+    <h4>Drill 7 — <code>CamelizeKeys&lt;T&gt;</code> (snake_case → camelCase keys)</h4>
+    <p>The API returns <code>{ user_id: number; created_at: string }</code>; your frontend wants <code>{ userId: number; createdAt: string }</code>. Write the type that renames the keys (one level deep is fine).</p>
+    <details>
+      <summary>Solution &amp; explanation</summary>
+      <pre><code><span class="kw">type</span> <span class="typ">CamelCase</span>&lt;<span class="typ">S</span> <span class="kw">extends</span> <span class="typ">string</span>&gt; =
+  <span class="typ">S</span> <span class="kw">extends</span> <span class="str">`${infer Head}_${infer Tail}`</span>
+    ? <span class="str">`${Head}${Capitalize&lt;CamelCase&lt;Tail&gt;&gt;}`</span>
+    : <span class="typ">S</span>;
+
+<span class="kw">type</span> <span class="typ">CamelizeKeys</span>&lt;<span class="typ">T</span>&gt; = {
+  [<span class="typ">K</span> <span class="kw">in keyof</span> <span class="typ">T</span> <span class="kw">as</span> <span class="typ">CamelCase</span>&lt;<span class="typ">K</span> &amp; <span class="typ">string</span>&gt;]: <span class="typ">T</span>[<span class="typ">K</span>];
+};
+
+<span class="com">// tests</span>
+<span class="kw">type</span> <span class="typ">Api</span> = { user_id: <span class="typ">number</span>; created_at: <span class="typ">string</span>; is_admin_user: <span class="typ">boolean</span> };
+<span class="kw">type</span> <span class="typ">Client</span> = <span class="typ">CamelizeKeys</span>&lt;<span class="typ">Api</span>&gt;;
+<span class="com">// { userId: number; createdAt: string; isAdminUser: boolean }</span></code></pre>
+      <p>Trace <code>CamelCase&lt;'is_admin_user'&gt;</code>: matches with <code>Head='is'</code>, <code>Tail='admin_user'</code> (first <code>infer</code> matches minimally, splitting at the <em>first</em> underscore) → <code>`is${Capitalize&lt;CamelCase&lt;'admin_user'&gt;&gt;}`</code> → inner call yields <code>'adminUser'</code> → <code>Capitalize</code> → <code>'AdminUser'</code> → <code>'isAdminUser'</code>. The mapped type then uses <strong>key remapping</strong> (<code>as</code>) to apply it per key; <code>K &amp; string</code> filters out symbol/number keys, which template literals can't accept. Follow-up they may ask: make it deep — recurse on <code>T[K] extends object</code> like DeepReadonly.</p>
+    </details>
+  </div>
+
+  <div class="exercise">
+    <h4>Drill 8 — <code>ExtractParams&lt;Path&gt;</code> (the typed-router finale)</h4>
+    <p>From <code>'/users/:id/posts/:postId'</code> produce a params object type <code>{ id: string; postId: string }</code>. Stretch goal: make <code>:id(number)</code>-style segments unnecessary but support a trailing catch-all <code>*</code>.</p>
+    <details>
+      <summary>Solution &amp; explanation</summary>
+      <pre><code><span class="kw">type</span> <span class="typ">ExtractParams</span>&lt;<span class="typ">Path</span> <span class="kw">extends</span> <span class="typ">string</span>&gt; =
+  <span class="typ">Path</span> <span class="kw">extends</span> <span class="str">`${infer _Pre}:${infer Param}/${infer Rest}`</span>
+    ? { [<span class="typ">K</span> <span class="kw">in</span> <span class="typ">Param</span>]: <span class="typ">string</span> } &amp; <span class="typ">ExtractParams</span>&lt;<span class="typ">Rest</span>&gt;
+    : <span class="typ">Path</span> <span class="kw">extends</span> <span class="str">`${infer _Pre}:${infer Param}`</span>
+      ? { [<span class="typ">K</span> <span class="kw">in</span> <span class="typ">Param</span>]: <span class="typ">string</span> }
+      : {};
+
+<span class="com">// prettify the intersection for readable hovers (a pro move):</span>
+<span class="kw">type</span> <span class="typ">Prettify</span>&lt;<span class="typ">T</span>&gt; = { [<span class="typ">K</span> <span class="kw">in keyof</span> <span class="typ">T</span>]: <span class="typ">T</span>[<span class="typ">K</span>] } &amp; {};
+<span class="kw">type</span> <span class="typ">RouteParams</span>&lt;<span class="typ">P</span> <span class="kw">extends</span> <span class="typ">string</span>&gt; = <span class="typ">Prettify</span>&lt;<span class="typ">ExtractParams</span>&lt;<span class="typ">P</span>&gt;&gt;;
+
+<span class="com">// tests</span>
+<span class="kw">type</span> <span class="typ">P1</span> = <span class="typ">RouteParams</span>&lt;<span class="str">'/users/:id/posts/:postId'</span>&gt;; <span class="com">// { id: string; postId: string }</span>
+<span class="kw">type</span> <span class="typ">P2</span> = <span class="typ">RouteParams</span>&lt;<span class="str">'/about'</span>&gt;;                    <span class="com">// {}</span>
+<span class="kw">type</span> <span class="typ">P3</span> = <span class="typ">RouteParams</span>&lt;<span class="str">'/files/:name'</span>&gt;;              <span class="com">// { name: string }</span></code></pre>
+      <p>Mechanics: the first pattern captures a param that is <em>followed by more path</em> — earlier <code>infer</code> holes match as little as possible up to the next literal character, so <code>Param</code> stops at the <code>/</code>; recursion continues on <code>Rest</code>. The second pattern catches a trailing param (no <code>/</code> after it). Base case: no <code>:</code> at all → <code>{}</code> (the identity for intersection). <code>{ [K in Param]: string }</code> is a mapped type over the single-literal union — a tidy way to build a one-key object from an inferred string. <code>Prettify</code> flattens <code>{id} &amp; {postId}</code> into one object in hovers/errors — knowing that trick marks you as someone who's shipped type-level code others had to read. This is precisely how TanStack Router and tRPC-style libraries type their APIs.</p>
+    </details>
+  </div>
+
+  <hr>
+  <p><strong>Where to go next:</strong> the React typing patterns here feed straight into the rendering internals chapter — knowing <em>what</em> the types promise makes it much easier to reason about <em>when</em> React actually does the work.</p>
+
+  <nav class="page-nav">
+    <a href="05-js-async-implementations.html">← Prev: Async JS &amp; Drills</a>
+    <a href="07-react-rendering-internals.html">Next: React Rendering Internals →</a>
+  </nav>
+
+</main>
+</body>
+</html>

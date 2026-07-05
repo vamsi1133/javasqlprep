@@ -1,0 +1,1201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>14 — Next.js &amp; Rendering Strategies | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <div class="breadcrumb"><a href="index.html">← Course Home</a></div>
+    <h1>14 — Next.js &amp; Rendering Strategies</h1>
+    <p>CSR vs SSR vs SSG vs ISR vs streaming, hydration, the App Router's four caches — and how to argue the trade-offs like an architect.</p>
+  </div>
+</header>
+<main class="container">
+
+<section>
+  <h2>Why interviewers ask this</h2>
+  <p>
+    "How would you render this page, and why?" is one of the most reliable senior-frontend interview questions in existence.
+    It is a perfect discriminator: a mid-level engineer answers with a framework name ("I'd use Next.js"), while a senior
+    engineer answers with a <strong>decision process</strong> — who the users are, whether SEO matters, how fresh the data must be,
+    whether the page is personalized, what infra the team can operate, and what each strategy costs in first paint,
+    interactivity, and server dollars. The rendering strategy question has no single right answer, which is exactly why
+    interviewers love it: it exposes how you think.
+  </p>
+  <p>
+    Next.js matters here for a pragmatic reason: it is the <em>reference implementation</em> interviewers assume. When a panel
+    says "SSR", "ISR", "server components", or "streaming", they are almost always picturing Next.js semantics. Even if
+    you'd choose Remix or a Vite SPA in real life, you need to speak fluent Next — especially the App Router's caching
+    model, which is notoriously confusing and therefore a favorite place to probe depth. FAANG interviews use this topic
+    in system-design rounds ("design a news site / e-commerce PDP / dashboard"); startup interviews use it to check you
+    can make architecture calls without a platform team behind you.
+  </p>
+  <div class="senior">
+    <strong>Senior signal:</strong> the single strongest move in this topic is <em>per-page thinking</em>. Rendering strategy is not
+    an app-level decision; it's a page-level (even component-level, with streaming and PPR) decision. Saying
+    "the marketing pages are SSG on a CDN, the product pages are ISR, the checkout is SSR because it's personalized,
+    and the account dashboard is effectively CSR behind auth" in one breath is worth more than an hour of framework trivia.
+  </div>
+</section>
+
+<div class="toc">
+  <strong>On this page</strong>
+  <ul>
+    <li><a href="#spectrum">1. The rendering spectrum (framework-agnostic)</a></li>
+    <li><a href="#hydration">2. Hydration, deeply</a></li>
+    <li><a href="#app-router">3. The Next.js App Router model</a></li>
+    <li><a href="#caching">4. Data fetching &amp; the four caches</a></li>
+    <li><a href="#streaming">5. Streaming in Next.js</a></li>
+    <li><a href="#pages-router">6. Pages Router literacy (legacy &amp; migrations)</a></li>
+    <li><a href="#performance">7. The Next.js performance toolkit</a></li>
+    <li><a href="#seo">8. SEO in Next.js</a></li>
+    <li><a href="#decision">9. The decision conversation (rehearse this)</a></li>
+    <li><a href="#deployment">10. Deployment awareness</a></li>
+    <li><a href="#qa">Interview Q&amp;A</a></li>
+    <li><a href="#exercises">Hands-on exercises</a></li>
+  </ul>
+</div>
+
+<!-- ================================================================ -->
+<h2 id="spectrum">1. The rendering spectrum <span class="tier-1">Tier 1 — must know cold</span></h2>
+<p>
+  Before any Next.js API, own the framework-agnostic mental model. Every rendering strategy answers one question:
+  <strong>where and when is the HTML for this page produced?</strong> At build time, at request time on a server, or at runtime
+  in the browser? Everything else — SEO, first paint, infra cost, data freshness — falls out of that answer.
+</p>
+
+<h3>1.1 CSR — Client-Side Rendering</h3>
+<p>
+  The server (or CDN) sends a nearly empty HTML shell plus a JavaScript bundle. The browser downloads, parses, and
+  executes the JS; React then fetches data and renders the UI into an empty <code>&lt;div id="root"&gt;</code>. This is the classic
+  Create React App / Vite SPA model.
+</p>
+<pre>
+CSR timeline (user on a mid-range phone, 4G):
+
+t0 ──── request ────► CDN returns ~1KB shell        (TTFB: great, page: blank)
+t1 ◄─── shell HTML ── &lt;div id="root"&gt;&lt;/div&gt;
+t2 ──── fetch JS ───► download 300KB bundle          (still blank / spinner)
+t3      parse + execute JS                           (still blank)
+t4 ──── fetch data ─► API round-trip                 (skeleton at best)
+t5      React renders                                FCP + LCP happen HERE, late
+t6      interactive                                  TTI ≈ FCP (once painted, it works)
+
+|--blank--|--blank--|--spinner--|== content + interactive ==|
+</pre>
+<ul>
+  <li><strong>First paint story:</strong> worst of all strategies — nothing meaningful paints until JS downloads, executes, and data arrives. It's a <em>waterfall</em>: HTML → JS → data → render.</li>
+  <li><strong>TTI story:</strong> ironically decent <em>relative to FCP</em> — the moment content appears, it's interactive, because the client rendered it. There's no hydration gap. The problem is everything happens late.</li>
+  <li><strong>SEO:</strong> historically poor. Googlebot does execute JS (second-wave indexing), but it's slower, budgeted, and other crawlers (social link unfurlers, some search engines) don't. If organic search or link previews matter, CSR is a liability.</li>
+  <li><strong>When CSR is genuinely fine:</strong> authenticated dashboards, admin panels, internal tools, editors — pages behind a login where SEO is irrelevant, users are on repeat visits with warm caches, and app-like interactivity dominates. Do not apologize for CSR in these cases; it's the <em>simplest</em> architecture (static hosting, no server to run).</li>
+</ul>
+
+<h3>1.2 SSR — Server-Side Rendering (per request)</h3>
+<p>
+  The server renders the React tree to an HTML string <em>on every request</em>, sends it down, then the client downloads JS
+  and <strong>hydrates</strong> (attaches interactivity — section 2). The user sees content fast but can't interact until hydration completes.
+</p>
+<pre>
+SSR timeline:
+
+t0 ──── request ────► server: fetch data + renderToString   (TTFB: SLOWER —
+t1 ◄─── full HTML ──  content visible! FCP/LCP early          you pay data +
+t2 ──── fetch JS ───► bundle downloads in background           render per req)
+t3      hydration runs                                        TTI happens here
+        ── the gap between t1 and t3 is "visible but dead" ──
+
+|--wait TTFB--|===== content visible (dead) =====|== interactive ==|
+</pre>
+<ul>
+  <li><strong>Fast FCP, delayed TTI:</strong> the inverse of CSR. Content is visible early; interactivity lags behind JS + hydration. The FCP→TTI gap is the "uncanny valley" (section 2.3).</li>
+  <li><strong>TTFB sensitivity:</strong> the whole page waits on the <em>slowest</em> data fetch on the server. One slow downstream API = slow TTFB = blank screen. This is the problem streaming solves.</li>
+  <li><strong>Server cost:</strong> every request costs CPU (rendering React on the server is not free) and holds a connection. You need servers, autoscaling, monitoring — real infra, unlike SSG/CSR on a CDN.</li>
+  <li><strong>Personalization:</strong> the killer feature. Because HTML is produced per request, it can read cookies, auth, geo, A/B buckets — fully personalized HTML with fast first paint. SSG can't do this; CSR does it late.</li>
+</ul>
+
+<h3>1.3 SSG — Static Site Generation (build time)</h3>
+<p>
+  HTML is rendered <em>once at build time</em>, output as static files, and served from a CDN. Requests never touch your origin.
+</p>
+<pre>
+SSG timeline:
+
+BUILD TIME (once):   fetch data ─► render ─► write .html files ─► deploy to CDN
+
+REQUEST TIME (every user):
+t0 ──── request ────► CDN edge (nearest PoP)      TTFB: near-instant
+t1 ◄─── full HTML ──  content visible immediately  FCP: best possible
+t2      JS + hydration                             TTI: after hydration
+
+|== content visible ==|== interactive ==|          (no origin involved)
+</pre>
+<ul>
+  <li><strong>Best case for everything except freshness:</strong> fastest FCP, effectively zero marginal infra cost, perfect SEO, trivially scalable to any traffic spike (it's just CDN cache hits).</li>
+  <li><strong>The stale-data problem:</strong> the page shows the world as it was at the last build. Price changed? Article corrected? You must rebuild and redeploy. This is what ISR fixes.</li>
+  <li><strong>Build-time scaling:</strong> 50 marketing pages: fine. 2 million product pages: your build takes hours and rebuilds on every content change. Rule of thumb — SSG all pages when the page count is small and change frequency is low; beyond that you need ISR (build a subset, generate the rest on demand) or SSR.</li>
+  <li><strong>No personalization in the HTML:</strong> everyone gets identical bytes. Personalization must layer on client-side (or via edge middleware rewrites).</li>
+</ul>
+
+<h3>1.4 ISR — Incremental Static Regeneration</h3>
+<p>
+  SSG plus a revalidation contract: static pages that <em>regenerate in the background</em>. Semantically it's
+  <strong>stale-while-revalidate applied to HTML</strong>, which is exactly the phrase to use in an interview.
+</p>
+<pre>
+ISR with revalidate: 60
+
+t=0     build generates page v1
+t=30    request ─► serve v1 (fresh, cache hit)
+t=90    request ─► serve v1 (STALE — but served instantly)
+                   └─► background: regenerate ─► v2 stored
+t=95    request ─► serve v2
+
+Key semantics:
+  • The user who triggers regeneration STILL GETS THE STALE PAGE. Nobody waits.
+  • revalidate is a MINIMUM staleness window, not a cron — regeneration happens
+    lazily, on the first request after expiry.
+  • First request to a never-built path (with fallback) can block-render on demand,
+    then the result is cached like any other static page.
+</pre>
+<ul>
+  <li><strong>Time-based revalidation:</strong> "this page may be up to N seconds stale." Great default for content/commerce catalog pages.</li>
+  <li><strong>On-demand revalidation:</strong> your CMS webhook calls <code>revalidatePath('/blog/slug')</code> or <code>revalidateTag('products')</code> — pages are effectively fresh <em>and</em> static. This is the modern best-of-both answer for content sites: "static until the data actually changes."</li>
+  <li><strong>Cost model:</strong> CDN economics for reads, occasional server render for regeneration. Handles the "2M product pages" problem: prebuild the top 10k, generate the long tail on first request.</li>
+</ul>
+
+<h3>1.5 Streaming SSR</h3>
+<p>
+  Instead of waiting for <em>all</em> server data before sending any HTML, the server flushes the shell immediately and streams
+  slow sections as they resolve, using Suspense boundaries as the seams. HTTP chunked transfer; React inlines small
+  scripts that swap fallbacks for real content as chunks arrive.
+</p>
+<pre>
+Classic SSR:        [.... wait for slowest fetch ....][ send everything ]
+                    TTFB gated by slowest data
+
+Streaming SSR:      [ send shell + fast parts ]───►  user sees layout now
+                        [ stream &lt;Suspense&gt; hole #1 when ready ]───►
+                            [ stream hole #2 when ready ]───►
+                    TTFB gated by NOTHING slow; slow parts show fallbacks
+
+&lt;Layout&gt;                          ← flushed immediately
+  &lt;Header /&gt;                      ← flushed immediately
+  &lt;Suspense fallback={Skeleton}&gt;
+    &lt;SlowRecommendations /&gt;       ← streamed at t+800ms
+  &lt;/Suspense&gt;
+&lt;/Layout&gt;
+</pre>
+<div class="note">
+  <strong>Framing for interviews:</strong> streaming doesn't make the slow data faster — it decouples TTFB and FCP from the
+  slowest fetch, converting a blank-screen wait into a progressive reveal. It improves <em>perceived</em> performance and
+  real FCP/LCP for the fast parts.
+</div>
+
+<h3>1.6 The comparison table (memorize the shape)</h3>
+<table>
+  <thead>
+    <tr><th>Strategy</th><th>FCP</th><th>TTI</th><th>SEO</th><th>Data freshness</th><th>Infra cost</th><th>Personalization</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><strong>CSR</strong></td><td>Worst (JS-gated)</td><td>Late but = FCP</td><td>Weak</td><td>Live (client fetch)</td><td>Lowest (static host)</td><td>Yes, but late</td></tr>
+    <tr><td><strong>SSR</strong></td><td>Fast (TTFB-gated)</td><td>FCP + hydration gap</td><td>Excellent</td><td>Live (per request)</td><td>High (render per req)</td><td>Full, in HTML</td></tr>
+    <tr><td><strong>SSG</strong></td><td>Best (CDN)</td><td>FCP + hydration gap</td><td>Excellent</td><td>Stale until rebuild</td><td>Near zero</td><td>None in HTML</td></tr>
+    <tr><td><strong>ISR</strong></td><td>Best (CDN)</td><td>FCP + hydration gap</td><td>Excellent</td><td>Bounded staleness / on-demand</td><td>Low</td><td>None in HTML</td></tr>
+    <tr><td><strong>Streaming SSR</strong></td><td>Fast (shell-gated)</td><td>Progressive (selective hydration)</td><td>Excellent</td><td>Live</td><td>High</td><td>Full, progressive</td></tr>
+  </tbody>
+</table>
+
+<h3>1.7 Per-page strategy thinking</h3>
+<p>
+  Real apps mix strategies. A typical e-commerce architecture, page by page:
+</p>
+<table>
+  <thead><tr><th>Page</th><th>Strategy</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td>Home / landing / marketing</td><td>SSG (+ on-demand revalidate from CMS)</td><td>SEO-critical, identical for everyone, changes rarely</td></tr>
+    <tr><td>Product detail (PDP)</td><td>ISR + stream the personalized bits (price for logged-in tier, stock)</td><td>SEO-critical, mostly shared, a few live/personal fields</td></tr>
+    <tr><td>Search results</td><td>SSR (or streamed SSR)</td><td>Infinite query space — can't prebuild; SEO for category queries</td></tr>
+    <tr><td>Cart / checkout</td><td>SSR or CSR</td><td>Fully personalized, zero SEO value, must be fresh</td></tr>
+    <tr><td>Account dashboard</td><td>CSR-ish (static shell + client fetch) or dynamic SSR</td><td>Behind auth, no SEO, interactivity-heavy</td></tr>
+  </tbody>
+</table>
+<div class="pitfall">
+  <strong>Pitfall:</strong> answering "which rendering strategy?" for the whole app. The moment you say "it depends on the page —
+  let me go page by page", you've differentiated yourself from most candidates.
+</div>
+
+<!-- ================================================================ -->
+<h2 id="hydration">2. Hydration, deeply <span class="tier-1">Tier 1 — must know cold</span></h2>
+
+<h3>2.1 What hydration actually is</h3>
+<p>
+  Server rendering gives the browser inert HTML — pixels, no behavior. Hydration is React running on the client,
+  rendering the <em>same</em> component tree in memory, and instead of creating new DOM nodes, <strong>adopting the existing
+  server-rendered DOM</strong>: it walks the HTML, matches each element to its fiber, wires up React's synthetic event system,
+  and initializes state/effects. After hydration, the page behaves exactly as if it had been client-rendered.
+</p>
+<pre>
+Server:   ReactDOMServer.renderTo(Pipeable)Stream(&lt;App /&gt;)  ─►  HTML string
+Client:   hydrateRoot(document.getElementById('root'), &lt;App /&gt;)
+             │
+             ├─ re-render &lt;App /&gt; in memory (build the fiber tree)
+             ├─ MATCH each fiber to an existing DOM node (adopt, don't create)
+             ├─ attach event listeners (React 17+: delegated at the root)
+             └─ run effects, initialize state
+</pre>
+<div class="note">
+  Key implication: hydration <strong>re-executes all your component code on the client anyway</strong>. Classic SSR ships the
+  rendering work twice — once as HTML, once as JS that re-derives the same tree. This double-payment is the motivation
+  for Server Components (ship no JS for server-only components) and islands architecture.
+</div>
+
+<h3>2.2 Hydration mismatches — the classic bug class</h3>
+<p>
+  React hydration assumes server HTML and the client's first render produce <strong>identical output</strong>. If they differ, React
+  warns ("Hydration failed because the initial UI does not match…"), and in React 18 it discards the server HTML for
+  the affected subtree and client-renders from scratch — you lose the SSR benefit and can get visible flicker.
+</p>
+<p><strong>The canonical causes (know all four):</strong></p>
+<table>
+  <thead><tr><th>Cause</th><th>Example</th><th>Fix</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Time / locale / randomness</td>
+      <td><code>new Date().toLocaleString()</code>, <code>Math.random()</code>, <code>crypto.randomUUID()</code> in render — server value ≠ client value</td>
+      <td>Compute once on the server and pass as prop; or render in <code>useEffect</code>; <code>suppressHydrationWarning</code> for a lone timestamp <code>&lt;time&gt;</code></td>
+    </tr>
+    <tr>
+      <td>Environment branching in render</td>
+      <td><code>typeof window !== 'undefined' ? &lt;Widget/&gt; : null</code> — server renders null, client renders widget on first pass</td>
+      <td>Gate on mounted state via <code>useEffect</code>, or <code>next/dynamic</code> with <code>ssr: false</code></td>
+    </tr>
+    <tr>
+      <td>Client-only state read during render</td>
+      <td>Reading <code>localStorage</code>/<code>matchMedia</code> for theme/viewport in the initial render</td>
+      <td>Render a neutral default on both sides; correct after mount (or use a cookie so the server knows too)</td>
+    </tr>
+    <tr>
+      <td>Third parties mutating HTML</td>
+      <td>Browser extensions (Grammarly, password managers) injecting attributes before hydration; also invalid HTML nesting (<code>&lt;p&gt;&lt;div&gt;</code>) that browsers "fix"</td>
+      <td>Not your bug for extensions — recognize it in triage; fix invalid nesting since the parser-corrected DOM won't match React's tree</td>
+    </tr>
+  </tbody>
+</table>
+<pre><code>// The standard "client-only after mount" pattern:
+function LocalTime({ iso }: { iso: string }) {
+  const [mounted, setMounted] = useState(false);
+  useEffect(() =&gt; setMounted(true), []);
+  // Server + first client render agree (both render the ISO string),
+  // then we upgrade to the locale-formatted version after mount.
+  return &lt;time dateTime={iso}&gt;{mounted ? new Date(iso).toLocaleString() : iso}&lt;/time&gt;;
+}
+
+// Legitimate suppressHydrationWarning — a single text node you EXPECT to differ:
+&lt;time dateTime={iso} suppressHydrationWarning&gt;
+  {new Date(iso).toLocaleString()}
+&lt;/time&gt;
+
+// Skip SSR entirely for a genuinely client-only widget (maps, charts, editors):
+const Map = dynamic(() =&gt; import('./Map'), { ssr: false });</code></pre>
+<div class="pitfall">
+  <strong>Pitfall:</strong> <code>suppressHydrationWarning</code> is one element deep and only silences text/attribute mismatches —
+  it is not a fix for structural mismatches, and sprinkling it everywhere hides real bugs. Use it for the timestamp
+  case; use effect-gating or <code>ssr: false</code> for structural differences.
+</div>
+
+<h3>2.3 The uncanny valley: visible but dead</h3>
+<p>
+  Between FCP (HTML painted) and hydration completing, the page <em>looks</em> interactive but isn't: buttons don't respond,
+  inputs may drop focus, clicks vanish. On low-end devices with big bundles this gap can be seconds. Users rage-click.
+  This is the core UX criticism of naive SSR and the reason "just SSR everything" is not a senior answer.
+</p>
+<pre>
+FCP                                TTI
+ │◄──────── uncanny valley ────────►│
+ │  page painted, JS still loading, │
+ │  handlers not attached — clicks  │
+ │  are silently lost               │
+</pre>
+
+<h3>2.4 Selective hydration (React 18) — the fix</h3>
+<p>
+  Pre-18, hydration was all-or-nothing: one synchronous pass over the whole tree; nothing interactive until everything
+  was. React 18 + Suspense changes this:
+</p>
+<ul>
+  <li><strong>Streaming boundaries:</strong> each <code>&lt;Suspense&gt;</code> boundary is an independent unit — its HTML can arrive late (streamed) and hydrate independently, before or after siblings.</li>
+  <li><strong>Hydration doesn't wait for all JS/data:</strong> boundaries hydrate as their code and content become available.</li>
+  <li><strong>Interaction-driven prioritization:</strong> if the user clicks inside a not-yet-hydrated boundary, React <em>synchronously prioritizes hydrating that boundary first</em>, and replays the event. The comment section the user is touching hydrates before the footer.</li>
+  <li><strong>Interruptible:</strong> hydration happens in concurrent chunks, so it doesn't block the main thread in one long task.</li>
+</ul>
+<pre>
+Without Suspense:   [========= hydrate entire app (one long task) =========] TTI
+With boundaries:    [hydrate nav] [hydrate hero]      user clicks comments!
+                                        └─► [hydrate comments NOW] ... [sidebar]
+</pre>
+<div class="senior">
+  <strong>Senior soundbite:</strong> "Suspense boundaries are simultaneously streaming seams on the server and hydration units on
+  the client. React 18 turned hydration from a monolithic blocking pass into a prioritized, interruptible, per-boundary
+  schedule — which is what makes SSR's uncanny valley tolerable at scale."
+</div>
+
+<h3>2.5 Islands &amp; resumability (literacy level)</h3>
+<ul>
+  <li><strong>Islands (Astro):</strong> the page is static HTML by default; only explicitly-marked interactive components ("islands") ship JS and hydrate — <code>&lt;Counter client:visible /&gt;</code> hydrates when scrolled into view. For content-heavy sites this can mean 90%+ less JS than a React SSR app. React Server Components are philosophically similar (server-only components ship zero JS) but inverted defaults: Astro is static-first, RSC is server-rendered-React-first.</li>
+  <li><strong>Resumability (Qwik):</strong> skips hydration entirely — the server serializes app state and listener wiring into the HTML, and the client <em>resumes</em> execution lazily on interaction, downloading only the handler code needed. One-liner for interviews: "Qwik's bet is that hydration is unnecessary work; you resume where the server left off instead of replaying the render."</li>
+</ul>
+
+<!-- ================================================================ -->
+<h2 id="app-router">3. The Next.js App Router model <span class="tier-1">Tier 1 — must know cold</span></h2>
+
+<h3>3.1 File conventions</h3>
+<pre><code>app/
+├── layout.tsx          // root layout (required): &lt;html&gt;&lt;body&gt; — wraps everything
+├── page.tsx            // route UI for "/"
+├── loading.tsx         // automatic &lt;Suspense&gt; fallback for this segment
+├── error.tsx           // error boundary ('use client', receives error + reset)
+├── not-found.tsx       // 404 UI for notFound()
+├── template.tsx        // like layout but REMOUNTS on every navigation
+├── (marketing)/        // route group — organizes files, no URL segment
+│   ├── layout.tsx      //   separate layout for marketing pages
+│   └── about/page.tsx  //   → /about
+├── blog/
+│   └── [slug]/page.tsx // dynamic segment → params.slug
+├── shop/[...parts]/    // catch-all;  [[...parts]] = optional catch-all
+└── api/things/route.ts // route handler (GET/POST/... exports)</code></pre>
+<table>
+  <thead><tr><th>File</th><th>The interview-relevant behavior</th></tr></thead>
+  <tbody>
+    <tr><td><code>layout.tsx</code></td><td><strong>Persists across navigations</strong> — does not re-render or lose state when children change. Nested layouts compose (root → segment → leaf). Layouts do not receive <code>searchParams</code> (they don't re-render on navigation, so the value would go stale).</td></tr>
+    <tr><td><code>template.tsx</code></td><td>Same nesting position as layout, but a <strong>fresh instance per navigation</strong> — state resets, effects re-run. Use for enter animations or per-page reset semantics.</td></tr>
+    <tr><td><code>loading.tsx</code></td><td>Sugar for wrapping the segment's page in <code>&lt;Suspense fallback={&lt;Loading/&gt;}&gt;</code>. This is what enables instant navigation + streaming with zero manual wiring.</td></tr>
+    <tr><td><code>error.tsx</code></td><td>Becomes a React error boundary around the segment. Must be a client component. Receives <code>{ error, reset }</code> — <code>reset()</code> re-renders the segment to retry. Does not catch errors in the layout above it (put <code>global-error.tsx</code> at the root for that).</td></tr>
+    <tr><td>Route groups <code>(name)</code></td><td>Group segments under different layouts without affecting URLs — e.g. <code>(marketing)</code> vs <code>(app)</code> with different shells.</td></tr>
+  </tbody>
+</table>
+
+<h3>3.2 Server Components by default</h3>
+<p>
+  Every component in <code>app/</code> is a <strong>React Server Component (RSC)</strong> unless a module (or an importer above it) declares
+  <code>'use client'</code>. Recap from tutorial 10, condensed to what this tutorial needs:
+</p>
+<ul>
+  <li>Server components run <em>only</em> on the server (build time or request time). Their code, their dependencies, and their data-fetching secrets <strong>never ship to the browser</strong>. They can be <code>async</code> and <code>await</code> data directly.</li>
+  <li>They cannot use state, effects, event handlers, or browser APIs. Anything interactive needs <code>'use client'</code>.</li>
+  <li><code>'use client'</code> marks a <strong>boundary</strong>, not a single component: everything it imports becomes client-bundle code. Server components can be passed <em>through</em> a client component as <code>children</code>/props (the "slot" pattern) without becoming client code.</li>
+  <li><strong>Placement heuristic: push client boundaries to the leaves.</strong> A page is a server component; the like button, the search input, the dropdown are small client islands. Marking a page-level component <code>'use client'</code> drags the whole subtree into the bundle — the most common RSC design smell.</li>
+</ul>
+<pre><code>// app/products/[id]/page.tsx — server component (default)
+import { AddToCart } from './add-to-cart';        // client island (leaf)
+
+export default async function ProductPage(
+  { params }: { params: Promise&lt;{ id: string }&gt; }  // Next 15: params is async
+) {
+  const { id } = await params;
+  const product = await db.products.find(id);       // direct data access, no API hop
+  return (
+    &lt;article&gt;
+      &lt;h1&gt;{product.name}&lt;/h1&gt;
+      &lt;p&gt;{product.description}&lt;/p&gt;
+      &lt;AddToCart id={product.id} /&gt;                 {/* only THIS ships JS */}
+    &lt;/article&gt;
+  );
+}</code></pre>
+<div class="note">
+  Important mental correction interviewers listen for: <strong>client components are still server-rendered to HTML</strong> on the
+  initial request (then hydrated). <code>'use client'</code> means "ships JS and hydrates," not "renders only in the browser."
+</div>
+
+<h3>3.3 Nested layouts &amp; the data pattern</h3>
+<p>
+  Each layout and page fetches its <em>own</em> data — there's no <code>getServerSideProps</code>-style single provider per route.
+  Layout and page fetches run in parallel (they're siblings in the tree), and <strong>request memoization</strong> (section 4.1)
+  means the layout and the page can both call <code>getUser()</code> without a duplicate network hit. Don't thread data through
+  props across layout levels; fetch where you need it and let the cache dedupe.
+</p>
+
+<h3>3.4 Parallel &amp; intercepting routes (awareness level)</h3>
+<ul>
+  <li><strong>Parallel routes:</strong> named slots — <code>app/@feed/page.tsx</code> and <code>app/@modal/page.tsx</code> both render into the parent layout as props (<code>{ feed, modal }</code>). Each slot can have its own loading/error states and navigate independently. <code>default.tsx</code> supplies a slot's fallback when it has no match.</li>
+  <li><strong>Intercepting routes:</strong> <code>(.)photo/[id]</code> intercepts navigation to <code>/photo/123</code> <em>from within the current layout</em> and renders it in place (e.g. into the <code>@modal</code> slot) instead of a full page change.</li>
+  <li><strong>The pattern to cite — modal over feed (Instagram-style):</strong> click a photo in the feed → intercepted route renders it as a modal over the feed; the URL is <code>/photo/123</code>, so refresh or direct-link renders the full photo page. Shareable modal URLs without duplicating the photo UI in two places.</li>
+</ul>
+
+<h3>3.5 Route handlers</h3>
+<pre><code>// app/api/products/route.ts
+import { NextResponse } from 'next/server';
+
+export async function GET(request: Request) {
+  const { searchParams } = new URL(request.url);
+  const items = await db.products.list({ q: searchParams.get('q') });
+  return NextResponse.json(items);
+}
+
+export async function POST(request: Request) {
+  const body = await request.json();
+  const created = await db.products.create(body);
+  return NextResponse.json(created, { status: 201 });
+}</code></pre>
+<p>
+  Web-standard <code>Request</code>/<code>Response</code>, HTTP-verb exports, per-route <code>runtime = 'edge' | 'nodejs'</code>. Use them for
+  webhooks, public APIs, and non-React clients. For your own app's mutations, prefer server actions; and note that
+  server components should call the database/service directly rather than fetching their own route handlers (a
+  pointless self-HTTP hop is a classic code-review catch).
+</p>
+
+<h3>3.6 Middleware</h3>
+<pre><code>// middleware.ts (project root) — runs BEFORE the route, on the edge runtime
+import { NextResponse, type NextRequest } from 'next/server';
+
+export function middleware(request: NextRequest) {
+  const session = request.cookies.get('session');
+  if (!session &amp;&amp; request.nextUrl.pathname.startsWith('/app')) {
+    return NextResponse.redirect(new URL('/login', request.url));
+  }
+  return NextResponse.next();
+}
+export const config = { matcher: ['/app/:path*'] };</code></pre>
+<ul>
+  <li><strong>Use for:</strong> auth gating/redirects, locale routing, A/B bucket assignment via cookie + rewrite, header manipulation — cheap decisions close to the user, before rendering.</li>
+  <li><strong>Limitations (say these):</strong> edge runtime — no Node APIs, no direct DB drivers (TCP), tight CPU/size budgets, and it runs on <em>every matched request</em>, so keep it fast. Check a session cookie's validity here; don't run your full ORM-backed authorization. Treat middleware auth as optimistic UX-level gating, and re-verify in the data layer (there was a real middleware-bypass CVE in 2025 — defense in depth is the lesson).</li>
+</ul>
+
+<h3>3.7 Server actions</h3>
+<pre><code>// app/posts/actions.ts
+'use server';
+import { revalidatePath, revalidateTag } from 'next/cache';
+import { redirect } from 'next/navigation';
+
+export async function createPost(formData: FormData) {
+  const user = await requireUser();                    // ALWAYS re-auth inside the action
+  const title = String(formData.get('title'));
+  const post = await db.posts.create({ title, userId: user.id });
+  revalidateTag('posts');                              // purge cached data for this tag
+  redirect(`/posts/${post.id}`);
+}
+
+// In a server component — progressively enhanced (works before hydration):
+&lt;form action={createPost}&gt;
+  &lt;input name="title" /&gt;
+  &lt;button type="submit"&gt;Create&lt;/button&gt;
+&lt;/form&gt;</code></pre>
+<ul>
+  <li>A server action compiles to an RPC endpoint the framework wires up; the client posts to it — no hand-written API route, end-to-end types.</li>
+  <li><code>useActionState</code> / <code>useFormStatus</code> on the client give pending state and returned validation errors.</li>
+  <li><strong>revalidatePath / revalidateTag</strong> after a mutation is the write-path half of the caching story: mutate, then purge exactly the cached data that changed, and Next re-renders affected routes with fresh data on the same round trip.</li>
+  <li><strong>Security framing (senior):</strong> actions are public HTTP endpoints regardless of where the button lives. Validate input and authorize <em>inside every action</em>, exactly as you would an API route.</li>
+</ul>
+
+<!-- ================================================================ -->
+<h2 id="caching">4. Data fetching &amp; the four caches <span class="tier-1">Tier 1 — the differentiator</span></h2>
+<p>
+  This is the most confusing part of modern Next.js and therefore the highest-leverage thing to be crisp about. There
+  are <strong>four distinct caches</strong>. Candidates who can name all four, say where each lives, and explain what invalidates
+  each one stand out immediately.
+</p>
+<pre>
+                 ┌────────────────────────────────────────────────────┐
+   ONE RENDER    │ 1. REQUEST MEMOIZATION  (React, per render pass)   │
+   PASS          │    same fetch(url) called twice → one network hit  │
+                 └────────────────────────────────────────────────────┘
+                 ┌────────────────────────────────────────────────────┐
+   SERVER,       │ 2. DATA CACHE  (Next, persistent across requests   │
+   PERSISTENT    │    and deploy-spanning)                            │
+                 │    fetch options: force-cache / no-store /         │
+                 │    next: { revalidate, tags }                      │
+                 └────────────────────────────────────────────────────┘
+                 ┌────────────────────────────────────────────────────┐
+   SERVER,       │ 3. FULL ROUTE CACHE  (rendered HTML + RSC payload  │
+   PER ROUTE     │    for STATICALLY rendered routes)                 │
+                 │    built at build time / ISR; skipped for dynamic  │
+                 └────────────────────────────────────────────────────┘
+                 ┌────────────────────────────────────────────────────┐
+   BROWSER       │ 4. ROUTER CACHE  (client-side, RSC payload per     │
+                 │    visited segment — instant back/forward)         │
+                 └────────────────────────────────────────────────────┘
+</pre>
+
+<h3>4.1 Request memoization</h3>
+<p>
+  Within a single render pass, identical <code>fetch(url, options)</code> calls are deduped — the layout, the page, and three
+  components can each call <code>getUser()</code> and only one request goes out. This is React-level, lasts only for the render,
+  and applies to <code>GET</code> fetches. For non-fetch data access (direct DB calls), wrap in React's <code>cache()</code> to get the
+  same per-render dedup:
+</p>
+<pre><code>import { cache } from 'react';
+export const getUser = cache(async (id: string) =&gt; db.user.find(id));</code></pre>
+<p>
+  <strong>Why it matters architecturally:</strong> it removes the pressure to hoist data fetching to a common ancestor and
+  prop-drill it down. Components can be self-sufficient about their data without duplicate queries.
+</p>
+
+<h3>4.2 The Data Cache</h3>
+<p>
+  A server-side, persistent cache of fetch <em>responses</em>, keyed by URL + options, surviving across requests and users.
+  Controlled per fetch:
+</p>
+<pre><code>// Cached indefinitely until invalidated:
+fetch(url, { cache: 'force-cache' })
+
+// Never cached — fresh on every request (also opts route into dynamic rendering):
+fetch(url, { cache: 'no-store' })
+
+// Time-based revalidation — stale-while-revalidate with a 1h window:
+fetch(url, { next: { revalidate: 3600 } })
+
+// Tag-based — the powerful one:
+fetch(url, { next: { tags: ['products', `product-${id}`] } })
+// ...later, in a server action or webhook route handler:
+revalidateTag('products')        // purges every fetch tagged 'products'
+revalidatePath('/products')      // purges data + route cache for a path</code></pre>
+<div class="pitfall">
+  <strong>Next 15 defaults change (know this story):</strong> in Next 13/14 App Router, <code>fetch</code> was <strong>cached by default</strong>
+  (<code>force-cache</code>). This surprised nearly everyone — devs shipped stale data without realizing they'd opted into caching —
+  and it became the loudest community complaint about the App Router. <strong>Next 15 flipped the default to uncached</strong>
+  (<code>no-store</code> semantics): you now opt <em>in</em> to caching explicitly (<code>'force-cache'</code>, <code>revalidate</code>, or route-level
+  <code>export const fetchCache</code>). Similarly, GET route handlers and the client Router Cache for pages became uncached by
+  default. Telling this story — aggressive-by-default caching, backlash, explicit-by-default reversal — is a strong
+  currency signal, and it means "which version?" is a legitimate clarifying question in interviews.
+</div>
+
+<h3>4.3 The Full Route Cache &amp; static vs dynamic rendering</h3>
+<p>
+  At build time, Next renders every route it can and stores the HTML + RSC payload — that stored result is the Full
+  Route Cache. Whether a route is <strong>statically rendered</strong> (cached) or <strong>dynamically rendered</strong> (per request) is
+  <em>determined by what the route uses</em>:
+</p>
+<table>
+  <thead><tr><th>Route stays STATIC when…</th><th>Route becomes DYNAMIC when it uses…</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>
+        All data is cached (or there is none); no request-time APIs used. Rendered once at build (or per ISR window),
+        served like SSG.
+      </td>
+      <td>
+        <code>cookies()</code>, <code>headers()</code>, or <code>connection()</code> — request-specific input<br>
+        <code>searchParams</code> accessed in a page<br>
+        any <code>fetch(..., { cache: 'no-store' })</code><br>
+        explicit <code>export const dynamic = 'force-dynamic'</code>
+      </td>
+    </tr>
+  </tbody>
+</table>
+<pre><code>// Route segment config — the explicit knobs:
+export const dynamic = 'force-static' | 'force-dynamic' | 'auto';
+export const revalidate = 60;            // ISR window for this whole route
+export const runtime = 'nodejs' | 'edge';</code></pre>
+<div class="senior">
+  <strong>The sentence that shows you get it:</strong> "In the App Router, SSG vs SSR isn't an API you pick — it's an outcome the
+  compiler infers. A route is static unless something in it demands request-time information; one <code>cookies()</code> call
+  or one <code>no-store</code> fetch flips the whole route to dynamic rendering." Then add the failure mode: a shared header
+  reading <code>cookies()</code> for auth silently makes <em>every</em> route dynamic — a very common accidental de-optimization.
+</div>
+
+<h3>4.4 Partial Prerendering (PPR)</h3>
+<p>
+  PPR resolves the static-vs-dynamic all-or-nothing: serve a <strong>static shell</strong> from the CDN instantly, with
+  <strong>dynamic holes</strong> (Suspense boundaries around request-time content) streamed into it from the server — one HTTP
+  response, both worlds.
+</p>
+<pre>
+/product/123 with PPR:
+
+  ┌─ STATIC SHELL (prerendered, CDN) ─────────────────┐
+  │  nav, product name, description, images, footer   │
+  │  ┌─ dynamic hole (Suspense) ──────────────┐       │
+  │  │ &lt;PersonalizedPrice/&gt;  ← reads cookies  │◄─ streamed per request
+  │  └────────────────────────────────────────┘       │
+  └───────────────────────────────────────────────────┘
+</pre>
+<pre><code>export const experimental_ppr = true;   // opt-in while experimental
+
+export default function Page() {
+  return (
+    &lt;&gt;
+      &lt;StaticProductInfo /&gt;                       {/* prerendered shell */}
+      &lt;Suspense fallback={&lt;PriceSkeleton /&gt;}&gt;
+        &lt;PersonalizedPrice /&gt;                     {/* dynamic hole */}
+      &lt;/Suspense&gt;
+    &lt;/&gt;
+  );
+}</code></pre>
+<p>
+  <strong>Status framing:</strong> experimental through Next 14/15 (flag-gated, canary), positioned as the intended default rendering
+  model going forward. Cite it as "where the framework is heading — the static/dynamic decision moves from the route
+  level to the Suspense-boundary level," and flag that you'd check current stability before adopting.
+</p>
+
+<h3>4.5 The Router Cache (client side)</h3>
+<p>
+  In the browser, Next caches the RSC payloads of visited (and prefetched) route segments in memory. Back/forward
+  navigation restores instantly from it; <code>&lt;Link&gt;</code> prefetching populates it before the click. It's invalidated by
+  <code>router.refresh()</code>, by <code>revalidatePath/Tag</code> from a server action, and by cookie-setting in actions. Historically its
+  aggressive staleness windows caused "why is my data stale after navigating back?" bugs — Next 15 set page segments'
+  default <code>staleTime</code> to 0 (layouts still reused). If asked "user updates their name but the old name shows when they
+  navigate back" — this cache is the answer.
+</p>
+
+<h3>4.6 generateStaticParams &amp; dynamicParams</h3>
+<pre><code>// app/blog/[slug]/page.tsx — SSG for a dynamic route
+export async function generateStaticParams() {
+  const posts = await getTopPosts(1000);              // prebuild the head of the tail
+  return posts.map((p) =&gt; ({ slug: p.slug }));
+}
+
+export const dynamicParams = true;   // default: unknown slugs render on demand,
+                                     // then get cached (ISR-style long tail)
+// dynamicParams = false → unknown slugs 404 (a strictly closed set)
+
+export const revalidate = 300;       // each generated page revalidates on a 5-min window</code></pre>
+<p>
+  This trio is the App Router's answer to <code>getStaticPaths</code> + <code>fallback</code>: prebuild what's popular, lazily generate and
+  cache the rest, and bound staleness with <code>revalidate</code> or purge precisely with tags.
+</p>
+
+<!-- ================================================================ -->
+<h2 id="streaming">5. Streaming in Next.js <span class="tier-2">Tier 2 — strong to know</span></h2>
+
+<h3>5.1 loading.tsx and nested Suspense granularity</h3>
+<p>
+  <code>loading.tsx</code> gives you a whole-segment Suspense boundary for free — navigation is instant (shell + skeleton paint
+  immediately) while the page's server components fetch. But one segment-level skeleton is coarse: the whole page pops
+  in at once, gated by its slowest fetch. Nested <code>&lt;Suspense&gt;</code> inside the page gives per-section granularity:
+</p>
+<pre><code>// app/dashboard/page.tsx
+export default function Dashboard() {
+  return (
+    &lt;&gt;
+      &lt;Header /&gt;                                     {/* fast — in initial flush */}
+      &lt;Suspense fallback={&lt;RevenueSkeleton /&gt;}&gt;
+        &lt;Revenue /&gt;                                  {/* awaits warehouse query, ~2s */}
+      &lt;/Suspense&gt;
+      &lt;Suspense fallback={&lt;ActivitySkeleton /&gt;}&gt;
+        &lt;ActivityFeed /&gt;                             {/* awaits feed service, ~400ms */}
+      &lt;/Suspense&gt;
+    &lt;/&gt;
+  );
+}</code></pre>
+<pre>
+t=0ms    flush: Header + both skeletons     ← user sees structured page
+t=400ms  stream: ActivityFeed replaces its skeleton
+t=2000ms stream: Revenue replaces its skeleton
+         (vs non-streaming: blank/loading until t=2000, then everything)
+</pre>
+<div class="note">
+  <strong>Design judgment to voice:</strong> boundary placement is a product decision, not just a technical one. Too many boundaries
+  = popcorn UI and layout shift; too few = slowest-fetch gating. Put boundaries around independently-useful,
+  independently-slow regions, and give fallbacks correct dimensions to avoid CLS.
+</div>
+
+<h3>5.2 The promise-as-prop / use() pattern</h3>
+<p>
+  Sometimes the <em>client</em> component needs the data (e.g., a chart with interactions) but you don't want to await it on
+  the server (blocking the stream) or fetch it client-side (waterfall). Answer: <strong>start the promise on the server,
+  don't await it, pass it down, unwrap with <code>use()</code> in the client under Suspense.</strong>
+</p>
+<pre><code>// Server component — kick off the fetch, do NOT await:
+export default function Page() {
+  const statsPromise = getStats();               // starts immediately, server-side
+  return (
+    &lt;Suspense fallback={&lt;ChartSkeleton /&gt;}&gt;
+      &lt;StatsChart statsPromise={statsPromise} /&gt;
+    &lt;/Suspense&gt;
+  );
+}
+
+// Client component:
+'use client';
+import { use } from 'react';
+export function StatsChart({ statsPromise }: { statsPromise: Promise&lt;Stats&gt; }) {
+  const stats = use(statsPromise);               // suspends until resolved, streamed in
+  return &lt;InteractiveChart data={stats} /&gt;;
+}</code></pre>
+<p>
+  The fetch starts at server render time (no client waterfall), the shell streams immediately (no server blocking), and
+  the resolved value streams across the RSC wire into the client component.
+</p>
+
+<h3>5.3 TTFB vs perceived performance — the narrative</h3>
+<p>
+  With buffered SSR, TTFB ≈ slowest fetch, and users stare at white. With streaming, TTFB is near-constant (the shell),
+  and slowness is <em>localized</em> to the component that's actually slow, with honest skeletons in the meantime. Metrics
+  version: streaming improves FCP and usually LCP (if the LCP element is in the shell), keeps TTFB flat as backend
+  latency varies, and pairs with selective hydration so early content is interactive early. The senior caveat: it
+  doesn't fix slow backends — if <em>everything</em> is slow, you've just replaced a blank page with a skeleton page, and the
+  real fix is caching or backend work.
+</p>
+
+<!-- ================================================================ -->
+<h2 id="pages-router">6. Pages Router literacy <span class="tier-2">Tier 2 — legacy interviews &amp; migrations</span></h2>
+<p>
+  Most companies interviewing you have Pages Router code in production. Being fluent in both — and saying
+  <strong>"depends which router — Pages or App?"</strong> when someone asks "how do you do SSR in Next?" — signals real-world
+  experience rather than tutorial knowledge.
+</p>
+
+<h3>6.1 The data-fetching trio</h3>
+<pre><code>// SSR — runs on EVERY request, on the server:
+export async function getServerSideProps(ctx) {
+  const { req, res, params, query } = ctx;         // full request access
+  const data = await getData(params.id);
+  if (!data) return { notFound: true };
+  return { props: { data } };
+}
+
+// SSG — runs at BUILD time:
+export async function getStaticProps({ params }) {
+  const post = await getPost(params.slug);
+  return {
+    props: { post },
+    revalidate: 60,                                // ← this one line = ISR
+  };
+}
+
+// Which dynamic paths to prebuild:
+export async function getStaticPaths() {
+  const posts = await getTopPosts();
+  return {
+    paths: posts.map((p) =&gt; ({ params: { slug: p.slug } })),
+    fallback: 'blocking',   // false → unknown = 404
+                            // true → serve fallback UI, render in background
+                            // 'blocking' → SSR the first hit, cache result
+  };
+}</code></pre>
+<table>
+  <thead><tr><th>Pages Router</th><th>App Router equivalent</th></tr></thead>
+  <tbody>
+    <tr><td><code>getServerSideProps</code></td><td>Dynamic rendering: async server component using <code>cookies()</code>/<code>headers()</code> or uncached fetches</td></tr>
+    <tr><td><code>getStaticProps</code></td><td>Static rendering (default when nothing dynamic is used)</td></tr>
+    <tr><td><code>getStaticProps</code> + <code>revalidate</code></td><td><code>export const revalidate = N</code> / <code>fetch(..., { next: { revalidate: N } })</code></td></tr>
+    <tr><td><code>getStaticPaths</code> + <code>fallback</code></td><td><code>generateStaticParams</code> + <code>dynamicParams</code></td></tr>
+    <tr><td><code>_app.tsx</code> / <code>_document.tsx</code></td><td>Root <code>layout.tsx</code> (owns <code>&lt;html&gt;&lt;body&gt;</code>, persists, can be async)</td></tr>
+    <tr><td><code>pages/api/*</code> (Node req/res)</td><td><code>route.ts</code> route handlers (web Request/Response)</td></tr>
+    <tr><td>Everything ships to client bundle</td><td>Server components ship zero JS by default</td></tr>
+  </tbody>
+</table>
+<p>
+  <code>_app</code> wrapped every page (providers, global CSS, layout persistence hacks); <code>_document</code> customized the HTML
+  shell. Both collapse into the root layout in the App Router. Pages Router API routes use Node-style
+  <code>(req, res)</code> handlers.
+</p>
+
+<h3>6.2 Migration posture</h3>
+<ul>
+  <li><strong>Both routers coexist</strong> in one app — <code>pages/</code> and <code>app/</code> side by side (App Router wins conflicts). The sane strategy is incremental: new features in <code>app/</code>, migrate high-value routes opportunistically, leave stable low-churn pages alone.</li>
+  <li>Migration order that works: shared layout → leaf/content pages → data-heavy pages → auth flows. The hard parts are re-thinking data fetching per component (vs one blob of props), moving context providers into client boundaries, and re-testing caching behavior.</li>
+  <li><strong>Honest senior take:</strong> a big-bang rewrite of a working Pages Router app is rarely justified by RSC benefits alone; migrate when you're touching the code anyway or when a route materially benefits (bundle size, streaming, server data proximity).</li>
+</ul>
+
+<!-- ================================================================ -->
+<h2 id="performance">7. The Next.js performance toolkit <span class="tier-2">Tier 2</span></h2>
+
+<h3>7.1 next/image</h3>
+<pre><code>import Image from 'next/image';
+
+&lt;Image
+  src="/hero.jpg"
+  alt="Product hero"
+  width={1200} height={630}      // required (or `fill`) → reserves space → no CLS
+  sizes="(max-width: 768px) 100vw, 50vw"
+  priority                        // for the LCP image: eager + preload
+/&gt;</code></pre>
+<p>What it actually does (be concrete, not magical):</p>
+<ul>
+  <li><strong>Resizes &amp; re-encodes on demand</strong> through an optimization endpoint — serves WebP/AVIF when the browser accepts them, generates a <code>srcset</code> from <code>sizes</code> so phones don't download desktop pixels.</li>
+  <li><strong>Lazy-loads below-the-fold images by default</strong>; <code>priority</code> opts the LCP image out of lazy-loading and preloads it (lazy-loading your LCP image is a classic own-goal).</li>
+  <li><strong>Prevents CLS</strong> by requiring dimensions and reserving the box before load.</li>
+  <li><strong>The cost nobody mentions:</strong> optimization is compute. On Vercel it's metered (per-image pricing); self-hosted it runs sharp on <em>your</em> server — CPU + a cache directory you must provision, or you offload with a custom <code>loader</code> to Cloudinary/imgix/Cloudflare. Mentioning this cost is a senior tell.</li>
+</ul>
+
+<h3>7.2 next/font</h3>
+<pre><code>import { Inter } from 'next/font/google';
+const inter = Inter({ subsets: ['latin'], display: 'swap' });
+// in root layout: &lt;body className={inter.className}&gt;</code></pre>
+<ul>
+  <li>Downloads Google fonts <strong>at build time</strong> and self-hosts them — no request to Google at runtime (performance + GDPR), no external connection setup cost.</li>
+  <li>Zero layout shift: computes <code>size-adjust</code> fallback metrics so the swap from fallback → webfont doesn't reflow.</li>
+  <li>Subsetting strips unused glyph ranges. <code>next/font/local</code> for owned fonts.</li>
+</ul>
+
+<h3>7.3 next/script</h3>
+<table>
+  <thead><tr><th>strategy</th><th>When it loads</th><th>Use for</th></tr></thead>
+  <tbody>
+    <tr><td><code>beforeInteractive</code></td><td>Before hydration</td><td>Rarely — consent managers, bot detection that must run first</td></tr>
+    <tr><td><code>afterInteractive</code> (default)</td><td>After hydration</td><td>Analytics, tag managers</td></tr>
+    <tr><td><code>lazyOnload</code></td><td>Browser idle</td><td>Chat widgets, social embeds — anything non-critical</td></tr>
+    <tr><td><code>worker</code> (experimental)</td><td>Web worker via Partytown</td><td>Getting third-party JS off the main thread entirely</td></tr>
+  </tbody>
+</table>
+
+<h3>7.4 Bundle analysis</h3>
+<pre><code>// npm i -D @next/bundle-analyzer
+const withBundleAnalyzer = require('@next/bundle-analyzer')({
+  enabled: process.env.ANALYZE === 'true',
+});
+module.exports = withBundleAnalyzer(nextConfig);
+// ANALYZE=true next build → treemap per entrypoint</code></pre>
+<p>
+  What you look for: a misplaced <code>'use client'</code> dragging a server-only lib into the bundle; a barrel import pulling a
+  whole component library; moment/lodash-style heavyweights with lighter substitutes; duplicate dependency versions.
+  Fixes: move the boundary down, <code>next/dynamic</code> for modal/route-conditional code, direct imports over barrels.
+</p>
+
+<h3>7.5 Edge vs Node runtimes</h3>
+<table>
+  <thead><tr><th></th><th>Node runtime</th><th>Edge runtime</th></tr></thead>
+  <tbody>
+    <tr><td>APIs</td><td>Full Node (fs, net, native addons, any DB driver)</td><td>Web-standard subset only — no fs, no TCP sockets, no native modules</td></tr>
+    <tr><td>Cold start</td><td>Heavier (Lambda-class)</td><td>Near-zero (V8 isolates)</td></tr>
+    <tr><td>Location</td><td>Region(s) you deploy to</td><td>Globally, at the CDN edge</td></tr>
+    <tr><td>Limits</td><td>Generous CPU/memory</td><td>Tight CPU-time and bundle-size budgets</td></tr>
+    <tr><td>Sweet spot</td><td>Default for pages/APIs; anything touching your DB</td><td>Middleware; light personalization/geo/AB at the CDN; simple rewrites</td></tr>
+  </tbody>
+</table>
+<div class="pitfall">
+  <strong>The edge trap:</strong> running edge functions that call a database in <code>us-east-1</code> means every data round-trip crosses
+  the ocean — edge compute + centralized data can be <em>slower</em> than regional Node next to the DB. Edge wins when the
+  decision needs no distant data (cookie checks, geo routing) or the data is also distributed. Saying this earns points.
+</div>
+
+<!-- ================================================================ -->
+<h2 id="seo">8. SEO in Next.js <span class="tier-2">Tier 2</span></h2>
+
+<h3>8.1 The Metadata API</h3>
+<pre><code>// Static — export an object:
+export const metadata: Metadata = {
+  title: { template: '%s | Acme', default: 'Acme' },   // template composes in children
+  description: 'Ship faster.',
+};
+
+// Dynamic — async generateMetadata (deduped with the page's own fetch
+// via request memoization — no double-fetch):
+export async function generateMetadata(
+  { params }: { params: Promise&lt;{ slug: string }&gt; }
+): Promise&lt;Metadata&gt; {
+  const { slug } = await params;
+  const post = await getPost(slug);                    // memoized with page fetch
+  return {
+    title: post.title,
+    description: post.excerpt,
+    openGraph: { title: post.title, images: [post.ogImage] },
+    alternates: { canonical: `https://acme.com/blog/${slug}` },
+  };
+}</code></pre>
+<p>
+  Metadata merges down the layout → page hierarchy (page wins). Because SSR/SSG put these tags in the initial HTML,
+  crawlers and link unfurlers see them without executing JS — the core SEO argument for server rendering.
+</p>
+
+<h3>8.2 File conventions: sitemap &amp; robots</h3>
+<pre><code>// app/sitemap.ts → served at /sitemap.xml
+export default async function sitemap(): Promise&lt;MetadataRoute.Sitemap&gt; {
+  const posts = await getAllPosts();
+  return [
+    { url: 'https://acme.com', changeFrequency: 'weekly', priority: 1 },
+    ...posts.map((p) =&gt; ({ url: `https://acme.com/blog/${p.slug}`,
+                           lastModified: p.updatedAt })),
+  ];
+}
+
+// app/robots.ts → /robots.txt
+export default function robots(): MetadataRoute.Robots {
+  return {
+    rules: { userAgent: '*', allow: '/', disallow: ['/app/', '/api/'] },
+    sitemap: 'https://acme.com/sitemap.xml',
+  };
+}</code></pre>
+
+<h3>8.3 JSON-LD structured data</h3>
+<pre><code>export default async function ProductPage({ params }) {
+  const product = await getProduct((await params).id);
+  const jsonLd = {
+    '@context': 'https://schema.org',
+    '@type': 'Product',
+    name: product.name,
+    offers: { '@type': 'Offer', price: product.price, priceCurrency: 'USD' },
+  };
+  return (
+    &lt;&gt;
+      &lt;script
+        type="application/ld+json"
+        dangerouslySetInnerHTML={{ __html: JSON.stringify(jsonLd) }}
+      /&gt;
+      &lt;ProductDetails product={product} /&gt;
+    &lt;/&gt;
+  );
+}</code></pre>
+<p>Rendered server-side into the HTML — this is what earns rich results (price, rating stars) in search.</p>
+
+<h3>8.4 OG image generation (awareness)</h3>
+<p>
+  <code>ImageResponse</code> from <code>next/og</code> renders JSX + a CSS subset to a PNG at request time — put it in
+  <code>app/blog/[slug]/opengraph-image.tsx</code> and every post gets a unique, data-driven social card (title, author, branding)
+  with no design pipeline. Edge-friendly and cacheable.
+</p>
+
+<!-- ================================================================ -->
+<h2 id="decision">9. The decision conversation <span class="tier-1">Tier 1 — rehearse this out loud</span></h2>
+<p>
+  "Would you use Next.js for this, or a plain SPA?" is the rendering question's final form. Have a structured,
+  honest answer ready — including Next's costs.
+</p>
+
+<h3>9.1 When Next.js earns its complexity</h3>
+<ul>
+  <li><strong>SEO / social sharing matters:</strong> content, commerce, marketing — anything acquired through search or shared links needs server-rendered HTML and metadata.</li>
+  <li><strong>First-paint on the open web matters:</strong> anonymous users, cold caches, mid-range devices — server HTML beats a JS waterfall.</li>
+  <li><strong>Content pages at scale:</strong> SSG/ISR + on-demand revalidation is a genuinely great content platform.</li>
+  <li><strong>Server data proximity:</strong> RSC lets components read the DB directly — no API layer to design, version, and secure just for your own frontend; smaller bundles as a bonus.</li>
+  <li><strong>Mixed rendering in one product:</strong> marketing + app + docs under one roof, each page picking its own strategy.</li>
+</ul>
+
+<h3>9.2 When a Vite SPA is the better call</h3>
+<ul>
+  <li><strong>Internal tools / dashboards behind auth:</strong> no SEO, repeat visitors with warm caches, app-like interactivity. A Vite SPA is radically simpler: static files on a CDN/S3, <strong>no server to run, patch, scale, or wake up for at 3am</strong>.</li>
+  <li>The modern SPA stack is excellent: <strong>TanStack Router</strong> (type-safe routing, search-param state) + <strong>TanStack Query</strong> (caching, revalidation, optimistic updates) covers most of what people actually wanted from a framework.</li>
+  <li>Deploy is a folder upload; local dev is instant; no RSC mental model, no serialization boundaries, no four-cache debugging.</li>
+</ul>
+
+<h3>9.3 Name Next's costs honestly (this is the senior move)</h3>
+<ul>
+  <li><strong>Server infra:</strong> you now operate a Node service (or pay a platform) — scaling, cold starts, observability, incidents.</li>
+  <li><strong>Framework coupling:</strong> caching semantics, routing, and rendering are deeply Vercel-flavored; self-hosting is supported but the best-path gravity toward Vercel is real, and framework churn (Pages→App, caching default flips) is a tax on teams.</li>
+  <li><strong>Caching complexity:</strong> four caches with different lifetimes and invalidation rules is a genuine source of production bugs ("why is this stale?" is the App Router's signature incident).</li>
+  <li><strong>RSC learning curve:</strong> server/client boundaries, serializability, "why can't I use useState here" — a real onboarding cost for teams.</li>
+</ul>
+
+<h3>9.4 Remix / React Router v7 literacy</h3>
+<p>
+  Interviewers raise Remix as the comparison. Its model: each route exports a <code>loader</code> (server data for GET) and an
+  <code>action</code> (mutations for POST); forms post to actions and loaders automatically revalidate — the framework leans on
+  <em>web fundamentals</em> (forms, HTTP semantics, browser caching via <code>Cache-Control</code> headers) instead of a bespoke cache
+  layer. Nested routes load data in parallel. Remix merged into <strong>React Router v7</strong> ("framework mode"), so the
+  loader/action model now lives in React Router itself. Fair one-line comparison: "Remix/RRv7 has a simpler, more
+  explicit data story built on HTTP caching; Next has RSC, a bigger ecosystem, and finer-grained server/client code
+  splitting. Both are good; Remix is easier to reason about, Next is more capable at the bleeding edge."
+</p>
+
+<h3>9.5 When plain SSG (Astro) beats both</h3>
+<p>
+  For content-dominant sites — docs, blogs, marketing — where interactivity is a search box and a mobile menu, Astro's
+  islands model ships near-zero JS and wins Core Web Vitals almost by default. Running React SSR + hydration for pages
+  with two interactive widgets is paying the full framework tax for none of the benefit. Rule of thumb to say:
+  <strong>mostly content → Astro; mostly app with public/SEO surface → Next; entirely app behind auth → Vite SPA.</strong>
+</p>
+
+<h3>9.6 A 30-second rehearsable answer</h3>
+<div class="senior">
+  "First I ask: does anyone hit these pages logged-out, via search or shared links? If yes, I need server-rendered
+  HTML — Next.js, rendering per page: SSG or ISR for content, dynamic/streamed SSR for personalized pages, client
+  islands for interactivity. If it's entirely behind auth — an internal tool, a dashboard — I'd default to a Vite SPA
+  with TanStack Router and Query: static hosting, no server fleet, simpler mental model. And if it's almost pure
+  content with a sprinkle of interactivity, Astro ships less JavaScript than either. Next is powerful but not free —
+  you take on server infra, a four-layer cache model, and the RSC learning curve — so I spend that complexity only
+  where server rendering actually buys something."
+</div>
+
+<!-- ================================================================ -->
+<h2 id="deployment">10. Deployment awareness <span class="tier-3">Tier 3 — good to have</span></h2>
+<ul>
+  <li><strong>Vercel:</strong> zero-config; pages/functions map onto their serverless + edge network, ISR and the Data Cache are backed by managed infra, image optimization is built in (and metered). Fastest path; the trade is cost at scale and platform coupling.</li>
+  <li><strong>Self-hosting:</strong> <code>output: 'standalone'</code> in <code>next.config.js</code> emits a minimal server + traced <code>node_modules</code> for a small Docker image; run <code>node server.js</code> behind your LB. Multi-instance gotcha: ISR/Data-Cache state is per-instance on disk by default — you need a shared cache handler (<code>cacheHandler</code> config, e.g. Redis-backed) or sticky revalidation behavior gets inconsistent across pods.</li>
+  <li><strong>CDN headers recap:</strong> the semantics under ISR are the classic pair — <code>Cache-Control: s-maxage=60, stale-while-revalidate=86400</code>: shared caches serve for 60s, then serve stale while refreshing in the background. Next sets appropriate headers for static/ISR content; if you put your own CDN in front, make sure it respects them and that you have a purge story for on-demand revalidation.</li>
+  <li><strong>Image optimization self-hosted:</strong> sharp on your Node server + an on-disk cache; budget CPU for traffic spikes of uncached sizes, or point <code>images.loader</code> at a dedicated image CDN.</li>
+  <li><strong>Monorepo integration:</strong> Next apps as workspace packages with shared UI/config libs, remote build caching — covered in tutorial 16.</li>
+</ul>
+
+<!-- ================================================================ -->
+<h2 id="qa">Interview Q&amp;A</h2>
+
+<details class="qa">
+  <summary>1. Walk me through CSR, SSR, SSG, and ISR. How do you choose?</summary>
+  <p>They differ on <em>where/when HTML is produced</em>. CSR: browser builds the UI after downloading JS — worst first paint, weak SEO, but simplest infra; fine behind auth. SSR: HTML per request on a server — fast FCP, full personalization, live data; costs server compute and is TTFB-sensitive. SSG: HTML at build time on a CDN — best FCP, near-zero cost, but stale until rebuilt and impossible to personalize in the HTML. ISR: SSG plus stale-while-revalidate regeneration (time-based or on-demand) — CDN economics with bounded staleness. Choice is per page, driven by: SEO needed? personalized? how fresh must data be? how many pages? what infra can we operate? Then I'd go page-by-page through the product.</p>
+</details>
+
+<details class="qa">
+  <summary>2. What exactly happens during hydration?</summary>
+  <p>The client re-renders the same component tree in memory to build the fiber tree, but instead of creating DOM nodes it adopts the existing server-rendered DOM — matching each fiber to its element — then attaches React's event system and initializes state and effects. It assumes server HTML and the client's first render match exactly. Notably, it re-executes all component render code on the client, which is the "double payment" of classic SSR that Server Components and islands architectures attack.</p>
+</details>
+
+<details class="qa">
+  <summary>3. What causes hydration mismatch errors and how do you fix them?</summary>
+  <p>Anything that renders differently on server vs client's first pass: dates/locales/randomness computed in render; <code>typeof window</code> branches; reading localStorage/matchMedia during render; plus invalid HTML nesting the browser "corrects," and browser extensions mutating the DOM pre-hydration. Fixes: make the first client render match the server (compute values server-side and pass as props; render client-only content after a <code>useEffect</code>-set mounted flag); <code>next/dynamic</code> with <code>ssr:false</code> for genuinely client-only widgets; <code>suppressHydrationWarning</code> narrowly for expected text differences like timestamps. In React 18, a mismatch discards server HTML for that subtree and client-renders it — so you also lose the SSR benefit, not just get a warning.</p>
+</details>
+
+<details class="qa">
+  <summary>4. What is selective hydration and what problem does it solve?</summary>
+  <p>Pre-React-18, hydration was one synchronous all-or-nothing pass: no part of the page was interactive until all of it hydrated — the "visible but dead" uncanny valley. React 18 uses Suspense boundaries as independent hydration units: they stream in and hydrate independently, hydration is interruptible/concurrent, and if the user interacts with an unhydrated boundary, React prioritizes hydrating that boundary immediately and replays the event. Result: interactivity arrives progressively and follows user attention rather than waiting on the whole tree.</p>
+</details>
+
+<details class="qa">
+  <summary>5. Explain the four caches in the Next.js App Router.</summary>
+  <p>(1) <strong>Request memoization</strong> — React-level, per render pass: identical fetches dedupe so layout and page can both call <code>getUser()</code> for one network hit; <code>React.cache()</code> extends this to non-fetch calls. (2) <strong>Data Cache</strong> — server-side, persistent across requests: stores fetch responses, controlled by <code>force-cache</code>/<code>no-store</code>/<code>next.revalidate</code>/tags, invalidated by <code>revalidateTag/Path</code>. (3) <strong>Full Route Cache</strong> — the rendered HTML + RSC payload of statically rendered routes, built at build time or ISR; dynamic routes skip it. (4) <strong>Router Cache</strong> — in the browser, RSC payloads of visited/prefetched segments for instant back/forward, invalidated by <code>router.refresh()</code> and server-action revalidations. Different layers, different lifetimes, different invalidation — most "stale data" bugs are confusion about which layer is serving you.</p>
+</details>
+
+<details class="qa">
+  <summary>6. What makes an App Router route static vs dynamic?</summary>
+  <p>It's inferred, not declared. A route is statically rendered (prerendered into the Full Route Cache) unless it uses request-time information: <code>cookies()</code>, <code>headers()</code>, <code>searchParams</code> in a page, a <code>no-store</code> fetch, or an explicit <code>dynamic = 'force-dynamic'</code>. One such usage flips the entire route to per-request rendering — so a shared header component calling <code>cookies()</code> silently makes every page dynamic, a classic accidental de-optimization. Partial Prerendering is the emerging fix: static shell with dynamic Suspense-bounded holes, moving the decision to boundary granularity.</p>
+</details>
+
+<details class="qa">
+  <summary>7. What changed about caching defaults in Next 15, and why?</summary>
+  <p>Next 13/14 cached <code>fetch</code> by default (<code>force-cache</code>), plus GET route handlers and aggressive client Router Cache staleness. Developers constantly shipped unexpectedly stale data — it became the App Router's biggest complaint. Next 15 flipped to uncached-by-default: fetches are dynamic unless you opt in via <code>'force-cache'</code> or <code>revalidate</code>/tags; GET handlers uncached; Router Cache page staleTime 0. The lesson I'd cite: implicit aggressive caching violated least-surprise, and the ecosystem forced explicit opt-in. It also means caching behavior is version-dependent — worth clarifying which version in any discussion.</p>
+</details>
+
+<details class="qa">
+  <summary>8. How does ISR work under the hood? What are its exact semantics?</summary>
+  <p>Stale-while-revalidate for HTML. A page rendered at build (or on first request) is served from cache; after the <code>revalidate</code> window expires, the <em>next</em> request still gets the stale page instantly while regeneration runs in the background; subsequent requests get the fresh version. So <code>revalidate</code> is a lazy minimum-staleness bound, not a scheduled rebuild — no user ever waits on regeneration (except the first-ever render of an unbuilt path with blocking fallback). On-demand revalidation (<code>revalidatePath/Tag</code>, typically from a CMS webhook) purges immediately, giving "static until the data actually changes."</p>
+</details>
+
+<details class="qa">
+  <summary>9. Server components vs client components — where do you draw the boundary?</summary>
+  <p>Default everything to server; push <code>'use client'</code> to the smallest interactive leaves — buttons, inputs, dropdowns — because the directive marks a boundary: everything it imports joins the client bundle. Keep pages and layouts as server components that compose client islands, and pass server components through client wrappers as <code>children</code> so a context provider doesn't drag the app into the bundle. Also correct a common misconception: client components still SSR to HTML on first load — <code>'use client'</code> means "hydrates and ships JS," not "browser-only."</p>
+</details>
+
+<details class="qa">
+  <summary>10. How does streaming SSR improve performance if the data is still slow?</summary>
+  <p>It doesn't make data faster — it decouples TTFB/FCP from the slowest fetch. Buffered SSR gates the entire response on the slowest server-side await; streaming flushes the shell and fast content immediately and streams slow Suspense-bounded sections when ready. Users get layout and usable content in hundreds of milliseconds with honest skeletons for the slow parts; paired with selective hydration, early content is interactive early. Real FCP improves, LCP usually improves if the LCP element is in the shell, and perceived performance improves a lot. Caveat I'd volunteer: if everything is slow you've swapped a blank page for a skeleton page — then the fix is caching or the backend.</p>
+</details>
+
+<details class="qa">
+  <summary>11. What does loading.tsx actually do?</summary>
+  <p>It's convention-based sugar: Next wraps the segment's page in a Suspense boundary with your loading component as the fallback. That yields instant navigations — the router paints the shell + fallback immediately while the page's server components fetch and stream in. It's segment-granular; for section-level granularity you nest <code>&lt;Suspense&gt;</code> boundaries inside the page yourself. It also composes: each nested segment's loading.tsx creates its own boundary.</p>
+</details>
+
+<details class="qa">
+  <summary>12. Explain the promise-as-prop pattern with use().</summary>
+  <p>When a client component needs server data without blocking the stream or creating a client waterfall: the server component calls the fetch function <em>without awaiting</em>, passes the promise as a prop, and the client component unwraps it with <code>use(promise)</code> inside a Suspense boundary. The fetch starts at server render time, the shell streams immediately, and the resolved data streams into the client component when ready. It's the best of three worlds: server-initiated fetch timing, non-blocking TTFB, and client-side interactivity over the data.</p>
+</details>
+
+<details class="qa">
+  <summary>13. What are server actions and what would you watch out for?</summary>
+  <p>Functions marked <code>'use server'</code> that the framework exposes as RPC endpoints — forms and event handlers invoke them directly, no hand-written API route, with progressive enhancement (a form with <code>action={fn}</code> can submit before hydration). After mutating, you call <code>revalidatePath/Tag</code> so cached data and routes refresh in the same round trip; <code>useActionState</code>/<code>useFormStatus</code> handle pending/error UI. Watch-outs: they're public HTTP endpoints, so authenticate and validate inside every action regardless of where the button renders; they run sequentially (not for parallel-heavy workloads); and keep them thin — delegate to a service layer you can also test directly.</p>
+</details>
+
+<details class="qa">
+  <summary>14. getServerSideProps vs getStaticProps vs the App Router equivalents?</summary>
+  <p>Pages Router: <code>getServerSideProps</code> = per-request SSR with full req/res access; <code>getStaticProps</code> = build-time SSG, plus <code>revalidate</code> for ISR; <code>getStaticPaths</code> declares which dynamic paths to prebuild with <code>fallback</code> controlling unknown paths. App Router folds these into rendering semantics: static rendering is the default (≈ getStaticProps), using <code>cookies()/headers()</code>/uncached fetches makes it dynamic (≈ getServerSideProps), <code>generateStaticParams</code> + <code>dynamicParams</code> replace getStaticPaths/fallback, and <code>revalidate</code> exists per-fetch or per-route. The deeper shift: data fetching moves from one per-page function to per-component async server components, with memoization deduping shared calls.</p>
+</details>
+
+<details class="qa">
+  <summary>15. How would you migrate a large Pages Router app to the App Router?</summary>
+  <p>Incrementally — both routers coexist in one deployment, so there's no big bang. Order: recreate the shared shell as a root layout; move leaf/content pages first (lowest risk, immediate RSC bundle wins); then data-heavy pages, rethinking one-blob-of-props into per-component fetching; auth and middleware-adjacent flows last. The gotchas are context providers (need client-boundary wrappers), anything reading Node req/res, and caching behavior differences — I'd re-verify freshness semantics per route. And I'd be honest about ROI: stable low-churn pages can stay on the Pages Router indefinitely; migrate where you're already working or where a route materially benefits.</p>
+</details>
+
+<details class="qa">
+  <summary>16. What does next/image actually do, and what does it cost?</summary>
+  <p>Four concrete things: on-demand resize/re-encode (WebP/AVIF via content negotiation) through an optimization endpoint with srcset generation from <code>sizes</code>; native lazy-loading below the fold; required dimensions that reserve layout space so images never cause CLS; and <code>priority</code> to eager-load + preload the LCP image. The cost: optimization is real compute — metered pricing on Vercel, sharp CPU + cache storage when self-hosting — so at scale many teams point a custom loader at a dedicated image CDN instead. Biggest practical wins in audits: correct <code>sizes</code> (phones stop downloading desktop images) and <code>priority</code> on the hero.</p>
+</details>
+
+<details class="qa">
+  <summary>17. Edge runtime vs Node runtime — when does edge actually win?</summary>
+  <p>Edge = V8 isolates at CDN PoPs: near-zero cold start, global proximity, but web-standard APIs only — no fs, no TCP database drivers, tight CPU/bundle limits. Node = full ecosystem, regional, heavier cold starts. Edge wins when the work needs no distant data: middleware auth-cookie checks, geo routing, A/B assignment, rewrites — decisions in microseconds next to the user. The trap: edge compute calling a single-region database round-trips the ocean per query and can be slower than Node deployed beside the DB. So: middleware and light personalization at the edge; data-heavy rendering in Node near the data, unless the data layer itself is globally distributed.</p>
+</details>
+
+<details class="qa">
+  <summary>18. How do you handle SEO for dynamic pages in the App Router?</summary>
+  <p>Async <code>generateMetadata</code> per route — it can fetch the entity (request memoization dedupes with the page's own fetch) and return title/description/OG/canonical, merged down the layout hierarchy. Add <code>app/sitemap.ts</code> and <code>app/robots.ts</code> file conventions, JSON-LD injected server-side as an <code>application/ld+json</code> script for rich results, and <code>opengraph-image.tsx</code> with <code>ImageResponse</code> for per-page dynamic social cards. The foundation is that these pages are server-rendered (SSG/ISR/SSR), so crawlers and unfurlers get complete HTML without JS execution.</p>
+</details>
+
+<details class="qa">
+  <summary>19. Next.js vs Remix (React Router v7) — how do you compare them?</summary>
+  <p>Remix's model: per-route <code>loader</code> (server data) and <code>action</code> (mutation); forms post to actions and loaders revalidate automatically; caching leans on standard HTTP <code>Cache-Control</code> rather than a framework cache — fewer novel concepts, very predictable. It merged into React Router v7 framework mode. Next counters with RSC (per-component server code with zero-JS shipping), streaming/PPR at finer granularity, ISR machinery, and a larger ecosystem. My honest framing: Remix/RRv7 is simpler to reason about and debug; Next is more capable at the frontier and better for static/ISR-heavy content. Either is defensible — the choice is usually team familiarity and how much you value web-standards simplicity vs bleeding-edge capability.</p>
+</details>
+
+<details class="qa">
+  <summary>20. When would you NOT use Next.js?</summary>
+  <p>Internal tools and authed dashboards — no SEO, warm-cache repeat users — where a Vite SPA with TanStack Router/Query is simpler: static hosting, no server fleet, no RSC model, no four-cache debugging. Content-dominant sites with trivial interactivity — Astro's islands ship near-zero JS and win vitals by default. Teams without appetite for operating servers or absorbing framework churn. And I'd name Next's costs explicitly: server infra, Vercel-flavored coupling, caching complexity as a bug source, RSC onboarding. Choosing Next everywhere by reflex is exactly the non-senior answer this question probes for.</p>
+</details>
+
+<details class="qa">
+  <summary>21. A user updates their profile, navigates away and back, and sees stale data. Diagnose.</summary>
+  <p>Layer by layer. Most likely: the client Router Cache serving a cached RSC payload on back-navigation — fix by performing the update via a server action that calls <code>revalidatePath('/profile')</code> (which also busts the router cache), or <code>router.refresh()</code> after a client mutation. Next suspect: the Data Cache — the profile fetch was cached (default in Next 14!) with no tag/revalidate; add <code>tags: ['user-123']</code> and <code>revalidateTag</code> on write, or <code>no-store</code> for always-fresh. Then: the route was statically rendered when it should be dynamic (it reads no request data, so it froze at build). Also check any CDN in front honoring stale s-maxage. The systematic answer — memoization → data cache → route cache → router cache → CDN — is what's being tested.</p>
+</details>
+
+<details class="qa">
+  <summary>22. What is Partial Prerendering and why does it matter?</summary>
+  <p>PPR serves a statically prerendered shell from the edge instantly, with dynamic "holes" — Suspense boundaries around request-time content like <code>cookies()</code>-reading components — streamed into the same response from the server. It dissolves the static-vs-dynamic route-level binary: today one personalized element forces the whole route dynamic; with PPR the decision moves to Suspense-boundary granularity, so a product page gets CDN-fast shell delivery <em>and</em> per-user pricing in one request. Status: experimental through Next 14/15 (flag-gated), positioned as the intended future default — I'd cite it as direction, and verify stability before production use.</p>
+</details>
+
+<details class="qa">
+  <summary>23. Explain layout.tsx persistence and when you'd use template.tsx instead.</summary>
+  <p>Layouts don't re-render or remount when navigating between their children — a sidebar keeps scroll position, a provider keeps state, effects don't re-run. That's also why layouts can't read <code>searchParams</code>: they don't re-render on navigation, so the value would be stale. <code>template.tsx</code> occupies the same slot but creates a fresh instance per navigation — state resets, effects re-fire — for enter animations, per-page logging, or forms that must reset between sibling routes. Default to layout; reach for template only when you specifically need remount semantics.</p>
+</details>
+
+<details class="qa">
+  <summary>24. How do parallel and intercepting routes enable the modal-over-feed pattern?</summary>
+  <p>Parallel routes give a layout named slots (<code>@feed</code>, <code>@modal</code>) rendered as props, each with independent navigation and loading/error states. An intercepting route like <code>(.)photo/[id]</code> under <code>@modal</code> catches client-side navigation to <code>/photo/123</code> and renders it into the modal slot over the feed instead of replacing the page — while a hard refresh or shared link hits the real <code>/photo/[id]/page.tsx</code> full page. Result: shareable, deep-linkable modal URLs with correct back-button behavior and no duplicated photo UI — the Instagram pattern. It's awareness-level API, but naming the use case shows you know why it exists.</p>
+</details>
+
+<details class="qa">
+  <summary>25. Your Next SSR app has p95 TTFB of 3s. Walk through your investigation.</summary>
+  <p>First, is the route dynamic unnecessarily? — a stray <code>cookies()</code> call or no-store fetch may be defeating static rendering; make it static/ISR if the content allows. If it's legitimately dynamic: profile server data fetches — serial awaits are the classic culprit (parallelize with <code>Promise.all</code> or component-level parallel fetching), then cache slow upstreams in the Data Cache with tags. If a slow dependency is irreducible, wrap it in Suspense and stream so TTFB detaches from it. Then infra: cold starts (bundle size, provisioned concurrency), server region vs data region, connection pooling to the DB. Order matters: eliminate the render-time work before optimizing it, cache before streaming, stream before scaling hardware.</p>
+</details>
+
+<!-- ================================================================ -->
+<h2 id="exercises">Hands-on exercises</h2>
+
+<div class="exercise">
+  <h3>Exercise 1 — Choose the strategy: news publisher</h3>
+  <p><strong>Scenario:</strong> A national news site: ~50k articles and growing hourly, breaking-news pages updated minute-by-minute for the first hours, evergreen archive, a personalized "For You" rail on every article page, comments, heavy SEO dependence. Design the rendering strategy per surface and defend it.</p>
+  <p><strong>Model reasoning:</strong></p>
+  <ul>
+    <li><strong>Article pages → ISR with on-demand revalidation.</strong> SEO-critical and read at 1000:1 read/write ratios — CDN static serving is mandatory economics. Time-based <code>revalidate: 60</code> alone is wrong for corrections (a libel fix must not wait); wire the CMS "publish/update" webhook to <code>revalidateTag(`article-${'{'}id{'}'}`)</code> so pages are static until content actually changes. Use <code>generateStaticParams</code> for the most recent/trafficked few thousand; <code>dynamicParams: true</code> renders the archive long tail on first hit then caches — never build 50k pages per deploy.</li>
+    <li><strong>Breaking-news liveblogs → static/ISR shell + client polling or streaming for the update feed.</strong> Even 30s staleness is acceptable for the article frame, but the live-update stream should be a client island fetching (or SSE) — don't force the whole page dynamic for the one live region. This is a PPR-shaped problem; say so.</li>
+    <li><strong>"For You" rail → out of the HTML cache path entirely.</strong> Either a client-fetched island under Suspense-style skeleton, or (if in-HTML matters) a PPR/streamed dynamic hole. The cardinal sin is letting a per-user component read <code>cookies()</code> at page level and flip every article to dynamic rendering — one candidate mistake interviewers plant deliberately.</li>
+    <li><strong>Comments → lazy client-side island.</strong> Below the fold, no SEO value worth the cost (or SSR only the first N for long-tail keywords if product insists), hydrate on visibility.</li>
+    <li><strong>Home page → ISR with a short window (30–60s).</strong> Same for everyone, changes constantly but tolerates a minute of staleness, absorbs traffic spikes as pure CDN hits — exactly what ISR is for.</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <h3>Exercise 2 — Choose the strategy: B2B analytics dashboard</h3>
+  <p><strong>Scenario:</strong> A SaaS analytics product: everything behind login, heavy charting and cross-filtering, data freshness matters (users watch live campaign numbers), 5-person frontend team, marketing site already exists separately on Webflow. The CTO asks: "Should this be Next.js?" Argue both sides, then commit.</p>
+  <p><strong>Model reasoning:</strong></p>
+  <ul>
+    <li><strong>Interrogate what Next would buy:</strong> SEO — none (authed). First-paint for anonymous cold visits — none (marketing is elsewhere). Server data proximity — real but replaceable by a normal API. Mixed rendering — not needed; every page is personalized and dynamic.</li>
+    <li><strong>The SPA case:</strong> a Vite SPA + TanStack Router/Query is the honest default here: static hosting (no server fleet for a 5-person team to operate), Query's cache/refetch/optimistic-update model is <em>better</em> suited to live-updating dashboards than RSC's request-time rendering, and the RSC learning curve buys nothing when ~everything would be <code>'use client'</code> anyway.</li>
+    <li><strong>The Next case (steelman):</strong> server actions + RSC could thin the API layer; if the team later adds public shareable report pages (SEO/unfurl), Next handles them natively; one framework across future surfaces.</li>
+    <li><strong>Commit:</strong> Vite SPA. The one Next-shaped requirement on the horizon — public share links with OG previews — can be served by a tiny separate Next app or even an edge function generating OG tags, cheaper than adopting Next's operational and conceptual costs product-wide. State the reversal condition explicitly: "If public, search-indexed content pages become core to the product, I'd revisit." Committing with a named trigger for reversal is the senior close.</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <h3>Exercise 3 — Debug the cache: the stale price incident</h3>
+  <p><strong>Scenario:</strong> Next 14 App Router e-commerce. Ops report: prices updated in the admin tool don't appear on product pages for up to an hour; sometimes a hard refresh shows the new price but in-app navigation shows the old one. <code>app/products/[id]/page.tsx</code> awaits <code>fetch(`${'{'}API{'}'}/products/${'{'}id{'}'}`)</code> with no options and the route has <code>revalidate = 3600</code>. Explain every layer involved and fix it properly.</p>
+  <p><strong>Model reasoning:</strong></p>
+  <ul>
+    <li><strong>Data Cache:</strong> in Next 14, an options-less fetch defaults to <code>force-cache</code>; combined with route <code>revalidate = 3600</code>, the price response is legitimately served stale for up to an hour. That's the headline hour-long staleness.</li>
+    <li><strong>Full Route Cache:</strong> the route is statically rendered (nothing dynamic in it), so the rendered HTML itself is also cached for the same window — two server-side layers agreeing to be stale.</li>
+    <li><strong>Router Cache:</strong> "refresh shows new, navigation shows old" is the client-side RSC payload cache serving a previously visited segment — hard refresh bypasses it, client-side navigation doesn't. Classic Next 14 symptom (30s+ staleness windows).</li>
+    <li><strong>The fix — event-driven invalidation, not shorter timers:</strong> tag the fetch (<code>next: {'{'} tags: [`product-${'{'}id{'}'}`] {'}'}</code>); have the admin mutation (server action or webhook → route handler) call <code>revalidateTag(`product-${'{'}id{'}'}`)</code>, which purges the Data Cache entry, invalidates the route's cached render, and propagates to router caches on next navigation. Keep <code>revalidate</code> as a long backstop. Dropping to <code>no-store</code> "fixes" it by paying full dynamic rendering on every view — the junior fix; tags keep CDN economics <em>and</em> instant correctness.</li>
+    <li><strong>Bonus depth:</strong> if truly live fields (flash-sale countdown, stock) coexist with cacheable content, isolate them into a streamed dynamic hole or client island rather than making the route dynamic — the PPR-shaped decomposition again.</li>
+  </ul>
+</div>
+
+<div class="exercise">
+  <h3>Exercise 4 — Design the streaming plan: travel search results</h3>
+  <p><strong>Scenario:</strong> Flight search results page: the search header and filters render from the query string instantly; the results list depends on a fan-out to airline APIs (p50 1.2s, p95 4s); a price-history chart depends on an internal service (200ms); a "price alerts" widget needs the user session. SEO matters for popular route pages (/flights/sfo-to-nyc). Design the rendering + streaming architecture.</p>
+  <p><strong>Model reasoning:</strong></p>
+  <ul>
+    <li><strong>Route classification:</strong> results depend on <code>searchParams</code> → dynamic rendering; that's fine and correct here. For canonical route pages like <code>/flights/sfo-to-nyc</code>, create ISR'd landing pages (static content + cached typical prices) that then stream live results — SEO gets stable static HTML, users get live data.</li>
+    <li><strong>Streaming layout:</strong> flush the shell (header, filters — derivable from the URL synchronously) immediately. Wrap the results list in its own <code>&lt;Suspense&gt;</code> with a realistic skeleton (fixed row heights → no CLS). The 200ms chart <em>could</em> go in the shell, but tying it to the results boundary couples fast to slow — give it its own boundary and let it appear at ~200ms.</li>
+    <li><strong>The 4s p95 problem:</strong> don't hold the results boundary for the full fan-out. Stream partial results: render what airlines returned by ~1.5s and let a client component merge late arrivals (promise-as-prop with <code>use()</code>, or client subscription to a results stream). Perceived performance beats completeness for search.</li>
+    <li><strong>Session widget:</strong> reads cookies — quarantine it in its own Suspense boundary (PPR-shaped) or make it a client island, so personalization never blocks or de-optimizes the shared content path.</li>
+    <li><strong>What to say about metrics:</strong> TTFB stays flat (shell), FCP ≈ shell paint, LCP is the results list — so invest in the partial-results strategy, and confirm the skeleton isn't accidentally the LCP element. Close with the caveat: streaming is presentation; the durable fix for a 4s p95 fan-out is caching airline responses server-side with short TTLs.</li>
+  </ul>
+</div>
+
+<nav class="page-nav">
+  <a href="13-frontend-testing.html">← Prev: Testing Frontend</a>
+  <a href="15-micro-frontends.html">Next: Micro-Frontends →</a>
+</nav>
+</main>
+</body>
+</html>

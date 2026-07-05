@@ -1,0 +1,1768 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>13 — Testing Frontend | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <div class="breadcrumb"><a href="index.html">← Course Home</a></div>
+    <h1>13 — Testing Frontend</h1>
+    <p>What to test, at which level, and what to leave alone — RTL, MSW, Vitest, and Playwright with senior judgment attached.</p>
+  </div>
+</header>
+
+<main class="container">
+
+  <section>
+    <h2>Why interviewers ask this</h2>
+    <p>
+      Testing questions are unusual: they grade <em>judgment</em> at least as hard as tool knowledge. Anyone can
+      memorize <code>getByRole</code>. What separates a senior candidate is being able to say <strong>what deserves
+      a test, at which level of the stack, and — just as importantly — what doesn't</strong>. Interviewers have all
+      seen the two failure modes: the team with 4,000 unit tests that all pass while the checkout button is broken
+      in production, and the team whose every refactor turns 80 tests red without a single real bug being caught.
+      Both are testing strategies that optimize for a number instead of for confidence.
+    </p>
+    <p>
+      At FAANG, testing shows up inside the coding round ("how would you test this component you just built?") and in
+      system/design follow-ups ("what's your CI story for this feature?"). At product startups it's often more direct:
+      "our test suite is slow and flaky, what would you do?" — a question about ROI and prioritization wearing a
+      technical costume. This tutorial covers the modern stack (React Testing Library, user-event v14, MSW v2,
+      Vitest, Playwright) with exactly-correct async and timer examples — the code people copy into real suites —
+      and, threaded through everything, the judgment framing interviewers actually score.
+    </p>
+    <div class="tier-legend">
+      <span class="tier tier-1">T1 — must be airtight</span>
+      <span class="tier tier-2">T2 — senior differentiator</span>
+      <span class="tier tier-3">T3 — awareness is enough</span>
+    </div>
+  </section>
+
+  <div class="toc">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#philosophy">Testing philosophy at the senior level</a></li>
+      <li><a href="#rtl">React Testing Library — the deep version</a></li>
+      <li><a href="#async">Async testing done right (findBy, waitFor, act, fake timers)</a></li>
+      <li><a href="#msw">MSW — network-level API mocking</a></li>
+      <li><a href="#mocking">Mocking judgment — modules, time, browser APIs, and when not to</a></li>
+      <li><a href="#vitest">Vitest vs Jest, environments, and the honest take on snapshots</a></li>
+      <li><a href="#hooks">Testing hooks, stores, and non-visual logic</a></li>
+      <li><a href="#playwright">Playwright e2e (and Cypress literacy)</a></li>
+      <li><a href="#strategy">The senior test-strategy answer, rehearsable</a></li>
+      <li><a href="#frontier">Frontier awareness — RSC, Storybook tests, contracts, mutation testing</a></li>
+      <li><a href="#qa">Interview Q&amp;A</a></li>
+      <li><a href="#exercises">Hands-on exercises</a></li>
+    </ol>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="philosophy">1. Testing philosophy at the senior level <span class="tier tier-1">T1</span></h2>
+
+  <h3>Trophy vs pyramid — why frontend inverted the middle</h3>
+  <p>
+    The classic <strong>testing pyramid</strong> (many unit tests, fewer integration, a handful of e2e) came from a
+    backend world where "unit" meant a pure class with injectable dependencies and integration tests meant slow,
+    shared databases. Frontend broke both assumptions. A React "unit" — one component rendered in isolation with
+    every child and hook mocked — tests almost nothing real: components exist to <em>compose</em>, and their bugs
+    live in the seams (props wiring, state flowing to the DOM, event handlers, data fetching). Meanwhile, jsdom made
+    integration-style tests <em>fast</em>: rendering a whole feature tree with a mocked network runs in milliseconds.
+  </p>
+  <p>
+    Kent C. Dodds' <strong>testing trophy</strong> captures the resulting sweet spot: a base of static analysis
+    (TypeScript, ESLint — bugs caught for free on every keystroke), a modest band of unit tests for pure logic,
+    a <em>fat middle</em> of integration tests (component trees + RTL + MSW), and a thin cap of e2e for the journeys
+    that pay the bills. The slogan is "the more your tests resemble the way your software is used, the more
+    confidence they can give you" — with cost rising as you go up, so the trophy is the point of best
+    confidence-per-dollar, not a claim that e2e is bad.
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>Level</th><th>What belongs here</th><th>What it catches</th><th>What it costs</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Static (types, lint)</td>
+        <td>Everything — it's free</td>
+        <td>Typos, nullability, wrong prop shapes, dead code</td>
+        <td>~0 per bug caught</td>
+      </tr>
+      <tr>
+        <td>Unit</td>
+        <td>Pure logic: reducers, selectors, formatters, validation, date math, parsing</td>
+        <td>Logic errors, edge cases (empty, negative, unicode)</td>
+        <td>Cheap to write and run; worthless for wiring bugs</td>
+      </tr>
+      <tr>
+        <td>Integration (RTL + MSW)</td>
+        <td>Component behavior: user does X → sees Y, incl. loading/error/empty states</td>
+        <td>Wiring, state→DOM, handlers, fetch flows, a11y regressions</td>
+        <td>Fast in jsdom; the workhorse — most tests live here</td>
+      </tr>
+      <tr>
+        <td>E2E (Playwright)</td>
+        <td>Critical user journeys only: signup, login, checkout, the one flow that makes money</td>
+        <td>Real-browser, real-integration failures nothing else can see</td>
+        <td>Slow, flake-prone, expensive to maintain — ration them</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>"Test behavior, not implementation" — made concrete</h3>
+  <p>
+    This phrase is repeated so often it has lost meaning. Here is exactly what an implementation-detail test
+    looks like, and why it's a liability:
+  </p>
+
+  <pre><code><span class="com">// ❌ IMPLEMENTATION-DETAIL TESTS — every assertion here is a refactor landmine</span>
+
+<span class="com">// 1. Asserting internal state values (enzyme-era habit)</span>
+expect(wrapper.state(<span class="str">'isOpen'</span>)).toBe(<span class="kw">true</span>);
+<span class="com">//    Breaks if you rename isOpen → expanded, move it into a reducer, or lift it</span>
+<span class="com">//    into a parent. Catches zero bugs the DOM assertion below wouldn't catch.</span>
+
+<span class="com">// 2. Calling instance methods directly</span>
+wrapper.instance().handleToggle();
+<span class="com">//    Breaks the moment the class becomes a function component. Tests a function</span>
+<span class="com">//    the user can never call — users click things, they don't invoke methods.</span>
+
+<span class="com">// 3. Asserting props passed to a child (shallow rendering's whole business model)</span>
+expect(wrapper.find(Modal).prop(<span class="str">'visible'</span>)).toBe(<span class="kw">true</span>);
+<span class="com">//    Breaks if Modal's prop is renamed to `open`, or Modal is replaced by a</span>
+<span class="com">//    Dialog, or the boolean is derived differently — even though the USER-VISIBLE</span>
+<span class="com">//    behavior (a dialog appears) is identical in all cases.</span>
+
+<span class="com">// ✅ BEHAVIOR TEST — same coverage, survives all of the above refactors</span>
+<span class="kw">const</span> user = userEvent.setup();
+render(&lt;Settings /&gt;);
+<span class="kw">await</span> user.click(screen.getByRole(<span class="str">'button'</span>, { name: <span class="str">/edit profile/i</span> }));
+expect(<span class="kw">await</span> screen.findByRole(<span class="str">'dialog'</span>, { name: <span class="str">/edit profile/i</span> })).toBeInTheDocument();</code></pre>
+
+  <p>
+    The litmus test: <strong>could a user (or a screen reader) observe what you're asserting?</strong> If not, the
+    test is coupled to <em>how</em> the code works rather than <em>what</em> it does. Implementation-detail tests
+    have the worst possible failure matrix: they produce <strong>false negatives</strong> (red on safe refactors,
+    training the team to ignore or mechanically "fix" tests) and <strong>false positives</strong> (green while the
+    behavior is broken — the state was set, but nothing rendered it). Two exceptions are fine to name in an
+    interview: asserting a <em>callback prop</em> was called with the right arguments (that callback <em>is</em> the
+    component's public contract with its parent), and asserting an outgoing <em>request body</em> (the contract with
+    the server). Contracts at the boundary are behavior; internals are not.
+  </p>
+
+  <h3>What to test at each level — the routing rule</h3>
+  <ul>
+    <li><strong>Pure logic → unit tests.</strong> If a function takes data and returns data, test it as a function.
+      Don't render a component to test a price formatter. Corollary: <em>extract</em> gnarly logic out of components
+      precisely so it becomes unit-testable.</li>
+    <li><strong>Component behavior → RTL integration.</strong> Render the realistic tree (real children, real
+      context providers, mocked network via MSW). One test per user-meaningful behavior: "shows validation error on
+      empty submit", "renders empty state when API returns []".</li>
+    <li><strong>Critical journeys → e2e.</strong> The 5–10 flows where breakage equals lost revenue or lost trust.
+      Not "every page renders" — that's what integration tests and smoke checks are for.</li>
+  </ul>
+
+  <h3>Coverage honesty</h3>
+  <p>
+    100% coverage means every line <em>executed</em>, not every behavior <em>verified</em>. A test that renders a
+    component and asserts nothing gets you full line coverage and zero confidence. Coverage is useful as a
+    <em>negative signal</em> — "this payment module is at 12%, that's a risk" — and nearly useless as a positive
+    one. The senior framing: <strong>coverage tells you where you definitely have no tests; it never tells you
+    where you have good ones.</strong> Target the risky paths: money, auth, data mutation, anything with branching
+    edge cases, anything that's broken before. Let trivial glue code go untested; the type checker has it.
+  </p>
+
+  <div class="senior">
+    When asked "what's your coverage target?", refuse the number gracefully: "I care about a coverage <em>floor</em>
+    on changed lines in CI (say 70–80%) as a smoke alarm, but I review what the tests assert, not what they execute.
+    I'd rather have 60% coverage of behavior-level tests than 95% of snapshot noise." Then pivot to the ROI
+    conversation: every test has a purchase price (writing it), a carrying cost (maintaining it through refactors,
+    CI minutes, flake triage), and a payoff (bugs caught × cost of those bugs). Tests on stable, risky, high-traffic
+    code have great ROI. Tests pinning implementation details of churning UI have negative ROI — you pay maintenance
+    forever and they never catch anything.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="rtl">2. React Testing Library — the deep version <span class="tier tier-1">T1</span></h2>
+
+  <h3>The guiding principle, operationalized</h3>
+  <p>
+    RTL's design enforces the philosophy above by <em>subtraction</em>: it gives you no access to state, instances,
+    or props — only the rendered DOM and ways to query it <strong>like a user would</strong>. <code>render()</code>
+    mounts your tree into a jsdom container; <code>screen</code> is a pre-bound query object for the whole document
+    (prefer it over destructuring queries from <code>render</code> — one idiom everywhere, and it plays nicely with
+    portals that render outside the container).
+  </p>
+
+  <pre><code><span class="kw">import</span> { render, screen } <span class="kw">from</span> <span class="str">'@testing-library/react'</span>;
+<span class="kw">import</span> userEvent <span class="kw">from</span> <span class="str">'@testing-library/user-event'</span>;
+
+test(<span class="str">'submits the search term'</span>, <span class="kw">async</span> () =&gt; {
+  <span class="kw">const</span> user = userEvent.setup();          <span class="com">// v14: always setup() first</span>
+  <span class="kw">const</span> onSearch = vi.fn();
+  render(&lt;SearchBar onSearch={onSearch} /&gt;);
+
+  <span class="kw">await</span> user.type(screen.getByRole(<span class="str">'searchbox'</span>, { name: <span class="str">/search products/i</span> }), <span class="str">'ssd'</span>);
+  <span class="kw">await</span> user.click(screen.getByRole(<span class="str">'button'</span>, { name: <span class="str">/search/i</span> }));
+
+  expect(onSearch).toHaveBeenCalledWith(<span class="str">'ssd'</span>);
+});</code></pre>
+
+  <h3>Query priority — and why it doubles as an a11y audit</h3>
+  <p>
+    RTL documents an explicit priority order. It is not stylistic — each step down the list is a step away from how
+    real users (and assistive tech) perceive the page:
+  </p>
+
+  <table>
+    <thead><tr><th>Priority</th><th>Query</th><th>Resembles</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td><code>getByRole(role, { name })</code></td><td>How screen readers navigate</td>
+        <td>Your default. The <code>name</code> option is the <strong>accessible name</strong> — label text, button text, <code>aria-label</code>. If you can't find it by role+name, a screen-reader user can't either.</td></tr>
+      <tr><td>2</td><td><code>getByLabelText</code></td><td>How users find form fields</td><td>Fails if the label isn't programmatically associated — catching a real a11y bug.</td></tr>
+      <tr><td>3</td><td><code>getByPlaceholderText</code></td><td>Weak substitute for a label</td><td>Placeholders aren't labels; using this often flags a design smell.</td></tr>
+      <tr><td>4</td><td><code>getByText</code></td><td>How users find non-interactive content</td><td>Fine for divs/spans/paragraphs.</td></tr>
+      <tr><td>5</td><td><code>getByDisplayValue</code></td><td>Current value of a filled form</td><td>Occasionally useful for edit forms.</td></tr>
+      <tr><td>6</td><td><code>getByAltText</code> / <code>getByTitle</code></td><td>Images / titles</td><td>Alt text is itself an a11y requirement.</td></tr>
+      <tr><td>Last</td><td><code>getByTestId</code></td><td>Nothing a user perceives</td><td>Escape hatch for genuinely unnameable containers (e.g., a chart wrapper). Every test-id is a small confession.</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    The senior insight to say out loud: <strong>this ordering makes your test suite a continuous accessibility
+    audit for free.</strong> If <code>getByRole('button', { name: /save/i })</code> can't find your save button,
+    it's because it's a <code>&lt;div onClick&gt;</code> with no role, or an icon button with no accessible name —
+    both real defects for keyboard and screen-reader users. Teams that reach for <code>data-testid</code> first
+    forfeit that audit and couple tests to attributes users never see.
+  </p>
+
+  <h3>get vs query vs find — the semantics table</h3>
+  <table>
+    <thead><tr><th>Variant</th><th>0 matches</th><th>1 match</th><th>&gt;1 match</th><th>Async?</th><th>Use for</th></tr></thead>
+    <tbody>
+      <tr><td><code>getBy…</code></td><td>❌ throws (with a DOM dump)</td><td>returns it</td><td>❌ throws</td><td>No</td><td>Elements that must be there <em>now</em></td></tr>
+      <tr><td><code>queryBy…</code></td><td>returns <code>null</code></td><td>returns it</td><td>❌ throws</td><td>No</td><td><strong>Only</strong> for asserting absence: <code>expect(queryBy…).not.toBeInTheDocument()</code></td></tr>
+      <tr><td><code>findBy…</code></td><td>rejects after timeout (~1s default)</td><td>resolves with it</td><td>rejects</td><td>Yes — retries</td><td>Elements that appear <em>after</em> async work</td></tr>
+      <tr><td><code>getAllBy…</code></td><td>❌ throws</td><td colspan="2">returns array</td><td>No</td><td>Lists that must exist</td></tr>
+      <tr><td><code>queryAllBy…</code></td><td>returns <code>[]</code></td><td colspan="2">returns array</td><td>No</td><td>Length assertions incl. zero</td></tr>
+      <tr><td><code>findAllBy…</code></td><td>rejects</td><td colspan="2">resolves with array</td><td>Yes</td><td>Async lists</td></tr>
+    </tbody>
+  </table>
+
+  <div class="pitfall">
+    <code>expect(screen.getByText('Error')).toBeInTheDocument()</code> is technically redundant — <code>getBy</code>
+    already threw if it's missing — but keep the <code>expect</code> anyway for readable failure output and lint
+    happiness. The real pitfall is the inverse: using <code>getBy</code> to assert absence. It throws before your
+    <code>.not.toBeInTheDocument()</code> ever runs. Absence checks are the <em>one</em> legitimate job of
+    <code>queryBy</code>.
+  </div>
+
+  <h3>user-event v14 — why it replaced fireEvent</h3>
+  <p>
+    <code>fireEvent.click(el)</code> dispatches exactly one synthetic <code>click</code> event.
+    A real click is a <em>sequence</em>: <code>pointerover → pointerdown → focus (if focusable) → pointerup →
+    click</code>, respecting disabled state, pointer-events CSS, and focusability. <code>user-event</code> simulates
+    the full sequence, which is why it catches bugs <code>fireEvent</code> can't: a button covered by an overlay with
+    <code>pointer-events: none</code>, a handler that depends on focus arriving first, a keydown-based shortcut.
+    Similarly <code>user.type()</code> fires per-character <code>keydown/keypress/input/keyup</code>, so your
+    per-keystroke validation and debounce logic actually exercise.
+  </p>
+
+  <pre><code><span class="kw">const</span> user = userEvent.setup();      <span class="com">// v14 pattern — do this per test, BEFORE render</span>
+
+<span class="kw">await</span> user.click(button);            <span class="com">// all APIs are async in v14 — always await</span>
+<span class="kw">await</span> user.type(input, <span class="str">'hello{Enter}'</span>);
+<span class="kw">await</span> user.keyboard(<span class="str">'{Tab}'</span>);        <span class="com">// keyboard navigation — great for a11y flows</span>
+<span class="kw">await</span> user.selectOptions(select, <span class="str">'US'</span>);
+<span class="kw">await</span> user.upload(fileInput, file);
+<span class="kw">await</span> user.hover(tooltipTrigger);
+<span class="kw">await</span> user.clear(input);</code></pre>
+
+  <div class="note">
+    <code>setup()</code> exists because v14 tracks a coherent input-device state (which keys are down, pointer
+    position) across calls, and because it's the injection point for fake-timer integration
+    (<code>setup({ advanceTimers: vi.advanceTimersByTime })</code> — see §3). Direct calls like
+    <code>userEvent.click(el)</code> still work but forfeit both; the setup pattern is the one to show in interviews.
+  </div>
+
+  <h3>Asserting with jest-dom matchers</h3>
+  <p>
+    <code>@testing-library/jest-dom</code> (works with Vitest too) turns DOM assertions into readable,
+    well-messaged matchers:
+  </p>
+
+  <pre><code>expect(button).toBeInTheDocument();
+expect(button).toBeDisabled();                      <span class="com">// understands aria-disabled &amp; fieldset too</span>
+expect(button).toBeEnabled();
+expect(link).toHaveAccessibleName(<span class="str">'View invoice'</span>); <span class="com">// computed a11y name — label/aria/content</span>
+expect(input).toHaveValue(<span class="str">'ada@lovelace.dev'</span>);
+expect(checkbox).toBeChecked();
+expect(alert).toHaveTextContent(<span class="str">/payment failed/i</span>);
+expect(panel).toBeVisible();                        <span class="com">// in DOM but display:none → fails</span>
+expect(form).toHaveFormValues({ email: <span class="str">'a@b.c'</span>, plan: <span class="str">'pro'</span> });
+expect(el).toHaveAttribute(<span class="str">'aria-expanded'</span>, <span class="str">'true'</span>);
+expect(el).toHaveFocus();</code></pre>
+
+  <h3>Debugging failing tests</h3>
+  <pre><code>screen.debug();                        <span class="com">// pretty-prints current DOM (truncated ~7000 chars)</span>
+screen.debug(el, Infinity);            <span class="com">// one element, no truncation</span>
+screen.logTestingPlaygroundURL();      <span class="com">// URL → testing-playground.com with your DOM loaded,</span>
+                                       <span class="com">// suggests the best query for any element you click</span>
+<span class="com">// Also: getByRole's failure message lists every role + accessible name in the DOM —</span>
+<span class="com">// read it before reaching for debug(); the answer is usually right there.</span></code></pre>
+
+  <!-- ============================================================ -->
+  <h2 id="async">3. Async testing done right <span class="tier tier-1">T1</span></h2>
+
+  <p>
+    Async is where most real-world test pain lives: flaky waits, act() warnings, timers that never fire. The rules
+    below are exact — this is the section to know cold.
+  </p>
+
+  <h3>findBy* — the default for "it appears later"</h3>
+  <pre><code>test(<span class="str">'loads and shows the user'</span>, <span class="kw">async</span> () =&gt; {
+  render(&lt;UserProfile id=<span class="str">"1"</span> /&gt;);
+
+  <span class="com">// findBy = getBy + waitFor: retries the query until it matches or ~1s passes</span>
+  expect(<span class="kw">await</span> screen.findByRole(<span class="str">'heading'</span>, { name: <span class="str">'Ada Lovelace'</span> })).toBeInTheDocument();
+
+  <span class="com">// and loading is gone — absence check, so queryBy</span>
+  expect(screen.queryByText(<span class="str">/loading/i</span>)).not.toBeInTheDocument();
+});</code></pre>
+
+  <h3>waitFor — semantics people get wrong</h3>
+  <p>
+    <code>waitFor(callback)</code> <strong>runs the callback repeatedly</strong> (on an interval and on DOM
+    mutations) until it stops throwing, or times out. Two consequences follow directly from "runs repeatedly":
+  </p>
+  <ul>
+    <li><strong>Never put side effects inside.</strong> A <code>user.click()</code> inside <code>waitFor</code> may
+      execute five times before the assertion passes — clicking five times, submitting five forms. Do the action
+      outside; wait for the <em>outcome</em> inside.</li>
+    <li><strong>Keep it to a single assertion (or one logical condition).</strong> If assertion #1 keeps failing,
+      you wait the full timeout before ever learning whether #2 would pass, and the failure message points at the
+      wrong thing. One condition per <code>waitFor</code>; put follow-up synchronous assertions after it.</li>
+  </ul>
+
+  <pre><code><span class="com">// ❌ side effect inside waitFor — click may fire multiple times</span>
+<span class="kw">await</span> waitFor(<span class="kw">async</span> () =&gt; {
+  <span class="kw">await</span> user.click(screen.getByRole(<span class="str">'button'</span>, { name: <span class="str">/save/i</span> }));
+  expect(screen.getByText(<span class="str">/saved/i</span>)).toBeInTheDocument();
+});
+
+<span class="com">// ✅ act outside, assert outcome inside — and prefer findBy when it's "element appears"</span>
+<span class="kw">await</span> user.click(screen.getByRole(<span class="str">'button'</span>, { name: <span class="str">/save/i</span> }));
+expect(<span class="kw">await</span> screen.findByText(<span class="str">/saved/i</span>)).toBeInTheDocument();
+
+<span class="com">// waitFor earns its keep for non-element conditions:</span>
+<span class="kw">await</span> waitFor(() =&gt; expect(onSubmit).toHaveBeenCalledTimes(1));
+
+<span class="com">// disappearance has a dedicated helper — resolves when the element is removed:</span>
+<span class="kw">await</span> waitForElementToBeRemoved(() =&gt; screen.queryByText(<span class="str">/loading/i</span>));</code></pre>
+
+  <div class="pitfall">
+    <code>waitForElementToBeRemoved</code> throws if the element is <em>already gone</em> when you call it — it needs
+    to observe the removal. If the timing is uncertain, guard with a presence check first, or just assert the
+    positive replacement state with <code>findBy</code> instead (waiting for the data to appear implies loading
+    disappeared, in most UIs).
+  </div>
+
+  <h3>The act() warning, actually explained</h3>
+  <p>
+    <code>act()</code> is React's test-time contract: "run this work, then <strong>flush everything it caused</strong>
+    — state updates, re-renders, effects, and (with modern React) the microtasks in between — before returning."
+    It makes the post-<code>act</code> DOM deterministic instead of mid-update. The warning
+    <em>"An update to X inside a test was not wrapped in act(...)"</em> means: <strong>a state update happened at a
+    moment no act() scope was active</strong> — almost always because an async thing (a resolved fetch, a timer, a
+    transition) landed <em>after</em> your test stopped looking.
+  </p>
+  <p>
+    Key fact interviewers probe: <strong>RTL already wraps <code>render</code>, <code>user-event</code> calls, and
+    its async utilities in act() for you.</strong> So manually wrapping those in <code>act(...)</code> is redundant
+    noise. The warning is not asking you to sprinkle <code>act()</code> — it's telling you your test has a
+    <em>synchronization bug</em>:
+  </p>
+
+  <pre><code><span class="com">// ❌ the warning-producing test: fetch resolves after assertions finish</span>
+test(<span class="str">'shows user'</span>, () =&gt; {
+  render(&lt;UserProfile id=<span class="str">"1"</span> /&gt;);
+  expect(screen.getByText(<span class="str">/loading/i</span>)).toBeInTheDocument();
+  <span class="com">// test ends → fetch resolves → setState fires outside any act() → warning</span>
+  <span class="com">// (and worse: the "loaded" behavior is silently untested)</span>
+});
+
+<span class="com">// ❌ the cargo-cult "fix" — wrapping in act() just silences the symptom</span>
+<span class="kw">await</span> act(<span class="kw">async</span> () =&gt; { render(&lt;UserProfile id=<span class="str">"1"</span> /&gt;); });
+
+<span class="com">// ✅ the real fix — await the async outcome; the warning disappears BECAUSE</span>
+<span class="com">//    the test now observes the update it was previously abandoning</span>
+test(<span class="str">'shows user'</span>, <span class="kw">async</span> () =&gt; {
+  render(&lt;UserProfile id=<span class="str">"1"</span> /&gt;);
+  expect(screen.getByText(<span class="str">/loading/i</span>)).toBeInTheDocument();
+  expect(<span class="kw">await</span> screen.findByText(<span class="str">'Ada Lovelace'</span>)).toBeInTheDocument();
+});</code></pre>
+
+  <div class="senior">
+    The rehearsable line: "An act() warning is a symptom, not the disease. It means my test finished — or asserted —
+    before some async update landed. The fix is to <em>await the thing</em> (findBy, waitFor,
+    waitForElementToBeRemoved), not to wrap everything in act(). The only times I write act() by hand are advancing
+    fake timers and driving updates in <code>renderHook</code> tests, because those bypass RTL's pre-wrapped APIs."
+  </div>
+
+  <h3>Fake timers + user-event: the debounced search test, in full</h3>
+  <p>
+    This is the classic tricky test. Two systems must cooperate: <code>user.type()</code> internally uses a small
+    delay between keystrokes (awaiting real timers), and your debounce uses <code>setTimeout</code>. With fake
+    timers on, user-event would deadlock waiting for time that never passes — unless you tell it how to advance
+    the fake clock. That's what <code>advanceTimers</code> in <code>setup()</code> is for.
+  </p>
+
+  <pre><code><span class="com">// SearchBox.tsx — debounces onSearch by 500ms</span>
+<span class="kw">function</span> SearchBox({ onSearch }) {
+  <span class="kw">const</span> [value, setValue] = useState(<span class="str">''</span>);
+  useEffect(() =&gt; {
+    <span class="kw">if</span> (!value) <span class="kw">return</span>;
+    <span class="kw">const</span> id = setTimeout(() =&gt; onSearch(value), 500);
+    <span class="kw">return</span> () =&gt; clearTimeout(id);
+  }, [value, onSearch]);
+  <span class="kw">return</span> &lt;input role=<span class="str">"searchbox"</span> aria-label=<span class="str">"Search"</span>
+           value={value} onChange={e =&gt; setValue(e.target.value)} /&gt;;
+}
+
+<span class="com">// SearchBox.test.tsx — the exact, correct pattern</span>
+<span class="kw">import</span> { render, screen, act } <span class="kw">from</span> <span class="str">'@testing-library/react'</span>;
+<span class="kw">import</span> userEvent <span class="kw">from</span> <span class="str">'@testing-library/user-event'</span>;
+
+beforeEach(() =&gt; vi.useFakeTimers());
+afterEach(() =&gt; {
+  vi.runOnlyPendingTimers();   <span class="com">// let queued cleanups fire…</span>
+  vi.useRealTimers();          <span class="com">// …then restore, or later tests hang mysteriously</span>
+});
+
+test(<span class="str">'debounces: one search call, 500ms after the last keystroke'</span>, <span class="kw">async</span> () =&gt; {
+  <span class="kw">const</span> onSearch = vi.fn();
+  <span class="com">// THE critical line — user-event advances the fake clock instead of awaiting it:</span>
+  <span class="kw">const</span> user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime.bind(vi) });
+  render(&lt;SearchBox onSearch={onSearch} /&gt;);
+
+  <span class="kw">await</span> user.type(screen.getByRole(<span class="str">'searchbox'</span>, { name: <span class="str">/search/i</span> }), <span class="str">'react'</span>);
+
+  <span class="com">// mid-debounce: nothing yet</span>
+  expect(onSearch).not.toHaveBeenCalled();
+
+  <span class="com">// advance 499ms — still nothing (each keystroke reset the timer; 500 counts</span>
+  <span class="com">// from the LAST one). act() because the timer callback triggers a state-less</span>
+  <span class="com">// call here, but in general timer callbacks setState → they need an act scope.</span>
+  act(() =&gt; vi.advanceTimersByTime(499));
+  expect(onSearch).not.toHaveBeenCalled();
+
+  act(() =&gt; vi.advanceTimersByTime(1));
+  expect(onSearch).toHaveBeenCalledTimes(1);
+  expect(onSearch).toHaveBeenCalledWith(<span class="str">'react'</span>);
+});</code></pre>
+
+  <div class="pitfall">
+    Three ways this test rots if written casually: (1) forgetting <code>advanceTimers</code> in
+    <code>setup()</code> → <code>user.type</code> times out or hangs; (2) forgetting
+    <code>vi.useRealTimers()</code> in <code>afterEach</code> → later tests using real waits stall; (3) advancing
+    timers <em>without</em> <code>act()</code> → the debounce fires, calls setState, and you get the act warning
+    plus a stale DOM. Interviewers who've maintained real suites recognize instantly whether you've fought this
+    battle.
+  </div>
+
+  <h3>Flushing promises with fake timers</h3>
+  <p>
+    If the timer callback itself starts async work (a debounced <em>fetch</em>), advancing timers fires the callback
+    but doesn't wait for its promises. Use the async advancing APIs, which yield to the microtask queue between
+    timer runs:
+  </p>
+  <pre><code><span class="kw">await</span> act(<span class="kw">async</span> () =&gt; { <span class="kw">await</span> vi.advanceTimersByTimeAsync(500); });
+<span class="com">// or run everything scheduled:  await vi.runAllTimersAsync();</span>
+expect(<span class="kw">await</span> screen.findByText(<span class="str">'3 results'</span>)).toBeInTheDocument();</code></pre>
+
+  <!-- ============================================================ -->
+  <h2 id="msw">4. MSW — network-level API mocking <span class="tier tier-1">T1</span></h2>
+
+  <h3>Why the network level beats mocking fetch/axios</h3>
+  <p>
+    The old way — <code>vi.mock('axios')</code> or stubbing <code>global.fetch</code> — replaces your <em>HTTP
+    client</em> with a function returning a canned object. That skips everything between your component and the
+    wire: URL construction, query-param serialization, request bodies, headers, response parsing, HTTP status
+    handling, interceptors, and your data-fetching library's cache/retry behavior. Your test passes while the real
+    request 400s because a param was named wrong.
+  </p>
+  <p>
+    <strong>MSW (Mock Service Worker) intercepts at the network layer</strong> — in Node tests by patching the
+    request internals (<code>setupServer</code>), in the browser via an actual Service Worker
+    (<code>setupWorker</code>). Your app runs its <em>entire real data path</em>; only the server on the other end
+    is fake. Three senior-grade consequences:
+  </p>
+  <ul>
+    <li><strong>Refactor-proof:</strong> swap fetch → axios → TanStack Query and every test still passes untouched —
+      the mock is defined in HTTP terms, not client-library terms.</li>
+    <li><strong>Realistic failure testing:</strong> you can return actual 500s, delays, network errors — exercising
+      the same error-handling code paths production hits.</li>
+    <li><strong>One mock, everywhere:</strong> the same handlers power tests, local dev without a backend, and
+      Storybook. The mock becomes a living contract, not per-test throwaway.</li>
+  </ul>
+
+  <h3>Setup — MSW v2 syntax (rest → http)</h3>
+  <pre><code><span class="com">// src/mocks/handlers.ts  (v2: `http` + `HttpResponse`; v1's `rest`/`res(ctx…)` is gone)</span>
+<span class="kw">import</span> { http, HttpResponse, delay } <span class="kw">from</span> <span class="str">'msw'</span>;
+
+<span class="kw">export const</span> handlers = [
+  http.get(<span class="str">'/api/users'</span>, () =&gt; {
+    <span class="kw">return</span> HttpResponse.json([
+      { id: 1, name: <span class="str">'Ada Lovelace'</span>, email: <span class="str">'ada@analytical.dev'</span> },
+      { id: 2, name: <span class="str">'Grace Hopper'</span>, email: <span class="str">'grace@navy.mil'</span> },
+    ]);
+  }),
+
+  http.get(<span class="str">'/api/users/:id'</span>, ({ params }) =&gt; {
+    <span class="kw">return</span> HttpResponse.json({ id: Number(params.id), name: <span class="str">'Ada Lovelace'</span> });
+  }),
+
+  http.post(<span class="str">'/api/users'</span>, <span class="kw">async</span> ({ request }) =&gt; {
+    <span class="kw">const</span> body = <span class="kw">await</span> request.json();          <span class="com">// standard Fetch API Request</span>
+    <span class="kw">return</span> HttpResponse.json({ id: 3, ...body }, { status: 201 });
+  }),
+];
+
+<span class="com">// src/mocks/server.ts</span>
+<span class="kw">import</span> { setupServer } <span class="kw">from</span> <span class="str">'msw/node'</span>;
+<span class="kw">import</span> { handlers } <span class="kw">from</span> <span class="str">'./handlers'</span>;
+<span class="kw">export const</span> server = setupServer(...handlers);
+
+<span class="com">// vitest.setup.ts</span>
+<span class="kw">import</span> { server } <span class="kw">from</span> <span class="str">'./src/mocks/server'</span>;
+beforeAll(() =&gt; server.listen({ onUnhandledRequest: <span class="str">'error'</span> })); <span class="com">// unmocked call = failure, not silence</span>
+afterEach(() =&gt; server.resetHandlers());   <span class="com">// per-test overrides don't leak</span>
+afterAll(() =&gt; server.close());</code></pre>
+
+  <h3>The full worked example — loading / success / error / empty</h3>
+  <p>
+    This quartet is the canonical "show me you can test a data-fetching component" answer. Note where each state
+    is produced: happy path from the default handlers, error and empty via <strong><code>server.use()</code>
+    per-test overrides</strong> — which prepend a one-off handler that <code>resetHandlers()</code> clears.
+  </p>
+
+  <pre><code><span class="kw">import</span> { render, screen } <span class="kw">from</span> <span class="str">'@testing-library/react'</span>;
+<span class="kw">import</span> { http, HttpResponse, delay } <span class="kw">from</span> <span class="str">'msw'</span>;
+<span class="kw">import</span> { server } <span class="kw">from</span> <span class="str">'../mocks/server'</span>;
+<span class="kw">import</span> { UserList } <span class="kw">from</span> <span class="str">'./UserList'</span>;
+
+test(<span class="str">'shows a loading indicator, then the users'</span>, <span class="kw">async</span> () =&gt; {
+  render(&lt;UserList /&gt;);
+
+  expect(screen.getByRole(<span class="str">'status'</span>)).toHaveTextContent(<span class="str">/loading/i</span>);
+
+  expect(<span class="kw">await</span> screen.findByRole(<span class="str">'list'</span>, { name: <span class="str">/users/i</span> })).toBeInTheDocument();
+  <span class="kw">const</span> items = screen.getAllByRole(<span class="str">'listitem'</span>);
+  expect(items).toHaveLength(2);
+  expect(items[0]).toHaveTextContent(<span class="str">'Ada Lovelace'</span>);
+});
+
+test(<span class="str">'shows an error state on 500'</span>, <span class="kw">async</span> () =&gt; {
+  server.use(
+    http.get(<span class="str">'/api/users'</span>, () =&gt; <span class="kw">new</span> HttpResponse(<span class="kw">null</span>, { status: 500 }))
+  );
+  render(&lt;UserList /&gt;);
+
+  expect(<span class="kw">await</span> screen.findByRole(<span class="str">'alert'</span>)).toHaveTextContent(<span class="str">/couldn't load users/i</span>);
+  <span class="com">// and a recovery affordance — error states should be actionable</span>
+  expect(screen.getByRole(<span class="str">'button'</span>, { name: <span class="str">/retry/i</span> })).toBeInTheDocument();
+});
+
+test(<span class="str">'shows an empty state when there are no users'</span>, <span class="kw">async</span> () =&gt; {
+  server.use(http.get(<span class="str">'/api/users'</span>, () =&gt; HttpResponse.json([])));
+  render(&lt;UserList /&gt;);
+
+  expect(<span class="kw">await</span> screen.findByText(<span class="str">/no users yet/i</span>)).toBeInTheDocument();
+  expect(screen.queryByRole(<span class="str">'list'</span>)).not.toBeInTheDocument();
+});
+
+test(<span class="str">'network failure (not an HTTP status) also lands in the error state'</span>, <span class="kw">async</span> () =&gt; {
+  server.use(http.get(<span class="str">'/api/users'</span>, () =&gt; HttpResponse.error())); <span class="com">// connection-level failure</span>
+  render(&lt;UserList /&gt;);
+  expect(<span class="kw">await</span> screen.findByRole(<span class="str">'alert'</span>)).toBeInTheDocument();
+});</code></pre>
+
+  <div class="note">
+    <code>await delay(200)</code> (or <code>delay('infinite')</code>) inside a handler is how you make loading states
+    observable or permanent — far better than racing a fast mock. And if you use TanStack Query, create a fresh
+    <code>QueryClient</code> per test with <code>retry: false</code>, or the error test waits through three retries
+    before failing over.
+  </div>
+
+  <h3>GraphQL awareness</h3>
+  <pre><code><span class="kw">import</span> { graphql, HttpResponse } <span class="kw">from</span> <span class="str">'msw'</span>;
+
+<span class="kw">export const</span> handlers = [
+  graphql.query(<span class="str">'GetUser'</span>, ({ variables }) =&gt; {
+    <span class="kw">return</span> HttpResponse.json({
+      data: { user: { id: variables.id, name: <span class="str">'Ada Lovelace'</span> } },
+    });
+  }),
+  graphql.mutation(<span class="str">'UpdateUser'</span>, () =&gt; {
+    <span class="kw">return</span> HttpResponse.json({ errors: [{ message: <span class="str">'Forbidden'</span> }] }); <span class="com">// GraphQL errors are 200s!</span>
+  }),
+];</code></pre>
+  <p>
+    MSW matches GraphQL operations <em>by name</em>, regardless of endpoint — and it lets you test the GraphQL
+    quirk that errors arrive in a 200 response body, which pure fetch-mocks routinely get wrong.
+  </p>
+
+  <!-- ============================================================ -->
+  <h2 id="mocking">5. Mocking judgment <span class="tier tier-2">T2</span></h2>
+
+  <h3>Module mocking — vi.mock / jest.mock and the hoisting gotcha</h3>
+  <p>
+    <code>vi.mock('./analytics')</code> is <strong>hoisted above all imports</strong> by the transform — it runs
+    before your module-under-test loads, so the mock is in place when the import resolves. The gotcha: the factory
+    can't close over variables declared later in the file (they don't exist yet at hoist time). Vitest throws a
+    helpful error; Jest fails silently unless the variable starts with <code>mock</code>.
+  </p>
+
+  <pre><code><span class="com">// ❌ ReferenceError — `track` isn't initialized when the hoisted factory runs</span>
+<span class="kw">const</span> track = vi.fn();
+vi.mock(<span class="str">'./analytics'</span>, () =&gt; ({ track }));
+
+<span class="com">// ✅ vi.hoisted lifts the variable creation along with the mock</span>
+<span class="kw">const</span> { track } = vi.hoisted(() =&gt; ({ track: vi.fn() }));
+vi.mock(<span class="str">'./analytics'</span>, () =&gt; ({ track }));
+
+<span class="com">// ✅ partial mock — keep the real module, replace one export</span>
+vi.mock(<span class="str">'./api'</span>, <span class="kw">async</span> (importOriginal) =&gt; {
+  <span class="kw">const</span> actual = <span class="kw">await</span> importOriginal&lt;<span class="kw">typeof</span> <span class="kw">import</span>(<span class="str">'./api'</span>)&gt;();
+  <span class="kw">return</span> { ...actual, uploadFile: vi.fn().mockResolvedValue({ url: <span class="str">'/f/1'</span> }) };
+});</code></pre>
+
+  <h3>Mocking time and dates</h3>
+  <pre><code>vi.useFakeTimers();
+vi.setSystemTime(<span class="kw">new</span> Date(<span class="str">'2026-07-02T09:00:00Z'</span>));  <span class="com">// Date.now(), new Date() now frozen</span>
+
+expect(formatRelative(<span class="kw">new</span> Date(<span class="str">'2026-07-01T09:00:00Z'</span>))).toBe(<span class="str">'yesterday'</span>);
+
+vi.useRealTimers();  <span class="com">// always restore — afterEach, not at the end of the happy path</span></code></pre>
+
+  <h3>Mocking browser APIs — the jsdom gaps</h3>
+  <p>
+    jsdom deliberately doesn't implement layout or several observer APIs. Any component using
+    <code>matchMedia</code>, <code>IntersectionObserver</code>, or <code>ResizeObserver</code> crashes in tests
+    until you stub them — in the <strong>setup file</strong>, once, not per-test:
+  </p>
+
+  <pre><code><span class="com">// vitest.setup.ts — the standard jsdom-gap stubs</span>
+Object.defineProperty(window, <span class="str">'matchMedia'</span>, {
+  writable: <span class="kw">true</span>,
+  value: vi.fn().mockImplementation((query) =&gt; ({
+    matches: <span class="kw">false</span>, media: query, onchange: <span class="kw">null</span>,
+    addEventListener: vi.fn(), removeEventListener: vi.fn(),
+    addListener: vi.fn(), removeListener: vi.fn(),   <span class="com">// legacy API some libs still call</span>
+    dispatchEvent: vi.fn(),
+  })),
+});
+
+<span class="kw">class</span> ObserverStub {
+  observe = vi.fn(); unobserve = vi.fn(); disconnect = vi.fn();
+  takeRecords = () =&gt; [];
+}
+vi.stubGlobal(<span class="str">'IntersectionObserver'</span>, ObserverStub);
+vi.stubGlobal(<span class="str">'ResizeObserver'</span>, ObserverStub);
+
+<span class="com">// also commonly needed: scrollIntoView, URL.createObjectURL, clipboard</span>
+Element.prototype.scrollIntoView = vi.fn();</code></pre>
+
+  <div class="note">
+    If a behavior genuinely <em>depends</em> on layout (virtualized lists, "load more when the sentinel is
+    visible"), a stub that never fires tests nothing — that behavior belongs in Playwright, where a real layout
+    engine exists. Knowing which side of that line a test sits on is exactly the judgment being graded.
+  </div>
+
+  <h3>When NOT to mock</h3>
+  <ul>
+    <li><strong>Your own components.</strong> Mocking <code>&lt;UserCard /&gt;</code> inside a
+      <code>&lt;UserList /&gt;</code> test converts an integration test back into a shallow-render test — the wiring
+      between them (the most bug-prone part) is now unverified. Render the real child. Exception: a genuinely heavy
+      third-party embed (map SDK, video player, chart canvas) — stub the <em>foreign</em> thing, never your own.</li>
+    <li><strong>Your own state management.</strong> Don't mock <code>useSelector</code>/<code>useStore</code>.
+      Provide a real store with preloaded state (§7) — otherwise selectors, reducers, and subscription wiring are
+      all outside the test.</li>
+    <li><strong>The thing you're testing.</strong> Sounds obvious; happens constantly via transitive over-mocking.
+      Each mock is a bet that the boundary is stable and correct — every one you add shrinks what the test can catch.</li>
+  </ul>
+
+  <h3>Spies on callback props — the legitimate contract assertion</h3>
+  <pre><code><span class="kw">const</span> onAddToCart = vi.fn();
+render(&lt;ProductCard product={ssd} onAddToCart={onAddToCart} /&gt;);
+
+<span class="kw">await</span> user.click(screen.getByRole(<span class="str">'button'</span>, { name: <span class="str">/add to cart/i</span> }));
+
+expect(onAddToCart).toHaveBeenCalledTimes(1);
+expect(onAddToCart).toHaveBeenCalledWith({ productId: ssd.id, quantity: 1 });</code></pre>
+
+  <h3>Module mocks vs dependency injection — prefer the seam you designed</h3>
+  <p>
+    <code>vi.mock</code> reaches into the module graph and swaps a file — powerful, but it couples the test to a
+    <em>file path</em> and hides the dependency. If a component instead receives its dependencies via
+    <strong>props or context</strong> (an <code>onSave</code> callback, an <code>ApiProvider</code>, a
+    <code>ClockContext</code>), tests inject fakes through the front door — no hoisting rules, no path coupling,
+    and the seam is visible in the component's API. The senior heuristic: <strong>if you keep needing
+    <code>vi.mock</code> for the same module, that's a design signal — the dependency wants to be injectable.</strong>
+    Reserve module mocking for third-party edges and true singletons.
+  </p>
+
+  <!-- ============================================================ -->
+  <h2 id="vitest">6. Vitest vs Jest — and the honest take on snapshots <span class="tier tier-2">T2</span></h2>
+
+  <h3>Why Vitest is winning for Vite apps</h3>
+  <table>
+    <thead><tr><th>Dimension</th><th>Jest</th><th>Vitest</th></tr></thead>
+    <tbody>
+      <tr><td>Module system</td><td>CJS-native; ESM support still experimental — hence years of transform pain with ESM-only packages</td><td>Native ESM + TypeScript out of the box (esbuild/Vite transform)</td></tr>
+      <tr><td>Config</td><td>Separate transform pipeline (babel-jest/ts-jest, moduleNameMapper) that must be kept in sync with the bundler</td><td><strong>Shares vite.config</strong> — same aliases, plugins, env handling as the app; one pipeline, zero drift</td></tr>
+      <tr><td>Parallelism</td><td>Worker processes</td><td>Worker threads (or forks/isolated pools), watch mode with Vite-grade HMR speed</td></tr>
+      <tr><td>API</td><td><code>jest.*</code>, expect</td><td><code>vi.*</code>, expect — <strong>deliberately Jest-compatible</strong>; jest-dom, RTL, MSW all work unchanged</td></tr>
+      <tr><td>Extras</td><td>Mature ecosystem, still the default in CRA-era and RN codebases</td><td>In-source testing, type testing (<code>expectTypeOf</code>), browser mode</td></tr>
+    </tbody>
+  </table>
+  <p>
+    The interview-safe summary: <strong>migration is mostly config</strong> — swap <code>jest.*</code> for
+    <code>vi.*</code> (or enable <code>globals</code>), move setup files, delete the transform config. The mental
+    model, matcher API, and testing-library layer are identical; the payoff is speed and never again debugging a
+    "Jest encountered an unexpected token" from an ESM dependency.
+  </p>
+  <p>
+    <strong>Environments:</strong> <code>jsdom</code> is the compatibility default; <code>happy-dom</code> is a
+    faster, lighter reimplementation — fine for most component tests, occasionally missing an API jsdom has
+    (measure, then choose; it's a per-file <code>// @vitest-environment</code> pragma if you need to mix).
+    <strong>Browser mode</strong> (running tests in a real Chromium/Firefox via Playwright providers) is the
+    emerging answer to "jsdom isn't a browser" — worth naming as awareness: it closes the layout/CSS gap for
+    component tests without going full e2e.
+  </p>
+
+  <h3>Snapshot testing — the honest take</h3>
+  <p>
+    Snapshots assert "output equals whatever it was last time someone pressed <code>u</code>." That's the whole
+    critique in one sentence. For a large component tree, the snapshot is hundreds of lines of markup nobody reads;
+    every legitimate change churns it; reviewers rubber-stamp the diff; and the test degenerates into a
+    change-detector with no opinion about correctness — pure carrying cost.
+  </p>
+  <ul>
+    <li><strong>Bad:</strong> full-tree component snapshots as your primary component tests.</li>
+    <li><strong>Fine:</strong> small, stable, <em>serializable</em> outputs where the whole value is the shape —
+      an error object, a generated className map, a transformed API payload, a CLI help string.
+      <strong>Inline snapshots</strong> (<code>toMatchInlineSnapshot</code>) are the best form: the expected value
+      lives in the test file, so the diff is reviewed in place and can't silently sprawl.</li>
+    <li><strong>Discipline:</strong> a snapshot update in a PR is a claim — "I looked at this diff and the new
+      output is intended." If your team can't honestly say that, delete the snapshot; it's asserting nothing.</li>
+  </ul>
+
+  <pre><code>expect(parseQueryString(<span class="str">'?page=2&amp;sort=price'</span>)).toMatchInlineSnapshot(<span class="str">`
+  {
+    "page": 2,
+    "sort": "price",
+  }
+`</span>);</code></pre>
+
+  <!-- ============================================================ -->
+  <h2 id="hooks">7. Testing hooks, stores, and non-visual logic <span class="tier tier-2">T2</span></h2>
+
+  <h3>renderHook — when there's no component to render</h3>
+  <p>
+    <code>renderHook</code> (now exported from <code>@testing-library/react</code> itself) mounts a tiny host
+    component that calls your hook and exposes the latest return value on <code>result.current</code>. Updates you
+    trigger imperatively must be wrapped in <code>act()</code> — this is one of the two legitimate manual-act sites:
+  </p>
+
+  <pre><code><span class="kw">import</span> { renderHook, act } <span class="kw">from</span> <span class="str">'@testing-library/react'</span>;
+
+test(<span class="str">'useCounter clamps at max'</span>, () =&gt; {
+  <span class="kw">const</span> { result } = renderHook(() =&gt; useCounter({ max: 2 }));
+
+  act(() =&gt; result.current.increment());
+  act(() =&gt; result.current.increment());
+  act(() =&gt; result.current.increment());   <span class="com">// should clamp</span>
+
+  expect(result.current.count).toBe(2);
+});
+
+<span class="com">// hooks that read context: supply providers via the wrapper option</span>
+<span class="kw">const</span> { result } = renderHook(() =&gt; useCart(), {
+  wrapper: ({ children }) =&gt; &lt;CartProvider&gt;{children}&lt;/CartProvider&gt;,
+});</code></pre>
+
+  <div class="pitfall">
+    <code>result.current</code> is a live getter for the latest render's value — but destructuring
+    (<code>const { count } = result.current</code>) freezes a stale copy from before your <code>act()</code> call.
+    Always read through <code>result.current.x</code> at assertion time.
+  </div>
+
+  <h3>Often better: test the hook through a consuming component</h3>
+  <p>
+    A hook's purpose is to power a component; if it has one obvious consumer, test <em>that</em> — you verify the
+    hook <em>and</em> its integration, via user-visible behavior, with no act() bookkeeping. Reserve
+    <code>renderHook</code> for genuinely reusable library hooks with many consumers, where you want to pin the
+    hook's contract independent of any one UI.
+  </p>
+
+  <h3>Reducers and selectors — the payoff of extraction</h3>
+  <pre><code><span class="com">// Pure function → trivial, exhaustive, millisecond tests. No render, no DOM, no async.</span>
+test(<span class="str">'applying a coupon never produces a negative total'</span>, () =&gt; {
+  <span class="kw">const</span> state = cartReducer(cartWith({ total: 500 }), applyCoupon({ amountOff: 900 }));
+  expect(selectTotal(state)).toBe(0);
+});</code></pre>
+  <p>
+    This is the concrete argument for extracting logic from components: every branch you move from JSX into a
+    reducer/selector moves from "needs an integration test" to "needs a one-line unit test." Edge-case matrices
+    (empty cart, expired coupon, currency rounding) belong here, not in RTL.
+  </p>
+
+  <h3>Store-connected components — real store, preloaded state</h3>
+  <pre><code><span class="com">// Redux Toolkit: a renderWithStore helper beats mocking useSelector every time</span>
+<span class="kw">function</span> renderWithStore(ui, { preloadedState } = {}) {
+  <span class="kw">const</span> store = configureStore({ reducer: rootReducer, preloadedState });
+  <span class="kw">return</span> { store, ...render(&lt;Provider store={store}&gt;{ui}&lt;/Provider&gt;) };
+}
+
+test(<span class="str">'checkout button disabled for an empty cart'</span>, () =&gt; {
+  renderWithStore(&lt;CartSummary /&gt;, { preloadedState: { cart: { items: [] } } });
+  expect(screen.getByRole(<span class="str">'button'</span>, { name: <span class="str">/checkout/i</span> })).toBeDisabled();
+});
+
+<span class="com">// Zustand: reset the (module-singleton) store between tests, then set state directly</span>
+beforeEach(() =&gt; useCartStore.setState(initialCartState, <span class="kw">true</span>));
+test(<span class="str">'badge shows item count'</span>, () =&gt; {
+  useCartStore.setState({ items: [item1, item2] });
+  render(&lt;CartBadge /&gt;);
+  expect(screen.getByText(<span class="str">'2'</span>)).toBeInTheDocument();
+});</code></pre>
+  <p>
+    Why real-store-over-mocked-hook is the senior answer: mocking <code>useSelector</code> hardcodes the derived
+    value, so selectors, reducer transitions, and re-render subscriptions are all unexercised — precisely the
+    layers where store bugs live. With a real store, dispatching an action in the test verifies the whole loop:
+    action → reducer → selector → DOM.
+  </p>
+
+  <!-- ============================================================ -->
+  <h2 id="playwright">8. Playwright e2e — and Cypress literacy <span class="tier tier-2">T2</span></h2>
+
+  <h3>Why Playwright won</h3>
+  <ul>
+    <li><strong>Real cross-browser engines:</strong> Chromium, Firefox, and WebKit (the only practical way to test
+      Safari-ish behavior in CI on Linux) from one API.</li>
+    <li><strong>Auto-waiting, web-first assertions:</strong> <code>await expect(locator).toBeVisible()</code>
+      <em>retries</em> until it passes or times out; actions like <code>click()</code> wait for the element to be
+      visible, stable, enabled, and unobscured before acting. This one design choice deletes the
+      <code>sleep(2000)</code> class of flake at the source.</li>
+    <li><strong>Trace viewer:</strong> a failed CI run hands you a time-travel recording — DOM snapshots, network,
+      console, per-action screenshots. Debugging remote flake goes from folklore to forensics.</li>
+    <li><strong>Isolation + parallelism:</strong> each test gets a fresh browser <em>context</em> (cheap incognito
+      profile), so tests parallelize safely across workers and shard across CI machines.</li>
+  </ul>
+
+  <h3>Locators — the same philosophy as RTL, on purpose</h3>
+  <pre><code><span class="kw">import</span> { test, expect } <span class="kw">from</span> <span class="str">'@playwright/test'</span>;
+
+test(<span class="str">'user can sign in'</span>, <span class="kw">async</span> ({ page }) =&gt; {
+  <span class="kw">await</span> page.goto(<span class="str">'/login'</span>);
+
+  <span class="kw">await</span> page.getByLabel(<span class="str">'Email'</span>).fill(<span class="str">'ada@lovelace.dev'</span>);
+  <span class="kw">await</span> page.getByLabel(<span class="str">'Password'</span>).fill(<span class="str">'correct-horse-battery'</span>);
+  <span class="kw">await</span> page.getByRole(<span class="str">'button'</span>, { name: <span class="str">'Sign in'</span> }).click();
+
+  <span class="kw">await</span> expect(page.getByRole(<span class="str">'heading'</span>, { name: <span class="str">'Dashboard'</span> })).toBeVisible();
+  <span class="kw">await</span> expect(page).toHaveURL(<span class="str">/\/dashboard/</span>);
+});</code></pre>
+  <p>
+    <code>getByRole</code>, <code>getByLabel</code>, <code>getByText</code>, <code>getByTestId</code> — deliberately
+    mirroring Testing Library. A team that standardizes on role-based locators gets <strong>one selector language
+    across unit, integration, and e2e</strong>, and the a11y-audit side effect at every level. A locator is lazy —
+    it re-queries at action time, which is what makes auto-waiting and retry-ability work.
+  </p>
+
+  <h3>Fixtures and auth state reuse — stop logging in per test</h3>
+  <pre><code><span class="com">// global-setup: log in ONCE, persist cookies + localStorage to disk</span>
+<span class="kw">import</span> { chromium } <span class="kw">from</span> <span class="str">'@playwright/test'</span>;
+
+<span class="kw">export default async function</span> globalSetup() {
+  <span class="kw">const</span> browser = <span class="kw">await</span> chromium.launch();
+  <span class="kw">const</span> page = <span class="kw">await</span> browser.newPage();
+  <span class="kw">await</span> page.goto(<span class="str">'http://localhost:3000/login'</span>);
+  <span class="kw">await</span> page.getByLabel(<span class="str">'Email'</span>).fill(process.env.E2E_USER!);
+  <span class="kw">await</span> page.getByLabel(<span class="str">'Password'</span>).fill(process.env.E2E_PASS!);
+  <span class="kw">await</span> page.getByRole(<span class="str">'button'</span>, { name: <span class="str">'Sign in'</span> }).click();
+  <span class="kw">await</span> page.waitForURL(<span class="str">'**/dashboard'</span>);
+  <span class="kw">await</span> page.context().storageState({ path: <span class="str">'e2e/.auth/user.json'</span> });
+  <span class="kw">await</span> browser.close();
+}
+
+<span class="com">// playwright.config.ts — every test starts already authenticated</span>
+use: { baseURL: <span class="str">'http://localhost:3000'</span>, storageState: <span class="str">'e2e/.auth/user.json'</span>, trace: <span class="str">'on-first-retry'</span> }</code></pre>
+  <p>
+    Login is the slowest, flakiest step in most suites, and it multiplied by every test. <code>storageState</code>
+    amortizes it to once per run (or once per <em>role</em> — an admin.json and a member.json, selected per
+    project/fixture). This is a standard "how do you make e2e fast?" answer.
+  </p>
+
+  <h3>Network interception — hermetic vs true e2e</h3>
+  <pre><code>test(<span class="str">'shows the outage banner when the status API is down'</span>, <span class="kw">async</span> ({ page }) =&gt; {
+  <span class="kw">await</span> page.route(<span class="str">'**/api/status'</span>, (route) =&gt;
+    route.fulfill({ status: 503, contentType: <span class="str">'application/json'</span>,
+                    body: JSON.stringify({ error: <span class="str">'maintenance'</span> }) })
+  );
+  <span class="kw">await</span> page.goto(<span class="str">'/dashboard'</span>);
+  <span class="kw">await</span> expect(page.getByRole(<span class="str">'alert'</span>)).toContainText(<span class="str">/scheduled maintenance/i</span>);
+});</code></pre>
+  <p>
+    <strong>The trade-off to articulate:</strong> <em>true e2e</em> (real backend, seeded test data) is the only
+    thing that verifies the whole system — but it's slow, needs environment discipline, and fails for reasons
+    outside your code. <em>Hermetic e2e</em> (<code>route.fulfill</code> everything) is fast and deterministic — but
+    it's really a browser-grade integration test; the backend contract is unverified. Sensible split: the
+    handful of revenue-critical journeys run true e2e against a staging environment; broader UI flows run hermetic;
+    forced-failure scenarios (503s, timeouts) are hermetic by necessity — you can't ask staging to fall over on cue.
+  </p>
+
+  <h3>Flake control — the operational discipline</h3>
+  <ul>
+    <li><strong>No manual sleeps, ever.</strong> <code>waitForTimeout(3000)</code> is either too long (slow suite)
+      or too short (flake). Every wait should be a condition: a web-first assertion, <code>waitForURL</code>, or a
+      <code>waitForResponse</code>.</li>
+    <li><strong>Retries as a detector, not a rug.</strong> <code>retries: 2</code> in CI keeps the pipeline green,
+      but a test that <em>passed on retry</em> is flagged "flaky" in the report — track those, don't ignore them.</li>
+    <li><strong>Quarantine, don't delete or skip-and-forget:</strong> move known-flaky tests to a non-blocking job
+      with an owner and a deadline. An ignored red suite trains everyone to ignore red.</li>
+    <li><strong>Root causes are usually:</strong> shared mutable test data (fix: per-test unique data / API-seeded
+      fixtures), unawaited navigation, animations (disable in test env), and time (freeze it).</li>
+    <li><strong>CI sharding:</strong> <code>--shard=1/4</code> splits the suite across machines; with
+      fully-parallel isolated tests, wall-clock time divides almost linearly. Merge reports afterward.</li>
+  </ul>
+
+  <h3>Cypress literacy — one honest paragraph</h3>
+  <p>
+    Cypress runs your test code <em>inside the browser</em> alongside the app (an iframe + injected runner), whereas
+    Playwright drives the browser <em>from outside</em> via CDP/driver protocols. Cypress's architecture gives it a
+    famously interactive dev experience (time-traveling command log, live reload) and made it the 2018–2021 default;
+    it also imposes real constraints — historically one browser tab, same-origin friction, limited multi-tab/iframe
+    control, WebKit support still experimental, and a command queue with its own async model instead of plain
+    <code>await</code>. Teams still reasonably pick it for its component-testing runner, existing suites and team
+    familiarity, or its dashboard ecosystem. In an interview, respect it, state the architectural difference
+    accurately, and explain your default is Playwright for cross-browser coverage, parallelism, worker isolation,
+    and standard async/await ergonomics.
+  </p>
+
+  <!-- ============================================================ -->
+  <h2 id="strategy">9. The senior test-strategy answer <span class="tier tier-2">T2</span></h2>
+
+  <p>
+    "How would you test this feature?" is the most common senior testing question, and it wants a <em>portfolio
+    allocation</em>, not a tool list. Here's a rehearsable shape, using "add a checkout coupon field" as the feature:
+  </p>
+
+  <ol>
+    <li><strong>Static first:</strong> the coupon API response and cart math get real types. A discriminated union
+      for <code>CouponResult</code> makes "forgot the expired-coupon case" a compile error, not a test to write.</li>
+    <li><strong>Pure logic → unit:</strong> extract <code>applyCoupon(cart, coupon)</code> and test the matrix as
+      data: percentage vs fixed, stacking rules, floor-at-zero, currency rounding, expiry. Ten one-line tests,
+      milliseconds each.</li>
+    <li><strong>Component behavior → RTL + MSW:</strong> render the real checkout form. Tests: valid code updates
+      the displayed total; invalid code shows an inline error (<code>role="alert"</code>) and doesn't change the
+      total; the field is disabled while validating; a 500 shows a retriable error. All four via MSW handlers +
+      <code>server.use</code> overrides.</li>
+    <li><strong>One happy-path e2e:</strong> Playwright — apply a real seeded coupon on staging, complete checkout,
+      assert the order total. One test, because checkout is revenue-critical; not five, because the variants are
+      already covered a level down.</li>
+    <li><strong>A11y assertions ride along:</strong> the RTL tests already enforce label/role correctness by
+      construction (query priority); add <code>jest-axe</code> / <code>axe-core</code> checks
+      (<code>expect(await axe(container)).toHaveNoViolations()</code>) on the form's key states for rules queries
+      can't catch (contrast, aria misuse).</li>
+    <li><strong>Visual regression only where pixels are the product:</strong> not for this form. For a marketing
+      page, a design system, or a chart library, Chromatic/Percy screenshot diffs earn their review cost —
+      elsewhere they're snapshot noise at higher resolution.</li>
+    <li><strong>Test data builders:</strong> <code>cartWith({ items: 2, total: 500 })</code> style factories
+      (plain functions or fishery/faker) so tests state only what they care about — the single biggest readability
+      lever in a mature suite.</li>
+    <li><strong>CI gates:</strong> on every PR — typecheck, lint, unit + integration (fast, parallel, must pass);
+      on merge to main — the e2e suite (sharded), preview-deploy smoke test; nightly — full cross-browser matrix
+      and visual diffs. Fast feedback where iteration happens, expensive certainty where it protects the trunk.</li>
+  </ol>
+
+  <div class="senior">
+    Close the answer with the maintenance stance: "And I treat the suite as a product — flaky tests get quarantined
+    with an owner, implementation-detail tests get deleted when they cry wolf, and if a test has never failed for a
+    real reason in a year and slows every CI run, I'll question its ROI. The goal is a suite the team trusts enough
+    to deploy on green." That last sentence — <em>deploy on green</em> — is the whole point of testing, and saying
+    it signals you know that.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="frontier">10. Frontier awareness <span class="tier tier-3">T3</span></h2>
+
+  <ul>
+    <li><strong>React Server Components &amp; server actions:</strong> unit-testing RSC is still rough — async
+      components and the server/client boundary don't fit jsdom's model cleanly (partial support is emerging, but
+      it's not settled practice). Current pragmatic answer: keep RSC thin (fetch + compose), unit-test the extracted
+      data/transform functions, test client islands with RTL as usual, and cover the composed server-rendered result
+      with Playwright against a running app. Server actions: test the action as a function where possible, plus one
+      e2e for the form round-trip.</li>
+    <li><strong>Storybook interaction tests:</strong> a <code>play</code> function in a story runs
+      testing-library-style interactions <em>inside the story</em>; the test-runner (or Vitest addon) executes all
+      stories headlessly in CI. Attractive because the story <em>is</em> the test fixture — one artifact serves
+      docs, visual review, and behavior tests.</li>
+    <li><strong>Contract testing:</strong> (Pact et al., or pragmatically: generating MSW handlers + types from the
+      OpenAPI/GraphQL schema) attacks the residual risk of hermetic mocks — "my mock says the API returns
+      <code>userName</code>, the API says <code>user_name</code>." Schema-derived mocks make that drift a build
+      failure instead of a production incident.</li>
+    <li><strong>Mutation testing:</strong> (Stryker) flips your operators/conditions and checks whether any test
+      fails — measuring whether tests <em>assert</em>, not just execute. Too slow to run everywhere; excellent as a
+      periodic audit of a critical module, and the sharpest rebuttal to coverage-percentage worship.</li>
+  </ul>
+
+  <!-- ============================================================ -->
+  <h2 id="qa">Interview Q&amp;A</h2>
+
+  <details class="qa">
+    <summary>Q1: Testing pyramid vs testing trophy — which do you follow for frontend, and why?</summary>
+    <div class="answer">
+      <p>
+        The trophy, because frontend inverts the pyramid's economics. The pyramid assumed unit tests were the
+        cheapest source of confidence and integration tests were slow. In frontend, an isolated component "unit"
+        (children and hooks mocked) verifies almost nothing — component bugs live in the seams: props wiring, state
+        reaching the DOM, fetch flows. Meanwhile jsdom + MSW made integration tests nearly as fast as unit tests.
+        So: a base of static analysis (free bug-catching), unit tests reserved for pure logic (reducers, formatters,
+        validation), the bulk of tests at the RTL-integration level where user-visible behavior is verified, and a
+        thin e2e layer for revenue-critical journeys. The principle underneath: confidence per dollar — tests that
+        resemble real usage catch more real bugs, and you buy as much of that as each level's cost allows.
+      </p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q2: "Test behavior, not implementation" — give me a concrete example of an implementation-detail test and why it's harmful.</summary>
+    <div class="answer">
+      <p>
+        Classic enzyme-era example: <code>expect(wrapper.state('isOpen')).toBe(true)</code>, or asserting
+        <code>wrapper.find(Modal).prop('visible')</code>. Both break if I rename the state field, convert class to
+        hooks, or swap Modal for Dialog — refactors that change zero user-visible behavior — while <em>passing</em>
+        if the state is set but nothing actually renders. Worst of both worlds: false negatives on safe refactors
+        (training the team to mechanically appease tests) and false positives on real breakage. The behavior
+        version — click the trigger, assert <code>getByRole('dialog')</code> appears — survives every one of those
+        refactors and fails for every real regression. My litmus test: could a user or screen reader observe this
+        assertion? Two boundary exceptions are legitimate: callback props called with correct arguments, and
+        outgoing request payloads — those are the component's public contracts.
+      </p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q3: Why does RTL rank getByRole first and getByTestId last?</summary>
+    <div class="answer">
+      <p>
+        The order tracks how closely each query resembles real perception. <code>getByRole</code> with the
+        accessible-name option queries the same accessibility tree a screen reader navigates — if
+        <code>getByRole('button', { name: /save/i })</code> fails, either it's a clickable div with no role or an
+        icon button with no accessible name, both genuine a11y defects. So the query priority doubles as a free,
+        continuous accessibility audit. <code>testid</code> sits last because it corresponds to nothing any user
+        perceives — the test passes regardless of whether the element is labeled, visible to AT, or even the right
+        kind of control. I keep test-ids as an escape hatch for genuinely unnameable containers, and I treat each
+        one as a small signal that the markup might lack semantics.
+      </p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q4: Explain getBy vs queryBy vs findBy — and when each is correct.</summary>
+    <div class="answer">
+      <p>
+        <code>getBy</code>: synchronous, throws (with a DOM dump) on zero or multiple matches — for elements that
+        must exist right now. <code>queryBy</code>: returns <code>null</code> on zero matches — its <em>only</em>
+        proper job is asserting absence (<code>expect(queryByText(...)).not.toBeInTheDocument()</code>), because
+        <code>getBy</code> would throw before the negated matcher runs. <code>findBy</code>: async — effectively
+        getBy wrapped in waitFor, retrying until match or ~1s timeout — for anything appearing after async work.
+        The <code>All</code> variants return arrays with matching semantics (<code>queryAllBy</code> gives
+        <code>[]</code>, so it's the one for asserting a count that might be zero). A common smell: using
+        <code>queryBy</code> for presence checks — it returns null and you get "can't read property of null" instead
+        of RTL's helpful error.
+      </p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q5: Why user-event over fireEvent?</summary>
+    <div class="answer">
+      <p>
+        <code>fireEvent.click</code> dispatches one bare event; <code>user.click</code> simulates the full
+        interaction sequence — pointerover, pointerdown, focus, pointerup, click — respecting disabled state,
+        <code>pointer-events</code>, and focusability. <code>user.type</code> fires per-character
+        keydown/input/keyup, so keystroke-level logic (debounce, per-char validation, maxlength) actually executes.
+        That fidelity catches real bugs fireEvent silently passes: a button visually covered by an overlay, a
+        handler depending on focus order, keyboard shortcuts. In v14 the pattern is
+        <code>const user = userEvent.setup()</code> per test — setup maintains coherent device state across calls
+        and is where fake-timer integration plugs in (<code>advanceTimers</code>) — and every API is async, so
+        always <code>await</code>. fireEvent remains a fallback for events user-event can't produce, like a raw
+        <code>scroll</code> or programmatic <code>load</code> event.
+      </p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q6: You see "not wrapped in act(...)" warnings. What does act() actually do, and what's the correct fix?</summary>
+    <div class="answer">
+      <p>
+        <code>act()</code> defines a scope in which React flushes everything the enclosed work caused — state
+        updates, re-renders, effects — before continuing, so assertions see a settled DOM. The warning means a state
+        update fired when no act scope was active — in tests, almost always an async operation (fetch resolution, a
+        timer) landing <em>after</em> the test stopped observing. Crucially, RTL already wraps render, user-event,
+        and its async utilities in act — so the fix is never to sprinkle act() around; act-wrapping just silences
+        the symptom while leaving the post-update behavior untested. The real fix is to await the async outcome:
+        <code>await screen.findBy…</code>, <code>waitFor</code>, or <code>waitForElementToBeRemoved</code> — the
+        warning disappears <em>because</em> the test now observes the update. The two places I write act() manually:
+        advancing fake timers whose callbacks setState, and imperative updates in <code>renderHook</code> tests —
+        both bypass RTL's pre-wrapped surface.
+      </p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q7: What are the rules for what goes inside a waitFor callback?</summary>
+    <div class="answer">
+      <p>
+        waitFor <em>re-runs</em> the callback — on an interval and on DOM mutations — until it stops throwing or
+        times out. Two rules follow. First, no side effects inside: a <code>user.click</code> in the callback may
+        execute several times before the assertion passes — multiple submissions, multiple mutations. Act outside,
+        assert the outcome inside. Second, one assertion (one logical condition) per waitFor: with several, a
+        failure in the first burns the whole timeout and masks whether the others would pass, and the error points
+        at the wrong condition. Also worth saying: when the condition is "an element appears," <code>findBy</code>
+        is the same mechanism with better ergonomics — I reserve waitFor for non-element conditions like
+        <code>expect(spy).toHaveBeenCalled()</code>, and use <code>waitForElementToBeRemoved</code> for
+        disappearance.
+      </p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q8: Why MSW instead of vi.mock-ing your fetch wrapper or axios?</summary>
+    <div class="answer">
+      <p>
+        Because mocking the client skips the entire data path: URL and query-string construction, request-body
+        serialization, headers, status-code handling, response parsing, interceptors, and whatever
+        TanStack Query/SWR does with the result. Those layers are where fetch bugs actually live — a test against a
+        mocked axios passes while production 400s on a misnamed param. MSW intercepts at the network level, so the
+        app executes all of its real code and only the server is fake. Three concrete wins: tests survive
+        refactors of the fetching layer (fetch→axios→React Query changes zero tests); error paths are realistic
+        (actual 500 responses, actual network errors via <code>HttpResponse.error()</code>, delays); and the same
+        handlers serve tests, local dev, and Storybook, so the mock becomes a shared, reviewable contract. I run
+        the server with <code>onUnhandledRequest: 'error'</code> so an unexpected request fails loudly, and use
+        <code>server.use()</code> for per-test error/empty overrides that <code>resetHandlers()</code> cleans up.
+      </p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q9: Walk me through testing the four states of a data-fetching component.</summary>
+    <div class="answer">
+      <p>
+        Default MSW handlers return the happy payload. <strong>Loading:</strong> render, synchronously assert the
+        spinner/skeleton (by <code>role="status"</code>); if the mock resolves too fast to observe, add
+        <code>await delay(200)</code> in the handler. <strong>Success:</strong> <code>await screen.findByRole</code>
+        for the loaded content, then assert loading is gone with <code>queryBy</code>. <strong>Error:</strong>
+        <code>server.use(http.get(url, () =&gt; new HttpResponse(null, { status: 500 })))</code>, then
+        <code>findByRole('alert')</code> — and I assert the retry affordance exists, because an error state without
+        recovery is a design bug. <strong>Empty:</strong> override with <code>HttpResponse.json([])</code> and
+        assert the empty-state copy, plus absence of the list. One caveat I always mention: with TanStack Query,
+        build a fresh QueryClient per test with <code>retry: false</code>, or the error test silently waits through
+        three retries.
+      </p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q10: How do you test a debounced search input? (The fake-timers + user-event question.)</summary>
+    <div class="answer">
+      <p>
+        The trap is that user-event awaits real time between keystrokes, so with fake timers enabled it hangs —
+        unless you wire them together: <code>vi.useFakeTimers()</code>, then
+        <code>userEvent.setup({ advanceTimers: vi.advanceTimersByTime })</code> so user-event advances the fake
+        clock instead of waiting. Then: type the query, assert the callback <em>hasn't</em> fired; advance 499ms
+        inside <code>act()</code> (timer callbacks trigger state updates), assert still nothing — this proves each
+        keystroke reset the timer; advance the final 1ms and assert exactly one call with the final string. Cleanup
+        matters: <code>vi.runOnlyPendingTimers()</code> then <code>vi.useRealTimers()</code> in afterEach, or later
+        tests hang. And if the debounced callback does async work — a fetch — advancing timers isn't enough;
+        <code>await vi.advanceTimersByTimeAsync(500)</code> also yields to the microtask queue so the promise chain
+        flushes.
+      </p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q11: When do you choose NOT to mock something?</summary>
+    <div class="answer">
+      <p>
+        My default is to mock only at boundaries I don't own: the network (via MSW), time, browser APIs jsdom lacks,
+        and heavy third-party SDKs. I don't mock my own components — mocking <code>UserCard</code> inside a
+        <code>UserList</code> test removes the wiring between them from the test, and wiring is where component bugs
+        live. I don't mock my own state management — a real store with preloaded state exercises selectors,
+        reducers, and subscriptions; mocking <code>useSelector</code> hardcodes the answer. Every mock is a bet that
+        the boundary behaves as the mock claims; each one narrows what the test can catch. And if I find myself
+        repeatedly <code>vi.mock</code>-ing the same internal module, I read that as a design smell — that
+        dependency wants to be injected via props or context, where tests can swap it through the front door.
+      </p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q12: What's the vi.mock/jest.mock hoisting gotcha, and how do you do a partial mock?</summary>
+    <div class="answer">
+      <p>
+        <code>vi.mock(path, factory)</code> is hoisted above all imports by the transform so the mock exists before
+        the module graph loads. Consequence: the factory runs before the rest of your file's top-level code, so it
+        can't reference variables declared below it — you get a ReferenceError (Vitest at least tells you; Jest
+        historically failed cryptically unless the variable name started with <code>mock</code>). The fix in Vitest
+        is <code>vi.hoisted(() =&gt; ...)</code> to lift the shared spy's creation alongside the mock. Partial
+        mocks: give the factory <code>importOriginal</code> — <code>vi.mock('./api', async (importOriginal) =&gt;
+        ({ ...await importOriginal(), uploadFile: vi.fn() }))</code> — keeping real exports and replacing one.
+        Jest's equivalent is <code>jest.requireActual</code> spread into the factory return.
+      </p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q13: Your team is on Jest; the app is on Vite. Do you migrate to Vitest? What actually changes?</summary>
+    <div class="answer">
+      <p>
+        Almost certainly yes, and the honest pitch is that it's a config migration, not a test rewrite. Vitest
+        reuses the Vite config — same aliases, plugins, and transforms as the app — killing the maintain-two-
+        pipelines problem and the whole class of "Jest encountered an unexpected token" ESM failures, since Vitest
+        is ESM/TS-native. The expect API is deliberately Jest-compatible; RTL, jest-dom, and MSW work unchanged; the
+        mechanical work is <code>jest.*</code> → <code>vi.*</code> (or a codemod / globals flag) and moving setup
+        files. Wins: dramatically faster watch mode, threaded parallelism, in-source and type testing. What I'd
+        check before committing: any dependence on Jest-only ecosystem pieces, and jsdom vs happy-dom choice —
+        happy-dom is faster but occasionally misses APIs, and it's switchable per file, so I'd start with jsdom
+        compatibility and optimize later. I would not migrate a React Native codebase — Jest is still the paved
+        road there.
+      </p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q14: Give me your honest opinion of snapshot testing.</summary>
+    <div class="answer">
+      <p>
+        A snapshot asserts "output equals last time someone pressed u" — it has no opinion about correctness, only
+        about change. For big component trees that's negative-ROI: hundreds of lines nobody reads, churn on every
+        legitimate change, and rubber-stamped updates that would happily lock in a bug. Where I do use them: small,
+        stable, serializable outputs where the shape <em>is</em> the value — transformed API payloads, error
+        objects, generated config — and preferably as <em>inline</em> snapshots, so the expected value sits in the
+        test file and gets genuinely reviewed in the diff. The discipline test I apply: when someone updates a
+        snapshot, can they honestly say "I read this diff and the new output is intended"? If the team can't, the
+        snapshot is asserting nothing and should be replaced with a few targeted assertions on what actually
+        matters.
+      </p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q15: How do you test a custom hook?</summary>
+    <div class="answer">
+      <p>
+        First question: does it need direct testing at all? If the hook has one consumer, I test through that
+        component — user-visible behavior, no act bookkeeping, and the integration is covered too. For genuinely
+        reusable hooks (a library <code>useDebounce</code>, <code>usePagination</code>), I use
+        <code>renderHook</code> from @testing-library/react: read the latest value via <code>result.current</code>,
+        wrap imperative updates in <code>act()</code> (renderHook is one of the legitimate manual-act sites), and
+        supply context via the <code>wrapper</code> option. Key trap: never destructure from
+        <code>result.current</code> before acting — you capture a stale snapshot; always read
+        <code>result.current.x</code> at assertion time. And if the "hook" is really wrapping pure logic, the best
+        move is extracting that logic into a plain function and unit-testing it exhaustively, leaving the hook as
+        thin React plumbing.
+      </p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q16: How do you test components connected to Redux or Zustand?</summary>
+    <div class="answer">
+      <p>
+        Real store, preloaded state — never mock the hooks. For Redux Toolkit, a <code>renderWithStore</code> helper
+        builds a fresh <code>configureStore</code> with the real root reducer and a <code>preloadedState</code>
+        argument, wraps the UI in <code>Provider</code>, and returns the store so tests can also dispatch or inspect.
+        For Zustand, the store is a module singleton, so the discipline is resetting it in <code>beforeEach</code>
+        (<code>useStore.setState(initial, true)</code>) and then setting the scenario's state directly. Why this
+        over mocking <code>useSelector</code>: the mock hardcodes derived values, so selectors, reducer transitions,
+        and subscription-driven re-renders — the layers where store bugs actually occur — go unexercised. With a
+        real store, a test can click a button and verify the full loop: action → reducer → selector → DOM. It also
+        means selector/reducer edge cases still get their own cheap pure-function unit tests, separate from the
+        component tests.
+      </p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q17: Why has Playwright largely displaced Cypress and Selenium for new projects?</summary>
+    <div class="answer">
+      <p>
+        Three structural reasons. First, real cross-browser: Chromium, Firefox, and WebKit from one API — the only
+        practical Safari-adjacent coverage in Linux CI. Second, auto-waiting web-first assertions:
+        <code>expect(locator).toBeVisible()</code> retries until pass-or-timeout and actions wait for
+        actionability (visible, stable, enabled, unobscured), which eliminates the manual-sleep class of flake by
+        design. Third, isolation and scale: cheap per-test browser contexts make full parallelism and CI sharding
+        safe, and the trace viewer turns remote failures into a time-travel recording of DOM, network, and console.
+        Architecturally, Cypress runs the test <em>inside</em> the browser with the app — great interactivity, but
+        historical constraints on multi-tab, origins, and browser support — while Playwright drives from outside
+        over CDP/driver protocols with plain async/await. I'd still respect an existing Cypress suite; the
+        migration cost is real and its component runner and dashboard keep teams productive.
+      </p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q18: Your e2e suite is flaky and everyone re-runs it until green. What do you do?</summary>
+    <div class="answer">
+      <p>
+        Treat it as an incident, because "re-run until green" means the suite no longer gates anything. Immediate
+        triage: turn on trace-on-retry and use the retry report to <em>identify</em> flaky tests rather than hide
+        them — a pass-on-retry is a signal, not a success. Quarantine the known-flaky set into a non-blocking job
+        with named owners and deadlines, so the blocking suite is trustworthy again this week. Then fix root causes,
+        which are nearly always: manual sleeps (replace with condition waits — web-first assertions, waitForURL,
+        waitForResponse), shared mutable test data (per-test unique data, API-seeded fixtures instead of UI setup),
+        animations (disable in the test env), time (freeze it), and login-per-test (storageState). Structurally,
+        shrink the suite: many "e2e" tests are really integration tests wearing a browser — push them down to
+        RTL+MSW or hermetic route-fulfilled Playwright where determinism is free. The metric I'd track is
+        pass-on-first-try rate, and the goal is cultural: red must mean something again.
+      </p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q19: In Playwright, when do you intercept the network (route.fulfill) versus hit a real backend?</summary>
+    <div class="answer">
+      <p>
+        It's a confidence-vs-determinism trade. True e2e — real backend, seeded staging data — is the only test that
+        verifies the whole system including the API contract, so the revenue-critical journeys (signup, login,
+        checkout) get that treatment, few in number and heavily maintained. Hermetic e2e — <code>route.fulfill</code>
+        for every call — is deterministic, fast, and runs anywhere, but it's really a browser-grade integration test:
+        if the backend renames a field, it stays green. I use it for breadth (many UI flows) and for
+        <em>forced-failure</em> scenarios — 503s, slow responses, malformed payloads — which you structurally cannot
+        ask a shared staging environment to produce on cue. The residual risk of hermetic mocks drifting from
+        reality is exactly what contract testing / schema-generated mocks address, which is the senior-level
+        connective tissue worth naming.
+      </p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q20: A PM asks why you're "spending sprint time on tests" — and separately, leadership wants 100% coverage. Your answer?</summary>
+    <div class="answer">
+      <p>
+        Same answer to both, from opposite directions: tests are an economic instrument, and both zero-testing and
+        coverage-worship misprice it. To the PM: the tests I write buy deployment speed — a trusted suite is what
+        lets us ship on green without a manual QA pass, catch regressions in minutes instead of in production, and
+        refactor without fear; I'm spending sprint time to make every future sprint faster. To leadership: coverage
+        measures lines <em>executed</em>, not behavior <em>verified</em> — a suite of assertion-free renders scores
+        100% and catches nothing, and the last 20% forces tests on trivial glue with negative ROI. What I'll commit
+        to instead: a coverage floor on changed lines as a smoke alarm, behavior-level tests concentrated on the
+        risky paths (money, auth, data mutation), e2e on the critical journeys, and — if they want proof of test
+        <em>quality</em> — a periodic mutation-testing audit on critical modules, which measures whether tests
+        actually fail when the code is broken. That's the number that means something.
+      </p>
+    </div>
+  </details>
+
+  <!-- ============================================================ -->
+  <h2 id="exercises">Hands-on exercises</h2>
+
+  <div class="exercise">
+    <h4>Exercise 1 — Test an accordion component (queries + user-event)</h4>
+    <p>Given this component, write tests that: (a) only the first panel's content is hidden initially,
+      (b) clicking a header reveals its panel and sets <code>aria-expanded</code>,
+      (c) clicking again hides it, (d) keyboard users can operate it with Enter. Use role-based queries only —
+      no test-ids.</p>
+    <pre><code><span class="kw">function</span> Accordion({ items }) {
+  <span class="kw">const</span> [openId, setOpenId] = useState(<span class="kw">null</span>);
+  <span class="kw">return</span> (
+    &lt;div&gt;
+      {items.map(item =&gt; (
+        &lt;section key={item.id}&gt;
+          &lt;h3&gt;
+            &lt;button aria-expanded={openId === item.id}
+                    onClick={() =&gt; setOpenId(openId === item.id ? <span class="kw">null</span> : item.id)}&gt;
+              {item.title}
+            &lt;/button&gt;
+          &lt;/h3&gt;
+          {openId === item.id &amp;&amp; &lt;div role=<span class="str">"region"</span> aria-label={item.title}&gt;{item.body}&lt;/div&gt;}
+        &lt;/section&gt;
+      ))}
+    &lt;/div&gt;
+  );
+}</code></pre>
+    <details>
+      <summary>Solution</summary>
+      <pre><code><span class="kw">import</span> { render, screen } <span class="kw">from</span> <span class="str">'@testing-library/react'</span>;
+<span class="kw">import</span> userEvent <span class="kw">from</span> <span class="str">'@testing-library/user-event'</span>;
+
+<span class="kw">const</span> items = [
+  { id: 1, title: <span class="str">'Shipping'</span>, body: <span class="str">'Ships in 2 days'</span> },
+  { id: 2, title: <span class="str">'Returns'</span>,  body: <span class="str">'30-day returns'</span> },
+];
+
+test(<span class="str">'panels are collapsed initially'</span>, () =&gt; {
+  render(&lt;Accordion items={items} /&gt;);
+  <span class="com">// content absent → queryBy; role=region only exists when open</span>
+  expect(screen.queryByRole(<span class="str">'region'</span>)).not.toBeInTheDocument();
+  expect(screen.getByRole(<span class="str">'button'</span>, { name: <span class="str">'Shipping'</span> }))
+    .toHaveAttribute(<span class="str">'aria-expanded'</span>, <span class="str">'false'</span>);
+});
+
+test(<span class="str">'clicking a header reveals its panel'</span>, <span class="kw">async</span> () =&gt; {
+  <span class="kw">const</span> user = userEvent.setup();
+  render(&lt;Accordion items={items} /&gt;);
+
+  <span class="kw">await</span> user.click(screen.getByRole(<span class="str">'button'</span>, { name: <span class="str">'Shipping'</span> }));
+
+  <span class="kw">const</span> region = screen.getByRole(<span class="str">'region'</span>, { name: <span class="str">'Shipping'</span> });
+  expect(region).toHaveTextContent(<span class="str">'Ships in 2 days'</span>);
+  expect(screen.getByRole(<span class="str">'button'</span>, { name: <span class="str">'Shipping'</span> }))
+    .toHaveAttribute(<span class="str">'aria-expanded'</span>, <span class="str">'true'</span>);
+  <span class="com">// and the OTHER panel stayed closed — behavior, not incidental structure</span>
+  expect(screen.queryByRole(<span class="str">'region'</span>, { name: <span class="str">'Returns'</span> })).not.toBeInTheDocument();
+});
+
+test(<span class="str">'clicking an open header collapses it'</span>, <span class="kw">async</span> () =&gt; {
+  <span class="kw">const</span> user = userEvent.setup();
+  render(&lt;Accordion items={items} /&gt;);
+  <span class="kw">const</span> header = screen.getByRole(<span class="str">'button'</span>, { name: <span class="str">'Shipping'</span> });
+
+  <span class="kw">await</span> user.click(header);
+  <span class="kw">await</span> user.click(header);
+
+  expect(screen.queryByRole(<span class="str">'region'</span>)).not.toBeInTheDocument();
+  expect(header).toHaveAttribute(<span class="str">'aria-expanded'</span>, <span class="str">'false'</span>);
+});
+
+test(<span class="str">'operable via keyboard'</span>, <span class="kw">async</span> () =&gt; {
+  <span class="kw">const</span> user = userEvent.setup();
+  render(&lt;Accordion items={items} /&gt;);
+
+  <span class="kw">await</span> user.tab();                       <span class="com">// focus lands on first header button</span>
+  expect(screen.getByRole(<span class="str">'button'</span>, { name: <span class="str">'Shipping'</span> })).toHaveFocus();
+  <span class="kw">await</span> user.keyboard(<span class="str">'{Enter}'</span>);
+  expect(screen.getByRole(<span class="str">'region'</span>, { name: <span class="str">'Shipping'</span> })).toBeInTheDocument();
+});</code></pre>
+      <p>
+        Judgment notes: absence via <code>queryBy</code> (never <code>getBy</code>); asserting
+        <code>aria-expanded</code> is legitimate because it's part of the accessible contract, not an internal;
+        the keyboard test doubles as the a11y check that these are real buttons, not click-divs.
+      </p>
+    </details>
+  </div>
+
+  <div class="exercise">
+    <h4>Exercise 2 — Async data component with MSW: all four states</h4>
+    <p>
+      <code>OrderHistory</code> fetches <code>GET /api/orders</code> on mount, shows a
+      <code>role="status"</code> loader, then a list of orders (<code>role="list"</code>, accessible name
+      "Order history"), an empty state ("No orders yet"), or a <code>role="alert"</code> error with a Retry button
+      that refetches. Write the four state tests plus a retry-recovers test, using MSW v2 with
+      <code>server.use</code> overrides.
+    </p>
+    <details>
+      <summary>Solution</summary>
+      <pre><code><span class="kw">import</span> { render, screen } <span class="kw">from</span> <span class="str">'@testing-library/react'</span>;
+<span class="kw">import</span> userEvent <span class="kw">from</span> <span class="str">'@testing-library/user-event'</span>;
+<span class="kw">import</span> { http, HttpResponse, delay } <span class="kw">from</span> <span class="str">'msw'</span>;
+<span class="kw">import</span> { server } <span class="kw">from</span> <span class="str">'../mocks/server'</span>;   <span class="com">// listen/reset/close live in vitest.setup.ts</span>
+<span class="kw">import</span> { OrderHistory } <span class="kw">from</span> <span class="str">'./OrderHistory'</span>;
+
+<span class="kw">const</span> orders = [
+  { id: <span class="str">'o-1'</span>, total: 4999, item: <span class="str">'Mechanical keyboard'</span> },
+  { id: <span class="str">'o-2'</span>, total: 1299, item: <span class="str">'USB-C cable'</span> },
+];
+
+test(<span class="str">'loading → success'</span>, <span class="kw">async</span> () =&gt; {
+  server.use(http.get(<span class="str">'/api/orders'</span>, <span class="kw">async</span> () =&gt; {
+    <span class="kw">await</span> delay(100);                       <span class="com">// make the loading state reliably observable</span>
+    <span class="kw">return</span> HttpResponse.json(orders);
+  }));
+  render(&lt;OrderHistory /&gt;);
+
+  expect(screen.getByRole(<span class="str">'status'</span>)).toBeInTheDocument();
+
+  <span class="kw">const</span> list = <span class="kw">await</span> screen.findByRole(<span class="str">'list'</span>, { name: <span class="str">/order history/i</span> });
+  expect(within(list).getAllByRole(<span class="str">'listitem'</span>)).toHaveLength(2);
+  expect(screen.queryByRole(<span class="str">'status'</span>)).not.toBeInTheDocument();
+});
+
+test(<span class="str">'empty state'</span>, <span class="kw">async</span> () =&gt; {
+  server.use(http.get(<span class="str">'/api/orders'</span>, () =&gt; HttpResponse.json([])));
+  render(&lt;OrderHistory /&gt;);
+
+  expect(<span class="kw">await</span> screen.findByText(<span class="str">/no orders yet/i</span>)).toBeInTheDocument();
+  expect(screen.queryByRole(<span class="str">'list'</span>)).not.toBeInTheDocument();
+});
+
+test(<span class="str">'error state on 500'</span>, <span class="kw">async</span> () =&gt; {
+  server.use(http.get(<span class="str">'/api/orders'</span>, () =&gt; <span class="kw">new</span> HttpResponse(<span class="kw">null</span>, { status: 500 })));
+  render(&lt;OrderHistory /&gt;);
+
+  <span class="kw">const</span> alert = <span class="kw">await</span> screen.findByRole(<span class="str">'alert'</span>);
+  expect(alert).toHaveTextContent(<span class="str">/couldn't load your orders/i</span>);
+});
+
+test(<span class="str">'retry recovers from a transient failure'</span>, <span class="kw">async</span> () =&gt; {
+  <span class="kw">const</span> user = userEvent.setup();
+  <span class="kw">let</span> calls = 0;
+  server.use(http.get(<span class="str">'/api/orders'</span>, () =&gt; {
+    calls += 1;
+    <span class="kw">return</span> calls === 1
+      ? <span class="kw">new</span> HttpResponse(<span class="kw">null</span>, { status: 500 })   <span class="com">// first call fails…</span>
+      : HttpResponse.json(orders);                    <span class="com">// …retry succeeds</span>
+  }));
+  render(&lt;OrderHistory /&gt;);
+
+  <span class="kw">await</span> screen.findByRole(<span class="str">'alert'</span>);
+  <span class="kw">await</span> user.click(screen.getByRole(<span class="str">'button'</span>, { name: <span class="str">/retry/i</span> }));
+
+  expect(<span class="kw">await</span> screen.findByRole(<span class="str">'list'</span>, { name: <span class="str">/order history/i</span> })).toBeInTheDocument();
+  expect(screen.queryByRole(<span class="str">'alert'</span>)).not.toBeInTheDocument();
+});</code></pre>
+      <p>
+        Judgment notes: the stateful handler in the retry test is the standard MSW pattern for "fails then
+        succeeds" — no client-mock could express this as naturally. If the component uses TanStack Query, wrap
+        each render in a fresh <code>QueryClientProvider</code> with <code>retry: false</code> or the 500 test
+        stalls through automatic retries.
+      </p>
+    </details>
+  </div>
+
+  <div class="exercise">
+    <h4>Exercise 3 — Debounced autocomplete: fake timers + user-event + MSW together</h4>
+    <p>
+      <code>CityAutocomplete</code> debounces input by 300ms, then fetches
+      <code>GET /api/cities?q=…</code> and renders suggestions in a <code>role="listbox"</code>. Write a test
+      proving: no request fires mid-typing; one request fires 300ms after the last keystroke with the correct
+      query param; suggestions render. This combines every async mechanism in §3–4.
+    </p>
+    <details>
+      <summary>Solution</summary>
+      <pre><code><span class="kw">import</span> { render, screen, act } <span class="kw">from</span> <span class="str">'@testing-library/react'</span>;
+<span class="kw">import</span> userEvent <span class="kw">from</span> <span class="str">'@testing-library/user-event'</span>;
+<span class="kw">import</span> { http, HttpResponse } <span class="kw">from</span> <span class="str">'msw'</span>;
+<span class="kw">import</span> { server } <span class="kw">from</span> <span class="str">'../mocks/server'</span>;
+<span class="kw">import</span> { CityAutocomplete } <span class="kw">from</span> <span class="str">'./CityAutocomplete'</span>;
+
+beforeEach(() =&gt; vi.useFakeTimers());
+afterEach(() =&gt; {
+  vi.runOnlyPendingTimers();
+  vi.useRealTimers();
+});
+
+test(<span class="str">'debounces, sends the right query, renders suggestions'</span>, <span class="kw">async</span> () =&gt; {
+  <span class="kw">const</span> seenQueries: string[] = [];
+  server.use(http.get(<span class="str">'/api/cities'</span>, ({ request }) =&gt; {
+    <span class="kw">const</span> q = <span class="kw">new</span> URL(request.url).searchParams.get(<span class="str">'q'</span>);
+    seenQueries.push(q!);                    <span class="com">// asserting the OUTGOING request = contract test</span>
+    <span class="kw">return</span> HttpResponse.json([{ id: 1, name: <span class="str">'Berlin'</span> }, { id: 2, name: <span class="str">'Bern'</span> }]);
+  }));
+
+  <span class="kw">const</span> user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime.bind(vi) });
+  render(&lt;CityAutocomplete /&gt;);
+
+  <span class="kw">await</span> user.type(screen.getByRole(<span class="str">'combobox'</span>, { name: <span class="str">/city/i</span> }), <span class="str">'ber'</span>);
+
+  <span class="com">// mid-debounce: no request has fired</span>
+  expect(seenQueries).toHaveLength(0);
+
+  <span class="com">// advance past the debounce; the callback starts a fetch → use the ASYNC advance</span>
+  <span class="com">// so promise microtasks flush between timer runs</span>
+  <span class="kw">await</span> act(<span class="kw">async</span> () =&gt; { <span class="kw">await</span> vi.advanceTimersByTimeAsync(300); });
+
+  <span class="com">// exactly one request, with the final debounced value — not one per keystroke</span>
+  expect(seenQueries).toEqual([<span class="str">'ber'</span>]);
+
+  <span class="kw">const</span> listbox = <span class="kw">await</span> screen.findByRole(<span class="str">'listbox'</span>);
+  <span class="kw">const</span> options = within(listbox).getAllByRole(<span class="str">'option'</span>);
+  expect(options.map(o =&gt; o.textContent)).toEqual([<span class="str">'Berlin'</span>, <span class="str">'Bern'</span>]);
+});</code></pre>
+      <p>
+        Why each piece is there: <code>advanceTimers</code> in setup keeps <code>user.type</code> from hanging
+        under fake timers; <code>advanceTimersByTimeAsync</code> (not the sync version) lets the fetch promise
+        chain resolve; the <code>seenQueries</code> capture asserts the outgoing request — the one implementation
+        boundary that IS contract, catching a misnamed query param that a client-side mock would never see.
+      </p>
+    </details>
+  </div>
+
+  <div class="exercise">
+    <h4>Exercise 4 — Signup form: full user flow with validation and submit contract</h4>
+    <p>
+      A signup form has Email, Password, a "Terms" checkbox, and a Create account button. Rules: submit with
+      invalid email shows "Enter a valid email" tied to the field; password under 8 chars shows an error; the
+      button is disabled until Terms is checked; a valid submit calls <code>onSignup({ email, password })</code>
+      exactly once and disables the button while pending. Write the suite.
+    </p>
+    <details>
+      <summary>Solution</summary>
+      <pre><code><span class="kw">import</span> { render, screen } <span class="kw">from</span> <span class="str">'@testing-library/react'</span>;
+<span class="kw">import</span> userEvent <span class="kw">from</span> <span class="str">'@testing-library/user-event'</span>;
+
+<span class="kw">function</span> setup(props = {}) {
+  <span class="kw">const</span> user = userEvent.setup();
+  <span class="kw">const</span> onSignup = vi.fn().mockResolvedValue(<span class="kw">undefined</span>);
+  render(&lt;SignupForm onSignup={onSignup} {...props} /&gt;);
+  <span class="kw">return</span> {
+    user, onSignup,
+    email: () =&gt; screen.getByLabelText(<span class="str">/email/i</span>),
+    password: () =&gt; screen.getByLabelText(<span class="str">/password/i</span>),
+    terms: () =&gt; screen.getByRole(<span class="str">'checkbox'</span>, { name: <span class="str">/terms/i</span> }),
+    submit: () =&gt; screen.getByRole(<span class="str">'button'</span>, { name: <span class="str">/create account/i</span> }),
+  };
+}
+
+test(<span class="str">'invalid email shows an error associated with the field'</span>, <span class="kw">async</span> () =&gt; {
+  <span class="kw">const</span> { user, email, password, terms, submit, onSignup } = setup();
+
+  <span class="kw">await</span> user.type(email(), <span class="str">'not-an-email'</span>);
+  <span class="kw">await</span> user.type(password(), <span class="str">'longenough1'</span>);
+  <span class="kw">await</span> user.click(terms());
+  <span class="kw">await</span> user.click(submit());
+
+  <span class="com">// the error is programmatically tied to the input → the INPUT's accessible</span>
+  <span class="com">// description contains it (aria-describedby); this asserts the a11y wiring too</span>
+  expect(email()).toHaveAccessibleDescription(<span class="str">/enter a valid email/i</span>);
+  expect(email()).toBeInvalid();                  <span class="com">// aria-invalid="true"</span>
+  expect(onSignup).not.toHaveBeenCalled();
+});
+
+test(<span class="str">'short password shows an error'</span>, <span class="kw">async</span> () =&gt; {
+  <span class="kw">const</span> { user, email, password, terms, submit, onSignup } = setup();
+
+  <span class="kw">await</span> user.type(email(), <span class="str">'ada@lovelace.dev'</span>);
+  <span class="kw">await</span> user.type(password(), <span class="str">'short'</span>);
+  <span class="kw">await</span> user.click(terms());
+  <span class="kw">await</span> user.click(submit());
+
+  expect(screen.getByText(<span class="str">/at least 8 characters/i</span>)).toBeInTheDocument();
+  expect(onSignup).not.toHaveBeenCalled();
+});
+
+test(<span class="str">'submit is disabled until terms are accepted'</span>, <span class="kw">async</span> () =&gt; {
+  <span class="kw">const</span> { user, terms, submit } = setup();
+  expect(submit()).toBeDisabled();
+  <span class="kw">await</span> user.click(terms());
+  expect(submit()).toBeEnabled();
+});
+
+test(<span class="str">'valid submit calls onSignup once and shows pending state'</span>, <span class="kw">async</span> () =&gt; {
+  <span class="com">// a controllable promise lets us observe the in-flight state deterministically</span>
+  <span class="kw">let</span> resolveSignup!: () =&gt; <span class="kw">void</span>;
+  <span class="kw">const</span> onSignup = vi.fn(() =&gt; <span class="kw">new</span> Promise&lt;<span class="kw">void</span>&gt;(res =&gt; { resolveSignup = res; }));
+  <span class="kw">const</span> { user, email, password, terms, submit } = setup({ onSignup });
+
+  <span class="kw">await</span> user.type(email(), <span class="str">'ada@lovelace.dev'</span>);
+  <span class="kw">await</span> user.type(password(), <span class="str">'longenough1'</span>);
+  <span class="kw">await</span> user.click(terms());
+  <span class="kw">await</span> user.click(submit());
+
+  <span class="com">// the contract with the parent: right shape, exactly once</span>
+  expect(onSignup).toHaveBeenCalledTimes(1);
+  expect(onSignup).toHaveBeenCalledWith({ email: <span class="str">'ada@lovelace.dev'</span>, password: <span class="str">'longenough1'</span> });
+
+  <span class="com">// while pending: disabled (double-submit guard)</span>
+  expect(<span class="kw">await</span> screen.findByRole(<span class="str">'button'</span>, { name: <span class="str">/creating/i</span> })).toBeDisabled();
+
+  resolveSignup();
+  expect(<span class="kw">await</span> screen.findByRole(<span class="str">'button'</span>, { name: <span class="str">/create account/i</span> })).toBeEnabled();
+});</code></pre>
+      <p>
+        Judgment notes: the tiny <code>setup()</code> helper is a test-data-builder in miniature — each test states
+        only what it varies. The deferred-promise trick is the deterministic way to test pending UI (no
+        setTimeout races). <code>toHaveAccessibleDescription</code> asserts the error is <em>announced</em>, not
+        merely rendered nearby — a validation test that also guards the aria-describedby wiring.
+      </p>
+    </details>
+  </div>
+
+  <div class="exercise">
+    <h4>Exercise 5 — Playwright: checkout journey with auth reuse and one forced failure</h4>
+    <p>
+      Write (a) a true-e2e happy path: an authenticated user adds a product to the cart and completes checkout
+      against a seeded staging backend; (b) a hermetic failure test: the payment API returns 402 and the user sees
+      an actionable error without losing their cart. Use storageState for auth and no manual waits anywhere.
+    </p>
+    <details>
+      <summary>Solution</summary>
+      <pre><code><span class="com">// playwright.config.ts (relevant parts)</span>
+<span class="kw">export default</span> defineConfig({
+  globalSetup: <span class="str">'./e2e/global-setup'</span>,       <span class="com">// logs in once, writes e2e/.auth/user.json</span>
+  retries: process.env.CI ? 2 : 0,
+  use: {
+    baseURL: process.env.E2E_BASE_URL ?? <span class="str">'http://localhost:3000'</span>,
+    storageState: <span class="str">'e2e/.auth/user.json'</span>,   <span class="com">// every test starts authenticated</span>
+    trace: <span class="str">'on-first-retry'</span>,
+  },
+});
+
+<span class="com">// e2e/checkout.spec.ts</span>
+<span class="kw">import</span> { test, expect } <span class="kw">from</span> <span class="str">'@playwright/test'</span>;
+
+test(<span class="str">'happy path: add to cart and complete checkout'</span>, <span class="kw">async</span> ({ page }) =&gt; {
+  <span class="com">// seeded product on staging — data setup happens via API/fixtures, not UI clicks</span>
+  <span class="kw">await</span> page.goto(<span class="str">'/products/e2e-test-ssd'</span>);
+
+  <span class="kw">await</span> page.getByRole(<span class="str">'button'</span>, { name: <span class="str">'Add to cart'</span> }).click();
+  <span class="com">// web-first assertion — retries until the cart badge updates; no sleep</span>
+  <span class="kw">await</span> expect(page.getByRole(<span class="str">'link'</span>, { name: <span class="str">'Cart, 1 item'</span> })).toBeVisible();
+
+  <span class="kw">await</span> page.getByRole(<span class="str">'link'</span>, { name: <span class="str">/cart/i</span> }).click();
+  <span class="kw">await</span> page.getByRole(<span class="str">'button'</span>, { name: <span class="str">'Checkout'</span> }).click();
+
+  <span class="kw">await</span> page.getByLabel(<span class="str">'Card number'</span>).fill(<span class="str">'4242 4242 4242 4242'</span>);
+  <span class="kw">await</span> page.getByLabel(<span class="str">'Expiry'</span>).fill(<span class="str">'12/28'</span>);
+  <span class="kw">await</span> page.getByLabel(<span class="str">'CVC'</span>).fill(<span class="str">'123'</span>);
+  <span class="kw">await</span> page.getByRole(<span class="str">'button'</span>, { name: <span class="str">'Pay now'</span> }).click();
+
+  <span class="kw">await</span> expect(page.getByRole(<span class="str">'heading'</span>, { name: <span class="str">'Order confirmed'</span> })).toBeVisible();
+  <span class="kw">await</span> expect(page).toHaveURL(<span class="str">/\/orders\/[\w-]+/</span>);
+});
+
+test(<span class="str">'payment declined: actionable error, cart preserved'</span>, <span class="kw">async</span> ({ page }) =&gt; {
+  <span class="com">// hermetic override of ONE endpoint — you can't ask staging to decline on cue</span>
+  <span class="kw">await</span> page.route(<span class="str">'**/api/payments'</span>, (route) =&gt;
+    route.fulfill({
+      status: 402,
+      contentType: <span class="str">'application/json'</span>,
+      body: JSON.stringify({ error: <span class="str">'card_declined'</span> }),
+    })
+  );
+
+  <span class="kw">await</span> page.goto(<span class="str">'/products/e2e-test-ssd'</span>);
+  <span class="kw">await</span> page.getByRole(<span class="str">'button'</span>, { name: <span class="str">'Add to cart'</span> }).click();
+  <span class="kw">await</span> page.getByRole(<span class="str">'link'</span>, { name: <span class="str">/cart/i</span> }).click();
+  <span class="kw">await</span> page.getByRole(<span class="str">'button'</span>, { name: <span class="str">'Checkout'</span> }).click();
+  <span class="kw">await</span> page.getByLabel(<span class="str">'Card number'</span>).fill(<span class="str">'4242 4242 4242 4242'</span>);
+  <span class="kw">await</span> page.getByLabel(<span class="str">'Expiry'</span>).fill(<span class="str">'12/28'</span>);
+  <span class="kw">await</span> page.getByLabel(<span class="str">'CVC'</span>).fill(<span class="str">'123'</span>);
+  <span class="kw">await</span> page.getByRole(<span class="str">'button'</span>, { name: <span class="str">'Pay now'</span> }).click();
+
+  <span class="kw">const</span> alert = page.getByRole(<span class="str">'alert'</span>);
+  <span class="kw">await</span> expect(alert).toContainText(<span class="str">/card was declined/i</span>);
+  <span class="kw">await</span> expect(page.getByRole(<span class="str">'button'</span>, { name: <span class="str">/try a different card/i</span> })).toBeVisible();
+  <span class="com">// the cart survived the failure — the assertion that catches real money bugs</span>
+  <span class="kw">await</span> expect(page.getByRole(<span class="str">'link'</span>, { name: <span class="str">'Cart, 1 item'</span> })).toBeVisible();
+});</code></pre>
+      <p>
+        Judgment notes: exactly one true-e2e happy path (checkout is revenue-critical); the failure variant is
+        hermetic because forced failures can't be produced on demand by a real backend; auth via storageState so
+        neither test pays the login tax; every wait is a retrying web-first assertion — zero
+        <code>waitForTimeout</code>. In CI this file would run post-merge, sharded, with trace-on-first-retry for
+        forensics.
+      </p>
+    </details>
+  </div>
+
+<nav class="page-nav"><a href="12-component-patterns-forms.html">← Prev: Component Patterns &amp; Forms</a><a href="14-nextjs-rendering.html">Next: Next.js &amp; Rendering →</a></nav>
+</main></body></html>

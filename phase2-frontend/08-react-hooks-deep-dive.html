@@ -1,0 +1,1222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>08 — Hooks Deep Dive | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <div class="breadcrumb"><a href="index.html">← Course Home</a></div>
+    <h1>08 — Hooks Deep Dive</h1>
+    <p>The fiber-level mechanics of state, effects, and refs — plus the design judgment that separates senior answers from junior ones.</p>
+  </div>
+</header>
+<main class="container">
+
+<h2>Why interviewers ask this</h2>
+<p>Every React candidate "knows hooks." That is exactly why interviewers dig here: hooks are the one topic where surface familiarity and real understanding look identical until you ask a precise question. A senior candidate is expected to explain <strong>why</strong> the Rules of Hooks exist (call-order slot resolution on the fiber), <strong>exactly when</strong> effects and cleanups fire relative to commit and paint, and <strong>why</strong> a <code>setInterval</code> inside an empty-dep effect logs a stale count forever — tracing the closure, not hand-waving "it's a stale closure."</p>
+<p>The second axis is judgment. FAANG interviewers and startup leads both probe for it: When does logic belong in an event handler instead of an effect? When is <code>useReducer</code> worth the ceremony? How do you design the return API of a custom hook so it composes without foot-guns? Wrong-but-common patterns (props-to-state syncing, effect chains, inline-object deps) are deliberately planted in code-review-style interview questions. This tutorial covers the mechanics first, then the judgment, then drills both with Q&amp;A and exercises.</p>
+
+<div class="toc">
+  <strong>Contents</strong>
+  <ol>
+    <li><a href="#under-the-hood">How hooks work under the hood</a></li>
+    <li><a href="#usestate">useState deep dive</a></li>
+    <li><a href="#useeffect">useEffect: the complete story</a></li>
+    <li><a href="#useref">useRef patterns</a></li>
+    <li><a href="#usememo">useMemo &amp; useCallback mechanics</a></li>
+    <li><a href="#uselayouteffect">useLayoutEffect &amp; useInsertionEffect</a></li>
+    <li><a href="#usereducer">useReducer</a></li>
+    <li><a href="#usecontext">useContext mechanics</a></li>
+    <li><a href="#usesyncexternalstore">useSyncExternalStore</a></li>
+    <li><a href="#utility-hooks">useId, useDebugValue, transitions</a></li>
+    <li><a href="#custom-hooks">Custom hook design</a></li>
+    <li><a href="#react19">React 19 additions overview</a></li>
+    <li><a href="#interview-qa">Interview Q&amp;A</a></li>
+    <li><a href="#exercises">Hands-on exercises</a></li>
+  </ol>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="under-the-hood">1. How hooks work under the hood <span class="tier tier-1">TIER 1</span></h2>
+
+<p>Hooks have no magic access to "the component instance" — function components don't have instances. Instead, every component has a <strong>fiber</strong> (its unit of work in the reconciler, covered in tutorial 07), and the fiber's <code>memoizedState</code> field points at a <strong>linked list of hook objects</strong>. Each call to <code>useState</code>, <code>useEffect</code>, <code>useRef</code>, etc. during render consumes the <em>next node</em> in that list. There are no names or keys — <strong>hooks are resolved purely by call order</strong>.</p>
+
+<pre><code><span class="com">// Conceptual model of what React keeps per component fiber:</span>
+fiber.memoizedState = {
+  memoizedState: <span class="num">0</span>,          <span class="com">// hook 1: useState(0) → the state value</span>
+  queue: { <span class="com">/* pending updates */</span> },
+  next: {
+    memoizedState: <span class="str">'idle'</span>,  <span class="com">// hook 2: useState('idle')</span>
+    queue: { ... },
+    next: {
+      memoizedState: {        <span class="com">// hook 3: useEffect → effect object</span>
+        create: fn, deps: [id], destroy: cleanupFn
+      },
+      next: <span class="kw">null</span>
+    }
+  }
+};</code></pre>
+
+<p>On the <strong>initial render</strong> (mount), each hook call appends a new node to the list. On <strong>every subsequent render</strong> (update), React walks the same list with a cursor: first hook call reads node 1, second call reads node 2, and so on. The hook's identity is literally "I was the 3rd hook called." This is the entire reason for the Rules of Hooks.</p>
+
+<h3>The Rules of Hooks — and what actually breaks</h3>
+<ul>
+  <li><strong>Only call hooks at the top level</strong> — never inside conditions, loops, early returns, or nested functions. The call sequence must be identical every render.</li>
+  <li><strong>Only call hooks from React function components or custom hooks</strong> — because only then is a fiber being rendered and a dispatcher installed (below).</li>
+</ul>
+
+<p>Here is the classic corrupted-state demonstration. Watch what happens to the slot alignment when a hook is called conditionally:</p>
+
+<pre><code><span class="kw">function</span> Profile({ user }) {
+  <span class="kw">const</span> [name, setName] = useState(user.name);      <span class="com">// hook slot 1</span>
+  <span class="kw">if</span> (user.isAdmin) {
+    <span class="kw">const</span> [audit, setAudit] = useState([]);          <span class="com">// hook slot 2 ...sometimes</span>
+  }
+  <span class="kw">const</span> [theme, setTheme] = useState(<span class="str">'light'</span>);      <span class="com">// slot 3 or slot 2?!</span>
+  ...
+}</code></pre>
+
+<table>
+  <thead>
+    <tr><th>Render</th><th>Slot 1</th><th>Slot 2</th><th>Slot 3</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Render A (<code>isAdmin: true</code>)</td><td><code>name</code></td><td><code>audit</code></td><td><code>theme</code></td></tr>
+    <tr><td>Render B (<code>isAdmin: false</code>)</td><td><code>name</code></td><td><code>theme</code> ← <strong>reads the <code>audit</code> node!</strong></td><td><em>(list has a leftover node)</em></td></tr>
+  </tbody>
+</table>
+
+<p>On render B, the <code>theme</code> call is the <em>second</em> hook call, so React hands it the stored state of the <em>audit</em> hook — <code>theme</code> is suddenly <code>[]</code>. React actually detects the mismatch in the hook count and throws <em>"Rendered fewer hooks than expected"</em> (or warns about a changed hook order), but the conceptual failure is silent state corruption: values shifting into the wrong slots. The same logic explains why an <strong>early return before a hook</strong> or a <strong>hook inside a loop with variable iterations</strong> is illegal.</p>
+
+<div class="note">If you need "conditional state", the fix is structural, not conditional hooks: either always call the hook and conditionally <em>use</em> the value, or split the conditional part into a child component that mounts/unmounts — each component owns its own fiber and hook list, so mounting a child is how you "conditionally allocate" hooks.</div>
+
+<h3>The dispatcher — why hooks only work during render</h3>
+<p><code>useState</code> exported from the <code>react</code> package is a thin wrapper. It reads a module-level mutable reference — the <strong>current dispatcher</strong> — and delegates:</p>
+
+<pre><code><span class="com">// Simplified from the React source:</span>
+<span class="kw">function</span> useState(initialState) {
+  <span class="kw">const</span> dispatcher = ReactCurrentDispatcher.current; <span class="com">// set by the renderer</span>
+  <span class="kw">return</span> dispatcher.useState(initialState);
+}</code></pre>
+
+<p>Right before react-dom renders your component, it installs the appropriate dispatcher: a <strong>mount dispatcher</strong> (creates hook nodes) on first render, an <strong>update dispatcher</strong> (walks existing nodes) on re-renders. When no component is rendering, the dispatcher is set to an implementation that throws. This explains several things at once:</p>
+<ul>
+  <li><strong>"Invalid hook call"</strong> when you call a hook outside a component: no valid dispatcher is installed.</li>
+  <li><strong>Two copies of React</strong> break hooks: the component renders under renderer A's dispatcher, but imports <code>useState</code> from copy B, whose <code>ReactCurrentDispatcher</code> was never set.</li>
+  <li>Custom hooks need no registration — they are plain functions that happen to call hooks <em>while a dispatcher is installed</em>, i.e. during someone's render.</li>
+  <li>Mount vs update behavior differences (e.g. the initial-state argument being ignored after mount) are literally two different function implementations.</li>
+</ul>
+
+<div class="senior">The linked-list-by-call-order design is a deliberate trade-off: it avoids requiring explicit keys for every piece of state (as some frameworks do) at the cost of the Rules of Hooks. Mentioning that <code>eslint-plugin-react-hooks</code> statically enforces the rules — and that the <strong>React Compiler</strong> depends on those same guarantees to memoize safely — signals you understand the rules as an architectural contract, not folklore.</div>
+
+<!-- ============================================================ -->
+<h2 id="usestate">2. useState deep dive <span class="tier tier-1">TIER 1</span></h2>
+
+<h3>Initial state runs once — the lazy initializer</h3>
+<p>The argument to <code>useState</code> is only <em>used</em> on mount, but the expression is <em>evaluated</em> on every render — it's a normal function argument. That's the trap:</p>
+
+<pre><code><span class="com">// ❌ expensiveParse runs on EVERY render; result discarded after mount</span>
+<span class="kw">const</span> [data, setData] = useState(expensiveParse(rawJson));
+
+<span class="com">// ✅ lazy initializer: React calls the function once, on mount only</span>
+<span class="kw">const</span> [data, setData] = useState(() =&gt; expensiveParse(rawJson));</code></pre>
+
+<p>If you pass a function, React treats it as an <strong>initializer</strong> and invokes it only when creating the hook node. Same idiom applies to <code>useReducer</code>'s third argument. Classic follow-up: "what if the state itself should <em>hold</em> a function?" — then you must wrap it: <code>useState(() =&gt; myFn)</code>, otherwise React calls <code>myFn</code> as an initializer.</p>
+
+<h3>The Object.is bail-out</h3>
+<p>When you call the setter, React compares the incoming value to the current one with <code>Object.is</code>. If they're identical, React <strong>bails out</strong>: no state change, and it skips re-rendering the component and its children.</p>
+
+<div class="note">Precise nuance worth stating in an interview: in some cases React <strong>may still render that one component once more</strong> before bailing out (it needs to run the function to confirm nothing changed when it couldn't decide eagerly), but it will not descend into children and will not commit. So "setting the same value never re-renders" is <em>almost</em> right — the guaranteed part is that it won't propagate or commit. This also implies: with objects, <code>setUser({ ...user })</code> always re-renders (new reference), while mutating <code>user.name = 'x'; setUser(user)</code> never does (same reference — a top-3 real-world hooks bug).</div>
+
+<h3>Updater-function queue semantics — the classic drill</h3>
+<p>Each setter call doesn't overwrite state; it <strong>enqueues an update</strong> on the hook's queue. During the next render, React processes the queue in order. There are two kinds of updates: <em>replace</em> (you passed a value) and <em>apply</em> (you passed a function, which receives the latest pending state).</p>
+
+<pre><code><span class="kw">function</span> handleClick() {          <span class="com">// count is 0 in this render's closure</span>
+  setCount(count + <span class="num">1</span>);            <span class="com">// enqueue "replace with 0 + 1 = 1"</span>
+  setCount(count + <span class="num">1</span>);            <span class="com">// enqueue "replace with 0 + 1 = 1"</span>
+  setCount(count + <span class="num">1</span>);            <span class="com">// enqueue "replace with 0 + 1 = 1"</span>
+}                                 <span class="com">// next render: count === 1</span>
+
+<span class="kw">function</span> handleClickUpdater() {
+  setCount(c =&gt; c + <span class="num">1</span>);           <span class="com">// enqueue "apply: pending 0 → 1"</span>
+  setCount(c =&gt; c + <span class="num">1</span>);           <span class="com">// enqueue "apply: pending 1 → 2"</span>
+  setCount(c =&gt; c + <span class="num">1</span>);           <span class="com">// enqueue "apply: pending 2 → 3"</span>
+}                                 <span class="com">// next render: count === 3</span></code></pre>
+
+<p>Why the difference: <code>count + 1</code> is computed <em>now</em>, from the snapshot captured by this render's closure — all three calls compute <code>1</code>. The updater function is stored uncalled and later fed the <strong>running pending value</strong> as React drains the queue. Mixed forms follow the same rule:</p>
+
+<pre><code>setCount(count + <span class="num">5</span>);   <span class="com">// pending: 5 (replace)</span>
+setCount(c =&gt; c + <span class="num">1</span>);  <span class="com">// pending: 6 (apply to 5)</span>
+setCount(<span class="num">42</span>);          <span class="com">// pending: 42 (replace discards the 6)</span>
+<span class="com">// next render: 42</span></code></pre>
+
+<h3>State is a snapshot per render</h3>
+<p>The single most-tested mental model. <code>count</code> is a <code>const</code> local variable in one execution of your function. Calling <code>setCount</code> does <strong>not</strong> change that variable — it schedules a re-render, in which a <em>new</em> function call will receive the new value:</p>
+
+<pre><code><span class="kw">const</span> [count, setCount] = useState(<span class="num">0</span>);
+
+<span class="kw">function</span> handleClick() {
+  setCount(count + <span class="num">1</span>);
+  console.log(count);        <span class="com">// logs 0 — NOT 1</span>
+  setTimeout(() =&gt; {
+    console.log(count);      <span class="com">// STILL 0, even after the re-render happened —</span>
+  }, <span class="num">3000</span>);                  <span class="com">// this closure belongs to the old render</span>
+}</code></pre>
+
+<p>Why, precisely: (1) <code>setCount</code> only enqueues an update and marks the fiber dirty — it never mutates anything the current closure can see; (2) the re-render creates a <em>new</em> closure with <code>count === 1</code>, but the running <code>handleClick</code> and any timeouts it spawned still close over the old render's bindings. State behaves like a <strong>snapshot photograph</strong> handed to each render. Every stale-closure bug in section 3 is this fact wearing a different costume.</p>
+
+<h3>Batching recap</h3>
+<p>Since React 18, <strong>all</strong> state updates are automatically batched — event handlers, promises, <code>setTimeout</code>, native event listeners. Multiple setter calls (even across different hooks and components) in one synchronous block produce <strong>one</strong> re-render, processed together. Pre-18 only React event handlers batched, which is why legacy code sometimes relied on updates in a timeout flushing immediately. Escape hatch when you truly need synchronous DOM reads between updates: <code>flushSync(() =&gt; setX(...))</code> from <code>react-dom</code> — use rarely, it forces sync render and hurts performance.</p>
+
+<h3>Derived state — the anti-pattern and its fixes</h3>
+<p>Storing anything computable from existing props/state is redundant state that <em>will</em> drift. The default answer is: <strong>compute during render</strong>.</p>
+
+<pre><code><span class="com">// ❌ redundant state + effect to "sync" it — extra render, drift risk</span>
+<span class="kw">const</span> [fullName, setFullName] = useState(<span class="str">''</span>);
+useEffect(() =&gt; { setFullName(first + <span class="str">' '</span> + last); }, [first, last]);
+
+<span class="com">// ✅ derive it — cheap computations don't even need useMemo</span>
+<span class="kw">const</span> fullName = first + <span class="str">' '</span> + last;</code></pre>
+
+<p><strong>The props-to-state sync trap.</strong> The subtler version: seeding state from a prop, then trying to keep it in sync.</p>
+
+<pre><code><span class="kw">function</span> EmailEditor({ contact }) {
+  <span class="com">// ❌ initializes once; when parent passes a different contact,</span>
+  <span class="com">// the draft silently keeps the OLD contact's email</span>
+  <span class="kw">const</span> [draft, setDraft] = useState(contact.email);
+  ...
+}</code></pre>
+
+<p>Ranked fixes:</p>
+<ol>
+  <li><strong>Reset with <code>key</code></strong> — tell React it's a different logical instance; the subtree remounts and all state re-initializes. Cleanest when "new contact = start over": <code>&lt;EmailEditor key={contact.id} contact={contact} /&gt;</code></li>
+  <li><strong>Render-time compare</strong> — for resetting <em>part</em> of the state. Storing the previous prop in state and calling the setter <em>during render</em> is legal (for the same component): React discards the render output and re-runs immediately, before touching the DOM or children — cheaper than an effect-based reset, which commits a stale frame first.
+<pre><code><span class="kw">const</span> [prevContact, setPrevContact] = useState(contact);
+<span class="kw">const</span> [draft, setDraft] = useState(contact.email);
+<span class="kw">if</span> (contact !== prevContact) {       <span class="com">// during render, no effect</span>
+  setPrevContact(contact);
+  setDraft(contact.email);
+}</code></pre></li>
+  <li><strong>Lift the state up</strong> — often the honest fix: make it controlled and let the parent own the draft.</li>
+</ol>
+
+<div class="note">Historical framing interviewers appreciate: class components had <code>componentWillReceiveProps</code>, whose misuse was so pervasive that React 16.3 replaced it with the deliberately awkward static <code>getDerivedStateFromProps</code> — and the accompanying blog post ("You Probably Don't Need Derived State") is the direct ancestor of the modern <code>key</code>-reset and render-time-compare guidance. The hooks-era doctrine is the same: derived state is a last resort, not a pattern.</div>
+
+<div class="pitfall">The effect-based version <code>useEffect(() =&gt; setDraft(contact.email), [contact])</code> is not just slow (paint stale → effect → re-render → paint again, a visible flicker under load) — it also stomps user input whenever the parent re-creates <code>contact</code> with a new reference but identical data. Object identity in deps strikes again (section 3).</div>
+<!-- ============================================================ -->
+<h2 id="useeffect">3. useEffect: the complete story <span class="tier tier-1">TIER 1</span></h2>
+
+<h3>The mental model: synchronization, not lifecycle</h3>
+<p>The senior framing: <strong>an effect synchronizes your component with an external system</strong> (network, subscriptions, timers, browser APIs, non-React widgets). It is not "code that runs on mount" — it's "code that makes the outside world match the current props/state, and undoes it when they change or the component leaves." That said, know the lifecycle vocabulary because interviewers still use it:</p>
+
+<table>
+  <thead><tr><th>Class-era vocabulary</th><th>Hooks equivalent</th><th>Caveat</th></tr></thead>
+  <tbody>
+    <tr><td><code>componentDidMount</code></td><td><code>useEffect(fn, [])</code></td><td>Runs <em>after paint</em> (didMount ran before paint — <code>useLayoutEffect</code> is the closer match)</td></tr>
+    <tr><td><code>componentDidUpdate</code></td><td><code>useEffect(fn, [deps])</code></td><td>No <code>prevProps</code>/<code>prevState</code> — the deps diff replaces manual comparison</td></tr>
+    <tr><td><code>componentWillUnmount</code></td><td>the returned cleanup</td><td>Cleanup also runs <em>between</em> re-runs, not only at unmount — the key difference</td></tr>
+  </tbody>
+</table>
+
+<h3>Execution timing — where effects sit in the pipeline</h3>
+<pre><code>render phase        → your function runs, React diffs (interruptible in concurrent React)
+commit phase        → DOM mutations applied
+                    → refs attached, useLayoutEffect cleanups + setups run (SYNC, pre-paint)
+browser paints      → user sees the new frame
+passive effects     → useEffect cleanups run, then useEffect setups run</code></pre>
+
+<p><code>useEffect</code> is deliberately <strong>deferred until after paint</strong> so it never blocks the frame — that's why data fetching, logging, and subscriptions belong there. Two precision points for interviews: (1) React <em>may</em> flush passive effects earlier — e.g. before processing a new discrete event like a click — so you can't assume "always after paint," only "never blocking this paint"; (2) effects flush <strong>bottom-up</strong>: children's effects run before their parent's.</p>
+
+<div class="note">In <code>StrictMode</code> (development only), React 18+ mounts, runs effects, immediately runs cleanups, then runs effects again. This is a deliberate stress test: if your effect's cleanup fully undoes its setup, the double-invoke is invisible. If your app breaks under StrictMode, you have a real cleanup bug, not a React bug.</div>
+
+<h3>Cleanup timing — a subscription trace</h3>
+<pre><code><span class="kw">function</span> ChatRoom({ roomId }) {
+  useEffect(() =&gt; {
+    <span class="kw">const</span> conn = connect(roomId);
+    <span class="kw">return</span> () =&gt; conn.disconnect();   <span class="com">// cleanup closes over THIS run's roomId</span>
+  }, [roomId]);
+}</code></pre>
+
+<table>
+  <thead><tr><th>Event</th><th>What runs, in order</th></tr></thead>
+  <tbody>
+    <tr><td>Mount with <code>roomId='general'</code></td><td>render → commit → paint → <code>connect('general')</code></td></tr>
+    <tr><td>Prop changes to <code>'travel'</code></td><td>render → commit → paint → <strong><code>disconnect('general')</code></strong> (previous cleanup) → <code>connect('travel')</code></td></tr>
+    <tr><td>Re-render with same <code>roomId</code></td><td>render → commit → deps <code>Object.is</code>-equal → effect skipped entirely</td></tr>
+    <tr><td>Unmount</td><td><code>disconnect('travel')</code></td></tr>
+  </tbody>
+</table>
+
+<p>The crucial detail: <strong>each effect run pairs with its own cleanup</strong>, and the cleanup closes over the same render's values. React always runs the previous cleanup before the next setup. So the model is not "unmount cleanup"; it's "every synchronization gets undone before the next one starts."</p>
+
+<h3>Dependency array semantics</h3>
+<ul>
+  <li>Deps are compared <strong>element-by-element with <code>Object.is</code></strong> against the previous render's array. Any mismatch → cleanup + re-run.</li>
+  <li><code>[]</code> means "synchronizes with nothing reactive" → setup after mount, cleanup at unmount (plus the StrictMode dev cycle).</li>
+  <li><strong>No array at all</strong> → runs after every render. Rarely what you want; usually a smell.</li>
+  <li>The rule is not "list what should trigger the effect" — it's "<strong>list every reactive value the effect reads</strong>": props, state, and anything derived from them in the component body. Deps are a <em>consistency declaration</em>, not a trigger config.</li>
+</ul>
+
+<div class="pitfall">Suppressing <code>react-hooks/exhaustive-deps</code> doesn't make the effect run less — it makes the effect <strong>lie</strong>. The closure still captures the omitted value from whatever render last created it, so the effect silently reads stale data forever after. Nine times out of ten the correct move is not suppression but restructuring: use an updater function, move the value into the effect, memoize the dependency, or hoist a non-reactive value out of the component. Legitimate suppressions exist (e.g. an intentional mount-only analytics ping) but should be rare, commented, and defensible in review.</div>
+
+<h3>Stale closures — the interval classic, traced exactly</h3>
+<pre><code><span class="kw">function</span> Counter() {
+  <span class="kw">const</span> [count, setCount] = useState(<span class="num">0</span>);
+
+  useEffect(() =&gt; {
+    <span class="kw">const</span> id = setInterval(() =&gt; {
+      console.log(<span class="str">'count is'</span>, count);   <span class="com">// logs "count is 0" forever</span>
+      setCount(count + <span class="num">1</span>);               <span class="com">// always computes 0 + 1</span>
+    }, <span class="num">1000</span>);
+    <span class="kw">return</span> () =&gt; clearInterval(id);
+  }, []);                                <span class="com">// ⚠️ effect reads `count` but lists nothing</span>
+
+  <span class="kw">return</span> &lt;h1&gt;{count}&lt;/h1&gt;;
+}</code></pre>
+
+<p><strong>Exact behavior:</strong> the display shows 0, ticks to 1 after one second, and then <em>never changes again</em>, while the console prints <code>count is 0</code> every second, forever. Walk the trace:</p>
+<ol>
+  <li>Render #1 executes with <code>count = 0</code>. The effect function — and the interval callback inside it — are created in render #1's scope. The callback's <code>count</code> is permanently bound to that render's <code>const count = 0</code>.</li>
+  <li>Deps are <code>[]</code>, so this effect runs once and is <strong>never replaced</strong>. The interval keeps firing the render-#1 callback.</li>
+  <li>Tick 1: logs 0, calls <code>setCount(0 + 1)</code> → re-render with <code>count = 1</code>. Render #2 creates a new closure — <em>but nobody is using it</em>; the interval still holds render #1's.</li>
+  <li>Tick 2 onward: logs 0 again, calls <code>setCount(1)</code>. Current state is already 1 → <code>Object.is</code> bail-out → no re-render. Steady state: UI frozen at 1, console stuck at 0.</li>
+</ol>
+
+<p><strong>Fixes, ranked:</strong></p>
+<ol>
+  <li><strong>Functional updater</strong> — best when the only need is "next state from previous." The effect no longer <em>reads</em> <code>count</code>, so <code>[]</code> becomes honest:
+<pre><code>setCount(c =&gt; c + <span class="num">1</span>);   <span class="com">// React supplies the latest pending value</span></code></pre></li>
+  <li><strong>Restart on dep change</strong> — add <code>count</code> to deps. Correct, and the right shape for subscriptions that genuinely depend on the value — but here it tears down and recreates the interval every second, and resets the tick cadence. Know it; also know its cost.</li>
+  <li><strong>Latest-value ref</strong> — when you must read fresh state inside a long-lived callback without restarting it (see the <code>useLatest</code> pattern in section 4). More moving parts; reserve for callbacks that are expensive to re-establish.</li>
+  <li><strong><code>useEffectEvent</code> awareness</strong> — the experimental API extracts non-reactive "event" logic from an effect: it always sees latest props/state and is excluded from deps. Not stable yet; name it as the designed solution to this class of problem, don't ship it.</li>
+</ol>
+
+<h3>The fetch race condition — and the full cleanup pattern</h3>
+<p>Effects re-run when deps change, but network responses don't arrive in dep-change order. Type "ab" quickly: the effect for <code>"a"</code> fires, then the effect for <code>"ab"</code>; if <code>"a"</code>'s response lands last, it overwrites the correct results. Two idiomatic fixes — the ignore flag (universal) and AbortController (also cancels the request):</p>
+
+<pre><code>useEffect(() =&gt; {
+  <span class="kw">const</span> controller = <span class="kw">new</span> AbortController();
+  <span class="kw">let</span> ignore = <span class="kw">false</span>;                    <span class="com">// belt AND suspenders shown; either works</span>
+
+  <span class="kw">async function</span> run() {
+    <span class="kw">try</span> {
+      <span class="kw">const</span> res = <span class="kw">await</span> fetch(<span class="str">`/api/search?q=${query}`</span>, {
+        signal: controller.signal,
+      });
+      <span class="kw">const</span> json = <span class="kw">await</span> res.json();
+      <span class="kw">if</span> (!ignore) setResults(json);     <span class="com">// stale runs never touch state</span>
+    } <span class="kw">catch</span> (err) {
+      <span class="kw">if</span> (err.name === <span class="str">'AbortError'</span>) <span class="kw">return</span>; <span class="com">// expected on cleanup — not an error</span>
+      <span class="kw">if</span> (!ignore) setError(err);
+    }
+  }
+  run();
+
+  <span class="kw">return</span> () =&gt; {
+    ignore = <span class="kw">true</span>;
+    controller.abort();                  <span class="com">// frees the connection, rejects the fetch</span>
+  };
+}, [query]);</code></pre>
+
+<p>Why the cleanup solves it: when <code>query</code> changes, the <em>old</em> effect's cleanup flips its own <code>ignore</code> and aborts its own request before the new effect starts. Each in-flight request is owned by exactly one effect run, and only the latest run's flag is still <code>false</code>. Note the AbortError swallow — forgetting it makes every keystroke log a spurious error. (In real apps, reach for React Query/SWR or router loaders — say so, then prove you can hand-roll it.)</p>
+
+<h3>What belongs where: render vs event handler vs effect</h3>
+<p>The "You Might Not Need an Effect" doctrine, condensed to a decision rule:</p>
+<table>
+  <thead><tr><th>Situation</th><th>Belongs in</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td>Data computable from props/state (filtered lists, totals, flags)</td><td><strong>Render</strong> (plus <code>useMemo</code> if expensive)</td><td>No extra render pass, cannot drift</td></tr>
+    <tr><td>Logic caused by a specific user action (submit → POST, buy → toast)</td><td><strong>Event handler</strong></td><td>The cause is the interaction, not "the component displayed with X"; effects would re-fire on unrelated re-renders and double-fire in StrictMode</td></tr>
+    <tr><td>Resetting state when an identity prop changes</td><td><strong><code>key</code></strong> (or render-time compare)</td><td>Effect-based reset paints a stale frame first</td></tr>
+    <tr><td>Synchronizing with something outside React (subscription, DOM lib, title, analytics-on-view)</td><td><strong>Effect</strong></td><td>This is the actual purpose of effects</td></tr>
+    <tr><td>Subscribing to an external store's value</td><td><strong><code>useSyncExternalStore</code></strong></td><td>Tear-free, SSR-aware (section 9)</td></tr>
+  </tbody>
+</table>
+
+<p><strong>The effect-chain anti-pattern.</strong> One effect sets state, which triggers another effect, which sets more state:</p>
+
+<pre><code><span class="com">// ❌ 3 cascading render passes to compute what one handler could do</span>
+useEffect(() =&gt; { <span class="kw">if</span> (card !== <span class="kw">null</span>) setGoldCount(c =&gt; c + <span class="num">1</span>); }, [card]);
+useEffect(() =&gt; { <span class="kw">if</span> (goldCount &gt; <span class="num">3</span>) setRound(r =&gt; r + <span class="num">1</span>); }, [goldCount]);
+useEffect(() =&gt; { <span class="kw">if</span> (round &gt; <span class="num">5</span>) setGameOver(<span class="kw">true</span>); }, [round]);
+
+<span class="com">// ✅ compute the entire next state in the event handler that caused it</span>
+<span class="kw">function</span> handlePlaceCard(next) {
+  <span class="kw">const</span> nextGold = next.gold ? goldCount + <span class="num">1</span> : goldCount;
+  setCard(next);
+  setGoldCount(nextGold);
+  <span class="kw">if</span> (nextGold &gt; <span class="num">3</span>) setRound(round + <span class="num">1</span>);
+  <span class="kw">if</span> (round + <span class="num">1</span> &gt; <span class="num">5</span>) setGameOver(<span class="kw">true</span>);
+}</code></pre>
+
+<p>Effect chains are slow (each link is a full render+commit cycle), fragile (ordering is implicit), and unreadable (the business rule is smeared across the file). Consolidate into the handler — or into a reducer, which is exactly the "multi-field transition" case <code>useReducer</code> exists for (section 7).</p>
+
+<h3>Object and function deps — the churn problem</h3>
+<pre><code><span class="kw">function</span> Map({ lat, lng }) {
+  <span class="kw">const</span> options = { center: { lat, lng }, zoom: <span class="num">12</span> };  <span class="com">// new object EVERY render</span>
+
+  useEffect(() =&gt; {
+    map.setOptions(options);
+  }, [options]);   <span class="com">// ❌ Object.is(prev, next) is false every time → runs every render</span>
+}</code></pre>
+
+<p>Worse, if the effect also sets state, you get an infinite loop: render → new object → effect → setState → render → new object… Fixes, in order of preference:</p>
+<ol>
+  <li><strong>Depend on primitives:</strong> <code>[lat, lng]</code> and build the object inside the effect. Primitives compare by value under <code>Object.is</code>; this is the most robust fix.</li>
+  <li><strong>Move creation into the effect</strong> if the object is only used there — it stops being a dependency at all.</li>
+  <li><strong><code>useMemo</code> the object / <code>useCallback</code> the function</strong> when it must be created outside (e.g. shared with JSX) — stabilizes the reference as long as <em>its</em> deps are stable.</li>
+  <li><strong>Hoist it out of the component</strong> if it doesn't depend on props/state at all — module-level constants are never reactive.</li>
+</ol>
+
+<div class="senior">This same churn problem is why custom hooks should be suspicious of option-object parameters: <code>useFetch(url, { headers })</code> with an inline object re-triggers everything each render unless the hook defends itself (serialize, destructure to primitives, or document the contract). Section 11 shows the defensive patterns.</div>
+
+<!-- ============================================================ -->
+<h2 id="useref">4. useRef patterns <span class="tier tier-1">TIER 1</span></h2>
+
+<h3>The mutable box</h3>
+<p><code>useRef(initial)</code> returns <code>{ current: initial }</code> — <strong>the same object on every render</strong> (it's stored in the hook node). Two defining properties: mutating <code>.current</code> never triggers a re-render, and the value survives re-renders. It is an instance variable for function components — the hooks answer to <code>this.something</code> on a class.</p>
+
+<table>
+  <thead><tr><th></th><th><code>useState</code></th><th><code>useRef</code></th></tr></thead>
+  <tbody>
+    <tr><td>Triggers re-render on change</td><td>Yes</td><td>No</td></tr>
+    <tr><td>Safe to read during render</td><td>Yes — it's the snapshot</td><td>No (except lazy-init idiom)</td></tr>
+    <tr><td>Mutation semantics</td><td>Immutable; setter enqueues</td><td>Mutable; write <code>.current</code> anytime outside render</td></tr>
+    <tr><td>Value during a render</td><td>Fixed snapshot for that render</td><td>Live — always the latest write</td></tr>
+    <tr><td>Use for</td><td>Anything the UI displays or derives from</td><td>Timer ids, DOM nodes, library instances, previous/latest values, "have I run yet" flags</td></tr>
+  </tbody>
+</table>
+
+<p><strong>The decision rule:</strong> if changing the value should change what the user sees → state. If it's bookkeeping the render output never reads → ref. If you find yourself calling <code>forceUpdate</code>-style hacks after writing a ref, it should have been state.</p>
+
+<h3>DOM refs and attachment timing</h3>
+<pre><code><span class="kw">function</span> SearchBox() {
+  <span class="kw">const</span> inputRef = useRef(<span class="kw">null</span>);
+  useEffect(() =&gt; {
+    inputRef.current.focus();     <span class="com">// safe: refs attach during commit,</span>
+  }, []);                         <span class="com">// before ANY effects run</span>
+  <span class="kw">return</span> &lt;input ref={inputRef} /&gt;;
+}</code></pre>
+
+<p>Timing precisely: during the commit phase React sets <code>ref.current</code> to the DOM node <strong>after mutating the DOM and before running layout effects</strong> — so both <code>useLayoutEffect</code> and <code>useEffect</code> can rely on the ref being attached. During render, <code>inputRef.current</code> is <code>null</code> on mount (the node doesn't exist yet) — reading it in render is both a rules violation and simply wrong. On unmount React sets it back to <code>null</code>. Conditional rendering means the ref can be <code>null</code> at any time; guard accordingly, or use a <strong>callback ref</strong> when you need to react to attach/detach itself.</p>
+
+<h3>The latest-value ref (<code>useLatest</code>) — defeating stale closures</h3>
+<pre><code><span class="kw">function</span> useLatest(value) {
+  <span class="kw">const</span> ref = useRef(value);
+  useEffect(() =&gt; { ref.current = value; });  <span class="com">// after every commit</span>
+  <span class="kw">return</span> ref;
+}
+
+<span class="kw">function</span> Chat({ onMessage }) {
+  <span class="kw">const</span> onMessageRef = useLatest(onMessage);
+  useEffect(() =&gt; {
+    <span class="kw">const</span> socket = connect();
+    socket.on(<span class="str">'msg'</span>, m =&gt; onMessageRef.current(m)); <span class="com">// always the latest handler</span>
+    <span class="kw">return</span> () =&gt; socket.close();
+  }, []);   <span class="com">// socket survives re-renders; the ref is stable, its contents fresh</span>
+}</code></pre>
+
+<p>The trick: the <em>ref object's identity</em> never changes (safe to omit from deps / include harmlessly), while <code>.current</code> is updated after each commit. Long-lived callbacks read through the ref at <em>call time</em> instead of capturing at <em>creation time</em>. This is the manual predecessor of <code>useEffectEvent</code>. Caveat: because the ref updates in an effect, it lags during the render phase itself — fine for event/timer callbacks, wrong for render logic.</p>
+
+<h3>Timers, instances, and the guard pattern</h3>
+<pre><code><span class="kw">const</span> timerRef = useRef(<span class="kw">null</span>);         <span class="com">// setTimeout/setInterval ids</span>
+<span class="kw">const</span> chartRef = useRef(<span class="kw">null</span>);         <span class="com">// third-party class instance</span>
+
+<span class="com">// Lazy-init idiom — the ONE sanctioned render-phase ref access:</span>
+<span class="kw">function</span> getChart() {
+  <span class="kw">if</span> (chartRef.current === <span class="kw">null</span>) {
+    chartRef.current = <span class="kw">new</span> ExpensiveChart();   <span class="com">// created once, on demand</span>
+  }
+  <span class="kw">return</span> chartRef.current;
+}</code></pre>
+
+<p><strong>Why not read/write refs during render (in general):</strong> React's contract is that rendering is pure — same inputs, same JSX. In concurrent rendering, React may render a component <em>twice, abandon a render, or render at a different priority</em>; render-phase ref mutations then execute an unpredictable number of times and can leak between attempts. The lazy-init idiom is exempt because it's idempotent: the first write wins and every subsequent render observes the same value, so purity is preserved <em>in effect</em>.</p>
+
+<h3>forwardRef, React 19's ref prop, and useImperativeHandle</h3>
+<p><code>ref</code> is not a normal prop in React ≤18 — function components need <code>forwardRef</code> to receive it. <strong>React 19 removes the ceremony: <code>ref</code> arrives as a regular prop</strong> on function components, and <code>forwardRef</code> is on the deprecation path.</p>
+
+<pre><code><span class="com">// React ≤18</span>
+<span class="kw">const</span> Input = forwardRef(<span class="kw">function</span> Input(props, ref) {
+  <span class="kw">return</span> &lt;input ref={ref} {...props} /&gt;;
+});
+
+<span class="com">// React 19 — just a prop</span>
+<span class="kw">function</span> Input({ ref, ...props }) {
+  <span class="kw">return</span> &lt;input ref={ref} {...props} /&gt;;
+}</code></pre>
+
+<p><strong><code>useImperativeHandle</code></strong> customizes what a parent's ref receives — the design-system use case is exposing a minimal imperative surface instead of the raw DOM node:</p>
+
+<pre><code><span class="kw">const</span> FancyInput = forwardRef(<span class="kw">function</span> FancyInput(props, ref) {
+  <span class="kw">const</span> inputRef = useRef(<span class="kw">null</span>);
+
+  useImperativeHandle(ref, () =&gt; ({
+    focus: () =&gt; inputRef.current.focus(),
+    clear: () =&gt; { inputRef.current.value = <span class="str">''</span>; },
+    <span class="com">// deliberately NOT exposing the node itself</span>
+  }), []);
+
+  <span class="kw">return</span> &lt;input ref={inputRef} {...props} /&gt;;
+});
+
+<span class="com">// Parent: inputHandle.current.focus() — can't reach into styles/DOM internals</span></code></pre>
+
+<p><strong>Use sparingly — and say why:</strong> imperative handles are escape hatches. Every method you expose is an API contract that bypasses the declarative data flow, is invisible to React DevTools' props view, and tends to accumulate ("just add a <code>scrollIntoView</code>…"). Legitimate uses are focus management, scrolling, text selection, media playback, and imperative animation triggers — things that are <em>inherently imperative</em> in the DOM. If a parent needs to imperatively set a child's <em>data</em>, model it as props/state instead.</p>
+<!-- ============================================================ -->
+<h2 id="usememo">5. useMemo &amp; useCallback mechanics <span class="tier tier-1">TIER 1</span></h2>
+
+<p>This section covers <em>what they are</em>; the strategy of when memoization pays off (profiling, <code>React.memo</code> trees, the React Compiler) lives in tutorial 09.</p>
+
+<h3>What they actually do</h3>
+<p>Both store a <code>[value, deps]</code> pair in their hook node. On re-render, React compares the new deps to the stored ones (<code>Object.is</code>, element-wise). Match → return the cached value <em>without calling your function</em>. Mismatch → recompute, store, return. That's the entire mechanism — a per-hook, single-entry cache keyed by the dependency array.</p>
+
+<pre><code><span class="kw">const</span> sorted = useMemo(() =&gt; [...items].sort(cmp), [items]);  <span class="com">// caches the RESULT</span>
+<span class="kw">const</span> onSave = useCallback(handleSave, [draftId]);            <span class="com">// caches the FUNCTION</span>
+
+<span class="com">// These two are exactly equivalent — useCallback is sugar:</span>
+useCallback(fn, deps)
+useMemo(() =&gt; fn, deps)</code></pre>
+
+<p><code>useMemo</code> calls your function and caches its <em>return value</em>; <code>useCallback</code> caches <em>the function itself</em>. Interviewers love the equivalence question because getting it backwards (<code>useMemo(fn, deps)</code>) means "call <code>fn</code> now and cache what it returns" — a real bug.</p>
+
+<h3>Hints, not guarantees</h3>
+<p>The docs are explicit: you may rely on <code>useMemo</code> as a <strong>performance optimization, not a semantic guarantee</strong>. React reserves the right to throw away cached values — for example for offscreen/reusable-state features, or when it needs to free memory — and recompute on next render. Consequences:</p>
+<ul>
+  <li>The memoized function must be <strong>pure</strong> and safe to re-run at any time.</li>
+  <li>Never use <code>useMemo</code> for "run once" semantics (creating a client, starting a subscription) — that's a ref (lazy-init idiom) or an effect.</li>
+  <li>Correctness must never depend on referential stability; it may only be <em>improved</em> by it.</li>
+</ul>
+
+<h3>The three legitimate referential-equality use cases</h3>
+<ol>
+  <li><strong>Props to memoized children:</strong> <code>React.memo(Child)</code> compares props shallowly — an inline object/lambda defeats it every render. Stabilize what you pass.</li>
+  <li><strong>Effect dependencies:</strong> an object/function dep churns the effect (section 3). <code>useMemo</code>/<code>useCallback</code> stops the loop when the value must live outside the effect.</li>
+  <li><strong>Context values:</strong> <code>value={{user, login}}</code> re-renders every consumer on every provider render; memoize the object (section 8).</li>
+</ol>
+<p>Plus the honest fourth: genuinely expensive computations (thousands of items, heavy transforms) — measure before claiming this one.</p>
+
+<h3>The cost of overuse</h3>
+<p>Every memo hook costs: allocation of the deps array each render, the comparison loop, memory for the cached value, and — the real price — <strong>reader complexity</strong> and a false sense of safety (one unstable dep silently voids the whole chain). Wrapping every value in a component with no memoized consumers is pure overhead. The senior answer: memoize at the <em>boundaries that need it</em> (memo children, effects, context), keep the rest plain, and note that the <strong>React Compiler</strong> exists precisely to make manual memoization obsolete by auto-memoizing based on the Rules of Hooks guarantees.</p>
+
+<!-- ============================================================ -->
+<h2 id="uselayouteffect">6. useLayoutEffect &amp; useInsertionEffect <span class="tier tier-2">TIER 2</span></h2>
+
+<h3>The timing difference — one line, then the consequences</h3>
+<p><code>useLayoutEffect</code> runs <strong>synchronously after DOM mutations, before the browser paints</strong>. <code>useEffect</code> runs after paint. Same signature, same cleanup semantics — only timing differs, and it changes everything about what each is for.</p>
+
+<pre><code>DOM updated → [useLayoutEffect cleanups + setups] → PAINT → [useEffect cleanups + setups]
+              ↑ blocks the frame; user never sees          ↑ user has already seen
+                the intermediate state                       the committed frame</code></pre>
+
+<h3>The measure-then-position tooltip — the canonical example</h3>
+<p>A tooltip should flip below the anchor when it doesn't fit above. You can't know its height until it's in the DOM — so you must render, measure, and reposition <em>before the user sees anything</em>:</p>
+
+<pre><code><span class="kw">function</span> Tooltip({ anchorRect, children }) {
+  <span class="kw">const</span> ref = useRef(<span class="kw">null</span>);
+  <span class="kw">const</span> [pos, setPos] = useState(<span class="kw">null</span>);   <span class="com">// null = not measured yet</span>
+
+  useLayoutEffect(() =&gt; {
+    <span class="kw">const</span> { height } = ref.current.getBoundingClientRect();
+    <span class="kw">const</span> fitsAbove = anchorRect.top - height &gt;= <span class="num">0</span>;
+    setPos(fitsAbove ? anchorRect.top - height : anchorRect.bottom);
+  }, [anchorRect]);
+
+  <span class="kw">return</span> (
+    &lt;div ref={ref} style={{ position: <span class="str">'fixed'</span>, top: pos ?? <span class="num">0</span>,
+                            visibility: pos === <span class="kw">null</span> ? <span class="str">'hidden'</span> : <span class="str">'visible'</span> }}&gt;
+      {children}
+    &lt;/div&gt;
+  );
+}</code></pre>
+
+<p><strong>Why this works:</strong> setting state inside <code>useLayoutEffect</code> forces React to re-render and re-commit <em>synchronously, still before paint</em>. The browser only ever paints the final position. Swap in <code>useEffect</code> and you get the <strong>flicker demo</strong>: frame 1 paints the tooltip at the wrong position (or at 0,0), then the effect measures and moves it — a visible one-frame jump, obvious on slow devices and in <code>&lt;React.StrictMode&gt;</code> with CPU throttling.</p>
+
+<div class="pitfall">Two costs of <code>useLayoutEffect</code>: (1) it blocks painting — heavy work here directly delays the frame, so keep it to measurement + a quick state set; (2) it does nothing on the server and React warns during SSR, since there's no layout to read. For SSR components, either gate the component to client-only rendering, or suppress the initial mismatch deliberately. Default to <code>useEffect</code>; reach for <code>useLayoutEffect</code> only when the user could <em>see</em> the intermediate state.</div>
+
+<h3>useInsertionEffect — awareness level</h3>
+<p>A niche hook <strong>for CSS-in-JS library authors</strong>: it fires before layout effects, at a point where injected <code>&lt;style&gt;</code> rules will be in place before any layout effect reads <code>getBoundingClientRect</code> — avoiding the "inject style during layout effect → invalidate layout → force recalc for every subsequent read" performance cliff. Constraints: refs are not attached yet and you can't schedule state updates from it. Interview answer: "I know what it's for — runtime style injection by libraries like styled-components — and that application code should essentially never use it."</p>
+
+<!-- ============================================================ -->
+<h2 id="usereducer">7. useReducer <span class="tier tier-2">TIER 2</span></h2>
+
+<h3>When it beats useState</h3>
+<ul>
+  <li><strong>Multi-field transitions:</strong> one action updates several fields consistently (submit → <code>loading</code>, clear <code>error</code>, keep <code>data</code>). With <code>useState</code> that's three setters that must always travel together.</li>
+  <li><strong>Next state derived from previous</strong> across complex rules: the reducer receives the authoritative previous state — stale closures over state largely disappear.</li>
+  <li><strong>Testable logic:</strong> a reducer is a pure function — unit test state transitions with zero React imports.</li>
+  <li><strong>Stable dispatch:</strong> React guarantees <code>dispatch</code>'s identity never changes — pass it deep without <code>useCallback</code>, put it in context without churn.</li>
+  <li><strong>Centralized invariants:</strong> impossible states become unrepresentable in one place instead of policed at every call site.</li>
+</ul>
+<p>Rule of thumb: independent primitives → <code>useState</code>; a state <em>machine</em> (fields that move together, events with names) → <code>useReducer</code>. "Number of <code>useState</code> calls" alone is not the criterion — coupling is.</p>
+
+<h3>Full example: reducer + TypeScript discriminated-union actions</h3>
+<pre><code><span class="kw">type</span> <span class="typ">State</span> =
+  | { status: <span class="str">'idle'</span> }
+  | { status: <span class="str">'loading'</span>; attempt: <span class="typ">number</span> }
+  | { status: <span class="str">'success'</span>; data: <span class="typ">User</span>[] }
+  | { status: <span class="str">'error'</span>; message: <span class="typ">string</span>; attempt: <span class="typ">number</span> };
+
+<span class="kw">type</span> <span class="typ">Action</span> =
+  | { type: <span class="str">'fetch_started'</span> }
+  | { type: <span class="str">'fetch_succeeded'</span>; data: <span class="typ">User</span>[] }
+  | { type: <span class="str">'fetch_failed'</span>; message: <span class="typ">string</span> }
+  | { type: <span class="str">'retried'</span> };
+
+<span class="kw">function</span> reducer(state: <span class="typ">State</span>, action: <span class="typ">Action</span>): <span class="typ">State</span> {
+  <span class="kw">switch</span> (action.type) {
+    <span class="kw">case</span> <span class="str">'fetch_started'</span>:
+      <span class="kw">return</span> { status: <span class="str">'loading'</span>, attempt: <span class="num">1</span> };
+    <span class="kw">case</span> <span class="str">'fetch_succeeded'</span>:
+      <span class="kw">return</span> { status: <span class="str">'success'</span>, data: action.data };  <span class="com">// `data` narrowed here</span>
+    <span class="kw">case</span> <span class="str">'fetch_failed'</span>: {
+      <span class="kw">const</span> attempt = state.status === <span class="str">'loading'</span> ? state.attempt : <span class="num">1</span>;
+      <span class="kw">return</span> { status: <span class="str">'error'</span>, message: action.message, attempt };
+    }
+    <span class="kw">case</span> <span class="str">'retried'</span>:
+      <span class="kw">return</span> state.status === <span class="str">'error'</span>
+        ? { status: <span class="str">'loading'</span>, attempt: state.attempt + <span class="num">1</span> }
+        : state;                                          <span class="com">// illegal transition → no-op</span>
+    <span class="kw">default</span>: {
+      <span class="kw">const</span> _exhaustive: <span class="typ">never</span> = action;  <span class="com">// compile error if a case is missed</span>
+      <span class="kw">return</span> state;
+    }
+  }
+}
+
+<span class="kw">const</span> [state, dispatch] = useReducer(reducer, { status: <span class="str">'idle'</span> });</code></pre>
+
+<p>Why the discriminated union matters: TypeScript narrows both <code>action</code> (per <code>case</code>) and <code>state</code> (per <code>status</code> check), so "read <code>data</code> while loading" is a compile error, and the <code>never</code> trick makes adding an action type break the build until every reducer handles it. Also note the reducer must be <strong>pure</strong> — no fetches, no mutation of the incoming state (StrictMode double-invokes reducers in dev to catch exactly this).</p>
+
+<h3>The dispatch-in-context pattern</h3>
+<pre><code><span class="kw">const</span> TasksContext = createContext(<span class="kw">null</span>);
+<span class="kw">const</span> TasksDispatchContext = createContext(<span class="kw">null</span>);
+
+<span class="kw">function</span> TasksProvider({ children }) {
+  <span class="kw">const</span> [tasks, dispatch] = useReducer(tasksReducer, []);
+  <span class="kw">return</span> (
+    &lt;TasksContext.Provider value={tasks}&gt;
+      &lt;TasksDispatchContext.Provider value={dispatch}&gt;
+        {children}
+      &lt;/TasksDispatchContext.Provider&gt;
+    &lt;/TasksContext.Provider&gt;
+  );
+}</code></pre>
+
+<p>Because <code>dispatch</code> is stable, the dispatch context's value <strong>never changes</strong> — components that only trigger actions (toolbars, buttons) subscribe to it and re-render zero times when the data changes. Only readers of <code>TasksContext</code> re-render. This split is the standard answer to "how do you build a small Redux with hooks," and previews the context-performance discussion next.</p>
+
+<!-- ============================================================ -->
+<h2 id="usecontext">8. useContext mechanics <span class="tier tier-2">TIER 2</span></h2>
+
+<h3>How propagation actually works</h3>
+<p>When a provider re-renders with a <strong>new <code>value</code></strong> (compared with <code>Object.is</code>), React walks the subtree and schedules a re-render for <em>every component that reads that context</em>. The critical mechanic: <strong>context propagation punches through memoization bail-outs</strong>. A <code>React.memo</code> parent with unchanged props will be skipped — but React still traverses past it to reach consumers underneath, and those consumers re-render anyway. Memoizing intermediate components does <em>not</em> protect consumers; conversely, it does still protect <em>non-consumers</em> from a re-rendering provider.</p>
+
+<pre><code>Provider (value changed)
+ └── React.memo(Middle)   ← bails out, does NOT re-render itself
+      └── Consumer        ← re-renders ANYWAY (reads the context)
+      └── PlainChild      ← does not re-render (parent bailed out)</code></pre>
+
+<p>Also: a consumer re-renders based on the <em>nearest</em> provider above it, and there is no built-in selector — a consumer re-renders when the value changes <strong>at all</strong>, even if it only uses one field. That limitation drives every pattern below.</p>
+
+<h3>The classic churn bug: <code>value={{...}}</code></h3>
+<pre><code><span class="kw">function</span> AuthProvider({ children }) {
+  <span class="kw">const</span> [user, setUser] = useState(<span class="kw">null</span>);
+  <span class="com">// ❌ new object identity on EVERY provider render —</span>
+  <span class="com">// every consumer re-renders even when user/login are unchanged</span>
+  <span class="kw">return</span> (
+    &lt;AuthContext.Provider value={{ user, login, logout }}&gt;
+      {children}
+    &lt;/AuthContext.Provider&gt;
+  );
+}</code></pre>
+
+<p>Any unrelated state change in the provider component (or its parents re-rendering it) creates a fresh object, fails <code>Object.is</code>, and fans out to all consumers. Fixes, in escalating order:</p>
+
+<ol>
+  <li><strong>Memoize the value:</strong>
+<pre><code><span class="kw">const</span> login  = useCallback((creds) =&gt; { ... }, []);
+<span class="kw">const</span> logout = useCallback(() =&gt; setUser(<span class="kw">null</span>), []);
+<span class="kw">const</span> value  = useMemo(() =&gt; ({ user, login, logout }), [user, login, logout]);</code></pre>
+  Now consumers re-render only when <code>user</code> actually changes.</li>
+  <li><strong>Split state and dispatch contexts</strong> (previous section): action-only components stop re-rendering entirely.</li>
+  <li><strong>Split slices into separate contexts:</strong> <code>ThemeContext</code>, <code>UserContext</code>, <code>SettingsContext</code> instead of one <code>AppContext</code> — each consumer subscribes to exactly the slice it needs.</li>
+  <li><strong>Children-as-stable-element:</strong> because <code>{children}</code> is created by the <em>parent's</em> render, a provider whose own state changes re-renders itself but passes the same <code>children</code> element — subtree reconciliation bails out except for consumers. Knowing this explains why "provider components with children" are cheap.</li>
+</ol>
+
+<h3>Context vs a store</h3>
+<p>Context is a <strong>dependency-injection mechanism</strong>, not a state-management system: it has no selectors, no memoized subscriptions, no out-of-render updates. It shines for low-frequency, tree-scoped values — theme, locale, auth identity, the <code>dispatch</code> half of a reducer. For high-frequency or widely-shared data (form keystrokes, live prices, large normalized caches), per-field subscriptions from a store (Zustand/Redux/Jotai — built on <code>useSyncExternalStore</code>, next section) avoid the fan-out. Full decision framework in tutorial 11.</p>
+
+<!-- ============================================================ -->
+<h2 id="usesyncexternalstore">9. useSyncExternalStore <span class="tier tier-2">TIER 2</span></h2>
+
+<h3>The tearing problem</h3>
+<p>Concurrent rendering means React can <strong>pause a render, handle something else, and resume</strong>. Suppose components read a mutable external variable (a store outside React). Component A renders and reads <code>price = 10</code>; React yields; the store updates to <code>11</code>; React resumes and component B reads <code>11</code>. The committed frame shows <strong>10 and 11 simultaneously</strong> — a "torn" UI that React's own state can never produce (state updates are snapshotted and scheduled through React). Tearing is invisible in synchronous rendering and only emerges under concurrent features (<code>startTransition</code>, Suspense) — which is why the hook appeared in React 18.</p>
+
+<h3>The API</h3>
+<pre><code><span class="kw">const</span> snapshot = useSyncExternalStore(
+  subscribe,          <span class="com">// (onStoreChange) =&gt; unsubscribe — how React learns of changes</span>
+  getSnapshot,        <span class="com">// () =&gt; current value — MUST be cached/immutable</span>
+  getServerSnapshot   <span class="com">// () =&gt; value for SSR + hydration (optional but needed for SSR)</span>
+);</code></pre>
+
+<ul>
+  <li>React calls <code>subscribe</code> once (per <code>subscribe</code> identity — keep it stable or hoisted!) and re-subscribes if it changes.</li>
+  <li>On store change, React calls <code>getSnapshot</code>, compares with <code>Object.is</code>, and re-renders subscribers if different. It <em>also</em> re-checks the snapshot during render to detect mid-render changes — if the store changed while rendering, React <strong>restarts the render synchronously</strong>, guaranteeing every component in the commit sees the same snapshot. That is the anti-tearing mechanism (updates through this hook are always treated as synchronous/non-deferred).</li>
+  <li><code>getSnapshot</code> must return <strong>the same reference until the store actually changes</strong>. Returning a fresh object each call (<code>() =&gt; ({ w: innerWidth })</code>) makes React think the store changed every render → infinite re-render loop with the famous "getSnapshot should be cached" error.</li>
+</ul>
+
+<h3>Build useWindowWidth correctly</h3>
+<pre><code><span class="com">// Hoisted: stable identities, no re-subscribe churn</span>
+<span class="kw">function</span> subscribe(onStoreChange) {
+  window.addEventListener(<span class="str">'resize'</span>, onStoreChange);
+  <span class="kw">return</span> () =&gt; window.removeEventListener(<span class="str">'resize'</span>, onStoreChange);
+}
+<span class="kw">const</span> getSnapshot = () =&gt; window.innerWidth;   <span class="com">// primitive → Object.is-safe</span>
+<span class="kw">const</span> getServerSnapshot = () =&gt; <span class="num">1024</span>;          <span class="com">// deterministic SSR fallback</span>
+
+<span class="kw">export function</span> useWindowWidth() {
+  <span class="kw">return</span> useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
+}</code></pre>
+
+<p>Contrast with the naive <code>useState</code> + resize-listener effect: that version can tear under transitions, double-subscribes per component, and needs a <code>typeof window</code> guard for SSR. Here the snapshot is a primitive (identity-safe), subscription is declarative, and SSR is handled by contract. This is also the correct tool for <code>navigator.onLine</code>, media queries, <code>localStorage</code> sync, and router location.</p>
+
+<div class="senior">How the libraries use it: Redux's <code>useSelector</code> and Zustand's <code>useStore</code> are wrappers around <code>useSyncExternalStore</code> (via the <code>use-sync-external-store</code> shim, whose <code>useSyncExternalStoreWithSelector</code> adds selector + equality-function support). Their stores are plain emitters; the hook is what bridges them safely into concurrent React. Trade-off worth naming: because uSES updates are handled synchronously, external-store updates can't be deferred as non-blocking transitions the way <code>useState</code> updates can — one argument for keeping fast-changing UI state <em>inside</em> React.</div>
+
+<!-- ============================================================ -->
+<h2 id="utility-hooks">10. useId, useDebugValue, transitions <span class="tier tier-2">TIER 2</span></h2>
+
+<h3>useId — SSR-safe unique ids</h3>
+<pre><code><span class="kw">function</span> EmailField() {
+  <span class="kw">const</span> id = useId();   <span class="com">// e.g. ":r1:" — opaque, stable, unique per hook call</span>
+  <span class="kw">return</span> (
+    &lt;&gt;
+      &lt;label htmlFor={id}&gt;Email&lt;/label&gt;
+      &lt;input id={id} aria-describedby={id + <span class="str">'-hint'</span>} /&gt;
+      &lt;span id={id + <span class="str">'-hint'</span>}&gt;Work email preferred&lt;/span&gt;
+    &lt;/&gt;
+  );
+}</code></pre>
+
+<p><strong>Why not <code>Math.random()</code> or a module counter:</strong> with SSR, the server generates ids into the HTML, then the client re-generates them during hydration — random values won't match, producing hydration mismatches; a counter depends on render order/timing, which differs between server and client (especially with streaming and selective hydration). <code>useId</code> derives the id from the <strong>position of the component in the tree</strong>, identical on both sides. It is explicitly <em>not</em> for list keys — keys must come from your data. One <code>useId</code> can prefix several related attributes, as above.</p>
+
+<h3>useDebugValue — trivia tier</h3>
+<p>Labels a custom hook's value in React DevTools: <code>useDebugValue(isOnline ? 'Online' : 'Offline')</code>. Second argument is a lazy formatter — <code>useDebugValue(date, d =&gt; d.toISOString())</code> — deferred until DevTools actually inspects, so production and non-inspecting renders pay nothing. Worth one sentence in an interview; using it in shared library hooks is a nice polish signal.</p>
+
+<h3>useTransition &amp; useDeferredValue — one paragraph each (full story in tutorial 10)</h3>
+<p><strong><code>useTransition</code></strong> returns <code>[isPending, startTransition]</code>; updates inside <code>startTransition(() =&gt; ...)</code> are marked low-priority: React keeps the current UI interactive, renders the new tree in the background, can interrupt it if new input arrives, and exposes <code>isPending</code> for spinners. Mental model: "this state update produces a <em>heavy</em> screen — don't block typing/clicking on it." Classic use: tab switches over expensive content, filtering huge lists.</p>
+<p><strong><code>useDeferredValue</code></strong> is the value-side twin: <code>const deferredQuery = useDeferredValue(query)</code> gives a value that "lags behind" during urgent updates — the input re-renders instantly with <code>query</code>, while expensive consumers re-render later with <code>deferredQuery</code>. Use it when you don't control the setState call (e.g. a prop) or want debounce-like behavior driven by rendering cost, adaptively, rather than a fixed timeout.</p>
+
+<!-- ============================================================ -->
+<h2 id="custom-hooks">11. Custom hook design <span class="tier tier-1">TIER 1</span></h2>
+
+<p>This is where senior judgment is graded. A custom hook is not a code-organization trick — it's a <strong>composition unit</strong>: a named, reusable piece of stateful behavior with a designed API. The framing to say out loud: <em>"hooks are composition units, not lifecycle hacks"</em> — a custom hook should express <em>what</em> it synchronizes or computes (<code>useOnlineStatus</code>, <code>useChatRoom</code>), never <em>when</em> it runs (<code>useMount</code>, <code>useUpdateEffect</code> are lifecycle nostalgia that hide dependencies and fight the model).</p>
+
+<h3>When to extract</h3>
+<ul>
+  <li><strong>Reuse:</strong> the same stateful logic appears in ≥2 components (form field logic, media queries, data polling).</li>
+  <li><strong>Complexity worth naming:</strong> even single-use — if a component drowns in effects/refs, extracting <code>useVideoPlayer(src)</code> turns 60 lines of plumbing into one declarative line. Naming is the point: the component reads as intent.</li>
+  <li><strong>Not:</strong> trivial wrappers (<code>useToggle</code> around one <code>useState</code> is fine but adds little), or extracting <em>just to share an effect</em> whose deps differ per caller — sometimes a plain function or a component is the right unit.</li>
+</ul>
+<p>Key mechanics fact interviewers check: <strong>custom hooks share logic, not state</strong>. Two components calling <code>useOnlineStatus()</code> each get their own hook nodes — completely independent state. Shared <em>state</em> requires lifting, context, or a store.</p>
+
+<h3>Return API design</h3>
+<table>
+  <thead><tr><th>Shape</th><th>When</th><th>Example</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Single value</strong></td><td>The hook answers one question</td><td><code>const width = useWindowWidth()</code></td></tr>
+    <tr><td><strong>Tuple (array)</strong></td><td>A value + its setter/action pair, ≤2–3 items — callers rename freely, mirrors <code>useState</code></td><td><code>const [copied, copy] = useClipboard()</code></td></tr>
+    <tr><td><strong>Object</strong></td><td>Many fields, optional consumption, self-documenting names</td><td><code>const { data, error, isLoading, refetch } = useFetch(url)</code></td></tr>
+  </tbody>
+</table>
+
+<p><strong>Stability of returned identities is part of your API contract.</strong> If your hook returns a function, wrap it in <code>useCallback</code>; if it returns an object callers might put in deps or pass to memo children, <code>useMemo</code> it. Otherwise every consumer inherits your churn and can't fix it from outside:</p>
+
+<pre><code><span class="kw">function</span> useCounter(initial = <span class="num">0</span>) {
+  <span class="kw">const</span> [count, setCount] = useState(initial);
+  <span class="kw">const</span> increment = useCallback(() =&gt; setCount(c =&gt; c + <span class="num">1</span>), []);
+  <span class="kw">const</span> reset = useCallback(() =&gt; setCount(initial), [initial]);
+  <span class="com">// stable unless a dep truly changed — safe in consumers' deps</span>
+  <span class="kw">return</span> useMemo(() =&gt; ({ count, increment, reset }), [count, increment, reset]);
+}</code></pre>
+
+<h3>Parameterizing: values vs refs vs option objects</h3>
+<ul>
+  <li><strong>Primitives</strong> are the friendliest parameters — identity-safe in your internal deps.</li>
+  <li><strong>Objects/functions from callers are hostile by default</strong> — assume inline creation each render. Defend: destructure to primitives for deps, serialize where cheap (<code>JSON.stringify(threshold)</code>), or accept-and-<code>useLatest</code> callbacks so your effect doesn't restart when the caller passes a new lambda.</li>
+  <li><strong>Refs as parameters</strong> when the hook needs a DOM node (<code>useIntersectionObserver(ref, opts)</code>): the ref object is identity-stable, but <code>ref.current</code> is not reactive — the hook must read it inside effects, and callback-ref designs handle late/conditional attachment better.</li>
+</ul>
+
+<h3>SSR safety</h3>
+<p>A library-grade hook must not explode on the server: no <code>window</code>/<code>document</code> at module scope or in render; initial state must be deterministic (guard with <code>typeof window !== 'undefined'</code> <em>in initializers</em>, do real reads in effects); anything subscribing to a browser API should prefer <code>useSyncExternalStore</code> with a <code>getServerSnapshot</code> — it makes the server value an explicit, hydration-safe part of the design instead of an accident.</p>
+
+<h3>Walkthrough 1: useDebounce, properly</h3>
+<pre><code><span class="kw">export function</span> useDebounce(value, delay = <span class="num">300</span>) {
+  <span class="kw">const</span> [debounced, setDebounced] = useState(value);   <span class="com">// seeded — no undefined flash</span>
+
+  useEffect(() =&gt; {
+    <span class="kw">const</span> id = setTimeout(() =&gt; setDebounced(value), delay);
+    <span class="kw">return</span> () =&gt; clearTimeout(id);   <span class="com">// each change cancels the pending timer —</span>
+  }, [value, delay]);                <span class="com">// this cancellation IS the debounce</span>
+
+  <span class="kw">return</span> debounced;
+}
+
+<span class="com">// Usage: input stays perfectly responsive; search fires 300ms after typing stops</span>
+<span class="kw">const</span> [query, setQuery] = useState(<span class="str">''</span>);
+<span class="kw">const</span> debouncedQuery = useDebounce(query, <span class="num">300</span>);
+useEffect(() =&gt; { <span class="com">/* fetch with debouncedQuery */</span> }, [debouncedQuery]);</code></pre>
+
+<p>Design notes: (1) the entire mechanism is the effect-cleanup pairing — every value change clears the previous timer, so only the last one in a quiet window survives; (2) seeding <code>useState(value)</code> means consumers never see an empty first render; (3) <code>delay</code> is a dep — changing it mid-flight restarts correctly; (4) if <code>value</code> is an object created inline by the caller, the debounce never settles — either document "pass primitives" or add a custom equality parameter. That caveat, volunteered, is a senior signal.</p>
+
+<h3>Walkthrough 2: useIntersectionObserver, with option-identity handling</h3>
+<pre><code><span class="kw">export function</span> useIntersectionObserver(
+  targetRef,
+  { root = <span class="kw">null</span>, rootMargin = <span class="str">'0px'</span>, threshold = <span class="num">0</span> } = {}
+) {
+  <span class="kw">const</span> [entry, setEntry] = useState(<span class="kw">null</span>);
+
+  <span class="com">// threshold may be a number or array; serialize so an inline [0, 0.5, 1]</span>
+  <span class="com">// doesn't recreate the observer every render</span>
+  <span class="kw">const</span> thresholdKey = JSON.stringify(threshold);
+
+  useEffect(() =&gt; {
+    <span class="kw">const</span> el = targetRef.current;
+    <span class="kw">if</span> (!el || <span class="kw">typeof</span> IntersectionObserver === <span class="str">'undefined'</span>) <span class="kw">return</span>;  <span class="com">// SSR / old browser</span>
+
+    <span class="kw">const</span> observer = <span class="kw">new</span> IntersectionObserver(
+      ([e]) =&gt; setEntry(e),
+      { root, rootMargin, threshold: JSON.parse(thresholdKey) }
+    );
+    observer.observe(el);
+    <span class="kw">return</span> () =&gt; observer.disconnect();   <span class="com">// no leaked observers on unmount/option change</span>
+  }, [targetRef, root, rootMargin, thresholdKey]);
+
+  <span class="kw">return</span> entry;   <span class="com">// callers derive: const isVisible = !!entry?.isIntersecting</span>
+}</code></pre>
+
+<p>Design decisions to narrate: <strong>destructure the options parameter immediately</strong> so deps are primitives (an inline <code>{}</code> from the caller costs nothing); serialize <code>threshold</code> because it may be an array; read <code>targetRef.current</code> <em>inside</em> the effect (render-time reads are illegal and the node may not exist yet); cleanup disconnects so option changes swap observers atomically. Remaining honest limitation: if the ref attaches <em>after</em> this effect runs (conditional rendering), the effect won't re-fire — the fix is a callback-ref variant where attachment itself triggers state; mentioning that trade-off unprompted is exactly the depth interviewers want.</p>
+
+<!-- ============================================================ -->
+<h2 id="react19">12. React 19 additions overview <span class="tier tier-3">TIER 3</span></h2>
+
+<p>Full coverage in tutorial 10 — here is the one-line-each map so nothing in a screening question surprises you:</p>
+<ul>
+  <li><strong><code>use(resource)</code></strong> — reads a promise (suspending until it resolves) or a context; uniquely among hooks it <em>may</em> be called conditionally, because it integrates with Suspense rather than the hook list's state slots.</li>
+  <li><strong><code>useActionState(action, initialState)</code></strong> — wraps an async "action" (often a form action) and returns <code>[state, formAction, isPending]</code>: pending/result/error plumbing for mutations without hand-rolled flags.</li>
+  <li><strong><code>useOptimistic(state, updateFn)</code></strong> — returns an optimistic copy of state you can set immediately while the real async mutation is in flight; React automatically reverts/reconciles when the action settles.</li>
+  <li><strong><code>useFormStatus()</code></strong> — from <code>react-dom</code>; inside a form, children read the enclosing form's <code>pending</code> (plus data/method/action) to disable submit buttons without prop drilling.</li>
+  <li><strong>Ref cleanup functions</strong> — callback refs may now return a cleanup function, called on detach (mirroring effects); this replaces the old "called with <code>null</code>" detachment idiom and makes ref-based subscriptions leak-proof.</li>
+  <li>Plus, from section 4: <strong><code>ref</code> as a regular prop</strong> (no <code>forwardRef</code>), and the <strong>React Compiler</strong> reducing manual <code>useMemo</code>/<code>useCallback</code>.</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="interview-qa">13. Interview Q&amp;A</h2>
+
+<details class="qa">
+  <summary>1. Why must hooks be called in the same order on every render?</summary>
+  <div class="answer">
+    <p>Hooks are stored as a linked list on the component's fiber (<code>fiber.memoizedState</code>), with no names or keys — each hook call during render consumes the next node in the list. React's only way to match "this <code>useState</code> call" to "that stored state" is call position. If a conditional skips a hook, every subsequent call reads the <em>previous</em> hook's node: state values shift into the wrong variables. React detects the count/order mismatch and throws ("Rendered fewer hooks than expected"), but the underlying failure is slot misalignment. The Rules of Hooks (top level only; only from components/custom hooks) exist purely to keep that sequence deterministic — and tools like the React Compiler build on that guarantee.</p>
+  </div>
+</details>
+
+<details class="qa">
+  <summary>2. What is the hooks "dispatcher," and why do hooks only work while rendering?</summary>
+  <div class="answer">
+    <p>The <code>useState</code> you import is a shim that delegates to <code>ReactCurrentDispatcher.current</code> — a mutable reference the renderer sets immediately before calling your component: a mount dispatcher on first render (creates hook nodes), an update dispatcher on re-renders (walks existing nodes), and a throwing implementation outside render. So calling a hook outside a component fails because no valid dispatcher is installed — not because of any syntactic rule. Bonus points: this also explains the "two copies of React" version of "Invalid hook call" (the rendering copy set <em>its</em> dispatcher; you imported the hook from the other copy), and why mount and update behave differently (they're literally different implementations).</p>
+  </div>
+</details>
+
+<details class="qa">
+  <summary>3. Is setState synchronous? What does it actually do?</summary>
+  <div class="answer">
+    <p>The setter never mutates the current render's variable. It (1) enqueues an update object on the hook's queue, (2) schedules a re-render of the fiber. The update is applied when React processes the queue during the <em>next</em> render — so within the current execution, state is unchanged, which is why <code>console.log(count)</code> right after <code>setCount(count + 1)</code> logs the old value. In React 18+, updates from any origin (handlers, timeouts, promises) are batched into a single re-render. The re-render itself is usually async (scheduled), and <code>flushSync</code> is the escape hatch to force it synchronously. Precise phrasing that scores: "state is a snapshot per render; setters request the next snapshot."</p>
+  </div>
+</details>
+
+<details class="qa">
+  <summary>4. Three calls to <code>setCount(count + 1)</code> vs three to <code>setCount(c =&gt; c + 1)</code> — results and why?</summary>
+  <div class="answer">
+    <p>+1 vs +3. <code>count + 1</code> is evaluated immediately from the closure's snapshot — with <code>count = 0</code>, all three enqueue "replace with 1." Updater functions are stored uncalled; when React drains the queue it feeds each one the running pending result: 0→1→2→3. Mixing follows the same drain order: <code>set(count + 5); set(c =&gt; c + 1); set(42)</code> ends at 42 (the final replace discards pending work). Rule of thumb: whenever the next state depends on the previous, use the updater — it's also the cheapest stale-closure fix inside effects and async callbacks.</p>
+  </div>
+</details>
+
+<details class="qa">
+  <summary>5. When does calling a setter <em>not</em> cause a re-render?</summary>
+  <div class="answer">
+    <p>When the new value is <code>Object.is</code>-equal to the current one, React bails out: no commit, children skipped. Nuance: React may still execute that one component's function once more before deciding to bail (when it can't determine equality eagerly), but it won't descend or commit — so "no visible re-render" is the accurate claim. Practical corollaries: mutating an object and setting the same reference never re-renders (top real-world bug), and spreading into a new-but-identical object always re-renders. The same <code>Object.is</code> comparison governs deps arrays, context values, and <code>getSnapshot</code> results — it's the one equality primitive across the hooks API.</p>
+  </div>
+</details>
+
+<details class="qa">
+  <summary>6. What's the difference between <code>useState(expensive())</code> and <code>useState(() =&gt; expensive())</code>?</summary>
+  <div class="answer">
+    <p>Both produce the same initial state, but the first calls <code>expensive()</code> on <em>every</em> render — it's an ordinary argument expression — with the result thrown away after mount. The second passes a lazy initializer that React invokes exactly once when creating the hook node. Use it whenever computing initial state is non-trivial (parsing localStorage, building an index). Follow-up trap: to <em>store a function</em> in state you must double-wrap — <code>useState(() =&gt; myFn)</code> — or React will call <code>myFn</code> as the initializer. The same lazy pattern exists as <code>useReducer</code>'s third argument.</p>
+  </div>
+</details>
+
+<details class="qa">
+  <summary>7. Explain exactly when effects and their cleanups run.</summary>
+  <div class="answer">
+    <p>Pipeline: render → commit (DOM mutations, then refs attached, then <code>useLayoutEffect</code> cleanups+setups synchronously) → browser paint → passive (<code>useEffect</code>) cleanups, then setups. On a deps change, the <em>previous</em> run's cleanup executes right before the new setup — cleanup is not unmount-only; every effect run pairs with its own cleanup, closing over that run's values. On unmount, only the cleanup runs. Effects flush bottom-up (children before parents). Precision caveat: passive effects usually fire after paint, but React may flush them earlier (e.g., before the next discrete event) — the guarantee is "doesn't block this paint," not "always after paint." And in dev StrictMode: setup → cleanup → setup on mount, deliberately.</p>
+  </div>
+</details>
+
+<details class="qa">
+  <summary>8. An interval inside <code>useEffect(..., [])</code> logs count = 0 forever. Trace why and give the fixes.</summary>
+  <div class="answer">
+    <p>The effect ran once, after the first render, so the interval callback closes over render #1's scope where <code>const count = 0</code>. Later renders create new closures nobody uses — the interval keeps invoking the original. So it logs 0 every tick; <code>setCount(0 + 1)</code> moves state to 1 once, then every subsequent <code>setCount(1)</code> hits the <code>Object.is</code> bail-out — UI frozen at 1, log stuck at 0. Fixes ranked: (1) <code>setCount(c =&gt; c + 1)</code> — effect no longer reads <code>count</code>, deps stay honestly empty; (2) add <code>count</code> to deps — correct but recreates the interval every tick and resets cadence; (3) a latest-value ref read at call time (<code>useLatest</code>) for long-lived callbacks that must see fresh state; (4) know <code>useEffectEvent</code> as the experimental purpose-built answer.</p>
+  </div>
+</details>
+
+<details class="qa">
+  <summary>9. How do you prevent race conditions when fetching in an effect?</summary>
+  <div class="answer">
+    <p>The bug: effects re-run per dep change but responses arrive out of order, so a stale response can overwrite a newer one. Fix with cleanup-scoped ownership: each effect run creates its own <code>let ignore = false</code> and/or <code>AbortController</code>; the async callback only calls <code>setState</code> if <code>!ignore</code>; the cleanup sets <code>ignore = true</code> and calls <code>controller.abort()</code>. When deps change, the old run is neutralized before the new one starts — only the latest run can commit results. Details that score: swallow <code>AbortError</code> in the catch (it's expected, not an error); the ignore flag works for non-abortable async (dynamic imports, SDK calls); AbortController additionally saves bandwidth by cancelling the request; and in production you'd reach for React Query/SWR or router loaders, which encapsulate exactly this.</p>
+  </div>
+</details>
+
+<details class="qa">
+  <summary>10. When does logic belong in an event handler vs an effect vs plain render?</summary>
+  <div class="answer">
+    <p>Ask "what causes this code?" Caused by a specific interaction (submit → POST, click → toast) → <strong>event handler</strong>; putting it in an effect makes it re-fire on unrelated re-renders, double-fire in StrictMode, and detaches cause from code. Computable from current props/state → <strong>render</strong> (with <code>useMemo</code> only if measured-expensive); an effect that only calls <code>setState</code> from other state is a redundant extra render pass. Caused by "the component is displaying with X and something <em>outside React</em> must match" (subscription, document title, non-React widget, analytics-on-view) → <strong>effect</strong>. Resetting state on identity change → <code>key</code>. Reading external mutable sources → <code>useSyncExternalStore</code>. Also name the effect-chain anti-pattern: cascading setState-in-effect sequences should collapse into one handler or a reducer.</p>
+  </div>
+</details>
+
+<details class="qa">
+  <summary>11. Why does an object or function in a dependency array cause loops, and what are the fixes?</summary>
+  <div class="answer">
+    <p>Deps are compared per element with <code>Object.is</code> — reference equality for objects. An inline object/lambda is a new reference each render, so the effect re-runs every render; if it sets state, that's an infinite loop. Fixes in preference order: depend on primitives and rebuild the object inside the effect; move creation into the effect if it's only used there; <code>useMemo</code>/<code>useCallback</code> when the value must exist outside (JSX + effect both use it); hoist to module scope if it's not reactive at all. Senior addendum: the same trap inverted is <em>your</em> responsibility as a custom-hook author — stabilize what you return, defend against unstable option objects you accept.</p>
+  </div>
+</details>
+
+<details class="qa">
+  <summary>12. Why is suppressing <code>exhaustive-deps</code> dangerous, and when is it acceptable?</summary>
+  <div class="answer">
+    <p>The deps array is a declaration of every reactive value the effect reads; omitting one doesn't stop the effect from using it — it freezes the closure at whatever render last created the effect, so the effect silently operates on stale data with no error. The lint rule is a consistency checker, not a style preference. Most "I need to suppress" cases have structural fixes: updater functions (drop the state dep), move the value inside, memoize the dep, <code>useLatest</code> for callbacks. Acceptable suppressions are rare and intentional — e.g. a strictly-once mount analytics event — and should carry a comment explaining which value is deliberately non-reactive. Bonus: <code>useEffectEvent</code> is the sanctioned future answer for "reads latest values but shouldn't re-trigger."</p>
+  </div>
+</details>
+
+<details class="qa">
+  <summary>13. useRef vs useState — how do you choose?</summary>
+  <div class="answer">
+    <p>Does changing the value need to change what the user sees? Yes → state (setter schedules a render; value is an immutable per-render snapshot). No — it's bookkeeping the render output never reads (timer ids, DOM nodes, library instances, previous/latest values, "already fired" flags) → ref (stable <code>{current}</code> box; mutation is free and invisible to React). Two contract details: don't read/write refs during render — concurrent React can double-execute or abandon renders, making render-phase mutations non-deterministic — with the one idempotent exception of lazy init (<code>if (ref.current === null) ref.current = make()</code>); and if you catch yourself forcing a render after writing a ref, it was state all along.</p>
+  </div>
+</details>
+
+<details class="qa">
+  <summary>14. When exactly is a DOM ref attached, and what changed about refs in React 19?</summary>
+  <div class="answer">
+    <p>React sets <code>ref.current</code> during the commit phase — after DOM mutations, before layout effects — so both <code>useLayoutEffect</code> and <code>useEffect</code> can safely use the node, while during render it's still <code>null</code> on mount. On unmount (or when a callback ref changes) React detaches. React 19 changes: <code>ref</code> is now a regular prop on function components (no <code>forwardRef</code> ceremony; <code>forwardRef</code> heads toward deprecation), and callback refs can return a <em>cleanup function</em> that runs on detach — replacing the old "called again with <code>null</code>" idiom and giving ref-based subscriptions effect-style cleanup guarantees.</p>
+  </div>
+</details>
+
+<details class="qa">
+  <summary>15. What do useMemo/useCallback actually guarantee? How are they related?</summary>
+  <div class="answer">
+    <p>Mechanically: a single-entry cache in the hook node keyed by the deps array; deps <code>Object.is</code>-equal → return cached value without calling the function. <code>useCallback(fn, deps)</code> is exactly <code>useMemo(() =&gt; fn, deps)</code> — cache the function itself vs cache its result. Guarantee: <strong>none, semantically</strong> — the docs reserve the right to discard cached values (memory pressure, offscreen features) and recompute, so treat memoization as a performance hint over pure functions, never as "run once" (that's a ref or effect). Legitimate uses: props to <code>React.memo</code> children, effect deps, context values, measured-expensive computations. Overuse costs allocations, comparisons, and reader complexity — and the React Compiler is the systemic fix.</p>
+  </div>
+</details>
+
+<details class="qa">
+  <summary>16. useEffect vs useLayoutEffect — when is the layout version required?</summary>
+  <div class="answer">
+    <p><code>useLayoutEffect</code> runs synchronously after DOM mutation, <em>before paint</em>; <code>useEffect</code> after paint. Required when the user could see an intermediate state: measure-then-position (tooltips, popovers), scroll restoration, synchronous DOM reads that must precede the visible frame. Setting state in a layout effect re-renders synchronously before paint, so only the corrected frame is painted — with <code>useEffect</code> you'd paint the wrong frame first (the flicker). Costs: it blocks painting (keep it to measure + set), and it doesn't run on the server (SSR warning — gate to client or restructure). Rounding it out: <code>useInsertionEffect</code> fires before layout effects, exists for CSS-in-JS libraries to inject styles before any layout reads, and shouldn't appear in app code.</p>
+  </div>
+</details>
+
+<details class="qa">
+  <summary>17. When do you reach for useReducer over useState?</summary>
+  <div class="answer">
+    <p>When state is a <em>machine</em> rather than independent values: multiple fields that must transition together (loading/error/data), next state derived from previous under non-trivial rules, or invariants worth centralizing ("can't retry unless in error state"). Concrete wins: the reducer is a pure, React-free unit-testable function; TypeScript discriminated unions on both actions and state make illegal states unrepresentable (plus a <code>never</code> default arm for exhaustiveness); and <code>dispatch</code> has a <strong>guaranteed stable identity</strong> — pass it deep or through context with zero churn, which enables the state-context/dispatch-context split where action-only components never re-render on data changes. Constraint to mention: reducers must be pure (StrictMode double-invokes them in dev to catch mutation).</p>
+  </div>
+</details>
+
+<details class="qa">
+  <summary>18. Why do context consumers re-render even under a React.memo parent? How do you tame a context that re-renders everything?</summary>
+  <div class="answer">
+    <p>Because context propagation is a separate mechanism from parent-child rendering: when a provider's <code>value</code> fails <code>Object.is</code> against the previous one, React traverses the subtree and schedules every reader of that context — <em>through</em> memo bail-outs. Memoized intermediates skip their own render but don't shield consumers. The classic bug is <code>value={{...}}</code> creating a fresh object every provider render, fanning out to all consumers on unrelated changes. Fixes in order: <code>useMemo</code> the value (with <code>useCallback</code>'d methods); split state and dispatch contexts (dispatch is stable → action-only components never re-render); split slices into separate contexts; and remember providers rendering <code>{children}</code> pass a stable element, so their own state changes don't re-render the subtree except consumers. Beyond that scale — high-frequency or selector-shaped access — move to an external store on <code>useSyncExternalStore</code>.</p>
+  </div>
+</details>
+
+<details class="qa">
+  <summary>19. What is tearing, and how does useSyncExternalStore prevent it?</summary>
+  <div class="answer">
+    <p>Under concurrent rendering React can pause mid-tree and resume later. If components read a mutable <em>external</em> source directly, the source can change during the pause — component A committed with the old value, component B with the new one: a single frame showing two versions of the truth. React state can't tear (updates are snapshotted through the scheduler); external mutable reads can. <code>useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot)</code> fixes it by re-checking the snapshot during render — if it changed mid-render, React restarts synchronously so every component in the commit sees one consistent snapshot; external-store updates are treated as urgent/synchronous rather than deferrable. Contracts: stable <code>subscribe</code> identity (or it re-subscribes), and <code>getSnapshot</code> must return a cached/same reference until the store truly changes — a fresh object per call means an infinite loop. Redux's <code>useSelector</code> and Zustand sit on this hook (via the shim with selector support).</p>
+  </div>
+</details>
+
+<details class="qa">
+  <summary>20. Why useId instead of Math.random() or a global counter for element ids?</summary>
+  <div class="answer">
+    <p>Because of SSR + hydration: ids are generated twice — once on the server into the HTML, once on the client during hydration — and they must match. <code>Math.random()</code> obviously differs; a module counter depends on execution order and timing, which streaming SSR and selective hydration make non-deterministic. <code>useId</code> derives the id from the component's structural position in the tree, identical on both sides, so <code>label htmlFor</code>/<code>aria-describedby</code> wiring hydrates cleanly. Two follow-ups: it is <em>not</em> for list keys (keys must come from data — <code>useId</code> is per-hook-call, not per-item), and one <code>useId</code> can prefix multiple related attributes (<code>id</code>, <code>id + '-hint'</code>).</p>
+  </div>
+</details>
+
+<details class="qa">
+  <summary>21. How do you decide to extract a custom hook, and what makes its API well-designed?</summary>
+  <div class="answer">
+    <p>Extract when stateful logic is <em>reused</em> across components, or when it's complex enough that a <em>name</em> improves the component (<code>useVideoPlayer</code> over 60 lines of effects) — and name it after what it synchronizes/computes, never after lifecycle (<code>useMount</code> is a smell). Mechanics: hooks share logic, not state — each caller gets independent hook nodes. API design: single value for one answer; tuple for a rename-friendly pair (the <code>useState</code> convention); object for many/optional fields. Return-identity stability is part of the contract — <code>useCallback</code> returned functions, <code>useMemo</code> returned objects, or consumers inherit churn they can't fix. Defend against hostile inputs (inline option objects → destructure to primitives / serialize; callbacks → latest-ref). And be SSR-safe: deterministic initializers, browser reads in effects, or <code>useSyncExternalStore</code> with a server snapshot.</p>
+  </div>
+</details>
+
+<details class="qa">
+  <summary>22. Props-to-state: a component seeds state from a prop, and the UI goes stale when the prop changes. What are the fixes?</summary>
+  <div class="answer">
+    <p>Diagnosis: <code>useState(prop)</code> reads its argument only at mount — later prop changes don't touch state, by design. Fixes, best-first: (1) <strong>don't copy</strong> — if the value is derivable, compute during render; (2) <strong><code>key</code> reset</strong> — <code>&lt;Editor key={contact.id} /&gt;</code> when a new identity should mean a fresh instance: the subtree remounts and all state re-initializes; (3) <strong>render-time compare</strong> for partial resets — store the previous prop in state and call setters <em>during render</em> when it differs; React discards that render and re-runs immediately, before commit, which beats an effect-based reset that paints a stale frame first; (4) <strong>lift the state</strong> and make it controlled. Historical hook: this is the hooks-era descendant of the <code>componentWillReceiveProps</code> → <code>getDerivedStateFromProps</code> saga and the "You Probably Don't Need Derived State" doctrine — deliberately awkward APIs because the pattern is usually wrong.</p>
+  </div>
+</details>
+
+<details class="qa">
+  <summary>23. What does StrictMode's double-invocation actually do to hooks, and why?</summary>
+  <div class="answer">
+    <p>In development only, StrictMode: double-invokes component functions, initializers, updaters, and reducers (to surface render-phase impurity — impure code produces visibly wrong results when run twice); and on mount runs effects as setup → cleanup → setup (to verify cleanup fully mirrors setup, simulating the remount behavior future features like state-preserving offscreen/Activity rely on). Consequences you should be able to predict: a mount-only analytics effect fires twice in dev (the fix is idempotence or moving it to the interaction, not deleting StrictMode); a subscription with correct cleanup shows no visible difference — which is precisely the test. Production behavior is completely unaffected. Framing: StrictMode failures are latent bugs being surfaced early, not React noise.</p>
+  </div>
+</details>
+
+<details class="qa">
+  <summary>24. Quick React 19 screen: use(), useActionState, useOptimistic, useFormStatus — what are they?</summary>
+  <div class="answer">
+    <p><code>use()</code> reads a promise (suspends until resolved, integrating with Suspense/error boundaries) or a context — and uniquely may be called conditionally, since it doesn't occupy a state slot in the hook list. <code>useActionState</code> wraps an async action (commonly a form action) returning <code>[state, formAction, isPending]</code> — standardized pending/error/result plumbing for mutations. <code>useOptimistic</code> exposes an optimistic view of state you set instantly while the mutation is in flight, auto-reconciled when it settles. <code>useFormStatus</code> (react-dom) lets any child of a form read the form's <code>pending</code> status without prop drilling — e.g. a shared SubmitButton. Together with ref-as-prop and ref cleanup functions, the theme is moving async-mutation and plumbing boilerplate into the framework.</p>
+  </div>
+</details>
+
+<!-- ============================================================ -->
+<h2 id="exercises">14. Hands-on exercises</h2>
+
+<p>Each of these maps to a question pattern that actually appears in senior React screens. Attempt them cold, out loud, before opening the solution — the interview skill being drilled is <em>narrating the mechanics while you code</em>, not just producing working code.</p>
+
+<div class="exercise">
+<h4>Exercise 1 — Fix the stale interval three different ways</h4>
+<p>The classic broken counter: the interval logs <code>0</code> forever and the UI freezes at <code>1</code>. Fix it three ways — (a) functional update, (b) latest-value ref, (c) a reusable <code>useInterval</code> custom hook — and state the trade-off of each. (Tracing <em>why</em> it's broken is section 3; here you defend the fixes.)</p>
+<pre><code><span class="kw">function</span> Counter() {
+  <span class="kw">const</span> [count, setCount] = useState(<span class="num">0</span>);
+  useEffect(() =&gt; {
+    <span class="kw">const</span> id = setInterval(() =&gt; {
+      console.log(count);          <span class="com">// 0, 0, 0, ...</span>
+      setCount(count + <span class="num">1</span>);         <span class="com">// always setCount(1)</span>
+    }, <span class="num">1000</span>);
+    <span class="kw">return</span> () =&gt; clearInterval(id);
+  }, []);
+  <span class="kw">return</span> &lt;h1&gt;{count}&lt;/h1&gt;;
+}</code></pre>
+<details><summary>Solution</summary>
+<p><strong>(a) Functional update</strong> — the best fix <em>when it fits</em>: the callback no longer reads <code>count</code> at all, so the empty deps array becomes honest and the lint rule is satisfied structurally, not suppressed. Limitation: only works when the update is expressible as <code>prev → next</code> over a single state value; it doesn't help a callback that needs to <em>read</em> several reactive values.</p>
+<pre><code>setCount(c =&gt; c + <span class="num">1</span>);   <span class="com">// React feeds the updater the queue's latest value</span></code></pre>
+<p><strong>(b) Latest-value ref</strong> — a ref is a stable box, so the once-created interval closure can dereference it at <em>call time</em> instead of capturing a snapshot at <em>creation time</em>:</p>
+<pre><code><span class="kw">const</span> countRef = useRef(count);
+useEffect(() =&gt; { countRef.current = count; });   <span class="com">// re-sync after every commit</span>
+useEffect(() =&gt; {
+  <span class="kw">const</span> id = setInterval(() =&gt; {
+    console.log(countRef.current);                <span class="com">// always fresh</span>
+    setCount(countRef.current + <span class="num">1</span>);
+  }, <span class="num">1000</span>);
+  <span class="kw">return</span> () =&gt; clearInterval(id);
+}, []);</code></pre>
+<p>Trade-off: it generalizes to arbitrary reads, but it deliberately steps <em>outside</em> React's reactivity — the value is no longer a dependency, so nothing re-runs when it changes. That's the point, and also the danger: use it for "long-lived callback needs fresh values", never as a lint silencer.</p>
+<p><strong>(c) <code>useInterval</code></strong> — package the latest-ref pattern once (Dan Abramov's canonical version), and gain pause/resume for free via a nullable delay:</p>
+<pre><code><span class="kw">function</span> useInterval(callback, delay) {
+  <span class="kw">const</span> savedCallback = useRef(callback);
+  useEffect(() =&gt; { savedCallback.current = callback; });
+  useEffect(() =&gt; {
+    <span class="kw">if</span> (delay === <span class="kw">null</span>) <span class="kw">return</span>;                     <span class="com">// null ⇒ paused</span>
+    <span class="kw">const</span> id = setInterval(() =&gt; savedCallback.current(), delay);
+    <span class="kw">return</span> () =&gt; clearInterval(id);
+  }, [delay]);
+}
+
+useInterval(() =&gt; setCount(count + <span class="num">1</span>), isRunning ? <span class="num">1000</span> : <span class="kw">null</span>);</code></pre>
+<p>The callback closure is recreated every render (so it's never stale), but the interval only depends on <code>delay</code> — cadence survives re-renders. Trade-off: an abstraction to maintain and explain, but it's lint-clean, reusable, and declarative. Senior close: "adding <code>count</code> to the deps also works, but recreates the timer every tick and drifts the cadence — correct, and the worst of the three."</p>
+</details>
+</div>
+
+<div class="exercise">
+<h4>Exercise 2 — Implement useDebounce and useThrottle</h4>
+<p>Write <code>useDebounce(value, delay)</code> and <code>useThrottle(value, interval)</code> returning the debounced/throttled <em>value</em>. Requirements: correct cleanup (no timers left after unmount), no lint suppressions, and the throttle must emit a trailing update (the final value always lands). Then explain why the <em>debounced-callback</em> variant is a harder identity problem.</p>
+<details><summary>Solution</summary>
+<p>Debounce falls out of effect semantics almost verbatim — the cleanup of the previous run cancelling the previous timer <em>is</em> the debounce:</p>
+<pre><code><span class="kw">function</span> useDebounce(value, delay = <span class="num">300</span>) {
+  <span class="kw">const</span> [debounced, setDebounced] = useState(value);
+  useEffect(() =&gt; {
+    <span class="kw">const</span> id = setTimeout(() =&gt; setDebounced(value), delay);
+    <span class="kw">return</span> () =&gt; clearTimeout(id);   <span class="com">// each new value cancels the pending emit</span>
+  }, [value, delay]);
+  <span class="kw">return</span> debounced;
+}</code></pre>
+<p>Every <code>value</code> change re-runs the effect; the cleanup kills the not-yet-fired timer, so only a value that survives <code>delay</code> ms of silence commits. Unmount runs the final cleanup — no setState-after-unmount, no leak.</p>
+<p>Throttle needs a timestamp ref (bookkeeping the render never reads → ref, not state) plus a trailing timer for the last value in a burst:</p>
+<pre><code><span class="kw">function</span> useThrottle(value, interval = <span class="num">300</span>) {
+  <span class="kw">const</span> [throttled, setThrottled] = useState(value);
+  <span class="kw">const</span> lastRun = useRef(Date.now());
+  useEffect(() =&gt; {
+    <span class="kw">const</span> elapsed = Date.now() - lastRun.current;
+    <span class="kw">if</span> (elapsed &gt;= interval) {
+      lastRun.current = Date.now();
+      setThrottled(value);                 <span class="com">// leading edge: emit immediately</span>
+    } <span class="kw">else</span> {
+      <span class="kw">const</span> id = setTimeout(() =&gt; {      <span class="com">// trailing edge: last value still lands</span>
+        lastRun.current = Date.now();
+        setThrottled(value);
+      }, interval - elapsed);
+      <span class="kw">return</span> () =&gt; clearTimeout(id);
+    }
+  }, [value, interval]);
+  <span class="kw">return</span> throttled;
+}</code></pre>
+<p>Why the <em>callback</em> variants (<code>useDebouncedCallback</code>) are harder: the returned function must have a <strong>stable identity</strong> (or consumers' effects and memoized children churn) while still calling the <em>latest</em> callback with the latest closure — exactly the tension Exercise 6 resolves with the latest-ref pattern. Naively wrapping <code>debounce(fn)</code> in <code>useMemo</code> with <code>[fn]</code> deps recreates the debouncer every render (inline <code>fn</code> = new reference), silently resetting its internal timer — the debounce never fires. That failure mode is invisible in a code read and deadly in review questions.</p>
+</details>
+</div>
+
+<div class="exercise">
+<h4>Exercise 3 — usePrevious, and why the timing works</h4>
+<p>Implement <code>usePrevious(value)</code> returning the value from the previous committed render. The implementation is four lines; the interview substance is explaining the read/write timing that makes it correct, plus one caveat about what "previous" actually means here.</p>
+<details><summary>Solution</summary>
+<pre><code><span class="kw">function</span> usePrevious(value) {
+  <span class="kw">const</span> ref = useRef(<span class="kw">undefined</span>);
+  useEffect(() =&gt; {
+    ref.current = value;     <span class="com">// runs AFTER commit — too late to affect this render</span>
+  });
+  <span class="kw">return</span> ref.current;        <span class="com">// read during render — still holds last commit's value</span>
+}</code></pre>
+<p>The timing: during render N, <code>ref.current</code> is read <em>before</em> any effect from render N runs — so it still contains what render N−1's effect wrote. After render N commits, the (deps-less) effect overwrites the box with render N's value, staging it for render N+1. The hook exploits two guarantees: refs mutate without scheduling renders, and effects run strictly after the render output that read them was committed. This is a sanctioned <em>read</em>-during-render because the write happens outside render — it doesn't violate the "no ref mutation during render" contract from section 4.</p>
+<p>Caveat: it returns the value as of the <strong>previous committed render</strong>, not the previous <em>distinct</em> value. If the component re-renders because unrelated state changed, <code>usePrevious(count)</code> now equals <code>count</code> — any <code>prev !== current</code> logic must tolerate that. StrictMode's setup → cleanup → setup just writes the same value twice — harmless, which is precisely what StrictMode is checking. If you need "compare and react <em>during</em> render" (the props-to-state reset from Q&amp;A 22), store the previous value in <em>state</em> and call the setter during render instead — the ref version is one commit late by construction.</p>
+</details>
+</div>
+
+<div class="exercise">
+<h4>Exercise 4 — useLocalStorage: SSR-safe and synced across tabs</h4>
+<p>Build <code>useLocalStorage(key, initial)</code> with the <code>useState</code>-tuple API. Requirements: no crash during SSR; functional updates supported; a change in one browser tab updates all others. Bonus: identify the hydration flaw the naive version still has, and rewrite on <code>useSyncExternalStore</code> to fix it.</p>
+<details><summary>Solution</summary>
+<pre><code><span class="kw">function</span> useLocalStorage(key, initial) {
+  <span class="kw">const</span> [value, setValue] = useState(() =&gt; {           <span class="com">// lazy: reads storage once</span>
+    <span class="kw">if</span> (<span class="kw">typeof</span> window === <span class="str">'undefined'</span>) <span class="kw">return</span> initial;  <span class="com">// SSR guard</span>
+    <span class="kw">try</span> {
+      <span class="kw">const</span> raw = window.localStorage.getItem(key);
+      <span class="kw">return</span> raw !== <span class="kw">null</span> ? JSON.parse(raw) : initial;
+    } <span class="kw">catch</span> { <span class="kw">return</span> initial; }                          <span class="com">// quota / private mode / bad JSON</span>
+  });
+
+  <span class="kw">const</span> set = useCallback(next =&gt; {                      <span class="com">// stable identity — part of the API contract</span>
+    setValue(prev =&gt; (<span class="kw">typeof</span> next === <span class="str">'function'</span> ? next(prev) : next));
+  }, []);
+
+  useEffect(() =&gt; {                                      <span class="com">// persist as an effect, not inside the</span>
+    window.localStorage.setItem(key, JSON.stringify(value)); <span class="com">// updater — updaters must stay pure</span>
+  }, [key, value]);                                      <span class="com">// (StrictMode double-invokes them)</span>
+
+  useEffect(() =&gt; {                                      <span class="com">// 'storage' fires in OTHER tabs only</span>
+    <span class="kw">const</span> onStorage = e =&gt; {
+      <span class="kw">if</span> (e.key === key &amp;&amp; e.storageArea === window.localStorage) {
+        setValue(e.newValue !== <span class="kw">null</span> ? JSON.parse(e.newValue) : initial);
+      }
+    };
+    window.addEventListener(<span class="str">'storage'</span>, onStorage);
+    <span class="kw">return</span> () =&gt; window.removeEventListener(<span class="str">'storage'</span>, onStorage);
+  }, [key]);
+
+  <span class="kw">return</span> [value, set];
+}</code></pre>
+<p>Design notes worth saying aloud: lazy initializer so storage is read once, not parsed every render; writes moved to an effect because <code>setState</code> updaters must be pure; <code>set</code> is <code>useCallback</code>'d because return-identity stability is part of a custom hook's contract (section 11); the storage event filter checks both <code>key</code> and <code>storageArea</code> (sessionStorage fires the same event type).</p>
+<p><strong>The remaining flaw</strong>: the SSR guard prevents the crash but not the <em>hydration mismatch</em> — the server rendered <code>initial</code>, the client's first render reads the stored value, and React hydrates against different content. This is exactly the tearing-shaped, "external mutable source" problem <code>useSyncExternalStore</code> exists for:</p>
+<pre><code><span class="kw">function</span> useLocalStorage(key, initial) {
+  <span class="kw">const</span> raw = useSyncExternalStore(
+    useCallback(cb =&gt; {
+      window.addEventListener(<span class="str">'storage'</span>, cb);
+      window.addEventListener(<span class="str">'local-storage'</span>, cb);   <span class="com">// custom event: same-tab writes</span>
+      <span class="kw">return</span> () =&gt; {
+        window.removeEventListener(<span class="str">'storage'</span>, cb);
+        window.removeEventListener(<span class="str">'local-storage'</span>, cb);
+      };
+    }, []),
+    () =&gt; window.localStorage.getItem(key),  <span class="com">// snapshot is the raw STRING — Object.is-stable</span>
+    () =&gt; <span class="kw">null</span>                               <span class="com">// server snapshot: hydrate as "no value"</span>
+  );
+  <span class="kw">const</span> value = useMemo(
+    () =&gt; (raw !== <span class="kw">null</span> ? JSON.parse(raw) : initial),  <span class="com">// parse memoized on the string</span>
+    [raw]
+  );
+  <span class="kw">const</span> set = useCallback(next =&gt; {
+    window.localStorage.setItem(key, JSON.stringify(next));
+    window.dispatchEvent(<span class="kw">new</span> Event(<span class="str">'local-storage'</span>)); <span class="com">// notify THIS tab's subscribers</span>
+  }, [key]);
+  <span class="kw">return</span> [value, set];
+}</code></pre>
+<p>Three contract points from section 9 show up concretely: <code>getSnapshot</code> returns the raw string (a fresh parsed object per call would fail the stability contract and loop); <code>getServerSnapshot</code> makes server and hydration renders agree, then the client corrects itself; and the <code>'storage'</code> event only fires in <em>other</em> tabs, so same-tab writes need a manual notification — the custom event. Both tabs and all components sharing the key now converge, tear-free.</p>
+</details>
+</div>
+
+<div class="exercise">
+<h4>Exercise 5 — Predict the console output, exactly</h4>
+<p>Without running it (no StrictMode), write the exact console output (1) on mount and (2) after clicking the button once. Then verify in a sandbox. Every line and its position tests a specific scheduling fact from sections 3 and 6.</p>
+<pre><code><span class="kw">function</span> Child() {
+  console.log(<span class="str">'child render'</span>);
+  useEffect(() =&gt; {
+    console.log(<span class="str">'child effect'</span>);
+    <span class="kw">return</span> () =&gt; console.log(<span class="str">'child effect cleanup'</span>);
+  });
+  useLayoutEffect(() =&gt; {
+    console.log(<span class="str">'child layout'</span>);
+    <span class="kw">return</span> () =&gt; console.log(<span class="str">'child layout cleanup'</span>);
+  });
+  <span class="kw">return</span> <span class="kw">null</span>;
+}
+
+<span class="kw">function</span> Parent() {
+  <span class="kw">const</span> [n, setN] = useState(<span class="num">0</span>);
+  console.log(<span class="str">'parent render'</span>);
+  useEffect(() =&gt; {
+    console.log(<span class="str">'parent effect'</span>);
+    <span class="kw">return</span> () =&gt; console.log(<span class="str">'parent effect cleanup'</span>);
+  });
+  useLayoutEffect(() =&gt; {
+    console.log(<span class="str">'parent layout'</span>);
+    <span class="kw">return</span> () =&gt; console.log(<span class="str">'parent layout cleanup'</span>);
+  });
+  <span class="kw">return</span> &lt;&gt;&lt;button onClick={() =&gt; setN(n + <span class="num">1</span>)}&gt;go&lt;/button&gt;&lt;Child /&gt;&lt;/&gt;;
+}</code></pre>
+<details><summary>Solution</summary>
+<p><strong>Mount:</strong></p>
+<pre><code>parent render
+child render
+child layout        <span class="com">// commit phase, synchronous, BEFORE paint, bottom-up</span>
+parent layout
+<span class="com">--- browser paints ---</span>
+child effect        <span class="com">// passive effects, after paint, bottom-up</span>
+parent effect</code></pre>
+<p><strong>After the click:</strong></p>
+<pre><code>parent render
+child render
+child layout cleanup   <span class="com">// ALL layout cleanups first (bottom-up)...</span>
+parent layout cleanup
+child layout           <span class="com">// ...then ALL layout setups (bottom-up)</span>
+parent layout
+<span class="com">--- browser paints ---</span>
+child effect cleanup   <span class="com">// same two-pass shape for passive effects</span>
+parent effect cleanup
+child effect
+parent effect</code></pre>
+<p>The facts each line pins down: renders are parent-then-child (rendering the parent is what <em>produces</em> the child element); every kind of effect flushes <strong>bottom-up</strong> (children before parents); on update, React runs <em>all</em> cleanups of a flavor, then <em>all</em> setups — cleanup and setup are not interleaved per-component; layout effects run inside commit before paint, passive effects after; and each cleanup logs the closure of the <em>previous</em> run — cleanup is per-run paired, not unmount-only. In StrictMode dev, mount would additionally replay setup → cleanup → setup for both flavors. If your answer differed, diff it line by line against these facts — each misplaced line is one precise misconception, which is exactly how interviewers use this drill.</p>
+</details>
+</div>
+
+<div class="exercise">
+<h4>Exercise 6 — Implement useEventCallback (the latest-ref pattern)</h4>
+<p>Implement <code>useEventCallback(fn)</code>: returns a function whose identity <strong>never changes</strong> but which always invokes the <strong>latest</strong> <code>fn</code> with the latest closed-over values. Explain (a) the problem it solves that <code>useCallback</code> cannot, (b) why the ref is synced in <code>useLayoutEffect</code> rather than <code>useEffect</code>, and (c) why the result must not be called during render.</p>
+<details><summary>Solution</summary>
+<pre><code><span class="kw">function</span> useEventCallback(fn) {
+  <span class="kw">const</span> ref = useRef(fn);
+  useLayoutEffect(() =&gt; {
+    ref.current = fn;                <span class="com">// re-point at this render's closure, pre-paint</span>
+  });
+  <span class="kw">return</span> useCallback((...args) =&gt; ref.current(...args), []);  <span class="com">// stable forever</span>
+}</code></pre>
+<p><strong>(a)</strong> <code>useCallback</code> forces a choice: <code>[]</code> deps → stable identity but a frozen closure (stale reads); honest deps → fresh closure but new identity whenever they change, cascading through <code>React.memo</code> children, effect deps, and subscriptions. <code>useEventCallback</code> decouples the two: <em>identity</em> is a stable trampoline created once; <em>behavior</em> is indirected through a ref that's re-pointed at the newest closure after every render. Stable and fresh — the exact combination a debounced handler, a subscription callback, or an <code>onEvent</code>-style prop into a memoized child needs.</p>
+<p><strong>(b)</strong> <code>useLayoutEffect</code> syncs the ref synchronously in the commit phase, <em>before</em> paint and before any passive effect. If it were <code>useEffect</code>, there'd be a window after commit in which another component's layout effect — or an event firing between paint and the passive flush — invokes the trampoline and reaches the <em>previous</em> render's closure. Narrow, but exactly the kind of rare-flake bug this hook exists to eliminate, so eliminate the window too.</p>
+<p><strong>(c)</strong> During render N, <code>ref.current</code> still points at render N−1's closure (the sync hasn't run yet) — so calling it during render can compute from stale props/state; and reading a mutable ref during render is non-deterministic under concurrent rendering anyway (section 4). Hence the name: it's for <em>event-time</em> code paths only.</p>
+<div class="senior">Name-drop the lineage: this is the userland version of the pattern the React team is standardizing as <code>useEffectEvent</code> — same latest-ref mechanics, same "don't call during render" restriction, plus lint integration that excludes it from deps. If asked "why doesn't React just make all callbacks behave this way?" — because a frozen-per-render closure is the <em>feature</em> that makes renders predictable snapshots; opting out must be explicit.</div>
+</details>
+</div>
+
+</main></body></html>

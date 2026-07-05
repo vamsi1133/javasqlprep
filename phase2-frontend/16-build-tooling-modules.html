@@ -1,0 +1,977 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>16 — Build Tooling &amp; Modules | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <div class="breadcrumb"><a href="index.html">← Course Home</a></div>
+    <h1>16 — Build Tooling &amp; Modules</h1>
+    <p>Module systems, bundler mechanics, Vite/webpack internals, publishing, and monorepos — the layer that separates "framework user" from "senior engineer".</p>
+  </div>
+</header>
+
+<main class="container">
+
+<section>
+  <h2>Why interviewers ask this</h2>
+  <p>
+    Anyone with two years of React can write components. What interviewers use build tooling for is to find out whether you
+    understand the <strong>system your code runs through</strong>. When a candidate says "the bundle is 2&nbsp;MB, I don't know why"
+    or "I added a library and tree shaking stopped working, so I gave up" — that's a mid-level signal. When a candidate says
+    "I opened the analyzer, found moment's locales in the vendor chunk, traced the import to a barrel file, and replaced it
+    with dayjs behind an adapter" — that's a senior signal: they can <em>debug the build</em>, not just the app.
+  </p>
+  <p>Concretely, build-tooling questions probe three things:</p>
+  <ul>
+    <li><strong>Mechanics</strong> — do you actually know why ESM enables tree shaking, what an exports map does, why Vite's dev server is fast? Or do you repeat blog-post slogans?</li>
+    <li><strong>Debugging under ambiguity</strong> — "the bundle doubled last sprint, walk me through finding out why" is a classic FAANG follow-up with no framework crutch.</li>
+    <li><strong>Trade-off judgment</strong> — single vendor chunk vs granular splitting, dual-publish vs ESM-only, monorepo vs polyrepo. Senior answers name the trade-offs and pick based on context, not fashion.</li>
+  </ul>
+  <div class="note">
+    <strong>How to use this page:</strong> Tier 1 sections are asked almost verbatim in interviews — know them cold, including the code.
+    Tier 2 is where senior loops differentiate. Tier 3 is currency: one-line awareness answers that show you follow the ecosystem.
+  </div>
+</section>
+
+<div class="toc">
+  <strong>On this page</strong>
+  <ul>
+    <li><a href="#modules">1. Module systems: ESM vs CJS from the build angle</a></li>
+    <li><a href="#bundler-model">2. What a bundler actually does</a></li>
+    <li><a href="#tree-shaking">3. Tree shaking for real</a></li>
+    <li><a href="#code-splitting">4. Code splitting mechanics</a></li>
+    <li><a href="#vite">5. Vite deep dive</a></li>
+    <li><a href="#webpack">6. Webpack literacy</a></li>
+    <li><a href="#tool-zoo">7. The compiler/tool zoo &amp; transpilation targets</a></li>
+    <li><a href="#publishing">8. Package publishing &amp; package managers</a></li>
+    <li><a href="#monorepos">9. Monorepos</a></li>
+    <li><a href="#trivia">10. Ecosystem currency (import maps, Rust tooling, Bun…)</a></li>
+    <li><a href="#qa">Interview Q&amp;A (20)</a></li>
+    <li><a href="#exercises">Hands-on exercises</a></li>
+  </ul>
+</div>
+
+<!-- ============================================================ -->
+<section>
+<h2 id="modules">1. Module systems: ESM vs CJS from the build angle <span class="tier-1">Tier 1</span></h2>
+
+<h3>1.1 Why the difference matters to a bundler</h3>
+<p>
+  You've seen the syntax comparison a hundred times. The <em>senior</em> framing is different: CJS and ESM differ in
+  <strong>when their structure is knowable</strong>, and that single property is why the entire modern toolchain looks the way it does.
+</p>
+<ul>
+  <li><strong>CommonJS is dynamic.</strong> <code>require()</code> is a plain function call that runs at runtime. You can call it conditionally, compute the path, mutate <code>module.exports</code> in a loop. A tool reading the source <em>cannot in general</em> know what a CJS module exports or imports without executing it.</li>
+  <li><strong>ESM is static.</strong> <code>import</code>/<code>export</code> are syntax, not functions. They must appear at the top level, specifiers must be string literals, and the full import/export graph is knowable by <em>parsing alone</em>. That static analyzability is <strong>why tree shaking exists</strong>: a bundler can prove "nothing ever imports <code>formatCurrency</code>" and delete it, because there is no way to sneak in a dynamic access the parser can't see (property access on namespace objects being the tricky edge — see §3).</li>
+</ul>
+
+<pre><code>// CommonJS — structure only knowable at runtime
+const name = process.env.IMPL === 'fast' ? './fast' : './slow';
+const impl = require(name);          // legal CJS, opaque to static analysis
+module.exports[Math.random() &gt; 0.5 ? 'a' : 'b'] = impl;  // exports unknowable
+
+// ESM — structure knowable by parsing
+import { format } from './format.js';   // must be top-level, literal specifier
+export { format };                       // export names fixed at parse time
+</code></pre>
+
+<h3>1.2 Live bindings vs value copies</h3>
+<p>
+  CJS exports are <strong>value copies at require time</strong> (you get whatever <code>module.exports</code> held when
+  <code>require</code> returned). ESM exports are <strong>live bindings</strong> — the importer holds a read-only view into the
+  exporting module's binding, and sees later reassignments. This matters for circular dependencies (ESM can tolerate cycles
+  via hoisted bindings that are "temporal-dead-zone until initialized"; CJS hands you a partially-filled snapshot) and for
+  understanding why bundler CJS-interop shims are hairy.
+</p>
+<pre><code>// counter.mjs
+export let count = 0;
+export function increment() { count++; }
+
+// main.mjs
+import { count, increment } from './counter.mjs';
+increment();
+console.log(count); // 1 — live binding, importer sees the update
+// count = 5;       // TypeError: Assignment to constant variable (read-only view)
+
+// CJS equivalent: `const { count } = require('./counter')` copies 0, stays 0.
+</code></pre>
+<p>Two more baseline facts worth stating unprompted: ESM is <strong>strict mode by default</strong> (no sloppy-mode <code>this === global</code>, no undeclared assignments), and ESM evaluation is deferred/asynchronous-capable (which is what makes top-level <code>await</code> possible), whereas <code>require</code> is fully synchronous.</p>
+
+<h3>1.3 Interop pain in practice</h3>
+<p>The classic bugs a senior candidate should be able to diagnose on sight:</p>
+<ul>
+  <li>
+    <strong>The default-export mismatch.</strong> CJS has no concept of a "default export" — there is just <code>module.exports</code>.
+    When Babel/TS compile <code>export default</code> to CJS, they emit <code>exports.default = ...</code> plus an
+    <code>exports.__esModule = true</code> marker. Consuming code then checks the marker: if present, <code>import x from 'lib'</code>
+    reads <code>.default</code>; if absent (a genuine hand-written CJS lib), the whole <code>module.exports</code> is treated as the default.
+    Tools disagree at the margins, which is why you've seen <code>lib.default.default</code> or "<code>x is not a function</code>" after
+    changing bundlers. TypeScript's <code>esModuleInterop: true</code> exists to paper over exactly this.
+  </li>
+  <li>
+    <strong>The dual-package hazard.</strong> A package that ships <em>both</em> CJS and ESM builds can be loaded twice in one process —
+    once via <code>require</code> (by a CJS dependency) and once via <code>import</code> (by your app). Now you have <strong>two module
+    instances</strong>: two singletons, two <code>instanceof</code> realms, two React copies ("Invalid hook call" is often exactly this),
+    <code>err instanceof MyError</code> failing across the boundary. Mitigations: ship ESM-only; or make one format a thin re-export
+    wrapper of the other so state lives in a single instance; or isolate shared state in a small CJS core that both entry points require.
+  </li>
+</ul>
+<div class="pitfall">
+  <strong>Pitfall:</strong> "Invalid hook call" / "two copies of React" is frequently a resolution problem, not a React problem.
+  Duplicate versions in the lockfile, a linked package resolving its own <code>node_modules/react</code>, or the dual-package hazard.
+  Debug with <code>npm ls react</code> and bundler aliasing (<code>resolve.alias</code> / <code>resolve.dedupe</code> in Vite) before touching app code.
+</div>
+
+<h3>1.4 Node resolution: the <code>"exports"</code> map</h3>
+<p>
+  Historically packages advertised entry points via <code>"main"</code> (CJS) and the unofficial <code>"module"</code> field
+  (ESM, honored by bundlers only, never by Node). Node 12+ replaced this with <strong><code>"exports"</code></strong> — an
+  explicit, encapsulating map of every path a consumer may import, with <strong>conditional resolution</strong>:
+</p>
+<pre><code>{
+  "name": "my-lib",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",       // MUST be first — resolvers take first match
+      "browser": "./dist/index.browser.js",
+      "import": "./dist/index.js",        // ESM consumers (import / import())
+      "require": "./dist/index.cjs",      // CJS consumers (require)
+      "default": "./dist/index.js"        // fallback, keep last
+    },
+    "./utils": {
+      "types": "./dist/utils.d.ts",
+      "import": "./dist/utils.js",
+      "require": "./dist/utils.cjs"
+    },
+    "./styles.css": "./dist/styles.css",  // non-JS assets must be listed too
+    "./package.json": "./package.json"    // tools often need to read this
+  },
+  "main": "./dist/index.cjs",             // fallback for old tooling only
+  "module": "./dist/index.js",            // legacy bundler hint, superseded
+  "sideEffects": false
+}
+</code></pre>
+<p>Key behaviors to be able to state:</p>
+<ul>
+  <li><strong>Conditions are matched in object order, first match wins</strong> — hence <code>"types"</code> first, <code>"default"</code> last. Conditions include <code>import</code>, <code>require</code>, <code>browser</code>, <code>node</code>, <code>development</code>/<code>production</code>, and custom ones (React Server Components use a <code>react-server</code> condition).</li>
+  <li><strong>Exports encapsulate.</strong> Once <code>"exports"</code> exists, deep imports of unlisted paths (<code>my-lib/dist/internal.js</code>) throw <code>ERR_PACKAGE_PATH_NOT_EXPORTED</code>. This is a feature (real public API) and a migration foot-gun (it broke countless <code>lodash/get</code>-style deep imports when libraries adopted it).</li>
+  <li><strong>The <code>"types"</code> condition + <code>moduleResolution: "bundler"</code>.</strong> TypeScript historically ignored exports maps under <code>moduleResolution: "node"</code> (now "node10"). Modern app tsconfig should use <code>"bundler"</code> (resolves exports/conditions like a bundler, without forcing file extensions); published Node libraries typically use <code>"node16"/"nodenext"</code>. If types "can't be found" for a modern package, a stale <code>moduleResolution</code> is suspect #1.</li>
+</ul>
+
+<h3>1.5 <code>"sideEffects": false</code></h3>
+<p>
+  A <em>declaration to bundlers</em>: "no module in this package does observable work at import time — if you don't use its exports,
+  you may drop the whole module without evaluating it." This lets webpack/Rollup skip modules entirely (module-level pruning),
+  which is much stronger than statement-level dead-code elimination.
+</p>
+<pre><code>// The gotcha: CSS imports ARE side effects.
+// If your library does:
+import './button.css';    // evaluating this module injects styles
+
+// and package.json says "sideEffects": false,
+// bundlers may drop the CSS import when tree-shaking. Fix — allowlist:
+{
+  "sideEffects": ["*.css", "./src/polyfills.js"]
+}
+</code></pre>
+<div class="pitfall">
+  <strong>Pitfall:</strong> "My library's styles vanished in the consumer's prod build but work in dev" is the canonical
+  <code>sideEffects: false</code> + CSS-import bug. Dev builds often skip tree shaking, so it only bites in production. Same story
+  for polyfills, global registrations (<code>customElements.define</code>), and monkey-patches.
+</div>
+
+<h3>1.6 Import specifiers and dynamic <code>import()</code></h3>
+<table>
+  <thead><tr><th>Specifier kind</th><th>Example</th><th>Resolved by</th></tr></thead>
+  <tbody>
+    <tr><td>Bare</td><td><code>import React from 'react'</code></td><td>node_modules walk + exports map (Node/bundlers). <em>Invalid in the browser</em> without an import map.</td></tr>
+    <tr><td>Relative</td><td><code>import x from './utils.js'</code></td><td>Relative to the importing file. Browsers &amp; Node ESM require the extension; bundlers/TS traditionally infer it.</td></tr>
+    <tr><td>Absolute / URL</td><td><code>import x from 'https://esm.sh/preact'</code></td><td>Browser-native ESM; Node supports <code>node:</code>, <code>file:</code> and (flagged/experimental) network imports.</td></tr>
+  </tbody>
+</table>
+<p>
+  Dynamic <code>import()</code> is the one dynamic escape hatch that stays analyzable <em>enough</em>: it returns a promise of the
+  module namespace, and — crucially — <strong>every bundler treats it as a code-split point</strong>. The imported module and its
+  unique dependencies become a separate chunk, loaded on demand. If the specifier contains an expression
+  (<code>import(`./locales/${lang}.js`)</code>), webpack/Vite glob the possible matches at build time and emit a chunk per candidate
+  plus a runtime map — which is clever, but can silently emit dozens of chunks.
+</p>
+<pre><code>// A split point in every bundler:
+const { renderChart } = await import('./chart.js');  // → chart-[hash].js chunk
+
+// React-level sugar over the same mechanism:
+const Chart = React.lazy(() =&gt; import('./Chart'));
+</code></pre>
+</section>
+
+<!-- ============================================================ -->
+<section>
+<h2 id="bundler-model">2. What a bundler actually does <span class="tier-1">Tier 1</span></h2>
+<p>
+  The single most valuable mental model on this page. Every bundler — webpack, Rollup, esbuild, Rspack, Parcel — is a pipeline:
+</p>
+<pre><code>entry points
+   │
+   ▼
+1. RESOLVE      turn each specifier into an absolute file
+                (node_modules walk, exports map conditions, aliases, extensions)
+   │
+   ▼
+2. LOAD + TRANSFORM   read the file, run it through loaders/plugins
+                (TS → JS, JSX → calls, CSS → JS module or extracted asset,
+                 SVG → component/URL, down-level syntax for targets)
+   │
+   ▼
+3. BUILD MODULE GRAPH  parse imports/exports of the transformed module,
+                enqueue its dependencies; repeat until closure is complete
+   │
+   ▼
+4. TREE-SHAKE   mark used exports from the entries outward; drop the rest
+                (needs ESM; respects sideEffects declarations)
+   │
+   ▼
+5. CHUNK        assign modules to output files:
+                entry chunks, dynamic-import chunks, shared/vendor chunks
+   │
+   ▼
+6. EMIT         write chunks + assets + source maps, inject a tiny RUNTIME
+                (module registry, chunk loader, HMR client in dev)
+</code></pre>
+<p>
+  When any build question stumps you in an interview, map it onto this pipeline out loud: "is this a resolution problem, a
+  transform problem, a graph problem, or a chunking problem?" That structure alone reads as senior.
+</p>
+
+<h3>2.1 Why bundle at all in the HTTP/2+ era?</h3>
+<p>"HTTP/2 multiplexes, so just ship 2,000 tiny ESM files" is a trap answer. Bundling still matters because:</p>
+<ul>
+  <li><strong>Request waterfalls, not request count, are the killer.</strong> Native ESM discovers dependencies by <em>fetching and parsing</em>. A chain <code>main → app → page → widget → util</code> is five sequential round trips before the leaf executes — depth, not width, and multiplexing doesn't help depth. Bundlers flatten the graph; browsers can only partially mitigate with <code>&lt;link rel="modulepreload"&gt;</code>.</li>
+  <li><strong>Compression efficiency.</strong> gzip/brotli build their dictionaries per response. One 300&nbsp;KB file compresses meaningfully better than 300 one-KB files, and each response also carries header + framing overhead.</li>
+  <li><strong>Transforms have to happen somewhere.</strong> TS, JSX, CSS Modules, vendor CJS→ESM — browsers run none of these. Even "no-bundle" dev servers (Vite) transform per-file and pre-bundle deps.</li>
+  <li><strong>Whole-graph optimizations</strong> — tree shaking, scope hoisting/concatenation, minification with cross-module knowledge, chunk-level cache strategy — only exist if a tool sees the graph.</li>
+</ul>
+
+<h3>2.2 Source maps</h3>
+<p>
+  A source map is a JSON file with a <code>mappings</code> field of Base64-VLQ–encoded segments; each segment says "generated
+  line/column X came from original file F, line/column Y (and optionally original identifier name N)". The generated file
+  links to it with <code>//# sourceMappingURL=app.js.map</code>. DevTools and error-reporting services use it to translate minified
+  stack traces back to your TS/JSX.
+</p>
+<pre><code>// vite.config.ts — production stance most teams should take
+export default defineConfig({
+  build: {
+    sourcemap: 'hidden'   // generate .map files but omit the sourceMappingURL
+                          // comment → browsers/users don't fetch them,
+                          // but you can upload them to Sentry/Datadog to
+                          // symbolicate production errors.
+  }
+});
+// webpack equivalent: devtool: 'hidden-source-map'
+</code></pre>
+<div class="senior">
+  <strong>Senior take:</strong> shipping full source maps publicly leaks source (including comments and sometimes secrets baked in
+  via env define); shipping none makes prod errors unreadable. <code>hidden</code> maps uploaded to the error tracker during CI, then
+  deleted from the artifact, is the standard grown-up answer. In dev, cheap variants (<code>eval-cheap-module-source-map</code> in
+  webpack terms) trade column accuracy for rebuild speed.
+</div>
+</section>
+
+<!-- ============================================================ -->
+<section>
+<h2 id="tree-shaking">3. Tree shaking for real <span class="tier-1">Tier 1</span></h2>
+<p>
+  Tree shaking = <strong>dead-code elimination performed on the ESM module graph</strong>. Because ESM import/export structure is
+  static (§1.1), the bundler can mark which exports are actually referenced starting from the entry points, and drop unreferenced
+  exports — and, with <code>sideEffects</code> info, entire unevaluated modules. The minifier (Terser/esbuild/SWC) then removes the
+  now-unreachable statements.
+</p>
+
+<h3>3.1 What defeats tree shaking</h3>
+<ul>
+  <li><strong>CJS anywhere in the chain.</strong> A CJS module is an opaque runtime object; the bundler must keep all of it. One CJS dependency of a dependency can anchor a large subgraph.</li>
+  <li><strong>Module-level side effects</strong> (or missing <code>sideEffects</code> declarations). If importing a module might do observable work, it must be evaluated even if nothing from it is used.</li>
+  <li><strong>Dynamic property access on a namespace.</strong> <code>import * as utils from './utils'; utils[key]()</code> — the bundler can't prove which exports are unused, so it keeps them all.</li>
+  <li><strong>Re-export barrels.</strong> The big one in real codebases — next.</li>
+</ul>
+
+<h3>3.2 The barrels problem</h3>
+<pre><code>// src/components/index.ts — the classic "barrel"
+export * from './Button';
+export * from './DataGrid';      // imports ag-grid, 400 KB
+export * from './RichTextEditor'; // imports prosemirror, 300 KB
+export * from './Chart';          // imports d3
+
+// consumer
+import { Button } from '@/components';   // just wants a button…
+</code></pre>
+<p>
+  In theory a perfect tree shaker prunes the rest. In practice: if <em>any</em> barrel-reachable module has (or can't be proven free of)
+  side effects, or the package lacks <code>sideEffects: false</code>, or a re-exported dep is CJS, the whole barrel graph is retained.
+  Even when shaking eventually succeeds, dev servers like Vite must still <em>load and transform every module in the barrel</em> to
+  serve one import — barrels are also a dev-speed tax. Framework teams now actively de-barrel (Next.js added
+  <code>optimizePackageImports</code> to rewrite barrel imports to direct ones automatically).
+</p>
+<p>The lodash example every interviewer knows:</p>
+<pre><code>import { get } from 'lodash';      // ❌ lodash is CJS → entire ~70 KB min+gz? no —
+                                   //    ~25 KB min+gz, ALL of it, untreeshakeable
+import get from 'lodash/get';      // ✔ deep import: only get + its internals (CJS but scoped)
+import { get } from 'lodash-es';   // ✔ ESM build, sideEffects flagged → shakes properly
+</code></pre>
+
+<h3>3.3 <code>/*#__PURE__*/</code> annotations</h3>
+<p>
+  Function <em>calls</em> at module top level are conservatively treated as side-effectful. The <code>/*#__PURE__*/</code> annotation
+  tells minifiers/bundlers "this call has no side effects — if its result is unused, delete the call."
+  Transpilers emit it automatically (e.g. class down-leveling, <code>styled.div`...`</code> wrappers in library builds), and library
+  authors write it by hand:
+</p>
+<pre><code>export const registry = /*#__PURE__*/ createRegistry();  // droppable if unused
+export const Button   = /*#__PURE__*/ styled('button')({ ... });
+</code></pre>
+<p>Awareness-level: you don't hand-write these in app code, but if a library's unused top-level constants keep landing in your bundle, missing PURE annotations (or a minifier not honoring them) is the mechanism to name.</p>
+
+<h3>3.4 Debugging walkthrough: "why is moment 300 KB in my bundle?"</h3>
+<p>This is the archetypal build-debugging interview story. Narrate it as a method, not a fact:</p>
+<ol>
+  <li><strong>Measure first.</strong> Run the analyzer — <code>rollup-plugin-visualizer</code> (Vite) or <code>webpack-bundle-analyzer</code> — on a <em>production</em> build. Treemap shows <code>moment/locale/*</code>: ~160 locale files dominating a ~290 KB (minified) moment blob.</li>
+  <li><strong>Explain the mechanism.</strong> Moment is CJS and its main file effectively drags in every locale (via a require pattern bundlers resolve eagerly); nothing here is tree-shakeable.</li>
+  <li><strong>Trace who imports it.</strong> Search the graph: maybe it's yours, maybe a date-picker dependency. <code>npm ls moment</code> / analyzer's "reasons" view / Vite's <code>vite-bundle-visualizer</code>.</li>
+  <li><strong>Pick a fix by blast radius:</strong>
+    <ul>
+      <li>Config-only, zero code change: stub the locales — webpack <code>new webpack.IgnorePlugin({ resourceRegExp: /^\.\/locale$/, contextRegExp: /moment$/ })</code>, or alias the locale dir to an empty module in Vite. Bundle drops to ~70 KB.</li>
+      <li>Better long-term: migrate to <code>date-fns</code> (per-function ESM imports, shakes to a few KB) or <code>dayjs</code> (~2 KB core + opt-in plugins) — moment itself is in maintenance mode and recommends this.</li>
+      <li>If it's a transitive dep, alias <code>moment → dayjs</code> compatibility shims or replace the offending dependency.</li>
+    </ul>
+  </li>
+  <li><strong>Lock the win in:</strong> add a size budget (<code>size-limit</code>, bundlesize CI check, webpack <code>performance.maxAssetSize</code>) so the regression can't silently return.</li>
+</ol>
+<div class="senior">
+  <strong>Senior framing:</strong> the specific library matters less than the loop — <em>analyzer → identify mass → trace importer →
+  fix at the cheapest effective layer → add a regression guard</em>. Interviewers reward the loop; they've all heard "use dayjs" as a slogan.
+</div>
+</section>
+
+<!-- ============================================================ -->
+<section>
+<h2 id="code-splitting">4. Code splitting mechanics <span class="tier-1">Tier 1</span></h2>
+
+<h3>4.1 Chunk taxonomy</h3>
+<table>
+  <thead><tr><th>Chunk type</th><th>Created by</th><th>Loaded</th></tr></thead>
+  <tbody>
+    <tr><td>Entry chunk</td><td>Each configured entry point</td><td>Via <code>&lt;script&gt;</code> in the HTML, immediately</td></tr>
+    <tr><td>Dynamic (async) chunk</td><td>Every <code>import()</code> expression</td><td>On demand by the bundler runtime</td></tr>
+    <tr><td>Shared/vendor chunk</td><td>splitChunks / manualChunks extraction rules</td><td>As a dependency of whichever chunks reference it</td></tr>
+    <tr><td>Runtime chunk</td><td>webpack <code>optimization.runtimeChunk</code></td><td>The chunk-loading machinery itself, split out so app-chunk hash changes don't invalidate it</td></tr>
+  </tbody>
+</table>
+
+<h3>4.2 Shared-chunk extraction and the vendor-splitting debate</h3>
+<pre><code>// webpack: splitChunks
+optimization: {
+  splitChunks: {
+    chunks: 'all',
+    cacheGroups: {
+      framework: {           // react + friends: changes rarely → stable hash
+        test: /[\\/]node_modules[\\/](react|react-dom|scheduler)[\\/]/,
+        name: 'framework',
+        priority: 40,
+      },
+      vendor: {
+        test: /[\\/]node_modules[\\/]/,
+        name: 'vendors',
+        priority: 20,
+      },
+    },
+  },
+  runtimeChunk: 'single',
+}
+
+// Vite/Rollup: manualChunks
+build: {
+  rollupOptions: {
+    output: {
+      manualChunks(id) {
+        if (id.includes('node_modules')) {
+          if (/react|react-dom|scheduler/.test(id)) return 'framework';
+          return 'vendor';
+        }
+      },
+    },
+  },
+}
+</code></pre>
+<p><strong>The debate you should be able to argue both sides of:</strong></p>
+<ul>
+  <li><strong>Single vendor chunk</strong> — fewer requests, simple; but bumping <em>any</em> dependency changes the contenthash and invalidates the whole vendor cache for every returning user.</li>
+  <li><strong>Granular per-package chunks</strong> (Next.js's approach: hash-named chunks per npm package above a size threshold) — a lodash patch only invalidates the lodash chunk; framework chunk stays cached for months. Costs: more requests (fine on H2), more complex graph, risk of many tiny chunks hurting compression.</li>
+  <li><strong>The reasoning primitive is cache stability with <code>[contenthash]</code>:</strong> filenames derive from content, served with <code>Cache-Control: immutable</code>; splitting strategy is really a question of <em>which bytes change together</em>. Group by change-frequency: framework (glacial) / vendors (monthly) / app (daily).</li>
+</ul>
+
+<h3>4.3 Preload / prefetch of chunks</h3>
+<pre><code>// webpack magic comments
+const Settings = lazy(() =&gt; import(
+  /* webpackPrefetch: true */   // &lt;link rel="prefetch"&gt; — idle-time, low priority,
+  './Settings'                  // for "probably needed later" (next route)
+));
+const Editor = lazy(() =&gt; import(
+  /* webpackPreload: true */    // &lt;link rel="preload"&gt; — parallel with parent chunk,
+  './Editor'                    // for "needed almost certainly, right now"
+));
+
+// Vite: build.modulepreload — Vite auto-injects
+// &lt;link rel="modulepreload"&gt; for each entry's static ESM deps,
+// flattening the discovery waterfall. For route prefetching you typically
+// trigger the import() on link hover/viewport (what Next/Remix do).
+</code></pre>
+<div class="pitfall">
+  <strong>Pitfall:</strong> preloading everything is anti-optimization — preload competes with critical resources for bandwidth.
+  Prefetch is the safe default for routes; reserve preload for assets on the critical path of the <em>current</em> interaction.
+</div>
+
+<h3>4.4 CSS splitting and the runtime</h3>
+<p>
+  Modern bundlers split CSS <em>per chunk</em>: the CSS imported by modules of an async chunk is emitted as a sibling
+  <code>.css</code> asset, and the runtime loads it before executing the chunk (Vite does this by default; webpack via
+  <code>MiniCssExtractPlugin</code>). Know the failure mode: a flash of unstyled content or an "await on CSS" delay when a chunk's
+  stylesheet is slow. Also be able to say what the <strong>runtime</strong> is: the few KB of generated code that maps chunk ids to URLs,
+  deduplicates in-flight loads, wires <code>import()</code> to script/CSS insertion, and (in dev) hosts the HMR client.
+</p>
+</section>
+
+<!-- ============================================================ -->
+<section>
+<h2 id="vite">5. Vite deep dive <span class="tier-1">Tier 1</span></h2>
+<p>Vite is the current default; interviewers expect you to explain <em>why it's fast</em> mechanically, not vibes.</p>
+
+<h3>5.1 The dev-mode architecture (the core answer)</h3>
+<p>Dev is <strong>unbundled</strong>: Vite serves your source as <strong>native ESM, transformed on demand, per file</strong>. The browser's module loader does the graph traversal; Vite is "just" a smart transform server with a cache. Cold start is near-instant because nothing is bundled up front — cost is proportional to the modules the current page actually imports, not the whole app.</p>
+<p>Two esbuild-powered pieces make this viable:</p>
+<ul>
+  <li>
+    <strong>Dependency pre-bundling.</strong> On first run, Vite scans your imports and bundles each bare dependency <em>once</em>
+    with esbuild into <code>node_modules/.vite/deps</code>. Why: (a) <strong>CJS→ESM conversion</strong> — the browser can't load CJS,
+    and much of npm still is; (b) <strong>waterfall collapse</strong> — lodash-es is 600+ internal modules; pre-bundling makes it one
+    request instead of 600 sequential-ish fetches. Pre-bundled deps are cached and served with immutable headers; the cache keys off
+    the lockfile, which is why "weird stale dep behavior" is fixed by <code>vite --force</code> or deleting <code>.vite</code>.
+  </li>
+  <li>
+    <strong>Per-file transforms.</strong> TS and JSX are handled by esbuild, which <em>strips types</em> — it does <strong>no type
+    checking</strong>. This is a deliberate trade: transforms stay ~20-30x faster, and type checking moves out-of-band — your editor
+    in dev, and <code>tsc --noEmit</code> (or <code>vue-tsc</code> for Vue SFCs) as a CI gate. If a team has no <code>tsc --noEmit</code>
+    in CI, their Vite app can deploy with type errors; saying that unprompted is a strong senior signal.
+  </li>
+</ul>
+
+<h3>5.2 The prod side: Rollup (and Rolldown)</h3>
+<p>
+  Production builds use <strong>Rollup</strong>: mature tree shaking, scope hoisting, a deep plugin ecosystem, and fine-grained
+  output control — things esbuild intentionally doesn't prioritize. So Vite is really two tools behind one config and one plugin
+  API (Vite plugins are a superset of Rollup plugins with extra dev hooks like <code>configureServer</code> and
+  <code>handleHotUpdate</code>). The dev/prod engine split is Vite's main criticism — subtle dev/prod inconsistencies — which is
+  exactly what <strong>Rolldown</strong> (the Rust Rollup-compatible bundler from the Vite team, folding in Oxc for transforms)
+  is built to eliminate: one Rust engine for both modes, and much faster prod builds. Rolldown-powered Vite is the announced
+  direction; know it exists and why.
+</p>
+
+<h3>5.3 Config anatomy</h3>
+<pre><code>// vite.config.ts
+import { defineConfig, loadEnv } from 'vite';
+import react from '@vitejs/plugin-react';
+
+export default defineConfig(({ mode }) =&gt; {
+  const env = loadEnv(mode, process.cwd(), '');
+  return {
+    plugins: [react()],                    // Rollup-compatible plugin objects
+    resolve: {
+      alias: { '@': '/src' },             // mirror tsconfig "paths"
+      dedupe: ['react', 'react-dom'],     // kill duplicate-React issues
+    },
+    define: {
+      // compile-time constant replacement (like webpack DefinePlugin);
+      // values are injected as source text → JSON.stringify strings!
+      __APP_VERSION__: JSON.stringify(process.env.npm_package_version),
+    },
+    server: {
+      proxy: {                             // dev-only API proxy: same-origin
+        '/api': {                          // requests → no CORS in dev
+          target: 'http://localhost:4000',
+          changeOrigin: true,
+        },
+      },
+    },
+    build: {
+      sourcemap: 'hidden',
+      target: 'es2020',
+    },
+  };
+});
+</code></pre>
+<p>
+  <strong>Env vars:</strong> exposed on <code>import.meta.env</code>, statically replaced at build time — and <strong>only variables
+  prefixed <code>VITE_</code></strong> reach client code. The prefix is a security design: it makes leaking a server secret into the
+  bundle an explicit act (you'd have to rename <code>DB_PASSWORD</code> to <code>VITE_DB_PASSWORD</code>) rather than a default.
+  The dual lesson to state: <em>nothing</em> in a client bundle is secret regardless of prefix — the prefix prevents accidents,
+  not extraction.
+</p>
+<p>
+  <strong>Library mode</strong> (<code>build.lib</code>): entry + formats (<code>es</code>/<code>cjs</code>/<code>umd</code>), with
+  <code>rollupOptions.external: ['react']</code> so peers aren't bundled — the standard way to build a publishable component library with Vite.
+</p>
+
+<h3>5.4 HMR mechanics and React Fast Refresh</h3>
+<p>
+  On file change, Vite invalidates the module, then walks <em>up</em> the import graph looking for an <strong>accepting
+  boundary</strong> — a module that called <code>import.meta.hot.accept()</code>. It pushes the update over WebSocket; the client
+  re-fetches just the changed module(s) (cache-busted URL query) and hands the new module to the boundary's accept callback.
+  If the walk reaches the entry with no accepting boundary → full page reload.
+</p>
+<pre><code>// what a framework plugin generates conceptually:
+if (import.meta.hot) {
+  import.meta.hot.accept((newModule) =&gt; {
+    // decide how to apply newModule without reloading the page
+  });
+}
+</code></pre>
+<p>
+  <strong>React Fast Refresh</strong> builds on this: the plugin makes every module whose exports are <em>all React components</em>
+  self-accepting. On update, React re-renders the component with the new implementation but <strong>preserves hook state</strong>
+  by keeping the fiber and matching hooks positionally. What <em>resets or downgrades</em> the experience:
+</p>
+<ul>
+  <li><strong>Non-component exports in the same file</strong> (a component plus an exported constant/util): the module can't be safely self-accepting → update propagates upward, often becoming a full reload or a state reset. This is the practical reason for "components-only files".</li>
+  <li>Anonymous/default-exported unnamed components (Refresh can't track identity), and edited <em>hook signatures</em> (order/count of hooks changed) → state is intentionally reset.</li>
+</ul>
+<div class="note">
+  <strong>Interview phrasing:</strong> "HMR is a protocol between the dev server and accepting module boundaries; Fast Refresh
+  is React's policy layered on it: component-only modules self-accept and remount is avoided by preserving fibers, so hook
+  state survives edits — unless the file mixes in non-component exports."
+</div>
+</section>
+
+<!-- ============================================================ -->
+<section>
+<h2 id="webpack">6. Webpack literacy <span class="tier-2">Tier 2</span></h2>
+<p>You'll meet webpack in legacy codebases, ejected CRA apps, and — most importantly for interviews — <strong>Module Federation</strong> micro-frontends (see chapter 15). You need literacy, not mastery.</p>
+
+<h3>6.1 Core concepts — and the classic distinction question</h3>
+<pre><code>// webpack.config.js
+module.exports = {
+  mode: 'production',            // sets sane defaults: minify, DefinePlugin
+                                 // NODE_ENV, deterministic ids…
+  entry: { app: './src/index.tsx' },
+  output: {
+    filename: '[name].[contenthash].js',
+    path: path.resolve(__dirname, 'dist'),
+    publicPath: '/assets/',      // URL prefix chunks are loaded from at runtime
+    clean: true,
+  },
+  module: {
+    rules: [
+      { test: /\.tsx?$/, use: 'swc-loader', exclude: /node_modules/ },
+      { test: /\.css$/, use: [MiniCssExtractPlugin.loader, 'css-loader'] },
+      { test: /\.png$/, type: 'asset' },   // asset modules replaced url/file-loader
+    ],
+  },
+  plugins: [
+    new HtmlWebpackPlugin({ template: 'src/index.html' }),
+    new MiniCssExtractPlugin({ filename: '[name].[contenthash].css' }),
+    new webpack.DefinePlugin({
+      'process.env.API_URL': JSON.stringify(process.env.API_URL),
+    }),
+  ],
+};
+</code></pre>
+<p>
+  <strong>"Loader vs plugin?"</strong> — a genuinely common question. <strong>Loaders</strong> are per-file transforms in the
+  module pipeline: they take one module's source in, return JS (or another loader's input) out — <code>ts → js</code>,
+  <code>css → js module</code>. <strong>Plugins</strong> hook into the compiler's lifecycle via the tapable event system and can see or
+  mutate <em>everything</em> — the whole compilation, chunk graph, and emitted assets. Rule of thumb: transforms one file = loader;
+  needs whole-build awareness (emit HTML, extract CSS to separate files, define globals, analyze) = plugin.
+</p>
+<p>Key plugins to recognize: <code>DefinePlugin</code> (compile-time constant substitution — enables dead-code elimination of <code>if (process.env.NODE_ENV !== 'production')</code> blocks), <code>MiniCssExtractPlugin</code> (CSS as real files instead of style-injecting JS), <code>HtmlWebpackPlugin</code> (emits HTML with hashed script/link tags injected).</p>
+
+<h3>6.2 Why it's slower — and when it's still the right call</h3>
+<ul>
+  <li><strong>Slower because:</strong> it's JavaScript end-to-end (parse/transform/minify all single-thread-JS unless you swap in swc/esbuild loaders), and its dev model is <strong>eager bundling</strong> — build the entire graph before serving byte one, and rebundle (incrementally) on change. Vite inverted exactly these two decisions.</li>
+  <li><strong>Still chosen when:</strong> <strong>Module Federation</strong> is a hard requirement at maturity (webpack is its home; Rspack now also ships MF, and Vite's ecosystem plugin has caveats); when a build depends on deep webpack-specific plugin/loader behavior; or when the migration risk of a huge legacy config outweighs dev-speed pain.</li>
+</ul>
+
+<h3>6.3 The webpack → Vite migration story</h3>
+<p>Interviewers love "you're migrating a 5-year-old webpack app to Vite — what breaks?" Checklist answer:</p>
+<ul>
+  <li><strong><code>require.context()</code></strong> and other webpack-only APIs → rewrite to Vite's <code>import.meta.glob()</code>.</li>
+  <li><strong>Env vars:</strong> <code>process.env.REACT_APP_X</code> → <code>import.meta.env.VITE_X</code>; sweep the codebase, and shim <code>process.env</code> via <code>define</code> only as a bridge.</li>
+  <li><strong>Worker syntax:</strong> loader-based (<code>worker-loader</code>) → standard <code>new Worker(new URL('./w.ts', import.meta.url), { type: 'module' })</code>.</li>
+  <li><strong>CJS in app source</strong> (sneaky <code>require()</code> in old files) — fine under webpack, breaks under native-ESM dev.</li>
+  <li>Loader chains for exotic assets (SVGR, raw imports) → equivalent Vite plugins / <code>?raw</code>/<code>?url</code> suffixes; <code>resolve.alias</code>/tsconfig paths re-wired; index.html moves to project root as the entry.</li>
+  <li>Then validate: dev/prod parity smoke tests, bundle-size diff before/after, and keep the webpack build runnable until the Vite build has shipped to prod for a cycle.</li>
+</ul>
+</section>
+
+<!-- ============================================================ -->
+<section>
+<h2 id="tool-zoo">7. The compiler/tool zoo &amp; transpilation targets <span class="tier-2">Tier 2</span></h2>
+
+<table>
+  <thead><tr><th>Tool</th><th>Language</th><th>Role &amp; one-line positioning</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Babel</strong></td><td>JS</td><td>The extensible transpiler: massive plugin ecosystem (JSX proposals, macros, styled-components plugin). <code>preset-env</code> + browserslist + core-js = precision polyfill/down-level strategy. Slow; now mostly kept where a specific plugin is needed.</td></tr>
+    <tr><td><strong>esbuild</strong></td><td>Go</td><td>10–100x faster transform + bundle + minify; powers Vite dev. Deliberately not extensible enough (no type-aware output, limited plugin surface) to replace Rollup for prod nuance.</td></tr>
+    <tr><td><strong>SWC</strong></td><td>Rust</td><td>Babel-compatible-ish transformer; Next.js's default compiler (replaced Babel/Terser there). Also usable as jest transform, webpack loader.</td></tr>
+    <tr><td><strong>Rspack</strong></td><td>Rust</td><td>Webpack-API-compatible bundler (ByteDance) — the "keep your webpack config, drop-in for speed" migration path; ships Module Federation.</td></tr>
+    <tr><td><strong>Turbopack</strong></td><td>Rust</td><td>Vercel's incremental-computation bundler; Next.js dev (and progressively build) engine. Not a general-purpose standalone tool yet.</td></tr>
+    <tr><td><strong>Rollup</strong></td><td>JS</td><td>The library bundler: cleanest ESM output, best-in-class tree shaking, <code>preserveModules</code> (emit per-module files instead of one bundle — lets consumers shake your library). Vite's prod engine.</td></tr>
+    <tr><td><strong>Parcel</strong></td><td>JS/Rust</td><td>Zero-config bundler; fine for small apps, rarely the senior conversation.</td></tr>
+  </tbody>
+</table>
+
+<h3>7.1 Babel's targets thinking (still the canonical model)</h3>
+<pre><code>// .browserslistrc
+&gt;0.5%, last 2 versions, not dead, not op_mini all
+
+// babel.config.js
+presets: [[ '@babel/preset-env', {
+  targets: 'defaults',          // reads browserslist
+  useBuiltIns: 'usage',         // inject core-js polyfills ONLY for features
+  corejs: '3.36',               // you use AND your targets lack
+}]]
+</code></pre>
+<p>The idea generalizes to every tool: <strong>declare targets once</strong>, let the toolchain compute the minimal set of syntax down-leveling and polyfills. esbuild/SWC/Vite all take a <code>target</code> the same way (Vite defaults to a modern <code>'baseline-widely-available'</code>-style ES2020+ target).</p>
+
+<h3>7.2 What down-leveling costs — and why the baseline moved</h3>
+<ul>
+  <li><strong>async/await → generator + regenerator-runtime:</strong> historically ~2-3x code size for async-heavy files plus a runtime helper, and worse debuggability/perf. Class fields, optional chaining, spread — each expands similarly.</li>
+  <li><strong>The history:</strong> the ES5 era begat <em>differential serving</em> — <code>&lt;script type="module"&gt;</code> (modern) + <code>&lt;script nomodule&gt;</code> (legacy) shipping two builds, because module-supporting browsers were a clean proxy for ES2017 support. Vite's <code>@vitejs/plugin-legacy</code> is the living descendant.</li>
+  <li><strong>Today:</strong> every evergreen browser has years of ES2017–ES2020; a modern baseline (ES2020-ish, aligned with Baseline "widely available") is the default, and you down-level further only for a measured legacy audience — a business decision backed by analytics, not a reflex. Saying "we shipped ES2019 because 4% of revenue was on an old embedded WebView, and it cost us 9% bundle size" is exactly the kind of quantified trade-off senior interviews want.</li>
+</ul>
+</section>
+
+<!-- ============================================================ -->
+<section>
+<h2 id="publishing">8. Package publishing &amp; package managers <span class="tier-2">Tier 2</span></h2>
+
+<h3>8.1 Dual ESM/CJS publishing — or ESM-only</h3>
+<p>The library-author decision tree:</p>
+<ul>
+  <li><strong>Dual publish:</strong> build both formats (tsup/unbuild/Rollup make this one config line), wire the exports map from §1.4 (<code>import</code> → <code>.js</code>, <code>require</code> → <code>.cjs</code>, <code>types</code> per format). Maximum compatibility; costs: double artifacts, the dual-package hazard (§1.3), and per-format type declarations (or "masquerading" type bugs — the class of problem the <em>arethetypeswrong</em> checker exists to catch).</li>
+  <li><strong>ESM-only:</strong> increasingly viable and where the ecosystem is heading — Node 20.17+/22 can <code>require()</code> synchronous-graph ESM natively, bundlers consume ESM natively, and major libraries have gone ESM-only. Costs: cuts off old Node CJS consumers and some Jest/ts-node configs; classic pain sign is <code>ERR_REQUIRE_ESM</code> in consumers' CI.</li>
+</ul>
+
+<h3>8.2 peerDependencies — the singleton question</h3>
+<pre><code>{
+  "peerDependencies": { "react": "&gt;=18" },
+  "devDependencies":  { "react": "^19.0.0" }   // for the lib's own tests/build
+}
+</code></pre>
+<p>
+  Why peer and not regular: React (and any <strong>singleton-by-contract</strong> lib — react-dom, styled-components with its
+  context, form libraries sharing context objects) must exist <em>exactly once</em> in the host app. A regular dependency risks
+  nesting a second copy → two Reacts → "Invalid hook call". <code>peerDependencies</code> says "the host provides this; I just
+  declare the compatible range." Also mark the peer <code>external</code> in your build so it isn't bundled.
+</p>
+
+<h3>8.3 Semver, lockfiles, and <code>npm ci</code></h3>
+<ul>
+  <li><code>^1.2.3</code> = any <code>1.x</code> ≥ 1.2.3; <code>~1.2.3</code> = patch-only. <strong>0.x is special:</strong> <code>^0.2.3</code> only allows 0.2.x — minors are treated as breaking pre-1.0.</li>
+  <li><strong>What the lockfile guarantees:</strong> the exact resolved version, registry URL, and <strong>integrity hash</strong> (SHA-512) of every package in the tree — reproducible installs <em>and</em> tamper evidence. Ranges live in package.json; truth lives in the lockfile.</li>
+  <li><strong><code>npm ci</code> vs <code>npm install</code>:</strong> <code>ci</code> installs <em>exactly</em> the lockfile (deletes node_modules first, errors if lockfile and package.json disagree, never writes the lockfile). <code>install</code> may re-resolve and rewrite the lockfile. CI pipelines must use <code>ci</code> — "our build changed with no commits" is almost always <code>npm install</code> in CI absorbing a new transitive release.</li>
+</ul>
+
+<h3>8.4 npm vs pnpm vs yarn</h3>
+<table>
+  <thead><tr><th></th><th>npm</th><th>pnpm</th><th>yarn (berry)</th></tr></thead>
+  <tbody>
+    <tr><td>node_modules layout</td><td>Flat/hoisted</td><td><strong>Content-addressable global store</strong> + hard links; strict symlinked layout</td><td>Hoisted by default; PnP (no node_modules) optional</td></tr>
+    <tr><td>Disk/install cost</td><td>Full copy per project</td><td>One copy per version on disk, ever — links per project</td><td>Cache + copy (or zip archives w/ PnP)</td></tr>
+    <tr><td>Phantom dependencies</td><td>Allowed (hoisting exposes undeclared deps)</td><td><strong>Prevented</strong> — you can only import what you declared, because only declared deps are linked at the top level</td><td>Prevented under PnP</td></tr>
+    <tr><td>Workspaces</td><td>Yes (basic)</td><td>Yes + <code>workspace:</code> protocol</td><td>Yes + protocol</td></tr>
+  </tbody>
+</table>
+<p>
+  The phantom-dependency point is the interview-worthy one: with hoisting, <code>require('lodash')</code> works if <em>any</em>
+  transitive dep brought lodash — until the day it doesn't, in prod. pnpm's strict layout turns that latent bug into an
+  immediate error. That + disk efficiency is why pnpm dominates monorepos.
+</p>
+
+<h3>8.5 Publishing hygiene</h3>
+<pre><code>{
+  "files": ["dist"],                        // allowlist — never ship src/tests/.env
+  "scripts": {
+    "prepublishOnly": "npm run build &amp;&amp; npm test"   // can't publish stale dist
+  },
+  "publishConfig": { "access": "public", "provenance": true }
+}
+// npm publish --provenance (from CI with OIDC) attaches a signed attestation
+// linking the tarball to the exact repo + workflow run — supply-chain answer.
+// Sanity check before every publish: `npm pack --dry-run` to see the file list.
+</code></pre>
+</section>
+
+<!-- ============================================================ -->
+<section>
+<h2 id="monorepos">9. Monorepos <span class="tier-2">Tier 2</span></h2>
+
+<h3>9.1 Why (and the honest costs)</h3>
+<ul>
+  <li><strong>Shared code without publish cycles:</strong> <code>packages/ui</code> is consumed by three apps directly — no version bump, publish, and triple-upgrade dance for a one-line fix.</li>
+  <li><strong>Atomic cross-package changes:</strong> change a shared component's API and all its call sites in one PR, one review, one CI run.</li>
+  <li><strong>Single toolchain:</strong> one ESLint/TS/build config, one dependency policy, one CI story.</li>
+  <li><strong>When it hurts:</strong> genuinely unrelated products with different release cadences (you get coupling without cohesion); CI cost explodes without caching discipline (every PR building everything); tooling/ownership overhead needs a platform-minded owner; VCS scale is a real (if distant) ceiling.</li>
+</ul>
+
+<h3>9.2 Workspaces mechanics</h3>
+<pre><code>// pnpm-workspace.yaml
+packages: ['apps/*', 'packages/*']
+
+// apps/web/package.json
+{
+  "dependencies": {
+    "@acme/ui": "workspace:*"   // ALWAYS link the local package; the protocol
+  }                             // errors rather than silently fetching from the
+}                               // registry, and pnpm rewrites it to a real
+                                // semver range on publish.
+</code></pre>
+<p>Workspaces = the package manager symlinks local packages into node_modules so imports resolve to sibling source/dist, and hoists/links shared external deps once at the root.</p>
+
+<h3>9.3 Task orchestration: Turborepo / Nx</h3>
+<pre><code>// turbo.json
+{
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],            // topological: build my deps first
+      "inputs": ["src/**", "package.json", "tsconfig.json"],
+      "outputs": ["dist/**"]
+    },
+    "test": { "dependsOn": ["build"], "inputs": ["src/**", "test/**"] },
+    "lint": {}
+  }
+}
+</code></pre>
+<p>The three mechanisms to explain:</p>
+<ul>
+  <li><strong>Task graph:</strong> <code>dependsOn: ["^build"]</code> derives execution order from the <em>package</em> dependency graph — maximal parallelism with correct ordering.</li>
+  <li><strong>Caching = inputs hash → replay outputs.</strong> Hash the declared inputs (files, env vars, dep-package hashes, task definition); on hit, skip execution and <strong>restore the recorded output files and replay the logs</strong>. Corollary interviewers probe: an <em>undeclared input</em> (env var not listed, file outside <code>inputs</code>) means stale cache hits — the classic "works after <code>turbo run --force</code>" bug.</li>
+  <li><strong>Remote caching + affected-only:</strong> share the cache across CI runners and laptops (CI builds it, you replay it); and compute the packages affected by a diff (<code>turbo run test --filter=...[origin/main]</code>, <code>nx affected -t test</code>) so a docs change doesn't run 40 test suites. Together these are what make monorepo CI bills survivable.</li>
+</ul>
+
+<h3>9.4 Internal packages: source vs built</h3>
+<table>
+  <thead><tr><th></th><th>Source packages ("just TS")</th><th>Built packages</th></tr></thead>
+  <tbody>
+    <tr><td>Mechanism</td><td>exports map points at <code>src/index.ts</code> (or tsconfig <code>paths</code>); the consuming app's bundler compiles it</td><td>Each package builds to <code>dist</code>; consumers import compiled output</td></tr>
+    <tr><td>DX</td><td>Instant — edit shared code, HMR in the app, no build step</td><td>Rebuild (or watch) shared package before app sees changes</td></tr>
+    <tr><td>Scale/CI</td><td>Every app recompiles all shared source; type-check cost concentrates in apps</td><td>Cacheable per-package builds; TS project references give incremental type-checking</td></tr>
+    <tr><td>Fit</td><td>Small/medium monorepos, app-centric teams</td><td>Large repos, packages nearing publishable status, mixed toolchains</td></tr>
+  </tbody>
+</table>
+<p>
+  The senior nuance: prefer <strong>exports-map-based resolution over tsconfig <code>paths</code></strong> even for source packages —
+  <code>paths</code> is a TS-only compile-time fiction that every other tool (bundler, jest, eslint-import-resolver) must separately
+  replicate, whereas an exports map with a <code>development</code>/custom condition pointing at <code>src</code> is honored by the actual
+  resolvers. Many teams start source-based and graduate hot packages to built as the repo grows.
+</p>
+
+<h3>9.5 Boundaries enforcement</h3>
+<pre><code>// Nx: tag-based module boundaries (eslint rule @nx/enforce-module-boundaries)
+{ "sourceTag": "scope:checkout",
+  "onlyDependOnLibsWithTags": ["scope:checkout", "scope:shared"] }
+
+// Vanilla ESLint equivalent:
+'no-restricted-imports': ['error', { patterns: [
+  { group: ['@acme/*/src/*'], message: 'Deep-import internals are forbidden; use the package entry.' },
+  { group: ['@acme/checkout-*'],
+    message: 'Only the checkout app may import checkout packages.' },
+]}]
+</code></pre>
+<p>Without enforcement, a monorepo's superpower (everything importable) becomes its failure mode (everything coupled). Dependency-cruiser or Nx graph checks in CI turn the intended architecture into a build error instead of a code-review plea.</p>
+</section>
+
+<!-- ============================================================ -->
+<section>
+<h2 id="trivia">10. Ecosystem currency <span class="tier-3">Tier 3</span></h2>
+<p>One-liner awareness answers — enough to show you track the field, no more:</p>
+<ul>
+  <li><strong>Import maps</strong> are native in all modern browsers: <code>&lt;script type="importmap"&gt;{"imports":{"react":"https://esm.sh/react@19"}}&lt;/script&gt;</code> lets bare specifiers resolve without a bundler — the primitive behind buildless setups and some micro-frontend version negotiation.</li>
+  <li><strong>CDN ESM</strong> (esm.sh, jsdelivr <code>/+esm</code>): serves npm packages as browser-ready ESM (CJS converted on the fly). Great for prototypes, playgrounds, and islands; production apps still bundle for waterfalls/compression (§2.1).</li>
+  <li><strong>The "JS infra rewritten in Rust/Go" narrative:</strong> the CPU-bound tier of the toolchain — parse, transform, minify, bundle, lint — has been systematically ported to native languages: esbuild (Go), SWC, Rspack, Turbopack, Rolldown/Oxc, Lightning CSS (Rust). The JS layer that remains is the plugin/config surface.</li>
+  <li><strong>Bun:</strong> runtime + package manager + test runner + bundler in one (Zig, JavaScriptCore). Its install speed and built-in TS execution are real; teams commonly adopt it as a faster npm/test runner before trusting the bundler for prod.</li>
+  <li><strong>Biome:</strong> Rust replacement for ESLint + Prettier in one binary — ~10-100x faster format/lint; the trade-off is a smaller rule/plugin ecosystem (notably type-aware rules).</li>
+  <li><strong>TypeScript 7 / the Go port ("tsgo", Project Corsa):</strong> Microsoft is porting the TS compiler and language server to Go, with ~10x compile/check speedups demonstrated on large repos. Relevance to this chapter: <code>tsc --noEmit</code> being the slow CI gate (§5.1) stops being true, and editor responsiveness on monorepos changes materially.</li>
+</ul>
+</section>
+
+<!-- ============================================================ -->
+<section>
+<h2 id="qa">Interview Q&amp;A</h2>
+
+<details class="qa">
+  <summary>1. Why does tree shaking require ESM? Why can't bundlers tree-shake CommonJS?</summary>
+  <p>Tree shaking is static dead-export elimination, and it needs the import/export graph to be knowable <em>without executing code</em>. ESM guarantees that: <code>import</code>/<code>export</code> are top-level syntax with literal specifiers, so parsing alone reveals exactly which bindings each module exposes and consumes. CJS gives no such guarantee — <code>require()</code> is a runtime function call with computable arguments, and <code>module.exports</code> can be mutated arbitrarily (conditionally, in loops, with computed keys). A bundler facing CJS must conservatively keep the whole module object. Some tools attempt heuristic CJS "shaking" for simple patterns, but it's best-effort; the reliable contract is ESM plus <code>sideEffects</code> metadata so unevaluated modules can be dropped entirely.</p>
+</details>
+
+<details class="qa">
+  <summary>2. Explain the dual-package hazard and how you'd mitigate it as a library author.</summary>
+  <p>If I publish both CJS and ESM builds behind an exports map, one Node process can load <em>both</em> — my app <code>import</code>s the ESM file while a CJS dependency <code>require</code>s the CJS file. Node treats them as two distinct modules, so any module-level state is duplicated: singletons split, <code>instanceof</code> fails across the boundary, React context/hooks break ("Invalid hook call" is often this in disguise). Mitigations: (1) go ESM-only if my consumer base allows it — the hazard vanishes with a single format; (2) make one format a thin wrapper that re-exports the other, so there's a single stateful instance (feasible now that modern Node can <code>require()</code> ESM); (3) isolate mutable state in one small CJS file both entry points share. I'd also document that peer-style singletons (my lib's context objects) must not be nested by consumers.</p>
+</details>
+
+<details class="qa">
+  <summary>3. Walk me through a modern package.json "exports" map — what does each condition do, and what changed vs main/module?</summary>
+  <p><code>"exports"</code> is an explicit map from every importable subpath to files, resolved per-condition: <code>"import"</code> for ESM consumers, <code>"require"</code> for CJS, <code>"types"</code> for TypeScript (must come first — first matching condition wins), <code>"browser"</code>/<code>"node"</code> for environment forks, <code>"default"</code> as the last-resort fallback. Versus the old world: <code>"main"</code> was a single CJS entry, <code>"module"</code> was an unofficial bundler-only ESM hint, and any file in the package was deep-importable. Exports gives (1) per-consumer-type resolution that Node itself honors, (2) encapsulation — unlisted paths throw <code>ERR_PACKAGE_PATH_NOT_EXPORTED</code>, making the public API real, and (3) subpath and condition granularity (e.g. a <code>react-server</code> condition). Consumer-side, TypeScript only respects exports maps under <code>moduleResolution: "bundler"</code>/<code>"node16"</code> — stale "node10" resolution is the usual cause of "types not found" for modern packages.</p>
+</details>
+
+<details class="qa">
+  <summary>4. What does <code>"sideEffects": false</code> actually declare, and what's the classic bug it causes?</summary>
+  <p>It's a package-level promise to bundlers: "importing any module here has no observable effects beyond providing exports — if no exports are used, skip evaluating the module entirely." That enables whole-module pruning, far stronger than statement-level DCE. The classic bug: a component library whose modules do <code>import './styles.css'</code> — that import <em>is</em> a side effect (it injects styles), so with <code>sideEffects: false</code> the consumer's production build tree-shakes the CSS away. Symptoms are sneaky: styles present in dev (no shaking), missing in prod. Fix: allowlist — <code>"sideEffects": ["*.css", "./src/polyfill.js"]</code>. Same class of bug for polyfills, <code>customElements.define</code> calls, and global registrations.</p>
+</details>
+
+<details class="qa">
+  <summary>5. Why is Vite's dev server so much faster than webpack-dev-server? Be mechanical.</summary>
+  <p>Two inverted decisions. First, <strong>no eager bundling</strong>: webpack builds the full module graph into a bundle before serving anything, so cold start scales with app size. Vite serves source files as native ESM, transformed on demand — the browser's module loader drives graph traversal, and cold-start cost is proportional to what the first page imports. Second, <strong>native-speed transforms</strong>: TS/JSX go through esbuild (Go, parallel) rather than JS-based loaders — an order-of-magnitude-plus difference. The load-bearing enabler is <strong>dependency pre-bundling</strong>: esbuild bundles each npm dep once into <code>.vite/deps</code>, which converts CJS to ESM (browsers can't load CJS) and collapses per-dependency waterfalls (lodash-es's 600 internal modules become one cached request). HMR is similarly bounded: invalidate one module, push over WebSocket, re-fetch just that module — no rebundle. The honest caveat: esbuild strips types without checking them, so <code>tsc --noEmit</code> must run in CI, and prod uses a different engine (Rollup), which is the dev/prod-parity criticism Rolldown targets.</p>
+</details>
+
+<details class="qa">
+  <summary>6. Your production bundle doubled since last month. Walk me through finding the cause.</summary>
+  <p>First, <strong>bisect the timeline</strong>: CI bundle-size history or <code>git bisect</code> with a build+measure script narrows it to a PR range. In parallel, <strong>diff the treemaps</strong>: run the analyzer (rollup-plugin-visualizer / webpack-bundle-analyzer) against current and last-month builds; the delta usually names the culprit in minutes — a new heavyweight dep, duplicated versions of one lib (check <code>npm ls &lt;pkg&gt;</code> and the lockfile diff), a barrel import pulling a whole library, moment-style locale/data payloads, or accidentally bundling a peer (externals config lost). Then classify the mechanism: <em>new code</em> (product decision — maybe fine, maybe split it behind <code>import()</code>), <em>duplication</em> (dedupe/resolutions/alias), <em>failed tree shaking</em> (CJS dep or sideEffects regression), or <em>config regression</em> (mode not production, minify off, sourcemaps inlined). Fix at the cheapest layer, and finish by adding a size budget (size-limit in CI) so the next regression is a red PR check, not a quarterly surprise.</p>
+</details>
+
+<details class="qa">
+  <summary>7. What's the difference between a webpack loader and a plugin?</summary>
+  <p>Loaders are <strong>per-module transforms</strong>: functions in <code>module.rules</code> that take one file's content and return JavaScript (or input for the next loader in the chain, applied right-to-left) — <code>ts-loader</code>, <code>css-loader</code>. Their scope is a single module in the graph-building phase. Plugins hook the <strong>compiler lifecycle</strong> via the tapable event system and can observe or mutate anything: the whole compilation, chunk graph, and emitted assets. <code>HtmlWebpackPlugin</code> emits a new asset; <code>MiniCssExtractPlugin</code> moves CSS out of JS into files (note it needs both a plugin and a loader — the loader intercepts modules, the plugin assembles assets); <code>DefinePlugin</code> rewrites source constants build-wide. Rule of thumb: transform one file → loader; need whole-build awareness or new assets → plugin.</p>
+</details>
+
+<details class="qa">
+  <summary>8. How does dynamic import() interact with the bundler, and when would you not use it?</summary>
+  <p>Every bundler treats <code>import()</code> as a <strong>split point</strong>: the target module and its exclusive dependency subgraph become a separate chunk, emitted with a content hash and loaded by the runtime (script injection + a promise for the namespace, plus that chunk's CSS first). Templated specifiers (<code>import(`./locales/${l}.js`)</code>) are handled by globbing candidates at build time — one chunk each. When <em>not</em> to: code needed for first paint (splitting it adds a request-waterfall hop and hurts LCP); tiny modules where per-chunk overhead exceeds savings; and inside hot paths where the async boundary complicates state (a modal's animation stuttering while its chunk loads — mitigate with prefetch-on-hover). Also remember each split point is a new failure mode: chunk-load errors after a deploy (old HTML referencing purged hashed chunks) need a retry/reload strategy.</p>
+</details>
+
+<details class="qa">
+  <summary>9. Single vendor chunk vs granular per-package chunks — argue both sides.</summary>
+  <p>The real question is <strong>cache stability under change</strong>, since contenthashed files are immutable-cached. Single vendor chunk: fewest requests, simplest mental model, best compression per byte — but bumping <em>any</em> dependency changes the hash and re-downloads the entire vendor payload for every returning user; in a weekly-deploy app your "stable" chunk is never stable. Granular (Next.js-style per-package chunks above a size threshold): a patch to one lib invalidates one small chunk; the React framework chunk survives for months — much better returning-user economics. Costs: dozens of requests (fine under HTTP/2 multiplexing but worse compression per response), a more complex graph, and possible over-fragmentation into sub-KB files. My default: three change-frequency bands — framework (glacial), vendor (monthly), app (daily) — plus a split runtime chunk; go granular when analytics show heavy repeat visits, keep it coarse for campaign-traffic sites where every visit is effectively cold.</p>
+</details>
+
+<details class="qa">
+  <summary>10. What is React Fast Refresh actually doing on top of HMR, and what causes a full state reset?</summary>
+  <p>Base HMR is a protocol: the dev server pushes changed modules, and the update propagates up the import graph until a module that called <code>import.meta.hot.accept()</code> (or webpack's <code>module.hot.accept</code>) handles it; no acceptor → full reload. Fast Refresh is React's policy layered on that: the babel/SWC plugin registers every component, and modules whose exports are <em>all</em> components are made self-accepting. On update, React swaps the component's implementation on the existing fiber and re-renders — hook state survives because the fiber and its positional hook list are preserved. Resets happen when identity or hook shape can't be preserved: the file exports non-components alongside components (module can't self-accept; update escalates), components are anonymous/unnameable, or the edit changed the hooks' order/count (Refresh deliberately resets to avoid corrupt state). This is the mechanical reason for the "one component per file, components-only exports" convention.</p>
+</details>
+
+<details class="qa">
+  <summary>11. Explain the barrels problem and how you'd fix it in a large codebase.</summary>
+  <p>A barrel (<code>index.ts</code> re-exporting a directory) makes every consumer import pull the <em>entire</em> re-export graph into the module graph. Tree shaking should prune it, but fails whenever anything in the graph is CJS, side-effectful, or unflagged by <code>sideEffects</code> — and even when prod shaking works, dev servers must transform every barrel-reachable module to serve one import, so dev is slow regardless. Diagnosis: analyzer treemap plus "why is this module included" traces; in Vite, watching hundreds of requests for one page. Fixes, in order of leverage: (1) codemod consumers to direct file imports (eslint <code>no-restricted-imports</code> on the barrel path to hold the line); (2) for third-party barrels, use per-module entry points (<code>lodash-es</code>, <code>date-fns/format</code>) or the framework's rewriter (Next's <code>optimizePackageImports</code>); (3) if a public barrel must exist (a library entry), ensure the package is pure ESM with <code>sideEffects</code> correctly declared so shaking actually can prune. I'd sell the change with before/after numbers from the analyzer, not ideology.</p>
+</details>
+
+<details class="qa">
+  <summary>12. What does <code>npm ci</code> guarantee that <code>npm install</code> doesn't, and why does it matter in CI?</summary>
+  <p><code>npm ci</code> is a pure function of the lockfile: it removes node_modules, installs <em>exactly</em> the locked resolutions (verifying each integrity hash), fails hard if package.json and the lockfile disagree, and never mutates the lockfile. <code>npm install</code> may re-resolve ranges (new transitive releases within semver), write the lockfile, and thus produce different trees on different days from identical commits. In CI that difference is everything: with <code>install</code>, a dependency's Tuesday patch release can break Wednesday's build of an untouched branch — the "no commits, build broke" mystery — and your deploy artifact stops being reproducible from the git SHA. It's also a supply-chain control: integrity hashes in the lockfile mean a tampered registry response fails the install. Rule: humans run <code>install</code> to change deps; machines run <code>ci</code>.</p>
+</details>
+
+<details class="qa">
+  <summary>13. Why is react a peerDependency of component libraries rather than a dependency?</summary>
+  <p>Because React must be a <strong>singleton per app</strong>: hooks and context rely on module-level state (the current dispatcher, context registry), so two React instances in one tree produce "Invalid hook call" and context values that mysteriously don't cross library boundaries. If my library listed react as a regular dependency, a version mismatch with the host could nest a second copy under my package. <code>peerDependencies: { "react": "&gt;=18" }</code> inverts ownership: the host app provides React, I declare the compatible range, and package managers install/validate accordingly (npm 7+ auto-installs peers; pnpm is stricter about conflicts). Two companion moves: keep react in my <code>devDependencies</code> for local dev/tests, and mark it <code>external</code> in the build config so it's never bundled into my dist. The same logic applies to any lib whose value is shared state: react-dom, react-router, styled-components, form-context libraries.</p>
+</details>
+
+<details class="qa">
+  <summary>14. How does Turborepo (or Nx) caching work, and how can it serve a stale result?</summary>
+  <p>Each task run is keyed by a hash of its declared <strong>inputs</strong>: relevant source files, the task definition, listed env vars, and the hashes of upstream package tasks (via <code>dependsOn: ["^build"]</code>). On execution, declared <strong>outputs</strong> (files + terminal logs) are stored under that key; on a later run with an identical hash, the tool skips execution and <em>replays</em> — restores output files, reprints logs. Remote caching shares this store across CI runners and developer machines, so CI's build is your laptop's cache hit. Staleness happens exactly when reality diverges from declaration: an env var the build reads but isn't listed in the task's env inputs; a file consumed outside declared <code>inputs</code> (reading from repo root, a generated file); non-hermetic steps (network fetches, timestamps); or outputs written outside declared <code>outputs</code> (so replay restores an incomplete set). The tell is "fails normally, passes with <code>--force</code>" — the fix is always to make the undeclared input declared, not to force-run in CI.</p>
+</details>
+
+<details class="qa">
+  <summary>15. What is dependency pre-bundling in Vite and why is it necessary?</summary>
+  <p>On first dev-server run (and whenever the lockfile changes), Vite scans source for bare imports and uses esbuild to bundle each dependency into single ESM files under <code>node_modules/.vite/deps</code>, served with strong cache headers. Two reasons it's not optional: (1) <strong>format</strong> — the browser only loads ESM, and a large share of npm is still CJS/UMD; pre-bundling converts them and applies the interop shims (named-export detection over CJS) once, up front; (2) <strong>waterfalls</strong> — a well-factored ESM package like lodash-es is hundreds of internal modules; served raw, that's hundreds of sequential-discovery requests for one import, so pre-bundling collapses each dep to one fetch. Practical corollaries: deps are optimized, <em>your source isn't</em>; discovering a new dep mid-session triggers re-optimization (a full-reload hiccup); and mismatched dep state causes the classic "outdated optimize dep" errors solved by <code>vite --force</code>. Linked monorepo packages are excluded by default so they stay hot-reloadable.</p>
+</details>
+
+<details class="qa">
+  <summary>16. What breaks when migrating a legacy webpack app to Vite?</summary>
+  <p>The predictable list: (1) <strong>webpack-only APIs</strong> — <code>require.context()</code> → <code>import.meta.glob()</code>; <code>module.hot</code> → <code>import.meta.hot</code>. (2) <strong>Env vars</strong> — <code>process.env.REACT_APP_X</code> doesn't exist in the browser; migrate to <code>import.meta.env.VITE_X</code>, optionally shimming via <code>define</code> during transition. (3) <strong>Workers</strong> — <code>worker-loader</code> imports → standard <code>new Worker(new URL(...), { type: 'module' })</code>. (4) <strong>Stray CJS in app source</strong> — old files using <code>require()</code>/<code>module.exports</code> break under native-ESM dev. (5) <strong>Loader chains</strong> — SVGR, raw/inline imports, sass options → Vite plugins and <code>?raw</code>/<code>?url</code> suffixes. (6) <strong>Structure</strong> — index.html becomes the root entry; publicPath → <code>base</code>; aliases re-declared in <code>resolve.alias</code>. (7) Node-globals assumptions (<code>Buffer</code>, <code>process</code>) that webpack 4 auto-polyfilled. Strategy: run both builds in parallel, migrate behind a branch with a dev/prod parity smoke suite and a bundle-size diff, and don't delete the webpack config until Vite prod has shipped for a full release cycle.</p>
+</details>
+
+<details class="qa">
+  <summary>17. What are source maps mechanically, and what's your production policy for them?</summary>
+  <p>A source map is JSON alongside a generated file: <code>sources</code> (original files, optionally embedded via <code>sourcesContent</code>), <code>names</code>, and <code>mappings</code> — Base64-VLQ segments mapping generated line/column → original file/line/column/name. The generated file opts in via <code>//# sourceMappingURL=</code>. DevTools use them live; error trackers use uploaded maps to symbolicate minified stack traces. Production policy: <strong>hidden source maps</strong> — generate them (<code>build.sourcemap: 'hidden'</code> in Vite, <code>devtool: 'hidden-source-map'</code> in webpack), upload to Sentry/Datadog keyed by release during CI, and exclude them from the deployed artifact. That gets readable prod stack traces without publishing your source (public maps expose comments, internal URLs, and occasionally secrets inlined by define/env substitution). Dev policy: fast, cheap variants — rebuild speed matters more than column-perfect mapping.</p>
+</details>
+
+<details class="qa">
+  <summary>18. ESM-only vs dual publishing for a new library in 2026 — what would you ship?</summary>
+  <p>Default: <strong>ESM-only</strong>, unless the consumer analysis says otherwise. The blockers have fallen: modern Node can <code>require()</code> ESM (synchronous graphs), all bundlers consume ESM natively, and the ecosystem's biggest packages have led the migration — while dual publishing carries permanent costs: two artifacts, the dual-package hazard for any stateful lib, and per-format types subtleties (the arethetypeswrong class of bugs). I'd still choose dual if the audience demands it: enterprise consumers pinned on old Node LTS, Jest-without-ESM-config shops, or a library commonly required from CJS server code. If dual, the discipline is: exports map with <code>types</code>-per-condition, both builds from one source via tsup/Rollup, state isolated so the hazard can't bite, and <code>attw</code> + <code>publint</code> in CI to catch packaging errors before consumers do. Either way: <code>files: ["dist"]</code>, <code>prepublishOnly</code> build+test, provenance on.</p>
+</details>
+
+<details class="qa">
+  <summary>19. What are phantom dependencies, and how does pnpm prevent them?</summary>
+  <p>A phantom dependency is a package your code imports but never declares — it works because npm/yarn's <em>hoisting</em> flattens transitive deps into the root node_modules where Node's resolution finds them. The failure is deferred and out of your control: the intermediate dependency drops or bumps that transitive package, and your build breaks with no change in your repo — or worse, prod resolves a different version than dev. pnpm's layout makes this structurally impossible: packages live once in a global content-addressable store; a project's node_modules contains symlinks <em>only for declared dependencies</em>, with each package's own deps nested in a hidden <code>.pnpm</code> virtual store. Undeclared imports fail immediately at dev time — the latent bug becomes a loud one. Bonus effects worth naming: massive disk/install savings via hard links, and stricter-by-default workspaces. Interop caveat: some legacy tools assume a flat layout, which is what pnpm's <code>shamefully-hoist</code> escape hatch exists for.</p>
+</details>
+
+<details class="qa">
+  <summary>20. When would you *not* recommend a monorepo?</summary>
+  <p>When the repo would contain <strong>coupling without cohesion</strong>: genuinely unrelated products, separate release cadences and on-call rotations, little shared code — you inherit shared CI queues, shared tooling upgrades, and shared breakage for zero atomic-change benefit. When the org won't fund the platform discipline: monorepo CI without remote caching and affected-only execution scales cost linearly with repo size, and someone must own turbo/Nx config, boundary rules, and dependency policy — absent that owner, it decays into a slow polyrepo with extra steps. When external constraints bite: open-sourcing one component from a private monorepo, vendor/partner access to a single project, or compliance boundaries requiring repo-level isolation. And when the driver is fashion: if the actual problem is "publishing shared UI is annoying," weigh lighter fixes (a single shared-packages monorepo consumed by polyrepo apps) before moving everything. My framing: monorepo is a tooling investment that pays off in shared-code density; measure that density first.</p>
+</details>
+</section>
+
+<!-- ============================================================ -->
+<section>
+<h2 id="exercises">Hands-on exercises</h2>
+
+<div class="exercise">
+  <h3>Exercise 1 — Analyze a real bundle</h3>
+  <p><strong>Setup:</strong> take any real Vite React app you own (or scaffold one and add <code>moment</code>, <code>lodash</code>, and a chart library to make it interesting).</p>
+  <ol>
+    <li>Add the analyzer: <code>npm i -D rollup-plugin-visualizer</code>, then in <code>vite.config.ts</code> plugins: <code>visualizer({ gzipSize: true, brotliSize: true, open: true })</code>. Run <code>vite build</code>.</li>
+    <li>Answer from the treemap: What are the top 5 modules by gzip size? What fraction is your code vs node_modules? Is any package present <em>twice</em> (two versions)?</li>
+    <li>Pick the single largest dependency and trace <em>why</em> it's included: find the import chain from an entry to it. Is it statically imported where a dynamic <code>import()</code> would do?</li>
+    <li>Apply one fix (dynamic-import a route/chart, replace moment, dedupe a duplicate) and record the before/after gzip total.</li>
+    <li>Add <code>size-limit</code> with a budget 5% above your new total and wire it as an npm script — the regression guard is part of the exercise.</li>
+  </ol>
+  <p><strong>Done when:</strong> you can narrate the §3.4 debugging loop over <em>your</em> app with real numbers — that narration is directly reusable in interviews.</p>
+</div>
+
+<div class="exercise">
+  <h3>Exercise 2 — Break tree shaking, then fix it</h3>
+  <p><strong>Setup:</strong> create a tiny Vite lib-consumer pair: <code>src/utils/</code> with 5 modules (one importing a heavy dep like <code>chart.js</code>), plus <code>src/utils/index.ts</code> barrel re-exporting all of them. In <code>main.ts</code>, import one light util from the barrel.</p>
+  <ol>
+    <li>Build and check output size. Now sabotage: add a top-level side effect to the heavy module (<code>console.log('loaded')</code> at module scope) and rebuild. Explain the size change.</li>
+    <li>Sabotage #2: convert one util to CJS (<code>module.exports</code>) and import it through the barrel. Observe and explain what the bundle keeps.</li>
+    <li>Sabotage #3: in <code>main.ts</code>, do <code>import * as utils from './utils'</code> and access <code>utils[name]()</code> with a runtime string. Verify all exports are retained.</li>
+    <li>Fix each in turn: remove/annotate the side effect (<code>/*#__PURE__*/</code> where applicable), restore ESM, restore static named imports, and finally replace the barrel import with a direct file import. Measure at each step.</li>
+  </ol>
+  <p><strong>Done when:</strong> you have a table of bundle size per sabotage/fix and can state, for each, <em>which analysis guarantee</em> was broken (side-effect provability, static exports, static usage).</p>
+</div>
+
+<div class="exercise">
+  <h3>Exercise 3 — Write a correct exports map for a dual-format library</h3>
+  <p><strong>Scenario:</strong> you maintain <code>@acme/dates</code>, TypeScript source in <code>src/index.ts</code> and <code>src/tz.ts</code>, plus <code>src/styles.css</code> for an included picker component. It must serve: modern bundler users (ESM + types), legacy Node CJS consumers, and it must keep <code>./tz</code> as a separate subpath so timezone data isn't pulled in by default.</p>
+  <ol>
+    <li>Set up a tsup (or Rollup) build emitting <code>dist/index.js</code>+<code>.cjs</code>, <code>dist/tz.js</code>+<code>.cjs</code>, and both <code>.d.ts</code>/<code>.d.cts</code> declaration sets.</li>
+    <li>Write the package.json: <code>"type"</code>, full <code>"exports"</code> with <code>types/import/require</code> per subpath (types first!), the CSS subpath, <code>"./package.json"</code>, correct <code>"sideEffects"</code> (careful — there's a CSS file), <code>"files"</code>, legacy <code>"main"</code>/<code>"module"</code> fallbacks, and react as a peer if the picker needs it.</li>
+    <li>Validate with <code>npx publint</code> and <code>npx @arethetypeswrong/cli --pack</code> — fix every finding and write one sentence per finding explaining the failure mode it would have caused for a consumer.</li>
+    <li>Prove encapsulation: in a scratch consumer, confirm <code>import '@acme/dates/dist/internal-helpers'</code> fails while <code>@acme/dates/tz</code> resolves in both a <code>require</code> and an <code>import</code> context.</li>
+  </ol>
+  <p><strong>Done when:</strong> both checkers pass clean and you can explain why <code>"types"</code> ordering and the CSS <code>sideEffects</code> entry are load-bearing.</p>
+</div>
+
+<div class="exercise">
+  <h3>Exercise 4 — Monorepo task graph with a cache-poisoning bug</h3>
+  <p><strong>Setup:</strong> pnpm workspace with <code>packages/ui</code> (built lib), <code>apps/web</code> (Vite app depending on <code>@acme/ui</code> via <code>workspace:*</code>), Turborepo with <code>build</code> (<code>dependsOn: ["^build"]</code>) and <code>test</code>.</p>
+  <ol>
+    <li>Verify orchestration: change a file in <code>ui</code>, run <code>turbo run build</code>, confirm ui rebuilds then web rebuilds; run again, confirm both are <code>FULL TURBO</code> cache hits.</li>
+    <li>Plant the bug: make <code>ui</code>'s build read an env var (<code>THEME=dark</code> baked into output) <em>without</em> declaring it in turbo.json's <code>env</code>. Build with <code>THEME=dark</code>, then build with <code>THEME=light</code> — observe the stale cache hit serving dark output.</li>
+    <li>Fix it by declaring the env input; verify the hash now changes with the variable. Then repeat the class of bug with an undeclared <em>file</em> input (build reads a root-level <code>brand.json</code> outside <code>inputs</code>) and fix that too.</li>
+    <li>Stretch: enable remote caching (Vercel or a self-hosted cache), run CI-then-local, and confirm the local run replays CI's outputs. Add an eslint <code>no-restricted-imports</code> rule forbidding <code>apps/web</code> from importing <code>@acme/ui/src/*</code> internals.</li>
+  </ol>
+  <p><strong>Done when:</strong> you can explain "inputs hash → replay outputs" from experience, and you've personally caused and cured a stale-cache incident — the exact story interviewers ask for.</p>
+</div>
+</section>
+
+<nav class="page-nav">
+  <a href="15-micro-frontends.html">← Prev: Micro-Frontends</a>
+  <a href="17-web-performance-cwv.html">Next: Web Performance &amp; CWV →</a>
+</nav>
+
+</main>
+</body>
+</html>

@@ -1,0 +1,1500 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>09 — React Performance &amp; Optimization | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <div class="breadcrumb"><a href="index.html">← Course Home</a></div>
+    <h1>09 — React Performance &amp; Optimization</h1>
+    <p>The systematic answer to "how do you optimize a slow React app?" — measure first, classify the problem, apply the matching fix, verify with numbers.</p>
+  </div>
+</header>
+
+<main class="container">
+
+<!-- ============================================================ -->
+<!-- WHY INTERVIEWERS ASK THIS                                    -->
+<!-- ============================================================ -->
+<section>
+  <h2 id="why">Why interviewers ask this</h2>
+  <p>
+    "How would you optimize a slow React app?" is a guaranteed question at the senior level, and it is
+    graded on <strong>process, not vocabulary</strong>. A mid-level candidate answers with a bag of tricks:
+    "memo, useMemo, useCallback, code splitting, virtualization." A senior candidate answers with a
+    <strong>runbook</strong>: reproduce the problem, <em>measure</em> it, classify it (startup cost vs.
+    interaction cost vs. re-render storm), apply the fix that matches the classification, verify the fix
+    with numbers, and then put a guardrail in place so it doesn't regress.
+  </p>
+  <p>
+    The single most important signal you can send is <strong>"I measure before I optimize."</strong>
+    Interviewers have all watched engineers sprinkle <code>React.memo</code> across a codebase and make it
+    slower and harder to read. If your first sentence is "I'd open the React DevTools Profiler and record
+    the slow interaction," you're already ahead of most candidates. The second most important signal is
+    knowing the <strong>trade-offs</strong>: memoization has a cost, virtualization breaks Ctrl+F and
+    accessibility if done carelessly, code splitting adds loading states you must design for.
+  </p>
+  <div class="senior">
+    <strong>The graded skill:</strong> this tutorial builds a rehearsable narrative — a diagnostic tree you
+    can walk through out loud in 3–4 minutes, with one worked story containing real-looking before/after
+    numbers. Interviewers remember stories with numbers; they forget lists of APIs.
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<!-- TOC                                                          -->
+<!-- ============================================================ -->
+<div class="toc">
+  <strong>On this page</strong>
+  <ul>
+    <li><a href="#mental-model">1. The performance mental model</a></li>
+    <li><a href="#measuring">2. Measure first: profiling tools</a></li>
+    <li><a href="#rerenders">3. Re-render control: memo, useMemo, useCallback</a></li>
+    <li><a href="#composition">4. Composition as free memoization</a></li>
+    <li><a href="#context-perf">5. The Context re-render problem</a></li>
+    <li><a href="#expensive">6. Expensive computation &amp; the main thread</a></li>
+    <li><a href="#virtualization">7. List virtualization</a></li>
+    <li><a href="#code-splitting">8. Code splitting &amp; lazy loading</a></li>
+    <li><a href="#assets">9. Asset-level concerns</a></li>
+    <li><a href="#state-perf">10. State management performance</a></li>
+    <li><a href="#forms-perf">11. Forms performance</a></li>
+    <li><a href="#runbook">12. The interview runbook</a></li>
+    <li><a href="#micro">13. Micro-topics &amp; concurrent features</a></li>
+    <li><a href="#qa">Interview Q&amp;A</a></li>
+    <li><a href="#exercises">Hands-on exercises</a></li>
+  </ul>
+</div>
+
+<!-- ============================================================ -->
+<!-- 1. MENTAL MODEL                                              -->
+<!-- ============================================================ -->
+<section>
+  <h2 id="mental-model">1. The performance mental model <span class="tier-1">Tier 1</span></h2>
+  <p>
+    Before any technique, get the model right, because interviewers probe it directly:
+    <strong>re-renders are usually cheap.</strong> A render is just calling your component functions and
+    diffing the resulting element trees. React was designed so that re-rendering is the default, normal
+    thing that happens. The goal of optimization is <em>not zero re-renders</em> — it is avoiding
+    <strong>expensive</strong> renders (large subtrees, heavy computation inside render) and
+    <strong>long tasks</strong> that block the main thread past a frame budget.
+  </p>
+  <p>Two distinct budgets, and every performance problem falls into one of them:</p>
+  <table>
+    <thead>
+      <tr><th>Budget</th><th>What it covers</th><th>Key metrics</th><th>Typical fixes</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Startup</strong></td>
+        <td>Getting the app on screen: download, parse, execute, first render, hydration</td>
+        <td>Bundle size, LCP, TTI/TBT, hydration cost</td>
+        <td>Code splitting, tree shaking, asset optimization, SSR/RSC, lazy hydration</td>
+      </tr>
+      <tr>
+        <td><strong>Interaction</strong></td>
+        <td>Responding to input: typing, clicking, scrolling</td>
+        <td>INP (Interaction to Next Paint), commit durations in the Profiler, long tasks &gt; 50ms</td>
+        <td>Re-render control, virtualization, deferring/debouncing, moving work off the main thread</td>
+      </tr>
+    </tbody>
+  </table>
+  <p>
+    The frame budget is roughly <strong>16ms at 60fps</strong> (~8ms at 120Hz). The browser considers any
+    task over <strong>50ms</strong> a "long task" — that's the threshold where an interaction starts to
+    feel laggy, and it's what INP punishes. A React commit that takes 200ms means the user's keystroke
+    took 200ms+ to paint. That's the enemy — not the fact that 40 components re-rendered in 3ms.
+  </p>
+  <pre><code>// The render pipeline, and where cost lives:
+//
+//   event → state update → RENDER PHASE → COMMIT PHASE → browser layout/paint
+//
+// Render phase (interruptible in concurrent React):
+//   - call component functions, build new element tree, diff ("reconciliation")
+//   - cost ∝ number of components rendered × work inside each
+//
+// Commit phase (synchronous, cannot be interrupted):
+//   - apply DOM mutations, run layout effects
+//   - cost ∝ number of DOM mutations
+//
+// Browser work after commit:
+//   - style recalc, layout, paint, composite
+//   - cost ∝ number of DOM nodes affected → why 10k-row tables hurt
+//     even when React itself is fast</code></pre>
+  <div class="pitfall">
+    <strong>Pitfall:</strong> equating "component re-rendered" with "DOM updated." If a component
+    re-renders and produces the same elements, React diffs them and touches <em>nothing</em> in the DOM.
+    Unnecessary re-renders waste CPU in the render phase, which only matters at scale. Saying "every
+    re-render repaints the DOM" in an interview is a red flag.
+  </div>
+  <div class="senior">
+    <strong>Senior framing:</strong> "I optimize the <em>expensive</em> path, not every path. First I find
+    out whether we're paying at startup or at interaction time, because the fixes barely overlap. And I
+    never optimize without a profile — my intuition about what's slow has been wrong too many times."
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<!-- 2. MEASURING                                                 -->
+<!-- ============================================================ -->
+<section>
+  <h2 id="measuring">2. Measure first: profiling tools <span class="tier-1">Tier 1</span></h2>
+  <p>
+    The measure-first doctrine needs concrete tools attached to it, or it sounds like a platitude.
+    Know these four and what each tells you:
+  </p>
+
+  <h3>2.1 React DevTools Profiler</h3>
+  <p>
+    The primary tool for render-phase problems. Record while performing the slow interaction, then read
+    the <strong>flamegraph</strong>: each bar is a component, width ∝ render time, colored bars rendered
+    in this commit, gray bars did not. The <strong>commit timeline</strong> at the top shows every commit
+    in the recording with its duration — a "re-render storm" looks like dozens of commits per keystroke,
+    or single commits that are hundreds of milliseconds wide.
+  </p>
+  <p>
+    Enable <em>"Record why each component rendered while profiling"</em> in the profiler settings. Then
+    clicking any component tells you: props changed (and which ones), state changed (which hook), parent
+    rendered, or context changed. This one checkbox answers 80% of "why is this re-rendering?" questions.
+  </p>
+  <div class="note">
+    <strong>Note:</strong> the Profiler measures <em>React's</em> work. A commit can be 5ms while the
+    browser then spends 300ms in layout because you mutated 10,000 DOM nodes. If the flamegraph looks
+    fine but the app still janks, the problem is downstream of React — go to the Chrome Performance panel.
+  </div>
+
+  <h3>2.2 The <code>&lt;Profiler&gt;</code> API (programmatic)</h3>
+  <p>
+    For measuring in code — CI perf tests, production sampling, or logging while you iterate:
+  </p>
+  <pre><code>import { Profiler } from 'react';
+
+function onRender(id, phase, actualDuration, baseDuration, startTime, commitTime) {
+  // id:             the "id" prop of the Profiler tree that committed
+  // phase:          "mount" | "update" | "nested-update"
+  // actualDuration: time spent rendering this commit (with memoization applied)
+  // baseDuration:   estimated time to re-render the ENTIRE subtree without memoization
+  //                 → actualDuration much smaller than baseDuration = memoization is working
+  if (actualDuration &gt; 16) {
+    reportToAnalytics({ id, phase, actualDuration });
+  }
+}
+
+&lt;Profiler id="ProductTable" onRender={onRender}&gt;
+  &lt;ProductTable rows={rows} /&gt;
+&lt;/Profiler&gt;</code></pre>
+  <p>
+    The <code>actualDuration</code> vs <code>baseDuration</code> comparison is the interview gem: it
+    quantifies how much your memoization is actually saving. If they're nearly equal, your
+    <code>memo</code> calls aren't bailing anything out.
+  </p>
+
+  <h3>2.3 Chrome Performance panel</h3>
+  <p>
+    For everything outside React: long tasks (red-flagged blocks &gt; 50ms), layout/style recalculation
+    cost, paint cost, script parse/eval at startup, and third-party script cost. Use the
+    <strong>Interactions</strong> track (Chrome's INP tooling) to trace a specific click/keystroke from
+    input event to next paint. Always profile with <strong>4–6× CPU throttling</strong> — your M-series
+    laptop hides problems that every mid-range Android phone will surface.
+  </p>
+
+  <h3>2.4 Field data (RUM)</h3>
+  <p>
+    Lab profiles reproduce; field data prioritizes. <code>web-vitals</code> reporting INP/LCP/CLS from
+    real users tells you which pages and interactions are actually slow at p75, so you profile the right
+    thing.
+  </p>
+  <pre><code>import { onINP, onLCP, onCLS } from 'web-vitals';
+
+onINP((metric) =&gt; sendToAnalytics('INP', metric.value, metric.attribution));
+onLCP((metric) =&gt; sendToAnalytics('LCP', metric.value));
+onCLS((metric) =&gt; sendToAnalytics('CLS', metric.value));
+// Targets at p75: INP &lt; 200ms, LCP &lt; 2.5s, CLS &lt; 0.1</code></pre>
+  <div class="senior">
+    <strong>Senior framing:</strong> "React DevTools Profiler for render cost and 'why did this render',
+    Chrome Performance panel for main-thread and browser-side cost, the Profiler API when I need numbers
+    in CI, and RUM to decide what's worth profiling in the first place."
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<!-- 3. RE-RENDER CONTROL                                         -->
+<!-- ============================================================ -->
+<section>
+  <h2 id="rerenders">3. Re-render control: memo, useMemo, useCallback <span class="tier-1">Tier 1</span></h2>
+
+  <h3>3.1 Why children cascade (30-second recap)</h3>
+  <p>
+    When a component's state updates, React re-renders it <strong>and, by default, its entire subtree</strong> —
+    every child it returns, regardless of whether their props changed. React doesn't do a props diff before
+    rendering a child; rendering <em>is</em> how it finds out what changed. Props changing is not the trigger
+    for a re-render — the parent rendering is. This default is fine (renders are cheap) until one of those
+    children is a 5,000-row table.
+  </p>
+
+  <h3>3.2 <code>React.memo</code> — the bailout</h3>
+  <p>
+    <code>memo</code> wraps a component so that when its parent re-renders, React does a
+    <strong>shallow comparison</strong> of old props vs new props (<code>Object.is</code> per key) and
+    skips the render if all are equal.
+  </p>
+  <pre><code>const ProductRow = memo(function ProductRow({ product, onSelect }) {
+  return (
+    &lt;tr onClick={() =&gt; onSelect(product.id)}&gt;
+      &lt;td&gt;{product.name}&lt;/td&gt;
+      &lt;td&gt;{formatPrice(product.price)}&lt;/td&gt;
+    &lt;/tr&gt;
+  );
+});</code></pre>
+  <p><strong>When it pays:</strong> the wrapped subtree is expensive (many nodes or heavy work) <em>and</em>
+  its props are referentially stable across the parent's re-renders. Both conditions, or it's dead weight.</p>
+  <p><strong>When it's useless</strong> — the classic failure modes, all of which pass a new reference every render:</p>
+  <pre><code>// ALL THREE of these silently defeat memo — the comparison never passes:
+
+&lt;MemoRow
+  onSelect={(id) =&gt; select(id)}          // 1. new function identity every render
+  style={{ color: 'red' }}                // 2. new object literal every render
+&gt;
+  &lt;Icon /&gt;                                 {/* 3. children = new element object
+                                              every render — memo around a component
+                                              that receives JSX children rarely helps */}
+&lt;/MemoRow&gt;</code></pre>
+  <div class="pitfall">
+    <strong>Pitfall — the custom comparator:</strong> <code>memo(Component, arePropsEqual)</code> lets you
+    write your own comparison, and it's how people introduce the worst class of bug: the comparator returns
+    <code>true</code> ("equal, skip") when something the component reads actually changed, and the UI goes
+    <strong>stale</strong> — it silently shows old data. Deep-equality comparators are also a perf trap:
+    on large props they can cost more than the render they're skipping. Reach for a custom comparator last,
+    and never compare functions "by ignoring them."
+  </div>
+
+  <h3>3.3 <code>useMemo</code> / <code>useCallback</code> — referential stability</h3>
+  <p>
+    These hooks have <strong>two distinct jobs</strong>, and interviewers like candidates who separate them:
+  </p>
+  <ol>
+    <li><strong>Skip expensive recomputation</strong> (<code>useMemo</code> around a genuinely heavy calc — see §6).</li>
+    <li><strong>Preserve reference identity</strong> so that things downstream that compare by reference —
+      <code>memo</code>'d children, effect dependency arrays, context values — see "unchanged."</li>
+  </ol>
+  <p>Job 2 is why <code>memo</code> and <code>useCallback</code> are a <strong>pairing</strong>. One without the other is broken:</p>
+  <pre><code>// BROKEN pair #1: memo'd child, unstable callback → memo never bails out
+function Parent() {
+  const [query, setQuery] = useState('');
+  const handleSelect = (id) =&gt; setSelected(id);   // new identity every render
+  return &lt;MemoizedTable onSelect={handleSelect} /&gt;; // props "changed" every time
+}
+
+// BROKEN pair #2: stable callback, child not memo'd → useCallback saves nothing
+function Parent() {
+  const handleSelect = useCallback((id) =&gt; setSelected(id), []);
+  return &lt;Table onSelect={handleSelect} /&gt;;  // Table re-renders anyway:
+}                                              // its parent rendered, no memo to bail
+
+// WORKING pair: stability + a consumer of stability
+const Table = memo(TableImpl);
+function Parent() {
+  const handleSelect = useCallback((id) =&gt; setSelected(id), []);
+  const columns = useMemo(() =&gt; buildColumns(config), [config]);
+  return &lt;Table onSelect={handleSelect} columns={columns} /&gt;;
+}</code></pre>
+  <div class="note">
+    <strong>Note:</strong> <code>useCallback(fn, deps)</code> is literally <code>useMemo(() =&gt; fn, deps)</code>.
+    And stability chains: a <code>useMemo</code>'d object that includes an un-memoized function is still
+    unstable. Audit the whole chain of references feeding a memo'd component.
+  </div>
+
+  <h3>3.4 When memoization HURTS <span class="tier-1">Tier 1</span></h3>
+  <p>This is the senior differentiator. Memoization is not free:</p>
+  <ul>
+    <li><strong>Comparison cost:</strong> every parent render still runs the shallow compare on every
+      memo'd child. For cheap components that would have re-rendered in 0.05ms, you pay the compare
+      <em>and</em> usually the render anyway (because some prop did change).</li>
+    <li><strong>Memory:</strong> <code>useMemo</code>/<code>useCallback</code> retain the previous value
+      and deps array per hook per component instance. Thousands of instances × several hooks adds up.</li>
+    <li><strong>Complexity tax:</strong> dependency arrays are a maintenance liability — a missed dep is a
+      stale-closure bug, an over-broad dep silently defeats the memo. Wrapped code is harder to read.</li>
+    <li><strong>False confidence:</strong> teams that memoize everything stop profiling, and the actual
+      problem (one 300ms computation, one 10k-node list) hides behind a wall of green <code>memo</code>s.</li>
+  </ul>
+  <div class="senior">
+    <strong>Senior take on premature memoization culture:</strong> "Default to <em>not</em> memoizing.
+    Memoize at the boundaries the profiler points at — typically a handful of expensive subtrees like
+    tables, charts, and editors — and make the memo actually work by stabilizing exactly the props that
+    cross that boundary. A codebase where every component is wrapped in <code>memo</code> and every value
+    in <code>useMemo</code> is a codebase where nobody profiled."
+  </div>
+
+  <h3>3.5 The React Compiler changes this calculus</h3>
+  <p>
+    The React Compiler (stable as of React 19 era tooling) auto-memoizes components and values at build
+    time — it does, correctly and exhaustively, what hand-written <code>memo</code>/<code>useMemo</code>/<code>useCallback</code>
+    do partially and error-prone-ly. On compiler-enabled codebases, hand memoization becomes mostly
+    obsolete; your job shifts to keeping components compliant with the Rules of React so the compiler can
+    do its work. Everything else in this tutorial — virtualization, code splitting, context architecture,
+    main-thread management — the compiler does <em>not</em> solve. Full treatment in
+    <a href="10-react-18-19-latest.html">tutorial 10</a>.
+  </p>
+</section>
+
+<!-- ============================================================ -->
+<!-- 4. COMPOSITION                                               -->
+<!-- ============================================================ -->
+<section>
+  <h2 id="composition">4. Composition as free memoization <span class="tier-1">Tier 1</span></h2>
+  <p>
+    The most under-used optimization in React needs zero APIs: <strong>restructure the tree so the
+    frequently-updating state doesn't sit above the expensive subtree.</strong> Two moves, remember them
+    as a slogan: <strong>push state down, lift content up.</strong>
+  </p>
+
+  <h3>4.1 Worked example 1 — push state DOWN (state colocation)</h3>
+  <pre><code>// BEFORE: search text lives at the top → every keystroke re-renders
+// the whole page, including &lt;ExpensiveAnalyticsPanel /&gt; (80ms render)
+function Dashboard() {
+  const [search, setSearch] = useState('');
+  return (
+    &lt;&gt;
+      &lt;input value={search} onChange={e =&gt; setSearch(e.target.value)} /&gt;
+      &lt;SearchResults query={search} /&gt;
+      &lt;ExpensiveAnalyticsPanel /&gt;   {/* doesn't read search, pays anyway */}
+    &lt;/&gt;
+  );
+}
+
+// AFTER: move the state into the only subtree that needs it
+function Dashboard() {
+  return (
+    &lt;&gt;
+      &lt;SearchSection /&gt;              {/* state lives here now */}
+      &lt;ExpensiveAnalyticsPanel /&gt;   {/* never re-renders on keystrokes */}
+    &lt;/&gt;
+  );
+}
+
+function SearchSection() {
+  const [search, setSearch] = useState('');
+  return (
+    &lt;&gt;
+      &lt;input value={search} onChange={e =&gt; setSearch(e.target.value)} /&gt;
+      &lt;SearchResults query={search} /&gt;
+    &lt;/&gt;
+  );
+}</code></pre>
+
+  <h3>4.2 Worked example 2 — lift content UP (the children prop)</h3>
+  <p>
+    When the stateful component must <em>wrap</em> the expensive one (theming wrappers, scroll trackers,
+    resizable panes), pass the expensive part as <code>children</code>. The key mechanic:
+    <strong>the parent creates the children element, so when only the wrapper's own state changes, the
+    children prop is the <em>same element object</em> as last render — and React skips re-rendering it.</strong>
+  </p>
+  <pre><code>// BEFORE: scroll position updates re-render the heavy table on every scroll tick
+function ScrollTracker() {
+  const [scrollY, setScrollY] = useState(0);
+  // ...scroll listener sets scrollY...
+  return (
+    &lt;div className={scrollY &gt; 100 ? 'stuck' : ''}&gt;
+      &lt;HeavyTable rows={rows} /&gt;   {/* re-created and re-rendered per tick */}
+    &lt;/div&gt;
+  );
+}
+
+// AFTER: content lifted up — HeavyTable's element is created by App,
+// so ScrollTracker's re-renders reuse the identical children reference
+function ScrollTracker({ children }) {
+  const [scrollY, setScrollY] = useState(0);
+  return &lt;div className={scrollY &gt; 100 ? 'stuck' : ''}&gt;{children}&lt;/div&gt;;
+}
+
+function App() {
+  return (
+    &lt;ScrollTracker&gt;
+      &lt;HeavyTable rows={rows} /&gt;   {/* rendered only when App renders */}
+    &lt;/ScrollTracker&gt;
+  );
+}</code></pre>
+  <div class="senior">
+    <strong>Senior framing:</strong> "Before I reach for <code>memo</code>, I ask whether the state is
+    simply in the wrong place. Colocation and the children pattern eliminate whole classes of re-renders
+    structurally — no dependency arrays to maintain, no comparators to get wrong, and it usually improves
+    the component design too."
+  </div>
+  <div class="pitfall">
+    <strong>Pitfall:</strong> the children trick only works when the element is created <em>outside</em>
+    the re-rendering component. If <code>ScrollTracker</code> itself wrote <code>children = &lt;HeavyTable /&gt;</code>
+    inside its body, the reference would be new each render and the bailout disappears.
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<!-- 5. CONTEXT                                                   -->
+<!-- ============================================================ -->
+<section>
+  <h2 id="context-perf">5. The Context re-render problem <span class="tier-1">Tier 1</span></h2>
+  <p>
+    The rule: when a provider's <code>value</code> changes identity (<code>Object.is</code>),
+    <strong>every consumer of that context re-renders</strong> — even consumers that only care about a
+    field that didn't change, and even if a <code>memo</code> sits between provider and consumer
+    (context updates tunnel through memo bailouts by design). Context has no selectors.
+  </p>
+  <pre><code>// The classic self-inflicted wound: a new object every provider render
+function AppProvider({ children }) {
+  const [user, setUser] = useState(null);
+  const [theme, setTheme] = useState('dark');
+  return (
+    // ❌ fresh object identity each render → ALL consumers re-render
+    // whenever AppProvider re-renders for ANY reason
+    &lt;AppContext.Provider value={{ user, theme, setUser, setTheme }}&gt;
+      {children}
+    &lt;/AppContext.Provider&gt;
+  );
+}</code></pre>
+  <p><strong>Fixes, ranked from cheapest to most structural:</strong></p>
+  <ol>
+    <li>
+      <strong>Memoize the provider value</strong> — stops <em>incidental</em> identity churn (provider
+      re-rendered but data didn't change). Doesn't help when the data really does change often.
+      <pre><code>const value = useMemo(() =&gt; ({ user, theme, setUser, setTheme }),
+                      [user, theme]);   // setters from useState are stable</code></pre>
+    </li>
+    <li>
+      <strong>Split state and dispatch contexts</strong> — components that only <em>trigger</em> changes
+      (buttons, forms) never re-render when the data changes, because the dispatch/setter object is stable forever.
+      <pre><code>const StateContext = createContext(null);
+const DispatchContext = createContext(null);
+
+function Provider({ children }) {
+  const [state, dispatch] = useReducer(reducer, initialState);
+  return (
+    &lt;StateContext.Provider value={state}&gt;
+      &lt;DispatchContext.Provider value={dispatch}&gt;  {/* dispatch is stable */}
+        {children}
+      &lt;/DispatchContext.Provider&gt;
+    &lt;/StateContext.Provider&gt;
+  );
+}
+// A toolbar that only dispatches: useContext(DispatchContext) → never
+// re-renders on state changes.</code></pre>
+    </li>
+    <li>
+      <strong>Slice contexts by update frequency</strong> — <code>ThemeContext</code> (changes rarely),
+      <code>UserContext</code> (changes on login), <code>NotificationsContext</code> (changes constantly)
+      as separate providers, so consumers subscribe only to the churn they need.
+    </li>
+    <li>
+      <strong>Selector layer</strong> — libraries like <code>use-context-selector</code> approximate
+      <code>useContextSelector(Ctx, s =&gt; s.user.name)</code> so consumers re-render only when their
+      slice changes. Know it exists and why (React shipped no built-in selector); it relies on
+      workarounds, so most teams jump to option 5 instead.
+    </li>
+    <li>
+      <strong>Move hot state to an external store</strong> subscribed via <code>useSyncExternalStore</code> —
+      this is exactly how Zustand and Redux avoid the problem. The store lives <em>outside</em> React;
+      components subscribe with a selector; the library re-renders a component <em>only</em> when its
+      selected value changes. Context is then used (if at all) just to pass the store instance, which
+      never changes identity.
+      <pre><code>// Zustand: subscription with a selector — no provider re-render cascade
+const useStore = create((set) =&gt; ({
+  notifications: [], user: null,
+  addNotification: (n) =&gt; set(s =&gt; ({ notifications: [...s.notifications, n] })),
+}));
+
+function Badge() {
+  // re-renders ONLY when the count changes — not on user changes
+  const count = useStore(s =&gt; s.notifications.length);
+  return &lt;span&gt;{count}&lt;/span&gt;;
+}</code></pre>
+    </li>
+  </ol>
+  <div class="senior">
+    <strong>Senior framing:</strong> "Context is a dependency-injection mechanism, not a state manager.
+    It's perfect for low-churn values — theme, auth, locale. The moment a context value updates many times
+    per second with many consumers, I split it or move it to a store with selector-based subscriptions."
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<!-- 6. EXPENSIVE COMPUTATION                                     -->
+<!-- ============================================================ -->
+<section>
+  <h2 id="expensive">6. Expensive computation &amp; the main thread <span class="tier-1">Tier 1</span></h2>
+
+  <h3>6.1 <code>useMemo</code> for genuinely heavy calcs — with proof</h3>
+  <pre><code>function ProductList({ products, filters, sortKey }) {
+  // Measured in the Profiler: 120ms for 50k products.
+  // Without useMemo this re-ran on EVERY render, including ones
+  // triggered by unrelated state (open/close a tooltip → 120ms hitch).
+  const visible = useMemo(() =&gt; {
+    const t0 = performance.now();
+    const result = sortProducts(filterProducts(products, filters), sortKey);
+    console.debug('filter+sort', performance.now() - t0); // temporary proof
+    return result;
+  }, [products, filters, sortKey]);
+
+  return &lt;VirtualList items={visible} /&gt;;
+}</code></pre>
+  <p>
+    The bar for "genuinely heavy": if the computation doesn't show up as a visible chunk in the
+    flamegraph or a <code>performance.now()</code> delta above ~1–2ms, the <code>useMemo</code> is
+    bookkeeping, not optimization. Say that in the interview.
+  </p>
+
+  <h3>6.2 Input-driven work: debounce or defer</h3>
+  <p>
+    When the expensive work is driven by typing, the fix isn't making one run faster — it's running it
+    less often, or at lower priority than the keystroke echo:
+  </p>
+  <pre><code>// Option A: debounce — delay the work until typing pauses (network-ish work)
+const [query, setQuery] = useState('');
+const [debounced, setDebounced] = useState('');
+useEffect(() =&gt; {
+  const id = setTimeout(() =&gt; setDebounced(query), 250);
+  return () =&gt; clearTimeout(id);
+}, [query]);
+// input binds to `query` (instant echo); expensive list reads `debounced`
+
+// Option B: useDeferredValue — React-native prioritization (CPU-bound work)
+const deferredQuery = useDeferredValue(query);
+const results = useMemo(() =&gt; expensiveFilter(items, deferredQuery), [items, deferredQuery]);
+// Input stays responsive; the list update renders at background priority
+// and can be interrupted by the next keystroke. Deep dive → tutorial 10.</code></pre>
+  <p>
+    Rule of thumb: <strong>debounce for I/O</strong> (fewer network requests),
+    <strong>defer for CPU</strong> (same amount of work, lower priority, interruptible).
+  </p>
+
+  <h3>6.3 Off the main thread: Web Workers</h3>
+  <p>
+    If a single computation is irreducibly 200ms+ (parsing a 20MB CSV, diffing large documents, crypto),
+    no amount of memoization helps — it must leave the main thread:
+  </p>
+  <pre><code>// worker.js
+self.onmessage = (e) =&gt; {
+  const rows = parseCsv(e.data);        // heavy, but off the UI thread
+  self.postMessage(rows);
+};
+
+// Component
+function useCsvParser() {
+  const workerRef = useRef(null);
+  const [rows, setRows] = useState(null);
+  useEffect(() =&gt; {
+    const worker = new Worker(new URL('./worker.js', import.meta.url));
+    worker.onmessage = (e) =&gt; setRows(e.data);
+    workerRef.current = worker;
+    return () =&gt; worker.terminate();
+  }, []);
+  return { rows, parse: (file) =&gt; workerRef.current.postMessage(file) };
+}</code></pre>
+  <p>
+    Mention <strong>Comlink</strong> for ergonomics (turns postMessage plumbing into async function calls)
+    and the caveat: data passed to a worker is <em>structured-cloned</em> (copy cost on large payloads)
+    unless you use Transferables (ArrayBuffer) — cloning a 100MB object can itself jank the main thread.
+  </p>
+
+  <h3>6.4 Chunking long loops</h3>
+  <p>When work must stay on the main thread, slice it so paint can happen between slices:</p>
+  <pre><code>async function processInChunks(items, fn, chunkSize = 500) {
+  for (let i = 0; i &lt; items.length; i += chunkSize) {
+    items.slice(i, i + chunkSize).forEach(fn);
+    // Yield to the event loop so input/paint can run.
+    // scheduler.yield() where supported; setTimeout(0) as fallback.
+    await new Promise(r =&gt; setTimeout(r, 0));
+  }
+}</code></pre>
+</section>
+
+<!-- ============================================================ -->
+<!-- 7. VIRTUALIZATION                                            -->
+<!-- ============================================================ -->
+<section>
+  <h2 id="virtualization">7. List virtualization <span class="tier-1">Tier 1</span></h2>
+
+  <h3>7.1 Why 10,000 DOM nodes kill you</h3>
+  <p>
+    Rendering 10k rows isn't primarily a React problem — React can build the element tree in tens of
+    milliseconds. The killers are downstream:
+  </p>
+  <ul>
+    <li><strong>Initial commit:</strong> creating ~10k × (cells per row) real DOM nodes — often 100k+ nodes — takes seconds.</li>
+    <li><strong>Layout &amp; paint:</strong> every style recalculation and layout pass now scales with the
+      full node count. A hover style, a window resize, a font load — each triggers work across 100k nodes.</li>
+    <li><strong>Memory:</strong> DOM nodes, fibers, and event bookkeeping per row; tabs OOM on mobile.</li>
+    <li><strong>Every subsequent React commit</strong> diffs a huge tree even when one row changes.</li>
+  </ul>
+
+  <h3>7.2 Windowing</h3>
+  <p>
+    Render only what's visible plus a small buffer (<strong>overscan</strong>): a 10k-row list at ~35px
+    row height in a 700px viewport is <strong>20 visible rows + ~5 overscan each side ≈ 30 DOM rows</strong>,
+    absolutely positioned inside a spacer div whose height equals the full list (so the scrollbar is honest).
+    On scroll, recycle: swap which items the 30 rows show.
+  </p>
+
+  <h3>7.3 TanStack Virtual example</h3>
+  <pre><code>import { useVirtualizer } from '@tanstack/react-virtual';
+
+function VirtualList({ items }) {
+  const parentRef = useRef(null);
+  const virtualizer = useVirtualizer({
+    count: items.length,
+    getScrollElement: () =&gt; parentRef.current,
+    estimateSize: () =&gt; 35,   // fixed-size case: exact; variable: an estimate
+    overscan: 5,
+  });
+
+  return (
+    &lt;div ref={parentRef} style={{ height: 600, overflow: 'auto' }}&gt;
+      &lt;div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}&gt;
+        {virtualizer.getVirtualItems().map((v) =&gt; (
+          &lt;div
+            key={items[v.index].id}
+            // variable-size rows: let the virtualizer measure the real height
+            ref={virtualizer.measureElement}
+            data-index={v.index}
+            style={{
+              position: 'absolute', top: 0, left: 0, width: '100%',
+              transform: `translateY(${v.start}px)`,
+            }}
+          &gt;
+            &lt;Row item={items[v.index]} /&gt;
+          &lt;/div&gt;
+        ))}
+      &lt;/div&gt;
+    &lt;/div&gt;
+  );
+}</code></pre>
+  <table>
+    <thead><tr><th>Concern</th><th>Fixed size</th><th>Variable size</th></tr></thead>
+    <tbody>
+      <tr><td>Offset math</td><td><code>index × size</code> — trivial, exact scrollbar</td><td>Estimate, then measure rendered rows and correct — scrollbar can "breathe"</td></tr>
+      <tr><td>Cost</td><td>Cheapest</td><td>Measurement passes (ResizeObserver) per row</td></tr>
+      <tr><td>Use when</td><td>Tables, uniform rows</td><td>Comments, feeds, chat</td></tr>
+    </tbody>
+  </table>
+  <p>
+    <strong>Overscan</strong> trades DOM count for blank-flash protection during fast scrolls — 5–10 rows
+    is typical. <strong>Sticky headers</strong> are the classic hard part: the header must live outside
+    the recycled rows (or be pinned via the virtualizer's range) because a header row that scrolls out of
+    the window gets unmounted; group-sticky headers need "which group owns the current scroll offset" logic.
+    react-window is the lighter fixed-focus alternative; TanStack Virtual is headless and handles dynamic
+    sizes, horizontal, and grids.
+  </p>
+
+  <h3>7.4 Infinite scroll + IntersectionObserver</h3>
+  <pre><code>function useInfiniteScroll(loadMore) {
+  const sentinelRef = useRef(null);
+  useEffect(() =&gt; {
+    const el = sentinelRef.current;
+    if (!el) return;
+    const observer = new IntersectionObserver(
+      ([entry]) =&gt; { if (entry.isIntersecting) loadMore(); },
+      { rootMargin: '400px' }   // start loading before the user hits bottom
+    );
+    observer.observe(el);
+    return () =&gt; observer.disconnect();
+  }, [loadMore]);   // loadMore must be stable — useCallback in the caller
+  return sentinelRef;
+}
+// &lt;div ref={sentinelRef} /&gt; sits after the last row. Pairs with
+// TanStack Query's useInfiniteQuery for pages + a virtualizer for DOM count:
+// infinite DATA growth without infinite DOM growth.</code></pre>
+
+  <h3>7.5 Keys recap + the CSS-only cousin</h3>
+  <p>
+    Dynamic lists need <strong>stable, identity-based keys</strong> — with index keys, prepending one item
+    makes React see every row's props change (row 0's content is now row 1's), forcing a full-list
+    re-render/DOM update and corrupting row-level state (inputs, focus). With ID keys, prepend = one insert.
+  </p>
+  <pre><code>/* content-visibility: the CSS-only cousin of virtualization.
+   The browser skips layout/paint for off-screen sections; DOM still
+   exists (Ctrl+F and a11y keep working), so it's weaker but nearly free. */
+.feed-item {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 120px;  /* placeholder size → honest scrollbar */
+}</code></pre>
+  <div class="pitfall">
+    <strong>Pitfall:</strong> virtualization's costs — native Ctrl+F can't find unmounted rows, screen
+    readers need correct <code>aria-rowcount</code>/<code>aria-rowindex</code>, and SEO loses non-rendered
+    content. A senior answer names these trade-offs unprompted and mentions
+    <code>content-visibility</code> as the lighter option when the list is only a few hundred items.
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<!-- 8. CODE SPLITTING                                            -->
+<!-- ============================================================ -->
+<section>
+  <h2 id="code-splitting">8. Code splitting &amp; lazy loading <span class="tier-1">Tier 1</span></h2>
+  <p>
+    Startup-budget territory: users pay download + parse + execute for every byte of JS before
+    interactivity. The fix is shipping less up front — split by route first (biggest win, natural
+    boundaries), then by heavy component.
+  </p>
+
+  <h3>8.1 Route-based splitting — the full pattern</h3>
+  <pre><code>import { lazy, Suspense } from 'react';
+import { Routes, Route } from 'react-router-dom';
+
+// Each lazy() call = a separate chunk, fetched on first render of that route.
+const Dashboard = lazy(() =&gt; import('./pages/Dashboard'));
+const Settings  = lazy(() =&gt; import('./pages/Settings'));
+const Reports   = lazy(() =&gt; import(
+  /* webpackChunkName: "reports" */ './pages/Reports'   // named chunk for debugging
+));
+
+function App() {
+  return (
+    &lt;ErrorBoundary fallback={&lt;ChunkErrorScreen /&gt;}&gt;   {/* REQUIRED pairing */}
+      &lt;Suspense fallback={&lt;PageSkeleton /&gt;}&gt;
+        &lt;Routes&gt;
+          &lt;Route path="/" element={&lt;Dashboard /&gt;} /&gt;
+          &lt;Route path="/settings" element={&lt;Settings /&gt;} /&gt;
+          &lt;Route path="/reports" element={&lt;Reports /&gt;} /&gt;
+        &lt;/Routes&gt;
+      &lt;/Suspense&gt;
+    &lt;/ErrorBoundary&gt;
+  );
+}</code></pre>
+  <p>
+    Why the error boundary is non-optional: chunk loads <strong>fail in the wild</strong> — flaky mobile
+    networks, and the classic deploy race where the user's open tab requests a hashed chunk that the new
+    deploy deleted. Handle it: an error boundary that offers "reload to update" (many teams auto-reload
+    once on chunk-load errors).
+  </p>
+
+  <h3>8.2 Component-level splitting: pay on demand</h3>
+  <pre><code>// A rich-text editor is 250KB and used by 5% of sessions — don't ship it to 100%.
+const RichTextEditor = lazy(() =&gt; import('./RichTextEditor'));
+
+function CommentBox() {
+  const [editing, setEditing] = useState(false);
+  return editing ? (
+    &lt;Suspense fallback={&lt;EditorSkeleton /&gt;}&gt;
+      &lt;RichTextEditor /&gt;
+    &lt;/Suspense&gt;
+  ) : (
+    &lt;button onClick={() =&gt; setEditing(true)}&gt;Write a comment…&lt;/button&gt;
+  );
+}</code></pre>
+  <p>Classic candidates: modals, charts, editors, PDF viewers, admin panels, anything behind a click.</p>
+
+  <h3>8.3 Preloading on intent — the <code>import()</code> promise trick</h3>
+  <p>
+    Lazy loading trades bundle size for a loading flash at click time. Erase the flash by fetching on
+    <em>intent</em>: <code>import()</code> is just a function returning a promise — call it early and the
+    module lands in the module cache, so the later <code>lazy()</code> resolution is instant.
+  </p>
+  <pre><code>const importEditor = () =&gt; import('./RichTextEditor');
+const RichTextEditor = lazy(importEditor);
+
+&lt;button
+  onMouseEnter={importEditor}   // hover-to-click gap ≈ 200–400ms of free download
+  onFocus={importEditor}        // keyboard users get the same treatment
+  onClick={() =&gt; setEditing(true)}
+&gt;
+  Write a comment…
+&lt;/button&gt;
+
+// Route flavor: preload the next route's chunk when its &lt;Link&gt; scrolls
+// into view or is hovered (framework routers ship this built in).</code></pre>
+
+  <h3>8.4 Bundle analysis workflow — find the 300KB date library</h3>
+  <p>A rehearsable mini-story interviewers love:</p>
+  <ol>
+    <li><strong>Visualize:</strong> <code>source-map-explorer 'dist/assets/*.js'</code> or
+      <code>rollup-plugin-visualizer</code> (Vite) / <code>webpack-bundle-analyzer</code> — a treemap of
+      what's actually in each chunk by source module.</li>
+    <li><strong>Spot the offender:</strong> the treemap shows <code>moment</code> + every locale at ~300KB
+      raw (~70KB gz) in the entry chunk, imported by one "format a timestamp" util.</li>
+    <li><strong>Fix by weight class:</strong> replace with <code>date-fns</code> (per-function imports,
+      tree-shakeable — a few KB for what's used) or zero-dependency <code>Intl.DateTimeFormat</code>;
+      other classics — full <code>lodash</code> import instead of <code>lodash-es</code> per-function,
+      a chart lib in the entry chunk for a page nobody starts on, duplicated dependency versions.</li>
+    <li><strong>Verify &amp; guard:</strong> re-run the analyzer, confirm the entry chunk delta, and add a
+      size budget (<code>size-limit</code> / bundlesize in CI) so the regression can't come back silently.</li>
+  </ol>
+  <p>
+    Also know <strong>vendor chunking</strong> at awareness level: bundlers split stable dependencies
+    (react, react-dom) into a separate long-cached chunk so app-code deploys don't invalidate the vendor
+    bytes users already have. Tooling mechanics in depth → <a href="16-build-tools.html">tutorial 16</a>.
+  </p>
+</section>
+
+<!-- ============================================================ -->
+<!-- 9. ASSETS                                                    -->
+<!-- ============================================================ -->
+<section>
+  <h2 id="assets">9. Asset-level React concerns <span class="tier-2">Tier 2</span></h2>
+  <p>JS isn't the only startup cost. The React-adjacent asset checklist:</p>
+  <pre><code>&lt;img
+  src="/products/chair-800.avif"
+  srcSet="/products/chair-400.avif 400w, /products/chair-800.avif 800w"
+  sizes="(max-width: 600px) 100vw, 400px"
+  width="800" height="600"        {/* intrinsic size → browser reserves space → no CLS */}
+  loading="lazy"                   {/* below-the-fold only! */}
+  decoding="async"
+  alt="Ergonomic chair"
+/&gt;</code></pre>
+  <ul>
+    <li><strong>Never <code>loading="lazy"</code> the LCP image</strong> — it delays your biggest paint.
+      For the hero, do the opposite: <code>fetchpriority="high"</code> (React 19 also lets you
+      <code>preload()</code> resources).</li>
+    <li><strong>Always width/height (or CSS <code>aspect-ratio</code>)</strong> so late-loading images
+      don't shift layout — CLS is the metric, and in React apps the classic offender is content popping
+      in after data fetches without reserved skeleton space.</li>
+    <li><strong>Fonts:</strong> <code>font-display: swap</code> vs <code>optional</code>, preloading the
+      one critical WOFF2, and size-adjusted fallbacks — full strategy in
+      <a href="17-web-performance.html">tutorial 17</a>.</li>
+    <li><strong>Third-party scripts</strong> are frequently the top main-thread consumer in real traces —
+      analytics, chat widgets, A/B tools. Load them <code>defer</code>/after-interactive, lazy-init on
+      idle or interaction, and audit quarterly; the honest senior answer is "the slowest thing in our app
+      wasn't our code."</li>
+    <li><strong>Don't hydrate static content:</strong> marketing sections and docs don't need React
+      attached client-side. React Server Components render zero-JS-shipped parts of the tree — the
+      structural fix — covered in <a href="11-nextjs-ssr.html">the SSR/RSC tutorial</a>.</li>
+  </ul>
+</section>
+
+<!-- ============================================================ -->
+<!-- 10. STATE MANAGEMENT PERF                                    -->
+<!-- ============================================================ -->
+<section>
+  <h2 id="state-perf">10. State management performance <span class="tier-2">Tier 2</span></h2>
+
+  <h3>10.1 Selector granularity</h3>
+  <p>
+    Redux's <code>useSelector</code> re-render rule: after every store dispatch, each subscribed component
+    re-runs its selector and re-renders <strong>iff the selected value changed by reference</strong>
+    (strict equality by default). Two failure modes:
+  </p>
+  <pre><code>// ❌ Selecting the whole slice: re-renders on ANY change within it
+const filters = useSelector(state =&gt; state.filters);          // big object
+
+// ❌ Worse: constructing a new reference IN the selector →
+// "new value" after every dispatch → re-render on EVERY dispatch app-wide
+const activeIds = useSelector(state =&gt;
+  state.todos.filter(t =&gt; t.active).map(t =&gt; t.id));           // fresh array each call
+
+// ✅ Select primitives — reference equality just works
+const sortKey = useSelector(state =&gt; state.filters.sortKey);
+
+// ✅ Derived data: memoize with createSelector (reselect) — recomputes only
+// when its INPUTS change, returns the cached (stable) reference otherwise
+const selectActiveIds = createSelector(
+  [(state) =&gt; state.todos],
+  (todos) =&gt; todos.filter(t =&gt; t.active).map(t =&gt; t.id)
+);
+const activeIds = useSelector(selectActiveIds);
+
+// ✅ Or shallow-compare a small object of picks
+const { sortKey, page } = useSelector(
+  s =&gt; ({ sortKey: s.filters.sortKey, page: s.pagination.page }),
+  shallowEqual
+);</code></pre>
+  <p>
+    Zustand is the same model, different spelling: <code>useStore(s =&gt; s.count)</code> for primitives,
+    <code>useShallow(s =&gt; ({a: s.a, b: s.b}))</code> for multi-picks.
+  </p>
+
+  <h3>10.2 Normalized state shape</h3>
+  <pre><code>// ❌ Deeply nested tree: updating one comment = deep-cloning the path to it,
+// and every selector of the tree sees a "new" ancestor object
+{ posts: [{ id, title, comments: [{ id, text, author: {…} }] }] }
+
+// ✅ Normalized entity maps (what RTK's createEntityAdapter gives you):
+{
+  posts:    { byId: { p1: { id:'p1', title, commentIds:['c1','c2'] } }, allIds:['p1'] },
+  comments: { byId: { c1: { id:'c1', text, authorId:'u1' } },           allIds:['c1','c2'] },
+  users:    { byId: { u1: { id:'u1', name } } }
+}
+// Editing comment c1 touches comments.byId.c1 (+ the byId map) — posts and
+// users keep their references, so their subscribers don't re-render. O(1)
+// lookups, no duplicated author objects drifting out of sync.</code></pre>
+
+  <h3>10.3 Stop putting server data in global state</h3>
+  <p>
+    The biggest architectural perf win of the last five years: <strong>server cache ≠ client state</strong>.
+    API data in Redux means hand-rolled loading flags, staleness logic, and every fetch dispatching
+    through one global store (every dispatch = every selector re-runs). TanStack Query (or RTK Query/SWR)
+    treats server data as a cache keyed by query, with per-query subscriptions:
+  </p>
+  <pre><code>const { data: products, isPending } = useQuery({
+  queryKey: ['products', filters],
+  queryFn: () =&gt; fetchProducts(filters),
+  staleTime: 60_000,        // fresh for 1min → no refetch storm on remount/refocus
+});
+// Only components using this queryKey re-render on its updates.
+// Local UI state (open modals, input drafts) stays in useState — colocated,
+// cheap, and gone when the component unmounts.</code></pre>
+</section>
+
+<!-- ============================================================ -->
+<!-- 11. FORMS                                                    -->
+<!-- ============================================================ -->
+<section>
+  <h2 id="forms-perf">11. Forms performance <span class="tier-2">Tier 2</span></h2>
+  <p>
+    A controlled input sets state per keystroke — which re-renders whatever owns that state. Fine for a
+    login form; a disaster when the state lives on a 60-field form component: every keystroke re-renders
+    all 60 fields plus validation. Typical profile: 40–80ms per keystroke on mid-range hardware — visible lag.
+  </p>
+  <pre><code>// ❌ Scale problem: one state object at the top of a big form
+function BigForm() {
+  const [values, setValues] = useState(initialValues);   // 60 fields
+  const set = (name) =&gt; (e) =&gt;
+    setValues(v =&gt; ({ ...v, [name]: e.target.value }));  // whole form re-renders
+  return &lt;&gt;{fields.map(f =&gt; &lt;Field key={f.name} value={values[f.name]} onChange={set(f.name)} /&gt;)}&lt;/&gt;;
+}
+
+// ✅ react-hook-form: uncontrolled inputs + a subscription model
+import { useForm } from 'react-hook-form';
+
+function BigForm() {
+  const { register, handleSubmit, formState: { errors } } = useForm();
+  return (
+    &lt;form onSubmit={handleSubmit(onSubmit)}&gt;
+      {/* register() attaches a ref — the DOM holds the value.
+          Typing causes ZERO React re-renders. */}
+      &lt;input {...register('email', { required: true })} /&gt;
+      &lt;input {...register('company')} /&gt;
+      &lt;button&gt;Save&lt;/button&gt;
+    &lt;/form&gt;
+  );
+}
+
+// Need to react to one field? Subscribe narrowly — only THIS component
+// re-renders as 'plan' changes, the rest of the form is untouched:
+function PlanSummary({ control }) {
+  const plan = useWatch({ control, name: 'plan' });
+  return &lt;Summary plan={plan} /&gt;;
+}</code></pre>
+  <p>
+    <strong>Why it's fast:</strong> react-hook-form keeps values in the DOM (uncontrolled, via refs) and
+    maintains an internal subscription registry — components opt in to specific fields with
+    <code>useWatch</code>/<code>watch</code>, mirroring the external-store-with-selectors pattern from §5.
+    React only gets involved at validation-error transitions and submit.
+  </p>
+  <div class="note">
+    <strong>Isolating hot inputs</strong> without a library: give the laggy input its own state in its own
+    component (state colocation, §4.1) and propagate upward on blur/debounce instead of per keystroke.
+    Controlled inputs aren't "wrong" — they're per-keystroke subscriptions; just keep the subscription scope tiny.
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<!-- 12. RUNBOOK                                                  -->
+<!-- ============================================================ -->
+<section>
+  <h2 id="runbook">12. The interview runbook <span class="tier-2">Tier 2</span></h2>
+  <p>
+    This is the deliverable of the whole tutorial — a narrative you can deliver when the interviewer says
+    <em>"a user reports the dashboard is slow. Walk me through what you do."</em>
+  </p>
+  <ol>
+    <li><strong>Reproduce &amp; scope.</strong> "Slow how — first load, or when they interact? Which page,
+      what data volume, what device?" Reproduce with production-like data and 4× CPU throttle. Check RUM:
+      is this one user or is p75 INP bad on that page?</li>
+    <li><strong>Profile.</strong> React DevTools Profiler recording of the exact interaction + a Chrome
+      Performance trace. Two questions: where is the time (React render? layout/paint? network? third-party
+      script?), and is the shape one huge commit, many repeated commits, or a startup waterfall?</li>
+    <li><strong>Classify.</strong>
+      <table>
+        <thead><tr><th>Signature in the profile</th><th>Class</th><th>Matching fixes</th></tr></thead>
+        <tbody>
+          <tr><td>Slow before first paint; big entry bundle; long parse/eval</td><td>Startup</td><td>Code split, tree-shake, defer third-party, asset fixes, SSR/RSC (§8–9)</td></tr>
+          <tr><td>One commit is huge; flamegraph dominated by one subtree</td><td>Expensive render</td><td>Virtualize, memoize the boundary, move computation to useMemo/worker (§3, 6, 7)</td></tr>
+          <tr><td>Many commits per interaction; unrelated components lit up</td><td>Re-render storm</td><td>Colocate state, composition, context split, selectors (§4, 5, 10)</td></tr>
+          <tr><td>React fast, but long purple/green blocks after commit</td><td>Browser-side</td><td>Fewer DOM nodes, batch reads/writes, content-visibility, CSS containment (§7, 13)</td></tr>
+        </tbody>
+      </table>
+    </li>
+    <li><strong>Fix the classified problem</strong> — one change at a time, so the measurement stays attributable.</li>
+    <li><strong>Verify with numbers.</strong> Same profile, same interaction, before/after commit durations
+      and INP. If the numbers didn't move, revert — don't keep "probably helpful" complexity.</li>
+    <li><strong>Guard.</strong> Bundle-size budget in CI, a Lighthouse/INP check on key pages, an
+      <code>onRender</code> Profiler threshold alert on the hottest tree — so the fix survives the next quarter.</li>
+  </ol>
+
+  <h3>12.1 The worked story (rehearse this)</h3>
+  <div class="senior">
+    <p>
+      <strong>"Typing lag in a filterable 5,000-row table."</strong> Support reported the operations
+      dashboard 'freezing while typing' in the filter box. I reproduced with a production data snapshot
+      and 4× CPU throttle — each keystroke visibly hitched. The DevTools Profiler showed one commit per
+      keystroke at <strong>~450ms</strong>, and the flamegraph was wall-to-wall <code>&lt;TableRow&gt;</code>:
+      all 5,000 rows re-rendering per keystroke, with 'why did this render' saying <em>parent rendered</em> —
+      the filter state lived on the component that also rendered the table, and rows weren't memoized.
+      The Chrome trace added a second problem: ~180ms of layout after each commit, because all 5,000 rows
+      were real DOM nodes.
+    </p>
+    <p>
+      Three targeted changes: <strong>(1)</strong> virtualized the table with TanStack Virtual — DOM went
+      from 5,000 rows to ~30; <strong>(2)</strong> <code>memo</code>'d <code>TableRow</code> and stabilized
+      its two callback props with <code>useCallback</code> so unchanged visible rows bail out;
+      <strong>(3)</strong> wrapped the filter text in <code>useDeferredValue</code> with the filtered array
+      in a <code>useMemo</code>, so the keystroke echo commits instantly and the list update renders at
+      background priority, interruptible by the next keystroke.
+    </p>
+    <p>
+      Result: keystroke commits went from <strong>~450ms to ~4–8ms</strong>, the deferred list commit to
+      <strong>~16ms</strong>, layout cost collapsed with the DOM count, and field INP on that page went from
+      <strong>~600ms to ~90ms at p75</strong>. Then I added a Profiler <code>onRender</code> assertion in an
+      integration test failing above 50ms on that tree, so it can't quietly regress."
+    </p>
+  </div>
+  <p>
+    Note the grading rubric hidden in that story: reproduced first, profiled second, <em>two</em> tools,
+    classified before fixing, fixes matched the classification, numbers on both sides, and a guardrail.
+    That structure — not the specific APIs — is what earns the senior signal.
+  </p>
+</section>
+
+<!-- ============================================================ -->
+<!-- 13. MICRO-TOPICS                                             -->
+<!-- ============================================================ -->
+<section>
+  <h2 id="micro">13. Micro-topics &amp; concurrent features <span class="tier-3">Tier 3</span></h2>
+
+  <h3>13.1 <code>key</code> as a reset, instead of effects</h3>
+  <pre><code>// ❌ Sync-state-with-effect: renders stale data first, then re-renders
+useEffect(() =&gt; { setDraft(''); setStep(0); }, [userId]);
+
+// ✅ Change the key → React unmounts and remounts with fresh state.
+// One clean initial render, no effect, no intermediate stale frame.
+&lt;UserProfileForm key={userId} userId={userId} /&gt;</code></pre>
+
+  <h3>13.2 Avoiding layout thrash</h3>
+  <pre><code>// ❌ Interleaved read → write → read forces synchronous layout each iteration
+elements.forEach(el =&gt; {
+  const h = el.offsetHeight;         // READ (forces layout if styles dirty)
+  el.style.height = h * 2 + 'px';    // WRITE (dirties styles)
+});                                   // next read re-forces layout: O(n) layouts
+
+// ✅ Batch: all reads, then all writes → one layout
+const heights = elements.map(el =&gt; el.offsetHeight);
+elements.forEach((el, i) =&gt; { el.style.height = heights[i] * 2 + 'px'; });
+
+// In React: measurement effects that read layout (getBoundingClientRect)
+// then set state that changes styles can ping-pong — measure in
+// useLayoutEffect once, and prefer CSS (flex/grid/aspect-ratio) over
+// JS measurement wherever possible.</code></pre>
+
+  <h3>13.3 Concurrent features as performance tools (summary + pointer)</h3>
+  <table>
+    <thead><tr><th>API</th><th>Perf role</th></tr></thead>
+    <tbody>
+      <tr><td><code>useTransition</code> / <code>startTransition</code></td><td>Mark a state update non-urgent: React keeps the current UI interactive and renders the update in the background, interruptible. Classic uses: tab switches into heavy panes, and <strong>route changes</strong> (React Router wraps navigation in a transition) so clicking a link never freezes the current page.</td></tr>
+      <tr><td><code>useDeferredValue</code></td><td>The value-flavored version — lag a derived-work input behind its source (§6.2).</td></tr>
+      <tr><td>Automatic batching (18+)</td><td>Multiple setStates in timeouts/promises/handlers → one render, fewer commits for free.</td></tr>
+      <tr><td>Suspense streaming + selective hydration</td><td>Startup-side: HTML streams early, hydration prioritizes what the user touches.</td></tr>
+    </tbody>
+  </table>
+  <p>Mechanics, lanes, and pitfalls of all of these → <a href="10-react-18-19-latest.html">tutorial 10</a>.</p>
+
+  <h3>13.4 Profiler in production (awareness)</h3>
+  <p>
+    Standard production builds strip Profiler hooks for speed; a dedicated <em>profiling build</em>
+    (<code>react-dom/profiling</code>, keeping the <code>&lt;Profiler&gt;</code> API live at small overhead)
+    lets you sample real-user render timings. Knowing this exists — "we ran the profiling build behind a
+    flag for 1% of traffic" — is a strong senior detail.
+  </p>
+</section>
+
+<!-- ============================================================ -->
+<!-- INTERVIEW Q&A                                                -->
+<!-- ============================================================ -->
+<section>
+  <h2 id="qa">Interview Q&amp;A</h2>
+
+  <details class="qa">
+    <summary>1. "How do you optimize a slow React app?" — the headline answer</summary>
+    <p>Lead with process: reproduce with realistic data and CPU throttling; profile (React DevTools Profiler for render cost + 'why did this render', Chrome Performance for main-thread/browser cost); classify — startup problem, expensive single render, re-render storm, or browser-side layout/paint; apply the matching fix (code splitting / memo+composition / virtualization / batching DOM work); verify with before/after numbers; guard with CI budgets. Then offer one concrete story with numbers (§12.1). Never lead with "add React.memo."</p>
+  </details>
+
+  <details class="qa">
+    <summary>2. Are re-renders bad? When do they actually matter?</summary>
+    <p>No — re-renders are React's normal operation and usually cost fractions of a millisecond. They matter when the rendered subtree is large or does heavy work, when they happen at high frequency (per keystroke, per scroll tick, per websocket message), or when the resulting commits exceed the interaction budget (~50ms long-task threshold, 16ms frame). A re-render that produces identical elements changes zero DOM. Optimize expensive renders and long tasks, not the render count itself.</p>
+  </details>
+
+  <details class="qa">
+    <summary>3. What exactly does React.memo compare, and when does it fail silently?</summary>
+    <p>A shallow comparison: for each prop key, <code>Object.is(prevProps[k], nextProps[k])</code>. It fails silently whenever any prop is recreated per parent render: inline arrow functions, object/array literals, and JSX children (a new element object every render). The component still works — it just never bails out, so you pay the compare plus the render. Fix by stabilizing the props (useCallback/useMemo/hoisting) or restructuring so the memo isn't needed.</p>
+  </details>
+
+  <details class="qa">
+    <summary>4. When would you NOT use useMemo/useCallback?</summary>
+    <p>When nothing consumes the stability: no memo'd child, no effect dep, no context value downstream — then useCallback is pure overhead. When the computation is trivial (the memo bookkeeping costs as much as recomputing). And when the dep array would be so churny it never hits cache. Memoization adds memory retention and dependency-array maintenance risk; I add it where a profiler shows a payoff or where a stability contract exists, not by default. The React Compiler makes the manual versions largely unnecessary where it's adopted.</p>
+  </details>
+
+  <details class="qa">
+    <summary>5. Explain the children-prop optimization. Why does it work?</summary>
+    <p>Move state into a wrapper and accept the expensive subtree as <code>children</code>. When only the wrapper's state changes, the wrapper re-renders but its <code>children</code> prop is the exact same element object the parent created last time — React sees an identical element reference and skips re-rendering that subtree. It's memoization by structure: no APIs, no comparators, no dependency arrays. The condition: the element must be created outside the re-rendering component.</p>
+  </details>
+
+  <details class="qa">
+    <summary>6. Why do all context consumers re-render together, and how do you fix it?</summary>
+    <p>Context has no selectors: when the provider's value changes identity, every consumer re-renders — and this tunnels through memo bailouts by design. Fixes in order: memoize the provider value (kills incidental identity churn); split state and dispatch contexts (dispatch is stable, so trigger-only components never re-render); slice contexts by update frequency; use-context-selector as a stopgap; or move hot state to an external store (Zustand/Redux) subscribed via useSyncExternalStore with selectors, which is how those libraries avoid the problem entirely.</p>
+  </details>
+
+  <details class="qa">
+    <summary>7. How do Redux/Zustand avoid the re-render problem Context has?</summary>
+    <p>The store lives outside React and never changes identity — nothing re-renders because "the store changed." Components subscribe with selectors via useSyncExternalStore; after each store update, each subscriber's selector runs and the component re-renders only if the selected value's reference changed. So granular selectors = granular re-renders. The failure mode is a selector that constructs a new reference each call (a .filter().map() inline) — that re-renders on every dispatch; fix with createSelector/reselect memoization or shallow equality.</p>
+  </details>
+
+  <details class="qa">
+    <summary>8. A component re-renders and you don't know why. Debug it.</summary>
+    <p>React DevTools Profiler with "record why each component rendered" enabled — it reports props changed (which), state changed (which hook), parent rendered, or context changed. If props "changed" but look identical, it's referential: an object/function recreated upstream. For hooks, changed-hook indices point at the culprit state. Escalations: a temporary useEffect logging prev-vs-next props with Object.is per key, or the why-did-you-render library in dev.</p>
+  </details>
+
+  <details class="qa">
+    <summary>9. Walk me through rendering a 50,000-row table.</summary>
+    <p>Don't render 50,000 DOM rows — initial commit takes seconds, and every layout/paint scales with node count forever after. Virtualize: render visible rows + overscan (~30 rows) absolutely positioned in a full-height spacer so the scrollbar is honest, recycling rows on scroll (TanStack Virtual / react-window). Memoize the row component and stabilize its props so scrolling only mounts the entering rows. Stable ID keys. Fixed row height if the design allows (exact math); otherwise measured dynamic sizes. Call out the trade-offs unprompted: Ctrl+F breaks, screen readers need aria-rowcount/rowindex, sticky group headers need pinning logic. If it's only a few hundred rows, <code>content-visibility: auto</code> may be enough.</p>
+  </details>
+
+  <details class="qa">
+    <summary>10. Fixed-size vs variable-size virtualization — what changes?</summary>
+    <p>Fixed size: offset = index × rowHeight — exact positions, exact scrollbar, cheapest. Variable size: you start from an estimate, measure rows as they render (ResizeObserver), and correct offsets — the scrollbar can shift as estimates are replaced by measurements, and scroll-to-index is approximate until neighbors are measured. Use fixed whenever the design permits; variable for feeds/comments/chat where content dictates height.</p>
+  </details>
+
+  <details class="qa">
+    <summary>11. How do you set up route-based code splitting, and what must accompany it?</summary>
+    <p><code>React.lazy(() =&gt; import('./Page'))</code> per route, a <code>Suspense</code> fallback (skeleton, not spinner-flash), and — non-negotiable — an error boundary: chunk loads fail on flaky networks and on the deploy race where a stale tab requests a deleted hashed chunk, so offer/trigger a reload. Then improve perceived speed by preloading chunks on link hover/viewport, and wrap navigations in a transition so the current page stays interactive while the next one loads.</p>
+  </details>
+
+  <details class="qa">
+    <summary>12. Your bundle is 2MB. What's your workflow?</summary>
+    <p>Analyze before cutting: source-map-explorer or the bundler's visualizer to see the treemap of the entry chunk. Typical findings: a monolithic date library with all locales (~300KB — replace with date-fns per-function imports or Intl), full lodash instead of lodash-es imports, a chart/editor library in the entry chunk used on one deep page (lazy-load it), duplicate dependency versions, and missing route splitting. Verify each change in the treemap, then lock it in with a size-limit CI budget. Named dynamic-import chunks keep the output debuggable.</p>
+  </details>
+
+  <details class="qa">
+    <summary>13. What's the import() preloading trick?</summary>
+    <p><code>import()</code> is just a promise-returning function, and the module cache dedupes it. Hoist the thunk — <code>const load = () =&gt; import('./Editor')</code> — pass it to <code>lazy(load)</code>, and also call <code>load()</code> on hover/focus/viewport-entry. The 200–400ms of human intent time downloads the chunk, so by click the lazy resolution is instant: bundle savings without the loading flash.</p>
+  </details>
+
+  <details class="qa">
+    <summary>14. Typing in a search box lags. Diagnose and fix.</summary>
+    <p>Profile first — the near-certain signature is a big commit per keystroke because the input's state lives above an expensive subtree. Fixes by layer: colocate the input state (or isolate the hot input and propagate on debounce); split urgency with useDeferredValue so the keystroke echoes instantly and the filtered list renders interruptibly in the background; useMemo the filter computation keyed on the deferred value; virtualize the results if they're long; debounce if the work is network-bound. Verify: commit per keystroke should drop from hundreds of ms to single digits.</p>
+  </details>
+
+  <details class="qa">
+    <summary>15. Debounce vs useDeferredValue — when each?</summary>
+    <p>Debounce delays the work until input pauses — right for I/O (fewer requests) and when you control the delay. It's a fixed time cost even on fast machines and doesn't help once the work starts (still blocks when it runs). useDeferredValue doesn't reduce work — it deprioritizes it: the urgent render commits immediately, the deferred render happens in the background and is <em>interruptible</em> by the next keystroke, adapting to device speed automatically. CPU-bound rendering → defer; network → debounce; heavy both → debounce the fetch, defer the render.</p>
+  </details>
+
+  <details class="qa">
+    <summary>16. When does work belong in a Web Worker, and what are the gotchas?</summary>
+    <p>When a single computation is irreducibly long (100ms+) and can't be chunked or deferred acceptably — parsing large files, heavy transforms, crypto, image processing. Gotchas: no DOM access; postMessage structured-clones payloads, so a 100MB object copy can itself jank the main thread — use Transferables (ArrayBuffer) or keep data worker-side and send back summaries; worker startup isn't free, so pool/reuse; Comlink removes the messaging boilerplate. React integration: create in an effect, terminate on cleanup, deliver results via setState.</p>
+  </details>
+
+  <details class="qa">
+    <summary>17. React DevTools Profiler vs Chrome Performance panel — what does each tell you?</summary>
+    <p>DevTools Profiler: React's render phase — which components rendered per commit, how long, and why (props/state/context/parent). It won't show browser work after commit. Chrome Performance: the whole main thread — long tasks, style/layout/paint cost, script parse/eval, GC, third-party scripts, with the Interactions track tracing input→paint for INP. A 5ms commit followed by 300ms of layout means React is innocent and the DOM/CSS is the problem — you need both tools to see that.</p>
+  </details>
+
+  <details class="qa">
+    <summary>18. actualDuration vs baseDuration in the Profiler onRender callback?</summary>
+    <p><code>actualDuration</code> is the time this commit actually spent rendering the subtree, with memoization bailouts applied. <code>baseDuration</code> estimates rendering the entire subtree with no bailouts (sum of each component's most recent render time). actualDuration ≪ baseDuration → memoization is earning its keep; roughly equal → your memos aren't bailing anything out and are candidates for removal. It's the built-in way to quantify whether memoization is working.</p>
+  </details>
+
+  <details class="qa">
+    <summary>19. Why is a controlled 60-field form slow, and how does react-hook-form fix it?</summary>
+    <p>Controlled inputs set state per keystroke; when that state lives on the form component, every keystroke re-renders all 60 fields plus validation — tens of ms per key. react-hook-form keeps values in the DOM via refs (uncontrolled) and runs a subscription registry: typing causes zero React renders, and components that need a live value subscribe narrowly with useWatch, so only they update. It's the selector pattern applied to forms. Without a library: colocate each hot input's state and propagate on blur/debounce.</p>
+  </details>
+
+  <details class="qa">
+    <summary>20. What does the React Compiler change about performance work?</summary>
+    <p>It auto-memoizes components and intermediate values at build time — exhaustively and without dependency-array bugs — making manual memo/useMemo/useCallback mostly redundant where it's enabled; your job becomes keeping code compliant with the Rules of React (purity, no mutation during render) so it can apply. It does NOT fix the structural problems: too many DOM nodes, unsplit bundles, context architecture, main-thread-blocking computation, layout thrash. So the runbook survives; the hand-memoization chapter shrinks.</p>
+  </details>
+
+  <details class="qa">
+    <summary>21. INP is 500ms on your dashboard. Where do you look?</summary>
+    <p>First, RUM attribution: which interaction, which element, and how the 500ms splits across input delay (main thread busy when the event fired — often third-party or long hydration), processing (your handlers + the synchronous React commit), and presentation delay (rendering/paint after handlers). Long processing → profile that interaction: giant commit (memo/virtualize/defer) or heavy handler (chunk it, move it post-paint). Long input delay → find what's hogging the thread at idle: scripts, polling, hydration. Long presentation → DOM size and layout cost. Fix, then confirm p75 moves in the field, not just in the lab.</p>
+  </details>
+
+  <details class="qa">
+    <summary>22. Explain key-based reset and why it beats an effect.</summary>
+    <p>Changing <code>key</code> tells React it's a different instance: unmount, remount, all state fresh from initializers. Compared to "reset state in a useEffect when the prop changes": the effect approach renders once with stale state, then re-renders after the effect — a flash of wrong data plus extra code paths; key-reset does one clean initial render with zero synchronization logic. Use it for "edit form per selected record" cases. Cost to note: full remount means effects re-run and DOM rebuilds — intended here, but not for frequently-changing keys.</p>
+  </details>
+
+  <details class="qa">
+    <summary>23. What is layout thrashing and where does it bite in React apps?</summary>
+    <p>Interleaving DOM reads (offsetHeight, getBoundingClientRect) with writes (style/class changes): each read after a write forces a synchronous layout, so a loop becomes O(n) layout passes. In React it bites in measurement code — useLayoutEffect that reads geometry then sets state that changes styles, repeating; drag/resize handlers reading and writing per mousemove; tooltip/popper positioning. Fix: batch all reads, then all writes; measure once; prefer CSS (aspect-ratio, flex/grid, transforms) over JS measurement; for animations, stick to transform/opacity which skip layout.</p>
+  </details>
+
+  <details class="qa">
+    <summary>24. Server data in Redux vs TanStack Query — the performance argument?</summary>
+    <p>Server data in a global store means: every fetch dispatches through one store (every dispatch runs every subscribed selector), hand-rolled caching/staleness/dedupe, and components coupled to global shape. Query libraries treat server data as a cache keyed by query with per-key subscriptions — only components on that key re-render on its updates — plus staleTime to stop refetch storms, request dedupe, background revalidation, and pagination/infinite primitives. Global stores shrink to genuinely client-global state, which shrinks the re-render blast radius of everything.</p>
+  </details>
+
+  <details class="qa">
+    <summary>25. How do you stop performance regressions from coming back?</summary>
+    <p>Budgets enforced in CI: bundle size per entry chunk (size-limit fails the build over threshold), Lighthouse CI on key pages, and a Profiler-API assertion in integration tests on the hottest trees (fail if commit exceeds N ms with production-scale fixture data). In the field, continuous web-vitals RUM with alerting on p75 INP/LCP regressions per release. The senior point: an unguarded optimization is a temporary one — the next feature will eat it silently.</p>
+  </details>
+</section>
+
+<!-- ============================================================ -->
+<!-- EXERCISES                                                    -->
+<!-- ============================================================ -->
+<section>
+  <h2 id="exercises">Hands-on exercises</h2>
+
+  <div class="exercise">
+    <h3>Exercise 1 — Fix the broken memo</h3>
+    <p>This list is memo'd but re-renders every row on every keystroke. Find all three defeats and fix them without restructuring the components.</p>
+    <pre><code>const Row = memo(function Row({ item, onToggle, badge }) {
+  return (
+    &lt;li onClick={() =&gt; onToggle(item.id)}&gt;
+      {item.label} {badge}
+    &lt;/li&gt;
+  );
+});
+
+function TodoList({ items }) {
+  const [query, setQuery] = useState('');
+  const [done, setDone] = useState(new Set());
+  return (
+    &lt;&gt;
+      &lt;input value={query} onChange={e =&gt; setQuery(e.target.value)} /&gt;
+      &lt;ul&gt;
+        {items.map(item =&gt; (
+          &lt;Row
+            key={item.id}
+            item={{ ...item, done: done.has(item.id) }}
+            onToggle={(id) =&gt; setDone(prev =&gt; {
+              const next = new Set(prev);
+              next.has(id) ? next.delete(id) : next.add(id);
+              return next;
+            })}
+            badge={&lt;Badge type="todo" /&gt;}
+          /&gt;
+        ))}
+      &lt;/ul&gt;
+    &lt;/&gt;
+  );
+}</code></pre>
+    <details>
+      <summary>Solution</summary>
+      <p>The three defeats: (1) <code>item={{ ...item, done }}</code> — a fresh object per render; (2) an inline <code>onToggle</code> arrow — fresh function per render; (3) <code>badge={&lt;Badge /&gt;}</code> — a fresh element per render.</p>
+      <pre><code>const badgeEl = &lt;Badge type="todo" /&gt;;   // hoisted: created once, stable forever
+
+function TodoList({ items }) {
+  const [query, setQuery] = useState('');
+  const [done, setDone] = useState(new Set());
+
+  const handleToggle = useCallback((id) =&gt; {
+    setDone(prev =&gt; {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+  }, []);   // functional update → no deps needed → stable forever
+
+  return (
+    &lt;&gt;
+      &lt;input value={query} onChange={e =&gt; setQuery(e.target.value)} /&gt;
+      &lt;ul&gt;
+        {items.map(item =&gt; (
+          &lt;Row
+            key={item.id}
+            item={item}                       // pass the original reference
+            done={done.has(item.id)}          // spread state as a primitive prop
+            onToggle={handleToggle}
+            badge={badgeEl}
+          /&gt;
+        ))}
+      &lt;/ul&gt;
+    &lt;/&gt;
+  );
+}
+// Adjust Row to accept `done` separately. Now typing in the input
+// re-renders TodoList, but every Row bails: item (same ref),
+// done (same boolean), onToggle (stable), badge (hoisted).
+// Toggling re-renders ONLY rows whose `done` boolean flipped.</code></pre>
+    </details>
+  </div>
+
+  <div class="exercise">
+    <h3>Exercise 2 — Composition, no memo allowed</h3>
+    <p>The mouse-position tracker below re-renders <code>&lt;ExpensiveChart /&gt;</code> (measured 60ms) on every mousemove. Eliminate the chart re-renders using only restructuring — no <code>memo</code>, <code>useMemo</code>, or <code>useCallback</code>.</p>
+    <pre><code>function Dashboard() {
+  const [pos, setPos] = useState({ x: 0, y: 0 });
+  return (
+    &lt;div onMouseMove={e =&gt; setPos({ x: e.clientX, y: e.clientY })}&gt;
+      &lt;Crosshair x={pos.x} y={pos.y} /&gt;
+      &lt;ExpensiveChart data={data} /&gt;
+    &lt;/div&gt;
+  );
+}</code></pre>
+    <details>
+      <summary>Solution</summary>
+      <pre><code>// Lift content up: the tracker owns the hot state and receives the
+// expensive subtree as children. Dashboard creates the chart element
+// once per ITS render, so tracker re-renders reuse the same reference
+// and React skips the chart subtree.
+function MouseTracker({ children }) {
+  const [pos, setPos] = useState({ x: 0, y: 0 });
+  return (
+    &lt;div onMouseMove={e =&gt; setPos({ x: e.clientX, y: e.clientY })}&gt;
+      &lt;Crosshair x={pos.x} y={pos.y} /&gt;
+      {children}                     {/* same element object as last render */}
+    &lt;/div&gt;
+  );
+}
+
+function Dashboard() {
+  return (
+    &lt;MouseTracker&gt;
+      &lt;ExpensiveChart data={data} /&gt;
+    &lt;/MouseTracker&gt;
+  );
+}
+// Verify in the Profiler: mousemove commits now show only MouseTracker
+// and Crosshair rendering (&lt;1ms); ExpensiveChart is gray.
+// Bonus hardening: for 60fps trackers, consider writing the crosshair
+// position via a ref + direct style transform to skip React entirely.</code></pre>
+    </details>
+  </div>
+
+  <div class="exercise">
+    <h3>Exercise 3 — Context architecture surgery</h3>
+    <p>One <code>AppContext</code> holds <code>{ user, theme, notifications, addNotification, toggleTheme }</code>. Notifications arrive several times per second; the profiler shows the theme toggle button, the user avatar, and 40 other consumers re-rendering with every notification. Redesign the context layer.</p>
+    <details>
+      <summary>Solution</summary>
+      <pre><code>// 1. Slice by update frequency + split actions from state.
+const UserContext          = createContext(null);  // changes on login
+const ThemeContext         = createContext(null);  // changes rarely
+const NotificationsContext = createContext(null);  // hot — changes constantly
+const ActionsContext       = createContext(null);  // NEVER changes
+
+function AppProviders({ children }) {
+  const [user, setUser] = useState(null);
+  const [theme, setTheme] = useState('dark');
+  const [notifications, dispatch] = useReducer(notificationsReducer, []);
+
+  // stable forever: setters are stable, dispatch is stable, deps = []
+  const actions = useMemo(() =&gt; ({
+    toggleTheme: () =&gt; setTheme(t =&gt; t === 'dark' ? 'light' : 'dark'),
+    addNotification: (n) =&gt; dispatch({ type: 'add', n }),
+  }), []);
+
+  return (
+    &lt;ActionsContext.Provider value={actions}&gt;
+      &lt;UserContext.Provider value={user}&gt;
+        &lt;ThemeContext.Provider value={theme}&gt;
+          &lt;NotificationsContext.Provider value={notifications}&gt;
+            {children}
+          &lt;/NotificationsContext.Provider&gt;
+        &lt;/ThemeContext.Provider&gt;
+      &lt;/UserContext.Provider&gt;
+    &lt;/ActionsContext.Provider&gt;
+  );
+}
+// Result: notification churn re-renders ONLY NotificationsContext
+// consumers. The theme button consumes ActionsContext (+ ThemeContext
+// for its icon) — untouched by notifications. Avatar consumes
+// UserContext — untouched.
+//
+// 2. If notification consumers are still too broad (e.g. one badge
+// needs only the count while a panel needs the list), that's the cue
+// to move notifications to an external store (Zustand) and subscribe
+// with selectors: useStore(s =&gt; s.notifications.length).</code></pre>
+    </details>
+  </div>
+
+  <div class="exercise">
+    <h3>Exercise 4 — Virtualize a log viewer</h3>
+    <p>Build a viewer for 100,000 log lines (fixed 28px height) with TanStack Virtual, plus: auto-scroll-to-bottom on new logs (tail mode) that disengages when the user scrolls up, and a "jump to latest" button. Sketch the solution.</p>
+    <details>
+      <summary>Solution</summary>
+      <pre><code>function LogViewer({ logs }) {
+  const parentRef = useRef(null);
+  const [tailing, setTailing] = useState(true);
+
+  const v = useVirtualizer({
+    count: logs.length,
+    getScrollElement: () =&gt; parentRef.current,
+    estimateSize: () =&gt; 28,       // fixed height → exact math, no measuring
+    overscan: 10,
+  });
+
+  // Tail mode: when new logs arrive and tailing is on, pin to the end.
+  useEffect(() =&gt; {
+    if (tailing &amp;&amp; logs.length &gt; 0) {
+      v.scrollToIndex(logs.length - 1, { align: 'end' });
+    }
+  }, [logs.length, tailing]);      // v is stable per instance
+
+  // Disengage when the user scrolls away from the bottom.
+  const onScroll = () =&gt; {
+    const el = parentRef.current;
+    const atBottom =
+      el.scrollHeight - el.scrollTop - el.clientHeight &lt; 40;
+    setTailing(atBottom);          // scroll up → false; return to bottom → true
+  };
+
+  return (
+    &lt;div style={{ position: 'relative' }}&gt;
+      &lt;div ref={parentRef} onScroll={onScroll}
+           style={{ height: 500, overflow: 'auto', fontFamily: 'monospace' }}&gt;
+        &lt;div style={{ height: v.getTotalSize(), position: 'relative' }}&gt;
+          {v.getVirtualItems().map(item =&gt; (
+            &lt;div key={item.key}
+                 style={{ position: 'absolute', top: 0, left: 0, width: '100%',
+                          height: 28, transform: `translateY(${item.start}px)` }}&gt;
+              &lt;LogLine line={logs[item.index]} /&gt;
+            &lt;/div&gt;
+          ))}
+        &lt;/div&gt;
+      &lt;/div&gt;
+      {!tailing &amp;&amp; (
+        &lt;button className="jump-latest"
+                onClick={() =&gt; { setTailing(true);
+                                 v.scrollToIndex(logs.length - 1, { align: 'end' }); }}&gt;
+          Jump to latest ↓
+        &lt;/button&gt;
+      )}
+    &lt;/div&gt;
+  );
+}
+// Key decisions to narrate: ~28 DOM rows instead of 100k; index keys are
+// acceptable ONLY if logs are append-only (prepends/deletions → stable ids);
+// memo(LogLine) so scroll commits only mount entering rows; if logs stream
+// faster than 60/s, buffer and flush appends with requestAnimationFrame
+// batching so you commit once per frame, not once per message.</code></pre>
+    </details>
+  </div>
+
+  <div class="exercise">
+    <h3>Exercise 5 — Run the runbook on a cold-start problem</h3>
+    <p>PM report: "the app takes 9 seconds to become usable on mid-range Android." Lab confirms: LCP 6.2s, TBT 3.8s, entry bundle 1.9MB gzipped. Write your step-by-step plan with expected impact per step.</p>
+    <details>
+      <summary>Solution</summary>
+      <p><strong>Classify:</strong> startup budget, twin problems — bytes (1.9MB → download+parse) and main-thread execution (TBT 3.8s). Plan, ordered by impact-per-effort:</p>
+      <ol>
+        <li><strong>Bundle treemap</strong> (source-map-explorer). Suppose it shows: charting lib 420KB used on /analytics only; moment+locales 310KB; a PDF lib 380KB behind an "export" button; full lodash 90KB.</li>
+        <li><strong>Route-split</strong> so the start route ships only its own code — charts and analytics move to their chunks. Expected: entry −500KB+.</li>
+        <li><strong>Component-split</strong> the PDF exporter behind its click, preloading on hover. Expected: −380KB from every non-exporting session.</li>
+        <li><strong>Replace/tree-shake:</strong> moment → date-fns or Intl (−~300KB raw), lodash → per-function lodash-es (−~70KB). Ballpark entry after 2–4: ~500–600KB gz.</li>
+        <li><strong>TBT pass:</strong> Performance trace of remaining long tasks — typically hydration of below-the-fold sections and third-party scripts. Defer third-party to post-interactive/idle; if on a framework, stream with Suspense boundaries so hydration is selective; consider RSC for static sections.</li>
+        <li><strong>LCP pass:</strong> ensure the hero image is preloaded/fetchpriority=high, not lazy-loaded, dimensions set; check server TTFB.</li>
+        <li><strong>Verify:</strong> re-run Lighthouse with Moto-G-class throttling — target LCP &lt; 2.5s, TBT &lt; 300ms — and confirm p75 field LCP/INP over the next release.</li>
+        <li><strong>Guard:</strong> size-limit CI budget on the entry chunk (e.g. fail &gt; 250KB gz), Lighthouse CI on the landing route.</li>
+      </ol>
+      <p>The grading points: treemap before touching code, ordered fixes with expected numbers, both budgets addressed (bytes AND main thread), lab + field verification, and a CI guard.</p>
+    </details>
+  </div>
+</section>
+
+<nav class="page-nav">
+  <a href="08-react-hooks-deep-dive.html">← Prev: Hooks Deep Dive</a>
+  <a href="10-react-18-19-latest.html">Next: React 18/19 →</a>
+</nav>
+
+</main>
+</body>
+</html>

@@ -1,0 +1,1523 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>07 — React Rendering Internals | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <div class="breadcrumb"><a href="index.html">← Course Home</a></div>
+    <h1>07 — React Rendering Internals</h1>
+    <p>What actually happens between <code>setState</code> and pixels — elements, reconciliation, Fiber, and the commit pipeline.</p>
+  </div>
+</header>
+
+<main class="container">
+
+  <section>
+    <h2>Why interviewers ask this</h2>
+    <p>
+      You can ship React apps for years without knowing what a Fiber is. Senior interviews exist to find out
+      whether you're operating on <em>cargo-culted rules</em> ("wrap it in <code>memo</code>", "don't use index keys")
+      or on an <em>accurate mental model</em> you can reason from when the rules run out. Internals questions are the
+      fastest way to tell the difference: someone with the real model can explain <em>why</em> a child re-renders when
+      no props changed, <em>why</em> an effect runs twice in dev, <em>why</em> an input's value jumps to the wrong row —
+      and, crucially, predict behavior in code they've never seen.
+    </p>
+    <p>
+      At FAANG, these show up as "walk me through what happens when you call <code>setState</code>" and
+      predict-the-output drills. At product startups, they show up as debugging exercises: here's a jank/state-loss/
+      double-fetch bug, find it. Both are testing the same thing — do you know the machine you drive?
+      This tutorial builds that model bottom-up: elements → renders → diffing → Fiber → commit → the DOM layer.
+      Everything here is accurate for <strong>React 18/19 with <code>createRoot</code></strong>; where 17-era behavior
+      differs (batching, event delegation, pooling) it's called out explicitly, because "what changed in 18" is itself
+      a classic question.
+    </p>
+    <div class="tier-legend">
+      <span class="tier tier-1">T1 — must be airtight</span>
+      <span class="tier tier-2">T2 — senior differentiator</span>
+      <span class="tier tier-3">T3 — awareness is enough</span>
+    </div>
+  </section>
+
+  <div class="toc">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#jsx-elements">JSX, elements, components, instances</a></li>
+      <li><a href="#render-model">The render model — what "rendering" actually means</a></li>
+      <li><a href="#reconciliation">Reconciliation, diffing heuristics, and keys</a></li>
+      <li><a href="#fiber">Fiber architecture — why and how</a></li>
+      <li><a href="#render-commit">Render phase vs commit phase — the full timeline</a></li>
+      <li><a href="#batching">Batching and the state-update queue</a></li>
+      <li><a href="#strictmode">StrictMode — why everything runs twice in dev</a></li>
+      <li><a href="#events">The synthetic event system</a></li>
+      <li><a href="#children">children &amp; composition as a performance mechanism</a></li>
+      <li><a href="#refs">Refs and the DOM — attachment timing and layout reads</a></li>
+      <li><a href="#reactdom">ReactDOM specifics — roots, portals, the package split</a></li>
+      <li><a href="#qa">Interview Q&amp;A</a></li>
+      <li><a href="#exercises">Hands-on exercises</a></li>
+    </ol>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="jsx-elements">1. JSX, elements, components, instances <span class="tier tier-1">T1</span></h2>
+
+  <p>
+    Everything in this tutorial rests on one fact: <strong>JSX is not HTML, not a template language, and not magic —
+    it's syntax sugar for function calls that return plain JavaScript objects.</strong> If you get this section exactly
+    right, half of React's "surprising" behavior stops being surprising.
+  </p>
+
+  <h3>What the compiler does with JSX</h3>
+  <p>
+    Babel/SWC/TypeScript transpile JSX before React ever sees it. Since React 17, the default is the
+    <em>automatic runtime</em>: JSX compiles to calls to <code>jsx()</code> / <code>jsxs()</code> imported from
+    <code>react/jsx-runtime</code> (before that, to <code>React.createElement</code> — which still works and is why
+    old code needed <code>import React</code> in every file).
+  </p>
+
+  <pre><code><span class="com">// What you write:</span>
+<span class="kw">const</span> el = &lt;button className=<span class="str">"primary"</span> onClick={handle}&gt;Save&lt;/button&gt;;
+
+<span class="com">// Automatic runtime (React 17+) — what the compiler emits:</span>
+<span class="kw">import</span> { jsx <span class="kw">as</span> _jsx } <span class="kw">from</span> <span class="str">"react/jsx-runtime"</span>;
+<span class="kw">const</span> el = _jsx(<span class="str">"button"</span>, { className: <span class="str">"primary"</span>, onClick: handle, children: <span class="str">"Save"</span> });
+
+<span class="com">// Classic runtime — equivalent:</span>
+<span class="kw">const</span> el = React.createElement(<span class="str">"button"</span>, { className: <span class="str">"primary"</span>, onClick: handle }, <span class="str">"Save"</span>);</code></pre>
+
+  <h3>An element is a plain, frozen object</h3>
+  <p>
+    The return value is a small immutable descriptor — no DOM node, no class instance, no hidden machinery:
+  </p>
+
+  <pre><code>{
+  $$typeof: Symbol.for(<span class="str">'react.element'</span>), <span class="com">// 'react.transitional.element' in React 19</span>
+  type: <span class="str">'button'</span>,          <span class="com">// string for host elements, function/class for components</span>
+  key: <span class="kw">null</span>,
+  props: { className: <span class="str">'primary'</span>, onClick: handle, children: <span class="str">'Save'</span> },
+  ref: <span class="kw">null</span>                 <span class="com">// in React 19, ref is just a normal prop inside props</span>
+}</code></pre>
+
+  <div class="note">
+    <code>$$typeof</code> is a security measure, not bookkeeping. It's a <code>Symbol</code>, and symbols can't survive
+    JSON serialization — so attacker-controlled JSON from a server can never smuggle in a fake "element" that React
+    would render (which could inject <code>dangerouslySetInnerHTML</code>). Knowing this is a nice senior flex.
+  </div>
+
+  <p>
+    In development, React <code>Object.freeze</code>s elements and their props. That's the mechanical reason
+    <strong>you can't mutate props</strong> — but the deeper reason is architectural: an element describes
+    <em>what the UI should look like at one point in time</em>. React compares element trees across renders to decide
+    what to do; if you mutated an element in place, React couldn't tell "before" from "after" and the diffing model
+    collapses. Cheap immutable descriptions, recreated every render, compared by React — that's the whole design.
+  </p>
+
+  <h3>Elements vs components vs instances — three words interviewers make you separate</h3>
+  <table>
+    <thead><tr><th>Term</th><th>What it is</th><th>Who creates it</th><th>Lifetime</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Component</strong></td><td>A function (or class) — a <em>factory for elements</em>. <code>function Button(props) {…}</code></td><td>You, at module load</td><td>Whole app lifetime</td></tr>
+      <tr><td><strong>Element</strong></td><td>Plain object describing one node: <code>{ type: Button, props: {…} }</code></td><td>JSX, every render</td><td>One render — thrown away after diffing</td></tr>
+      <tr><td><strong>Instance</strong></td><td>The stateful thing living across renders — for function components, this is effectively the <em>fiber</em> (holding hook state); for classes, <code>this</code></td><td>React, at mount</td><td>Mount → unmount</td></tr>
+    </tbody>
+  </table>
+
+  <pre><code>Component (function)      Element (per render)          Instance / Fiber (persistent)
+┌──────────────────┐      ┌────────────────────────┐    ┌───────────────────────────┐
+│ function Button  │ ───► │ { type: Button,        │───►│ fiber: hook state,        │
+│   (props) {...}  │ JSX  │   props: {label:'Go'} }│    │ effects, host DOM node    │
+└──────────────────┘      └────────────────────────┘    └───────────────────────────┘
+   "the recipe"              "the order ticket"             "the actual dish"</code></pre>
+
+  <div class="pitfall">
+    <code>&lt;Button /&gt;</code> does <strong>not call</strong> <code>Button</code>. It creates
+    <code>{ type: Button, props: {} }</code>. React calls <code>Button(props)</code> later, during the render phase,
+    when it's this element's turn in the work loop. This gap — element creation vs component invocation — is exactly
+    why the <a href="#children">children optimization</a> works, and why calling a component directly
+    (<code>{Button(props)}</code> instead of <code>&lt;Button /&gt;</code>) subtly breaks things: React sees the
+    <em>output</em> of Button inlined into the parent, so Button gets no fiber of its own — its hooks get attributed
+    to the parent, and conditional rendering of it will corrupt hook order.
+  </div>
+
+  <h3>Referential identity — the foundation for everything later</h3>
+  <p>
+    Because JSX creates a <em>new object every time it runs</em>, two renders of the same JSX produce elements that
+    are <code>===</code>-unequal even if every prop is identical. React's bailout checks
+    (<code>memo</code>, the same-element bailout) compare references, not deep-equality. So:
+  </p>
+  <pre><code><span class="com">// Every render of Parent creates a NEW element object here:</span>
+&lt;Child items={[<span class="num">1</span>, <span class="num">2</span>, <span class="num">3</span>]} /&gt;   <span class="com">// new element AND new array prop each time</span>
+
+<span class="com">// But an element held in a variable/state keeps its identity across renders:</span>
+<span class="kw">const</span> [modal] = useState(() =&gt; &lt;Modal /&gt;);  <span class="com">// same element object forever</span></code></pre>
+  <p>
+    Corollary you'll use constantly: <strong>if React receives the exact same element object it saw last render, it
+    can skip re-rendering that subtree entirely</strong> (the props can't have changed — the object is frozen and
+    identical). This single fact powers the <code>children</code>-composition optimization in section 9 and is the
+    honest answer to "how do I avoid re-renders without memo".
+  </p>
+
+  <!-- ============================================================ -->
+  <h2 id="render-model">2. The render model — what "rendering" actually means <span class="tier tier-1">T1</span></h2>
+
+  <p>
+    This is the single most important mental model in the file. Most React confusion — and most wrong interview
+    answers — comes from an imprecise definition of "render". Here is the precise one:
+  </p>
+
+  <div class="note">
+    <strong>A render is React calling your component functions to compute the next element tree.</strong>
+    It is a pure computation. Nothing touches the DOM during a render. "Re-render" ≠ "repaint" ≠ "DOM update" —
+    a component can re-render 50 times and produce zero DOM mutations if its output didn't change.
+  </div>
+
+  <h3>Exactly three things trigger a re-render</h3>
+  <ol>
+    <li><strong>A state update</strong> in the component (<code>useState</code>/<code>useReducer</code> setter, class <code>setState</code>) — <em>with one caveat below</em>.</li>
+    <li><strong>Its parent re-rendered</strong> — and didn't bail out for this child.</li>
+    <li><strong>A context it consumes changed value</strong> (compared with <code>Object.is</code> on the Provider's <code>value</code>).</li>
+  </ol>
+  <p>
+    That's the whole list. Props are conspicuously absent — see the misconception below. (Force-update mechanisms and
+    hot reload are just state updates under the hood.)
+  </p>
+
+  <h3>The Object.is bail-out</h3>
+  <pre><code><span class="kw">const</span> [count, setCount] = useState(<span class="num">0</span>);
+
+setCount(<span class="num">0</span>);  <span class="com">// same value per Object.is → React bails out, no re-render</span>
+setCount(<span class="num">1</span>);  <span class="com">// different → schedules a render</span>
+setCount(<span class="num">1</span>);  <span class="com">// later, again 1 → bails out</span>
+
+<span class="com">// Objects compare by reference:</span>
+setUser({ ...user });        <span class="com">// NEW object → re-renders even if fields identical</span>
+setUser(user);               <span class="com">// same reference → bails out</span></code></pre>
+  <div class="senior">
+    The bail-out has a nuance worth volunteering: when you set state to the same value, React <em>may still render
+    that one component</em> (and run its function body) before deciding its children can be skipped — it needs a
+    render to confirm nothing changed in some edge cases (e.g., a previous update in the queue). So "same value →
+    guaranteed zero renders" is slightly too strong; "same value → React bails out and won't render the children,
+    and usually skips the component too" is the accurate phrasing. Never rely on the extra invocation either way —
+    renders must be pure precisely so this is unobservable.
+  </div>
+
+  <h3>The #1 misconception: "components re-render when their props change"</h3>
+  <p>
+    Backwards. <strong>When a component renders, React renders all of its children by default — regardless of whether
+    their props changed.</strong> Props changing is not a trigger; it's a <em>consequence</em> of the parent
+    re-rendering (the parent re-ran, so it created new elements with possibly-new props). React does not sit around
+    watching props. There is no dirty-checking of props. The cascade is top-down and unconditional unless something
+    stops it:
+  </p>
+
+  <pre><code>          setState in B
+               │
+   A           ▼            A   — not rendered (state lives in B; parents never
+   └─ B ◄── re-renders            re-render because a child updated)
+      ├─ C  ── re-renders   C   — re-renders even though its props are identical
+      └─ D  ── re-renders   D   — re-renders even though it takes NO props at all
+         └─ E ── re-renders E   — the cascade goes all the way down</code></pre>
+
+  <p>Only three things stop the cascade at a subtree:</p>
+  <ol>
+    <li><code>React.memo</code> — shallow-compares props, skips the render if all are <code>Object.is</code>-equal.</li>
+    <li><strong>Same-element bailout</strong> — the child element object is referentially identical to last render's (typically because it came through <code>children</code> or was hoisted — section 9).</li>
+    <li>(Class components) <code>shouldComponentUpdate</code> / <code>PureComponent</code>.</li>
+  </ol>
+
+  <div class="pitfall">
+    A memoized child still re-renders if any prop is a freshly-created reference — inline object/array/function props
+    defeat <code>memo</code> every time. That's the entire reason <code>useCallback</code>/<code>useMemo</code> exist:
+    they are <em>referential-stability tools for crossing memoization boundaries</em>, not general "make it faster"
+    knobs. Saying that sentence in an interview is worth a lot.
+  </div>
+
+  <div class="note">
+    Context is the one hole in <code>memo</code>'s armor: a context-value change re-renders every <em>consumer</em>,
+    punching straight through <code>memo</code>'d ancestors that don't consume it (they stay skipped; the consumer
+    below them still renders). And because Provider <code>value</code> is compared with <code>Object.is</code>, an
+    inline <code>value={{user, theme}}</code> re-notifies all consumers on every Provider render — the classic
+    context perf bug.
+  </div>
+
+  <h3>Renders must be pure — and React enforces it</h3>
+  <p>
+    React reserves the right to call your component <strong>more than once per committed update</strong> (StrictMode
+    dev double-invocation, §7) and to <strong>throw a computed tree away entirely</strong> (an interrupted concurrent
+    render that got superseded by a higher-priority update — §4). If your render mutates a module-level variable,
+    pushes to an array it didn't create this render, fires analytics, or writes to a ref, those side effects will run
+    a nondeterministic number of times. The contract:
+  </p>
+  <ul>
+    <li>Same props + state + context → same JSX. No exceptions.</li>
+    <li>No mutation of anything that existed before this render began (mutating objects you <em>created during</em> this render is fine — "local mutation").</li>
+    <li>Side effects belong in event handlers (preferred) or effects (for synchronization with external systems) — both run only for <em>committed</em> updates.</li>
+  </ul>
+
+  <h3>"Is setState asynchronous?" — the senior answer</h3>
+  <p>
+    The precise answer: <strong><code>setState</code> is synchronous as a function call, but the re-render it
+    requests is batched and deferred</strong> — and the state <em>variable in your closure</em> never changes within
+    a render. It's not Promise-async; there's no microtask you can <code>await</code> to get the new value.
+    <code>setCount(1)</code> synchronously enqueues an update and schedules work; your local <code>count</code>
+    still holds the old value because it's a <code>const</code> captured when this render ran. "State behaves like a
+    snapshot per render" is the modern framing; "setState is async" is the 2016 framing that interviewers will probe.
+  </p>
+  <pre><code>function handleClick() {
+  setCount(count + <span class="num">1</span>);
+  console.log(count);      <span class="com">// old value — not because "async", but because `count`</span>
+}                          <span class="com">// is a constant snapshot belonging to THIS render</span></code></pre>
+  <p>
+    One more consequence worth stating before we move on: because every state setter merely <em>enqueues</em> an
+    update, several setters called in one event handler produce <strong>one</strong> render, not several — the queue
+    is drained when React finally renders (§6 covers the queue mechanics). And the render that gets scheduled has to
+    answer a question we've been dancing around: given the new element tree your components return, <em>what should
+    React actually do to the DOM?</em> That's reconciliation.
+  </p>
+
+  <!-- ============================================================ -->
+  <h2 id="reconciliation">3. Reconciliation, diffing heuristics, and keys <span class="tier tier-1">T1</span></h2>
+
+  <p>
+    After a render produces a new element tree, React must transform the previous DOM into the new description with
+    the minimum reasonable set of mutations. The theoretically optimal tree-diff is <strong>O(n³)</strong> — a
+    thousand-element tree would need a billion comparisons. React gets to <strong>O(n)</strong> by refusing to solve
+    the general problem and betting on two heuristics that hold for real UIs:
+  </p>
+  <ol>
+    <li><strong>Two elements of different <code>type</code> produce different trees.</strong> React never tries to
+      morph a <code>&lt;div&gt;</code> subtree into a <code>&lt;span&gt;</code> subtree or a <code>&lt;UserPanel&gt;</code>
+      into an <code>&lt;AdminPanel&gt;</code> — it tears down and rebuilds. And there is no cross-level matching,
+      ever: if a node moves to a different depth in the tree, it's destroyed and recreated at the new location.</li>
+    <li><strong>The developer can hint stable identity across renders with <code>key</code>.</strong> Keys turn list
+      diffing from positional matching into identity matching.</li>
+  </ol>
+
+  <h3>The type comparison — position by position</h3>
+  <p>
+    Reconciliation walks the old fiber tree and the new element tree together, comparing the element at each position
+    with the fiber that occupied that position last render:
+  </p>
+  <table>
+    <thead><tr><th>Comparison result</th><th>What React does</th><th>State?</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><strong>Same type, host element</strong> (<code>div</code> → <code>div</code>)</td>
+        <td>Keeps the DOM node, diffs the props, patches only changed attributes/styles, recurses into children</td>
+        <td>DOM state (focus, scroll, input value) preserved</td>
+      </tr>
+      <tr>
+        <td><strong>Same type, component</strong> (<code>Panel</code> → <code>Panel</code>)</td>
+        <td>Keeps the fiber (the instance), updates props, re-renders it, recurses</td>
+        <td><strong>Hook/class state preserved</strong></td>
+      </tr>
+      <tr>
+        <td><strong>Different type</strong> (<code>div</code> → <code>span</code>, <code>Panel</code> → <code>Modal</code>)</td>
+        <td>Unmounts the entire old subtree (cleanup effects run, DOM removed), mounts the new one from scratch</td>
+        <td><strong>All state in the subtree destroyed</strong></td>
+      </tr>
+      <tr>
+        <td><strong>Different <code>key</code>, same position</strong></td>
+        <td>Treated as a different element — unmount + remount, even if <code>type</code> is identical</td>
+        <td>State destroyed — this is the reset tool</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <pre><code><span class="com">// Same position + same type = SAME instance, state survives:</span>
+{isEditing
+  ? &lt;TextInput placeholder=<span class="str">"Edit…"</span> /&gt;
+  : &lt;TextInput placeholder=<span class="str">"Search…"</span> /&gt;}
+<span class="com">// Toggling isEditing does NOT remount TextInput. React sees TextInput at the</span>
+<span class="com">// same position both renders → keeps the fiber, patches the placeholder prop.</span>
+<span class="com">// Whatever the user typed persists across the toggle — often a surprise.</span>
+
+<span class="com">// Different type at the position = teardown, even though a TextInput sits inside both:</span>
+{isEditing
+  ? &lt;div&gt;&lt;TextInput /&gt;&lt;/div&gt;
+  : &lt;section&gt;&lt;TextInput /&gt;&lt;/section&gt;}
+<span class="com">// div → section: React destroys the whole subtree. The inner TextInput loses</span>
+<span class="com">// its state even though "the same component" appears in both branches.</span></code></pre>
+
+  <div class="senior">
+    "State is tied to position in the tree, not to the JSX you wrote" is the sentence to say. Two
+    <code>&lt;Counter /&gt;</code>s rendered at the same position across renders share one instance;
+    the same <code>&lt;Counter /&gt;</code> rendered at two different positions is two instances. React has no idea
+    your two JSX branches "mean" the same component — it only sees type + position (+ key).
+  </div>
+
+  <div class="pitfall">
+    Defining a component <em>inside</em> another component's body creates a new function identity every render —
+    and a new function is a <strong>different <code>type</code></strong>. React unmounts and remounts that child's
+    entire subtree on every parent render: state wiped, effects re-run, DOM rebuilt, focus lost. This is the
+    mechanical reason "never define components during render" is a hard rule, not a style preference.
+  </div>
+
+  <pre><code><span class="kw">function</span> Parent() {
+  <span class="com">// ❌ New function identity each render → different type → remount every render</span>
+  <span class="kw">function</span> Child() { <span class="kw">return</span> &lt;input /&gt;; }
+  <span class="kw">return</span> &lt;Child /&gt;;   <span class="com">// typing in this input loses focus on every keystroke</span>
+}</code></pre>
+
+  <h3>List diffing — what happens without keys</h3>
+  <p>
+    For a set of siblings, React's default is <strong>positional matching</strong>: old child 0 vs new child 0,
+    old child 1 vs new child 1, and so on. Appending to the end is cheap — positions 0…n-1 match, one insert at the
+    end. But <em>prepending</em> or <em>removing from the middle</em> is pathological: every element after the change
+    point sits at a shifted position, so React sees "child at position i changed props/content" for the entire rest
+    of the list and patches every row — and any per-row state stays glued to the position, not the data.
+  </p>
+  <pre><code><span class="com">// Old:  [A, B, C]        New: [Z, A, B, C]   (prepend Z, no keys)</span>
+<span class="com">// React compares by position:</span>
+<span class="com">//   pos 0: A → Z   "props changed" → patch entire row</span>
+<span class="com">//   pos 1: B → A   patch</span>
+<span class="com">//   pos 2: C → B   patch</span>
+<span class="com">//   pos 3: (new) → C   insert</span>
+<span class="com">// 3 full patches + 1 insert, instead of the truthful: 1 insert.</span>
+
+<span class="com">// With stable keys [z, a, b, c] vs [a, b, c]:</span>
+<span class="com">//   React maps old children by key, finds a/b/c unchanged (same key + type</span>
+<span class="com">//   → reuse fiber and DOM node, possibly move it), inserts only z.</span></code></pre>
+  <p>
+    Mechanically, keyed reconciliation does a first pass matching old and new children in order until keys stop
+    lining up, then builds a <code>Map</code> of the remaining old children by key and, for each remaining new
+    element, either reuses the matching old fiber (moving the DOM node if needed) or mounts a new one; leftovers in
+    the map are deleted. One caveat worth knowing: React's algorithm only moves nodes <em>forward</em> — a
+    "move the last item to the front" reorder can degrade to moving every <em>other</em> node instead, which is why
+    large animated reorders are sometimes slower than expected. Still O(n), still correct.
+  </p>
+
+  <h3>Why index-as-key is a bug, concretely</h3>
+  <p>
+    Using the array index as the key re-encodes exactly the positional matching you were trying to escape — the key
+    <em>is</em> the position. Two classes of bugs follow, and interviewers love making you produce them on a whiteboard:
+  </p>
+  <h4>Bug 1 — component state sticks to the position</h4>
+  <pre><code><span class="com">// Each row has local state: an "expanded" flag.</span>
+{comments.map((c, i) =&gt; &lt;Comment key={i} data={c} /&gt;)}
+
+<span class="com">// User expands row 0 ("Alice"). A new comment "Zed" is prepended.</span>
+<span class="com">// key=0 now belongs to Zed's row. React sees key 0 in both renders →</span>
+<span class="com">// SAME fiber, same state:  Zed renders expanded, Alice renders collapsed.</span>
+<span class="com">// The expansion belongs to slot 0, not to Alice. Deleting a middle row</span>
+<span class="com">// shifts every later row's state up by one — same disease, other direction.</span></code></pre>
+  <h4>Bug 2 — uncontrolled inputs and DOM state</h4>
+  <pre><code>{rows.map((row, i) =&gt; (
+  &lt;li key={i}&gt;
+    {row.label}
+    &lt;input defaultValue={row.draft} /&gt;   <span class="com">// uncontrolled — value lives in the DOM</span>
+  &lt;/li&gt;
+))}
+<span class="com">// Delete row 1 of 3. With positional keys React deletes the LAST li (key 2</span>
+<span class="com">// vanished) and patches the labels of keys 0/1. The &lt;input&gt; DOM nodes at</span>
+<span class="com">// positions 0 and 1 are reused untouched — so row 2's label now sits next to</span>
+<span class="com">// row 1's typed text. Same story for focus, checkboxes, scroll, transitions.</span></code></pre>
+  <div class="note">
+    When is index-as-key actually fine? When the list is effectively static: never reordered, never filtered,
+    items only appended or the whole list replaced wholesale, <em>and</em> rows carry no state — no inputs, no
+    animations, no memoization relying on identity. Read-only rendering of a fixed array qualifies. The honest
+    senior answer: "fine under those conditions, but the conditions are fragile — the day someone adds a delete
+    button, the bug appears far from the code that caused it, so I default to real ids." And
+    <code>key={Math.random()}</code> or anything regenerated per render is <em>worse</em> than an index:
+    every render unmounts and remounts every row.
+  </div>
+
+  <h3>Key as an identity and reset tool</h3>
+  <p>
+    Because a changed key means "different element, remount," <code>key</code> doubles as React's official
+    <strong>state-reset API</strong> — usable on any element, not just list items:
+  </p>
+  <pre><code><span class="com">// A form that should reset completely when the selected user changes:</span>
+&lt;UserEditForm key={selectedUserId} userId={selectedUserId} /&gt;
+<span class="com">// key changed → unmount + fresh mount: every useState initializer re-runs,</span>
+<span class="com">// uncontrolled inputs are cleared, effects torn down and re-created. One line</span>
+<span class="com">// replaces an error-prone "reset all fields in a useEffect when userId changes."</span></code></pre>
+  <p>
+    Compared to effect-based resets, key-reset is atomic — no intermediate render showing the previous user's data,
+    no synchronization logic to get wrong. The trade-off: it's a full remount (effects re-run, DOM rebuilds), which
+    is exactly right for "different record" and exactly wrong per-keystroke. Also remember the scoping rules: keys
+    only need to be unique <strong>among siblings</strong>, not globally; and <code>key</code> is consumed by React —
+    it never arrives in the child's props (pass a separate <code>id</code> prop if the child needs the value).
+  </p>
+
+  <!-- ============================================================ -->
+  <h2 id="fiber">4. Fiber architecture — why and how <span class="tier tier-2">T2</span></h2>
+
+  <p>
+    Fiber is React's ground-up reimplementation of the reconciler, shipped in React 16 (2017), and it's the substrate
+    every modern feature stands on — concurrent rendering, transitions, Suspense, selective hydration. The interview
+    question is rarely "recite the fields of a fiber"; it's <strong>"why did React need Fiber?"</strong> — a design
+    question with a crisp answer.
+  </p>
+
+  <h3>Why the stack reconciler had to go</h3>
+  <p>
+    Pre-16 React reconciled <em>recursively</em>: rendering a component immediately and synchronously rendered its
+    children, theirs, and so on — the work lived on the <strong>JavaScript call stack</strong>. That has a fatal
+    property: <em>you cannot pause a call stack</em>. Once a big update started, the main thread was locked until the
+    entire tree finished — a 200ms reconciliation meant 200ms of dropped frames, frozen inputs, and janked animations.
+    No interrupting for a higher-priority event, no splitting work across frames, no abandoning work that went stale
+    mid-flight.
+  </p>
+  <p>
+    The fix: <strong>reify the call stack as a data structure on the heap</strong>. Instead of stack frames, each unit
+    of work becomes a <em>fiber</em> — a plain object React can process one at a time in a loop, pause between any
+    two, resume, reprioritize, or throw away. A fiber is literally a virtual stack frame; the name comes from the
+    OS concept of fibers as cooperatively-scheduled lightweight threads.
+  </p>
+
+  <h3>Anatomy of a fiber node</h3>
+  <pre><code>{
+  <span class="com">// Identity — mirrors the element</span>
+  tag: <span class="num">0</span>,                    <span class="com">// FunctionComponent | HostComponent | HostRoot | …</span>
+  type: App,                 <span class="com">// the function/class, or 'div' for host fibers</span>
+  key: <span class="kw">null</span>,
+  stateNode: <span class="kw">null</span>,           <span class="com">// the real DOM node (host fibers) / class instance</span>
+
+  <span class="com">// Tree structure — a linked list, NOT a children array</span>
+  child: fiber,              <span class="com">// first child</span>
+  sibling: fiber,            <span class="com">// next sibling</span>
+  <span class="kw">return</span>: fiber,             <span class="com">// parent — "where to return to": the stack metaphor</span>
+
+  <span class="com">// State</span>
+  pendingProps: {…},         <span class="com">// props from the new element, about to be applied</span>
+  memoizedProps: {…},        <span class="com">// props from the last completed render</span>
+  memoizedState: hook,       <span class="com">// function components: the LINKED LIST OF HOOKS</span>
+  updateQueue: […],          <span class="com">// pending state updates / effects for this fiber</span>
+
+  <span class="com">// Scheduling &amp; bookkeeping</span>
+  lanes: <span class="num">0b0100</span>,             <span class="com">// priority bitmask of pending updates here</span>
+  flags: <span class="num">0b0110</span>,             <span class="com">// side effects to apply at commit: Placement, Update…</span>
+  alternate: fiber           <span class="com">// the OTHER version of this fiber — see double buffering</span>
+}</code></pre>
+  <p>
+    Two of these fields explain long-standing "rules" mechanically. <code>memoizedState</code> holds hook state as a
+    <strong>linked list in call order</strong> — hook #1's node points to hook #2's, with no names attached. That is
+    the entire reason hooks can't be called conditionally: React identifies "which useState is this?" purely by
+    position in the list, so one skipped hook shifts every subsequent hook onto the wrong node's state. And
+    <code>child</code>/<code>sibling</code>/<code>return</code> turn the tree into something traversable with a
+    pointer-following loop — down to <code>child</code>, across to <code>sibling</code>, up via <code>return</code> —
+    which is what makes the work pausable: all "where am I?" state lives in one pointer instead of a call stack.
+  </p>
+
+  <h3>Double buffering — current and workInProgress</h3>
+  <p>
+    React keeps <strong>two fiber trees</strong>. The <code>current</code> tree describes what's on screen right now.
+    When an update arrives, React builds the next tree — the <code>workInProgress</code> tree — by walking the
+    current tree and, for each fiber that needs work, creating or reusing its <code>alternate</code>. The two
+    versions of each node point at each other via <code>alternate</code>, and untouched subtrees are shared
+    structurally between the trees rather than copied.
+  </p>
+  <pre><code>   current (on screen)          workInProgress (being built)
+   ┌──────────┐    alternate    ┌──────────┐
+   │ App  v1  │ ◄─────────────► │ App  v2  │
+   └────┬─────┘                 └────┬─────┘
+        │                            │
+   ┌────▼─────┐    alternate    ┌────▼─────┐
+   │ List v1  │ ◄─────────────► │ List v2  │
+   └──────────┘                 └──────────┘
+
+   Commit = an atomic pointer flip:  root.current = workInProgressTree.
+   The old tree becomes the recycled alternate pool for the NEXT update.</code></pre>
+  <p>
+    This is classic double buffering, exactly as in graphics: never mutate the frame being displayed; compose the next
+    frame off-screen and flip a pointer. It buys three things: the screen can never show a half-rendered state; an
+    interrupted or abandoned workInProgress tree costs nothing to discard (the current tree was never touched); and
+    memory churn stays low because each node's two versions are reused alternately forever.
+  </p>
+
+  <h3>The work loop and time slicing</h3>
+  <pre><code><span class="com">// Conceptually (real source: ReactFiberWorkLoop.js)</span>
+<span class="kw">function</span> workLoopConcurrent() {
+  <span class="kw">while</span> (workInProgress !== <span class="kw">null</span> &amp;&amp; !shouldYield()) {
+    workInProgress = performUnitOfWork(workInProgress);
+  }
+}
+<span class="com">// performUnitOfWork: beginWork (call the component, reconcile its children,</span>
+<span class="com">// return the child fiber to work on next) … and when a subtree bottoms out,</span>
+<span class="com">// completeWork (prepare host-node updates, bubble effect flags upward), then</span>
+<span class="com">// move to the sibling, or return to the parent.</span></code></pre>
+  <p>
+    <code>shouldYield()</code> is where concurrency lives: React's scheduler slices render work into ~5ms chunks and
+    yields the main thread between chunks so the browser can handle input and paint. The scheduling itself rides a
+    <code>MessageChannel</code> macrotask loop — not <code>requestIdleCallback</code> (fires too infrequently, patchy
+    support) and not a microtask (microtasks don't let paint through). If a higher-priority update arrives while a
+    low-priority render is mid-flight, React <strong>abandons the workInProgress tree, renders the urgent update,
+    then restarts the low-priority render from scratch against the new state</strong>. That restart is why render
+    purity is a hard contract rather than a style rule: your components observably run for renders that never commit.
+  </p>
+
+  <h3>Lanes — priority as a bitmask</h3>
+  <p>
+    Every update is assigned a <strong>lane</strong> — one bit in a 31-bit mask — encoding its priority class.
+    Conceptually, from most to least urgent:
+  </p>
+  <table>
+    <thead><tr><th>Lane (conceptual)</th><th>Source</th><th>Behavior</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Sync</strong></td><td>Discrete events: click, keydown, submit</td><td>Rendered synchronously to completion — a click's result must not be interleaved</td></tr>
+      <tr><td><strong>InputContinuous</strong></td><td>Continuous events: scroll, drag, mousemove</td><td>High priority, coalesced</td></tr>
+      <tr><td><strong>Default</strong></td><td>Network responses, timers</td><td>Normal concurrent rendering</td></tr>
+      <tr><td><strong>Transition</strong></td><td><code>startTransition</code>, <code>useDeferredValue</code></td><td>Interruptible background rendering — abandoned and restarted when urgent work lands</td></tr>
+      <tr><td><strong>Idle / Offscreen</strong></td><td>Hidden or prerendered content</td><td>Only when nothing else is pending</td></tr>
+    </tbody>
+  </table>
+  <p>
+    Bitmasks make the bookkeeping cheap: "does this subtree have pending work at this priority?" is one bitwise
+    <code>&amp;</code> against <code>childLanes</code> bubbled up the tree, and multiple compatible lanes batch into a
+    single render. You don't need implementation-level lane detail in interviews — you need the model:
+    <strong>updates carry priorities; urgent renders interrupt background ones; interrupted work is discarded and
+    redone.</strong> That model is exactly what <code>useTransition</code> exposes as API.
+  </p>
+  <div class="senior">
+    Preempt the common misconception: Fiber did <em>not</em> make individual renders faster — the same components run
+    the same code, and a sliced render actually finishes slightly later in wall-clock terms. It made rendering
+    <em>schedulable</em>: pausable, prioritizable, abandonable. The payoff is responsiveness under load, not
+    throughput — and every headline React feature since 2017 (Suspense, transitions, streaming SSR with selective
+    hydration, <code>&lt;Activity&gt;</code>) is a scheduling feature that's only possible because the reconciler
+    stopped living on the call stack.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="render-commit">5. Render phase vs commit phase — the full timeline <span class="tier tier-1">T1</span></h2>
+
+  <p>
+    Every React update flows through the same two-phase pipeline, and knowing precisely what runs in which phase —
+    and where the browser's paint fits — is the backbone of "walk me through setState to pixels":
+  </p>
+
+  <pre><code>trigger (setState) → schedule (lane assigned, batched)
+        │
+        ▼
+┌─ RENDER PHASE ────────────────────────────────────────────────┐
+│  interruptible · pausable · restartable · MUST BE PURE        │
+│  beginWork:   call components, reconcile children             │
+│  completeWork: compute host-node diffs, bubble effect flags   │
+│  output: a finished workInProgress tree + effect list         │
+└───────────────────────────────────────────────────────────────┘
+        │  (may be thrown away and restarted — nothing visible happened yet)
+        ▼
+┌─ COMMIT PHASE ── synchronous, never interruptible ────────────┐
+│  1. before-mutation:  getSnapshotBeforeUpdate                 │
+│  2. mutation:         DOM inserts/updates/deletes,            │
+│                       detach refs, run layout-effect CLEANUPS │
+│         → root.current = workInProgress  (the tree flip)      │
+│  3. layout:           attach refs, useLayoutEffect setups,    │
+│                       componentDidMount/DidUpdate             │
+└───────────────────────────────────────────────────────────────┘
+        │
+        ▼
+   browser paints the mutated DOM
+        │
+        ▼
+   passive effects flush: useEffect cleanups, then setups</code></pre>
+
+  <h3>Render phase: interruptible, therefore pure</h3>
+  <p>
+    Everything up to the finished workInProgress tree is <em>computation without consequence</em> — no DOM mutations,
+    no lifecycle side effects. That's a design requirement, not a nicety: because concurrent React can pause this
+    phase, run something more urgent, and restart it, any code that runs here may execute multiple times per
+    committed update, or for updates that never commit at all. This is the phase your component function bodies,
+    <code>useMemo</code> callbacks, <code>useState</code> initializers/updaters, and render-time reconciliation all
+    belong to.
+  </p>
+
+  <h3>Commit phase: synchronous by necessity</h3>
+  <p>
+    Once React decides to commit, it applies every mutation for the update in one uninterruptible pass. Why can't
+    commit be sliced too? Because a half-mutated DOM would be visible: the browser could paint between slices,
+    showing users an inconsistent frame (old header, new list). The commit's three sub-phases each exist for a
+    specific timing need:
+  </p>
+  <table>
+    <thead><tr><th>Sub-phase</th><th>What runs</th><th>DOM state at that moment</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><strong>Before-mutation</strong></td>
+        <td><code>getSnapshotBeforeUpdate</code> (class)</td>
+        <td>Still the <em>old</em> DOM — last chance to read pre-update layout (the canonical use: capture <code>scrollHeight</code> of a chat list so you can preserve scroll position after prepending messages)</td>
+      </tr>
+      <tr>
+        <td><strong>Mutation</strong></td>
+        <td>Insert/update/delete host nodes per effect flags; <code>ref</code>s of removed/replaced nodes set to <code>null</code>; layout-effect <em>cleanups</em> run; unmounting components' <code>componentWillUnmount</code></td>
+        <td>Transitioning old → new; at the end, <code>root.current</code> flips to the new tree</td>
+      </tr>
+      <tr>
+        <td><strong>Layout</strong></td>
+        <td>Refs attached (<code>ref.current = node</code>); <code>useLayoutEffect</code> setups; <code>componentDidMount</code>/<code>DidUpdate</code>; <code>useImperativeHandle</code> values wired</td>
+        <td><em>New</em> DOM, fully mutated — but <strong>not yet painted</strong></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>useLayoutEffect vs useEffect — the paint boundary</h3>
+  <p>
+    The layout sub-phase runs <strong>after mutation, before the browser paints</strong>. That's the entire
+    difference between the two effect hooks:
+  </p>
+  <ul>
+    <li><code>useLayoutEffect</code> runs synchronously inside the commit. It can read the new layout
+      (<code>getBoundingClientRect</code>) and even <em>set state</em>, forcing a synchronous re-render+re-commit
+      before anything is painted — the user never sees the intermediate frame. This is the flicker-free way to
+      position tooltips/popovers: render invisibly (or at 0,0), measure, reposition, all within one frame.</li>
+    <li><code>useEffect</code> is deferred until after paint (scheduled as a passive effect). The user may see the
+      first frame before the effect runs — which is fine for its actual job: synchronizing with external systems
+      (subscriptions, fetches, logging), none of which need to beat the paint.</li>
+  </ul>
+  <pre><code><span class="com">// Flicker with useEffect, no flicker with useLayoutEffect:</span>
+<span class="kw">function</span> Tooltip({ anchorRef, children }) {
+  <span class="kw">const</span> [top, setTop] = useState(<span class="num">0</span>);
+  useLayoutEffect(() =&gt; {
+    <span class="kw">const</span> rect = anchorRef.current.getBoundingClientRect();
+    setTop(rect.bottom + <span class="num">8</span>);   <span class="com">// re-render + re-commit happen BEFORE paint</span>
+  }, [anchorRef]);
+  <span class="kw">return</span> &lt;div style={{ position: <span class="str">'fixed'</span>, top }}&gt;{children}&lt;/div&gt;;
+}
+<span class="com">// With useEffect: frame 1 paints the tooltip at top:0, THEN it jumps into</span>
+<span class="com">// place — a visible one-frame flicker on slower devices.</span></code></pre>
+  <div class="pitfall">
+    Because <code>useLayoutEffect</code> blocks paint, heavy work inside it is a direct hit to interaction latency —
+    every ms in a layout effect is a ms the user stares at a stale frame. Measure/position work only; move data
+    work to <code>useEffect</code>. Two more timing facts worth volunteering: passive effects are "after paint" as a
+    scheduling default, not an absolute guarantee (React will flush pending passive effects <em>early</em> — e.g.
+    before processing the next discrete event or the next sync render — so sequencing logic must not depend on
+    paint having happened); and on the server, <code>useLayoutEffect</code> triggers a warning because neither
+    effect runs during SSR — there's no layout to measure.
+  </div>
+
+  <h3>Effect ordering — the full picture for one commit</h3>
+  <pre><code><span class="com">// For an UPDATE that affects parent P and child C (effects run bottom-up):</span>
+<span class="com">//   mutation:  C layout-cleanup → P layout-cleanup → DOM mutated</span>
+<span class="com">//   layout:    C useLayoutEffect setup → P useLayoutEffect setup</span>
+<span class="com">//   (browser paints)</span>
+<span class="com">//   passive:   C useEffect cleanup → P useEffect cleanup →</span>
+<span class="com">//              C useEffect setup   → P useEffect setup</span>
+<span class="com">// Children before parents — a parent's effect can rely on its children's</span>
+<span class="com">// effects having run (same guarantee componentDidMount always gave).</span></code></pre>
+
+  <!-- ============================================================ -->
+  <h2 id="batching">6. Batching and the state-update queue <span class="tier tier-1">T1</span></h2>
+
+  <p>
+    Batching is React collecting multiple state updates and processing them in <strong>one render + one commit</strong>.
+    It exists because the alternative — render-per-setState — would make ordinary code pathologically slow and would
+    surface half-updated, inconsistent frames (first name updated, last name not yet). The interview relevance is the
+    React 18 change, plus the queue mechanics that explain the classic <code>setCount(count + 1)</code> puzzle.
+  </p>
+
+  <h3>React 17 vs 18 — the automatic batching change</h3>
+  <p>
+    In React 17 and earlier, batching only happened inside React event handlers — React wrapped your handler in a
+    "batching context" and flushed once at the end. Updates fired from anywhere else — <code>setTimeout</code>,
+    promise callbacks, <code>await</code> continuations, native event listeners — each triggered their own
+    synchronous render. React 18's <code>createRoot</code> made batching <strong>automatic everywhere</strong>:
+  </p>
+  <pre><code><span class="kw">function</span> handleClick() {
+  setCount(c =&gt; c + <span class="num">1</span>);
+  setFlag(f =&gt; !f);
+  <span class="com">// 17: one render (inside a React event handler) · 18: one render</span>
+}
+
+setTimeout(() =&gt; {
+  setCount(c =&gt; c + <span class="num">1</span>);
+  setFlag(f =&gt; !f);
+  <span class="com">// 17: TWO renders, one per setter · 18: ONE render — the change</span>
+}, <span class="num">100</span>);
+
+<span class="kw">async function</span> save() {
+  <span class="kw">await</span> api.save(data);
+  setSaving(<span class="kw">false</span>);
+  setToast(<span class="str">'Saved'</span>);
+  <span class="com">// 17: two renders · 18: one render. (Updates on opposite sides of an</span>
+  <span class="com">// `await` are separate ticks → separate batches — that part is unchanged.)</span>
+}</code></pre>
+  <div class="note">
+    Mechanically there's no timer or debounce involved: each setter enqueues an update and schedules a render as a
+    microtask-ish continuation; every setter called synchronously in the same tick lands in the same pending batch
+    before React gets control back. Batching also composes with lanes — React groups pending updates <em>of
+    compatible priority</em> into one render, so a sync click update won't wait for a transition to batch with it.
+  </div>
+
+  <h3>The update queue — why setCount(count + 1) × 3 gives 1</h3>
+  <p>
+    Each hook's fiber node keeps a <strong>queue of pending updates</strong>. A setter call appends an update object —
+    either a replacement value or an updater function — and during the next render React reduces the queue in order
+    to produce the new memoized state:
+  </p>
+  <pre><code><span class="kw">const</span> [count, setCount] = useState(<span class="num">0</span>);   <span class="com">// this render: count === 0</span>
+
+<span class="kw">function</span> handleClick() {
+  setCount(count + <span class="num">1</span>);   <span class="com">// enqueue REPLACE with 0+1 = 1  (count is the snapshot: 0)</span>
+  setCount(count + <span class="num">1</span>);   <span class="com">// enqueue REPLACE with 1 — same stale snapshot</span>
+  setCount(count + <span class="num">1</span>);   <span class="com">// enqueue REPLACE with 1</span>
+}
+<span class="com">// queue: [replace 1, replace 1, replace 1] → next render: count === 1</span>
+
+<span class="kw">function</span> handleClickFn() {
+  setCount(c =&gt; c + <span class="num">1</span>);  <span class="com">// enqueue UPDATER — receives the queue's running result</span>
+  setCount(c =&gt; c + <span class="num">1</span>);
+  setCount(c =&gt; c + <span class="num">1</span>);
+}
+<span class="com">// queue: [0→1, 1→2, 2→3] → next render: count === 3</span>
+
+<span class="com">// They mix — the queue is reduced strictly in order:</span>
+setCount(<span class="num">5</span>);           <span class="com">// → 5</span>
+setCount(c =&gt; c + <span class="num">1</span>);  <span class="com">// → 6</span>
+setCount(<span class="num">42</span>);          <span class="com">// → 42 (replacement ignores the running result)</span></code></pre>
+  <p>
+    The rule of thumb that falls out: <strong>use the functional form whenever the next state depends on the previous
+    state</strong> — it's immune to stale closures (interval callbacks, memoized handlers with <code>[]</code> deps)
+    and immune to multiple-updates-per-batch surprises. Replacement form is fine when the new value is independent
+    of the old.
+  </p>
+
+  <h3>flushSync — opting out, at a price</h3>
+  <pre><code><span class="kw">import</span> { flushSync } <span class="kw">from</span> <span class="str">'react-dom'</span>;
+
+<span class="kw">function</span> addTodo(todo) {
+  flushSync(() =&gt; {
+    setTodos(prev =&gt; [...prev, todo]);
+  });
+  <span class="com">// React has rendered AND committed here — the DOM is updated.</span>
+  listRef.current.lastElementChild.scrollIntoView();  <span class="com">// safe to measure/scroll</span>
+}</code></pre>
+  <p>
+    <code>flushSync</code> forces React to render and commit the wrapped updates synchronously before returning.
+    Legitimate uses are narrow and all of the shape "the very next line must see the committed DOM": scroll a
+    just-added row into view, focus a just-mounted input, integrate with a non-React library that reads the DOM
+    imperatively, or print (<code>window.print()</code> needs the DOM final <em>now</em>). It is a
+    performance cliff by design — it defeats batching, forces work to complete at the highest priority, and can
+    force-flush pending effects. Treat every usage as a code smell requiring a comment.
+  </p>
+  <div class="pitfall">
+    "Batched and deferred" also means you can never read the new state synchronously after a setter — not even with
+    <code>flushSync</code>: the <em>fiber's</em> state updates, but your closure's <code>count</code> const is still
+    the old snapshot. If code needs the value being set, compute it first (<code>const next = count + 1</code>), use
+    it, then <code>setCount(next)</code> — or derive in an effect keyed on the state.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="strictmode">7. StrictMode — why everything runs twice in dev <span class="tier tier-2">T2</span></h2>
+
+  <p>
+    <code>&lt;StrictMode&gt;</code> is a development-only correctness fuzzer: it deliberately double-invokes the
+    code that React's programming model says must be safe to run more than once, so that violations crash and burn
+    on your machine instead of intermittently in production. It renders no UI, adds zero behavior in production
+    builds, and is the answer key to two of the most-Googled React mysteries: "why does my component render twice"
+    and "why does my effect run twice on mount."
+  </p>
+
+  <h3>What exactly runs twice</h3>
+  <table>
+    <thead><tr><th>Double-invoked (dev only)</th><th>What it's checking</th></tr></thead>
+    <tbody>
+      <tr><td>Component function bodies</td><td>Render purity — impure renders produce visibly different results between the two calls</td></tr>
+      <tr><td><code>useState</code>/<code>useMemo</code> initializers, updater functions, <code>useReducer</code> reducers</td><td>These run during render, so they must be pure too</td></tr>
+      <tr><td>Effects: setup → <strong>cleanup → setup again</strong> on mount</td><td>Symmetry of setup/cleanup — can this component survive being unmounted and remounted?</td></tr>
+      <tr><td>Ref callbacks (attach → detach/cleanup → attach, React 19)</td><td>Same symmetry check for ref-based setup</td></tr>
+    </tbody>
+  </table>
+
+  <pre><code><span class="com">// Mount sequence WITHOUT StrictMode:    render → effect setup</span>
+<span class="com">// Mount sequence WITH StrictMode (dev): render → render →</span>
+<span class="com">//                                       effect setup → cleanup → setup</span>
+
+useEffect(() =&gt; {
+  <span class="kw">const</span> ws = <span class="kw">new</span> WebSocket(url);        <span class="com">// runs twice on mount in dev</span>
+  <span class="kw">return</span> () =&gt; ws.close();               <span class="com">// ← the cleanup makes it correct:</span>
+}, [url]);                               <span class="com">//   connect, disconnect, connect = fine</span></code></pre>
+
+  <h3>The bugs it actually catches</h3>
+  <ul>
+    <li><strong>Missing effect cleanup:</strong> the classic. An effect that subscribes/connects/sets an interval
+      without a cleanup produces <em>two</em> live subscriptions after the StrictMode remount — duplicate WebSocket
+      messages, double intervals, doubled analytics events. In production the same bug fires whenever the component
+      genuinely remounts (route back-and-forward, key change) or the dependency changes; StrictMode just makes it
+      happen on every mount so you can't miss it.</li>
+    <li><strong>Impure renders:</strong> mutating props/state, pushing into a module-level array, incrementing a
+      shared counter, <code>Date.now()</code>-based "unique" ids created during render — the double render makes the
+      duplication observable (two array entries, ids that don't match between renders).</li>
+    <li><strong>Fetch-in-effect without cancellation:</strong> the doubled request in dev is loudly annoying — which
+      is the point. The fix (an <code>AbortController</code> or an <code>ignore</code> flag in cleanup) is exactly
+      what protects the production race where a slow first response overwrites a fast second one.</li>
+  </ul>
+
+  <div class="note">
+    Historical wrinkle worth knowing: effect double-invocation arrived in React 18 (renders were already
+    double-invoked in 17-era StrictMode), and React 18 <em>suppressed</em> console logs from the second render while
+    React 19 shows them, dimmed, in DevTools. So "my effect runs twice but I only see one log" has been a
+    version-dependent experience — another reason candidates half-remember this area.
+  </div>
+
+  <div class="senior">
+    The "why" that separates senior answers: StrictMode's remount simulation isn't pedantry — it's the compatibility
+    test for <strong>reusable state</strong>. Features like <code>&lt;Activity&gt;</code> (offscreen rendering),
+    back/forward cache-style navigation, Fast Refresh, and any future "preserve the tree, detach the effects" work
+    all need components whose effects can be torn down and re-established without breaking. StrictMode is React
+    asking, on every mount, "would you survive that?" Production is unaffected — one render, one setup — but code
+    that only works with exactly-once effects is code with a latent bug even today (remounts happen), and it's
+    opting out of where React is going. If the doubled behavior "breaks" your app in dev, the app was broken; fix
+    the effect, don't remove StrictMode.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="events">8. The synthetic event system <span class="tier tier-2">T2</span></h2>
+
+  <p>
+    React does not attach your <code>onClick</code> to the button. It implements its own event layer on top of the
+    DOM's — for cross-browser normalization, for integration with batching and priorities (a click handler's updates
+    get the Sync lane <em>because</em> React controls the dispatch), and for memory efficiency on large trees.
+    Knowing where the listeners actually live explains a whole family of "why doesn't stopPropagation work"
+    surprises.
+  </p>
+
+  <h3>Delegation — one listener per event type, at the root</h3>
+  <p>
+    React attaches <strong>one native listener per event type on your root container</strong> (the element you passed
+    to <code>createRoot</code>) — not one per button. When a native event fires and bubbles up to the root, React's
+    listener looks up the target's fiber, walks <em>up the fiber tree</em> collecting every matching
+    <code>onX</code>/<code>onXCapture</code> prop along the path, and dispatches them in the right order (capture
+    props top-down, then bubble props bottom-up) with a synthetic event object.
+  </p>
+  <pre><code>&lt;div id=<span class="str">"root"</span>&gt;            ← React 18/19: native listeners live HERE
+  &lt;App&gt;
+    &lt;button onClick={…}&gt;   ← NO native click listener on this node; onClick is
+                             just a prop React reads during its root dispatch</code></pre>
+  <div class="note">
+    Until React 16, delegation targeted <code>document</code>. React 17 moved it to the root container — partly to
+    let multiple React versions coexist on one page (each root owns its events; a 17 tree nested in a 16 tree no
+    longer fights over document-level handlers), and partly to make <code>e.stopPropagation()</code> in React
+    behave sanely relative to non-React listeners <em>outside</em> the root: stopping propagation in a React handler
+    now actually prevents the event reaching a listener on <code>document</code>. "Where does React attach event
+    listeners, and what changed in 17?" is a stock trivia question with this exact answer.
+  </div>
+
+  <h3>The SyntheticEvent wrapper — and the pooling history</h3>
+  <p>
+    Handlers receive a <code>SyntheticEvent</code>: a cross-browser wrapper with a normalized interface
+    (<code>e.target</code>, <code>e.preventDefault()</code>, consistent key/mouse fields) and the real event under
+    <code>e.nativeEvent</code>. Through React 16, synthetic events were <strong>pooled</strong>: the object was
+    reused across events and all fields nulled after the handler returned, so <code>setTimeout(() =&gt;
+    console.log(e.target))</code> logged <code>null</code> unless you called <code>e.persist()</code>. React 17
+    <strong>removed pooling entirely</strong> — modern engines made the allocation savings irrelevant and the
+    confusion wasn't worth it. Events are now plain per-dispatch objects; <code>e.persist()</code> is a no-op kept
+    for compatibility. If an interviewer asks about <code>e.persist()</code>, the correct answer is "that's a
+    ≤16 concern; explain pooling, then say it's gone."
+  </p>
+
+  <h3>Where stopPropagation surprises people</h3>
+  <pre><code><span class="com">// Surprise 1: a native listener between the target and the root fires FIRST.</span>
+containerEl.addEventListener(<span class="str">'click'</span>, () =&gt; console.log(<span class="str">'native container'</span>));
+<span class="com">// &lt;div ref={containerEl}&gt;&lt;button onClick={() =&gt; console.log('react')}/&gt;&lt;/div&gt;</span>
+<span class="com">// Click logs: "native container" → "react".  React's onClick can't run until</span>
+<span class="com">// the native event finishes bubbling to the ROOT — every native bubble-phase</span>
+<span class="com">// listener below the root beats every React bubble handler, regardless of depth.</span>
+
+<span class="com">// Surprise 2: native stopPropagation SILENCES React.</span>
+containerEl.addEventListener(<span class="str">'click'</span>, e =&gt; e.stopPropagation());
+<span class="com">// The native event now never reaches the root → React never dispatches →</span>
+<span class="com">// every React onClick under that container is dead. Classic culprit: a</span>
+<span class="com">// third-party widget or an old-school "close dropdown on outside click"</span>
+<span class="com">// helper calling stopPropagation at document/body level.</span>
+
+<span class="com">// Surprise 3 (inverse): React's e.stopPropagation() DOES stop the native event</span>
+<span class="com">// too — React calls nativeEvent.stopPropagation() under the hood, so listeners</span>
+<span class="com">// above the root (window/document) won't hear it either.</span></code></pre>
+  <p>
+    The debugging rule that falls out: React handlers and native handlers live in <strong>two different propagation
+    systems</strong> that only synchronize at the root. Mixing them (analytics snippets, jQuery-era widgets, portals
+    into non-React DOM) is where events "mysteriously don't fire" — check for a native <code>stopPropagation</code>
+    between the target and the root before anything else.
+  </p>
+
+  <h3>Passive listeners and other modern details</h3>
+  <ul>
+    <li><strong>Passive by default for scroll-blocking events:</strong> React registers its root-level
+      <code>touchstart</code>/<code>touchmove</code>/<code>wheel</code> listeners as <code>passive: true</code>
+      (matching browser defaults for document-level listeners), which keeps scrolling off the main-thread critical
+      path — but means <code>e.preventDefault()</code> in those React handlers cannot cancel the scroll. Need to
+      actually prevent it (custom pinch-zoom, drawing surfaces)? Attach a native non-passive listener via a
+      ref + effect.</li>
+    <li><strong>Not everything is delegated:</strong> events that don't bubble or have special semantics —
+      <code>scroll</code> (since 17, no longer bubbles through React trees), <code>focus</code>/<code>blur</code>
+      (implemented via <code>focusin</code>/<code>focusout</code> internally), media events, <code>load</code>/<code>error</code> —
+      are attached directly to the element or handled specially. The mental model "one root listener per type" has
+      documented exceptions; know they exist.</li>
+    <li><strong>Priorities enter here:</strong> the event type determines the update lane — discrete events
+      (click, keydown) produce sync-priority updates; continuous ones (mousemove, scroll, drag) produce
+      input-continuous priority. The event system is the front door of the scheduler.</li>
+  </ul>
+
+  <!-- ============================================================ -->
+  <h2 id="children">9. children &amp; composition as a performance mechanism <span class="tier tier-1">T1</span></h2>
+
+  <p>
+    <code>children</code> is not magic syntax — it's an ordinary prop that happens to be filled from JSX nesting, and
+    its value is whatever you put there: an element, an array of elements, a string, a function (render props), or
+    anything else. Two properties make it architecturally powerful: it's <strong>opaque</strong> to the receiving
+    component (a layout shell renders <code>{children}</code> without knowing or caring what's inside), and it's
+    <strong>created by the parent's parent</strong> — which is a re-render firewall hiding in plain sight.
+  </p>
+
+  <h3>The mechanism: elements are created by whoever writes the JSX</h3>
+  <pre><code><span class="kw">function</span> App() {                       <span class="com">// App creates BOTH elements:</span>
+  <span class="kw">return</span> (
+    &lt;Sidebar&gt;                          <span class="com">// { type: Sidebar, props: { children:</span>
+      &lt;HeavyNav /&gt;                     <span class="com">//     { type: HeavyNav, props: {} } } }</span>
+    &lt;/Sidebar&gt;
+  );
+}
+
+<span class="kw">function</span> Sidebar({ children }) {
+  <span class="kw">const</span> [open, setOpen] = useState(<span class="kw">true</span>);   <span class="com">// state churn lives here</span>
+  <span class="kw">return</span> &lt;aside className={open ? <span class="str">'open'</span> : <span class="str">''</span>}&gt;{children}&lt;/aside&gt;;
+}</code></pre>
+  <p>
+    When <code>setOpen</code> fires, <code>Sidebar</code> re-renders — but it does not re-create the
+    <code>HeavyNav</code> element; <em>App</em> made that object, and App didn't render. Sidebar just returns the
+    same <code>children</code> reference it received. During reconciliation React hits the bailout from §1: the
+    element at this position is <strong>referentially identical</strong> to last render's element, so its props
+    cannot have changed (elements are immutable), so the entire subtree is skipped — fiber reused, not re-rendered,
+    not diffed. Zero API, zero dependency arrays, and it composes: everything App passes through Sidebar is
+    firewalled from Sidebar's state churn.
+  </p>
+  <div class="pitfall">
+    The firewall has exactly one requirement: the element must be created <em>outside</em> the re-rendering
+    component. If Sidebar built <code>&lt;HeavyNav /&gt;</code> in its own body, that's a fresh element object per
+    render — no bailout. Same for <code>children</code> re-created via <code>React.Children.map</code> or
+    <code>cloneElement</code> on the way through: cloning mints new element objects and forfeits the identity
+    bailout. (Also note the flip side: when <em>App</em> re-renders, it re-creates the children element, so the
+    bailout disappears for that render — this pattern firewalls against the <em>wrapper's</em> churn, not the
+    owner's.)
+  </div>
+
+  <h3>Slot patterns — the same trick, multiplied</h3>
+  <p>
+    Nothing is special about the name <code>children</code>; any prop can carry elements. "Slots" — multiple named
+    element props — give layout components their flexibility and keep the same referential-identity benefits:
+  </p>
+  <pre><code><span class="kw">function</span> PageShell({ header, sidebar, footer, children }) {
+  <span class="kw">const</span> [collapsed, setCollapsed] = useState(<span class="kw">false</span>);   <span class="com">// shell-local churn</span>
+  <span class="kw">return</span> (
+    &lt;div className={collapsed ? <span class="str">'rail'</span> : <span class="str">'full'</span>}&gt;
+      &lt;header&gt;{header}&lt;/header&gt;
+      &lt;nav&gt;{sidebar}&lt;/nav&gt;
+      &lt;main&gt;{children}&lt;/main&gt;
+      &lt;footer&gt;{footer}&lt;/footer&gt;
+    &lt;/div&gt;
+  );
+}
+
+&lt;PageShell header={&lt;TopBar /&gt;} sidebar={&lt;NavTree /&gt;} footer={&lt;Legal /&gt;}&gt;
+  &lt;Dashboard /&gt;
+&lt;/PageShell&gt;
+<span class="com">// Collapsing the shell re-renders PageShell only — all four slot subtrees</span>
+<span class="com">// keep their element identity and bail out.</span></code></pre>
+  <div class="senior">
+    This is the answer to "how would you reduce re-renders <em>without</em> memo?" — restructure so hot state lives
+    in a leaf-ish wrapper that receives expensive content as children/slots ("lift content up"), or move the state
+    down into its own component ("push state down"). Structural fixes beat memoization: no comparator to get wrong,
+    no dependency array to maintain, and they usually improve the design anyway. <code>memo</code> is for the cases
+    composition can't reach. (Full performance treatment: tutorial 09.)
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="refs">10. Refs and the DOM — attachment timing and layout reads <span class="tier tier-2">T2</span></h2>
+
+  <p>
+    A ref is a stable box (<code>{ current }</code>) that survives renders without participating in them — mutating
+    it triggers nothing. For DOM refs the interview substance is <em>timing</em>: exactly when does
+    <code>ref.current</code> hold the node, and where can you safely read layout from it?
+  </p>
+
+  <h3>The attachment timeline</h3>
+  <pre><code>render phase      │ ref.current is NOT set (null on first render; on updates it
+                  │ still points at the OLD node) — never read refs during render
+commit·mutation   │ refs of deleted/replaced nodes are DETACHED (set to null /
+                  │ callback invoked with null / React 19 cleanup fn runs)
+commit·layout     │ refs ATTACHED to new nodes — ref.current = domNode —
+                  │ BEFORE useLayoutEffect setups run
+                  ▼
+useLayoutEffect   │ ✅ node available, pre-paint — measure here to avoid flicker
+(browser paint)   │
+useEffect         │ ✅ node available, post-paint — fine for non-visual setup</code></pre>
+  <p>
+    The ordering guarantee — refs attach in the layout sub-phase <em>before</em> layout effects fire — is why
+    <code>useLayoutEffect(() =&gt; ref.current.getBoundingClientRect(), [])</code> just works: React commits DOM
+    mutations, wires refs bottom-up, then runs your layout effects. It's also why "why is my ref null?" almost
+    always has one of three answers: you read it during render; the element is conditionally not rendered this
+    pass; or it's on a custom component that doesn't forward it to a host element.
+  </p>
+
+  <h3>Callback refs — and React 19's cleanup</h3>
+  <pre><code><span class="com">// A callback ref runs at attach (node) and detach (null) — pre-19:</span>
+&lt;video ref={(node) =&gt; {
+  <span class="kw">if</span> (node) observer.observe(node);
+  <span class="kw">else</span> observer.disconnect();          <span class="com">// the awkward null branch</span>
+}} /&gt;
+
+<span class="com">// React 19: return a cleanup function instead — effect-like symmetry:</span>
+&lt;video ref={(node) =&gt; {
+  observer.observe(node);
+  <span class="kw">return</span> () =&gt; observer.disconnect(); <span class="com">// runs on detach; null is no longer passed</span>
+}} /&gt;</code></pre>
+  <p>
+    Callback refs are the tool when you need to <em>react to the node appearing/disappearing</em> (attach observers,
+    measure conditionally-rendered nodes) rather than merely hold it. Two operational details: a callback ref runs
+    during commit, so setting state inside one is legal (it triggers a synchronous follow-up render, like a layout
+    effect would); and an <strong>inline</strong> callback ref has a new function identity each render — pre-19
+    React would call it with <code>null</code> then the node again on every render, so hoist it with
+    <code>useCallback</code> if the attach/detach work is non-trivial. React 19 rounds this area out with
+    <strong>ref as a regular prop</strong> — function components accept <code>ref</code> directly, and
+    <code>forwardRef</code> is on the deprecation path.
+  </p>
+
+  <h3>Measuring the DOM safely</h3>
+  <ul>
+    <li><strong>Synchronous, before the user sees it:</strong> <code>useLayoutEffect</code> + read
+      (<code>getBoundingClientRect</code>, <code>scrollHeight</code>) + optionally set state to adjust — commits
+      again before paint, so no flicker. This is the tooltip/popover/auto-size-textarea pattern.</li>
+    <li><strong>Reactive to size changes:</strong> don't poll — a <code>ResizeObserver</code> wired in an effect (or
+      a callback ref) with cleanup. Same for visibility: <code>IntersectionObserver</code>.</li>
+    <li><strong>Batch reads before writes:</strong> interleaving reads and style writes forces synchronous layout
+      each time (layout thrashing). Read everything, then write.</li>
+  </ul>
+  <div class="pitfall">
+    Don't read <em>or write</em> <code>ref.current</code> during render. Reading is unreliable (stale or null,
+    per the timeline); writing is an impurity — StrictMode's double render will do it twice, and a concurrent render
+    that never commits will have mutated your ref anyway. The blessed places to touch refs: event handlers, effects,
+    layout effects, and callback refs. The one tolerated render-time pattern is lazy initialization
+    (<code>if (ref.current === null) ref.current = makeThing()</code>) — idempotent by construction.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="reactdom">11. ReactDOM specifics — roots, portals, the package split <span class="tier tier-3">T3</span></h2>
+
+  <h3>Why two packages — react vs react-dom</h3>
+  <p>
+    <code>react</code> is the platform-agnostic core: elements/JSX runtime, hooks, component model, Suspense,
+    context. <code>react-dom</code> is one <strong>renderer</strong> — the code that knows how to turn the fiber
+    tree's effects into DOM mutations and how to speak browser events. The shared reconciler lives behind the
+    renderer interface (<code>react-reconciler</code>), which is how the same core drives React Native,
+    <code>react-three-fiber</code> (Three.js scenes), Ink (terminal UIs), and PDF/canvas renderers: they implement
+    "create instance / append child / commit update" for their host environment, and everything from hooks to
+    reconciliation comes for free. That's the architecture answer to "why can't hooks live in react-dom" and
+    "how does React Native share code with React."
+  </p>
+
+  <h3>createRoot vs the legacy API</h3>
+  <pre><code><span class="com">// Legacy (React ≤17 — REMOVED in React 19):</span>
+ReactDOM.render(&lt;App /&gt;, document.getElementById(<span class="str">'root'</span>));
+
+<span class="com">// Modern (React 18+):</span>
+<span class="kw">import</span> { createRoot } <span class="kw">from</span> <span class="str">'react-dom/client'</span>;
+<span class="kw">const</span> root = createRoot(document.getElementById(<span class="str">'root'</span>));
+root.render(&lt;App /&gt;);
+<span class="com">// later: root.render(&lt;App tab="settings" /&gt;)  — update in place</span>
+<span class="com">//        root.unmount()                        — tear down</span></code></pre>
+  <p>
+    The API change is the <em>switch</em> for concurrent React: apps still on <code>ReactDOM.render</code> in React
+    18 ran in legacy mode — no automatic batching outside handlers, no transitions, no concurrent features. React 19
+    removed the legacy entry points entirely. <code>createRoot</code> also changed hydration's spelling:
+  </p>
+  <pre><code><span class="com">// SSR hydration — attach to existing server-rendered markup:</span>
+<span class="kw">import</span> { hydrateRoot } <span class="kw">from</span> <span class="str">'react-dom/client'</span>;
+hydrateRoot(document.getElementById(<span class="str">'root'</span>), &lt;App /&gt;);
+<span class="com">// Renders to compare-and-adopt instead of create: React walks the existing DOM,</span>
+<span class="com">// attaches fibers + listeners to it, and errors on markup mismatches (React 19</span>
+<span class="com">// prints an actual diff). Mismatch classics: Date.now()/locale text, browser-only</span>
+<span class="com">// branches like `typeof window !== 'undefined'` changing the tree shape.</span></code></pre>
+
+  <h3>Portals — DOM elsewhere, React tree unchanged</h3>
+  <pre><code><span class="kw">import</span> { createPortal } <span class="kw">from</span> <span class="str">'react-dom'</span>;
+
+<span class="kw">function</span> Modal({ onClose, children }) {
+  <span class="kw">return</span> createPortal(
+    &lt;div className=<span class="str">"overlay"</span> onClick={onClose}&gt;{children}&lt;/div&gt;,
+    document.body            <span class="com">// physically render here…</span>
+  );
+}
+<span class="com">// …but LOGICALLY the modal stays a child of whoever rendered &lt;Modal&gt;:</span>
+<span class="com">// context flows in normally, and events BUBBLE THROUGH THE REACT TREE —</span>
+<span class="com">// a click inside the modal fires onClick handlers on the modal's React</span>
+<span class="com">// ANCESTORS, even though in the DOM the overlay is a sibling of #root.</span></code></pre>
+  <p>
+    Portals solve the CSS containment problem — modals, tooltips, dropdowns escaping <code>overflow: hidden</code>,
+    stacking contexts, and <code>transform</code>ed ancestors — without breaking the component model: state, context,
+    and error boundaries all behave as if the portal content were inline. The event-bubbling-through-the-React-tree
+    behavior is the classic gotcha in both directions: a "click outside to close" handler on a React ancestor will
+    hear clicks <em>inside</em> the portal (they bubble through the React tree), while a native
+    <code>document</code>-level listener sees the true DOM path instead. Also worth a sentence: portals don't
+    manage focus for you — trap and restore focus yourself, or better, build modals on
+    <code>&lt;dialog&gt;</code>/a11y-audited primitives.
+  </p>
+  <div class="note">
+    Odds and ends that live in <code>react-dom</code> and show up in screens: <code>flushSync</code> (§6);
+    <code>react-dom/server</code>'s streaming SSR (<code>renderToPipeableStream</code>); React 19's resource
+    preloading APIs (<code>preload</code>, <code>preinit</code>) and built-in <code>&lt;title&gt;</code>/<code>&lt;meta&gt;</code>
+    hoisting; and <code>useFormStatus</code>/form actions, which are react-dom hooks because forms are a DOM
+    concept. If asked "what's in react vs react-dom," the sorting rule is: platform-agnostic model in
+    <code>react</code>, anything that knows what a DOM node is in <code>react-dom</code>.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="qa">12. Interview Q&amp;A</h2>
+
+  <details class="qa">
+    <summary>1. Walk me through everything that happens from a setState call to pixels on screen.</summary>
+    <div class="answer">
+      <p>(1) The setter enqueues an update object on the hook's queue on that fiber and schedules a render with a priority lane derived from the context (click handler → sync lane; transition → transition lane). (2) React batches: every other setter called in the same tick joins the same batch. (3) Render phase: starting from the root (skipping clean subtrees via bailouts), React builds a workInProgress fiber tree — calling component functions, reducing state-update queues to new memoizedState, and reconciling each component's returned elements against the old fibers (same type = reuse, different type/key = teardown, keyed list diff). This phase is pure and, for non-sync lanes, interruptible — it can be abandoned and restarted. (4) Commit phase, synchronous: before-mutation (getSnapshotBeforeUpdate), mutation (apply DOM inserts/updates/deletes, detach refs, run layout-effect cleanups, flip <code>root.current</code>), layout (attach refs, run useLayoutEffect, componentDidMount/Update). (5) The browser then paints the mutated DOM. (6) Passive effects (useEffect) flush after paint. Bonus points for noting that steps 3–4 may not happen at all if every update bails out via Object.is.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>2. Why did React need Fiber? What could the old reconciler not do?</summary>
+    <div class="answer">
+      <p>The stack reconciler rendered recursively — the work lived on the JS call stack, and a call stack can't be paused. Any large update locked the main thread until the whole tree finished: dropped frames, frozen inputs, no way to prioritize a keystroke over a data refresh, no way to abandon work made stale by a newer update. Fiber reifies each unit of work as a heap object (a fiber — a "virtual stack frame") linked via child/sibling/return pointers, processed by an iterative work loop that can yield every ~5ms, resume, restart, or discard work. That's what makes updates prioritizable (lanes), renders interruptible, and features like transitions, Suspense, and selective hydration possible. Key nuance: Fiber didn't make renders faster — it made them schedulable; the win is responsiveness, not throughput.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>3. Is setState asynchronous?</summary>
+    <div class="answer">
+      <p>Precise answer: the call is synchronous, but the state application is deferred — the setter enqueues an update and schedules a batched render; it doesn't return a promise and there's nothing to await. The reason you "can't read the new value" isn't asynchrony at all: your <code>count</code> is a const captured when this render ran — a per-render snapshot — and no amount of waiting changes a closed-over constant; the <em>next</em> render's closure gets the new value. Follow-ups to expect: multiple setters in one handler → one render (batching, and since React 18 this holds in timeouts/promises too); need next-state-from-previous-state → functional updater; need the committed DOM immediately → flushSync, which forces the commit but still never changes your current closure's variable.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>4. How does React "know" which components to re-render?</summary>
+    <div class="answer">
+      <p>It doesn't watch anything — there's no dirty-checking of props or observables on state. A state update marks that fiber (and bubbles pending-lane bits up its ancestors so the root knows where work exists). At render time React walks down from the root: subtrees with no pending work and unchanged props/context are skipped via bailouts; the component that owns the update re-renders; and then, by default, <strong>everything it returns re-renders too</strong> — rendering a child is how React discovers what changed, not the result of detecting a prop change. The cascade is stopped only by memo's shallow compare, the same-element-reference bailout (children/hoisted elements), or shouldComponentUpdate. Context is the extra channel: a provider's value change (Object.is) re-renders all consumers regardless of memo in between.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>5. "A component re-renders when its props change." Critique that statement.</summary>
+    <div class="answer">
+      <p>It's backwards in both directions. First, props changing isn't a trigger: props only "change" because the parent re-rendered and created a new element — the parent's render is the trigger, and the child re-renders even if its props are identical (or if it takes no props at all). Second, changed props don't guarantee a render is caused by them — a memo'd child with changed props renders, but a non-memo'd child renders regardless. The accurate statement: a component renders when (a) its own state updates, (b) its parent renders and no bailout applies, or (c) a context it consumes changes value. Props are just data flowing along for the ride; React never diffs props to decide whether to render (only memo does, as an opt-in).</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>6. How does React's diffing get away with O(n) when tree diff is O(n³)? What are the heuristics?</summary>
+    <div class="answer">
+      <p>By not solving the general problem. Heuristic 1: elements of different types produce different trees — so React compares position-by-position, and on a type mismatch it tears down the whole old subtree and rebuilds, never attempting cross-type morphing or cross-level moves. Heuristic 2: keys let developers declare identity within a sibling list, turning positional matching into map-lookup matching. Both heuristics are nearly always true for real UIs, so the rare pathological case (a subtree that "moved" across levels gets recreated) is an acceptable price for a single linear pass. Consequences worth naming: same type + position = same instance (state persists across conditional branches that render the same component), different type = state annihilation for the whole subtree, and key changes force remounts — which is also a feature (key-based reset).</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>7. Why do lists need keys? What does React do without them?</summary>
+    <div class="answer">
+      <p>Without keys, sibling diffing is positional: old[0] vs new[0], old[1] vs new[1]. Appends are fine; prepends/removals/reorders shift every subsequent position, so React patches nearly every row (sees them all as "changed") and — worse — per-row state (hook state, uncontrolled input values, focus, animations) stays attached to the <em>position</em>, showing up next to the wrong data. Keys give React an identity map: same key + same type = same fiber and DOM node, reused and moved as needed; new keys mount; missing keys unmount. Result: minimal DOM operations and state that travels with the data. Keys must be stable (survive re-renders), unique among siblings only, and are consumed by React — they don't appear in props.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>8. Index as key — when is it actually fine, and what exactly breaks when it isn't?</summary>
+    <div class="answer">
+      <p>Fine when the list is static in identity terms: no reorder, no filter, no insert/delete except appends (or full replacement), and rows are stateless — no inputs, no row-local hooks, no animations, no memo depending on identity. Then index and identity coincide and nothing can desynchronize. It breaks the moment positions shift: index keys re-encode positional matching, so hook state and uncontrolled-input DOM values stick to their slot — delete row 1 and row 2's data renders next to row 1's typed text; prepend an item and the expanded/checked state belongs to the wrong record. Two extra points for seniority: <code>key={Math.random()}</code> is strictly worse (full remount of every row every render), and when data truly has no id, synthesize one at data-creation time (crypto.randomUUID when the item enters state), never at render time.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>9. You need to reset a form when the selected record changes. Compare key-based reset vs an effect.</summary>
+    <div class="answer">
+      <p><code>&lt;Form key={recordId}/&gt;</code> makes React treat each record's form as a different instance: unmount, remount, every useState initializer re-runs, uncontrolled inputs cleared — atomic, declarative, zero synchronization code, and no frame where the previous record's draft is visible. The effect approach ("watch recordId, setState everything back") renders once with stale state, then re-renders after the effect — a flash of wrong data — and grows a maintenance liability: every new field needs remembering in the reset. Trade-off to name: key-reset is a full remount (effects re-run, DOM rebuilt, focus lost), perfect for "different entity," wasteful for high-frequency changes; and if you need to <em>preserve</em> some state across the switch, that state must be lifted above the keyed boundary.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>10. Output drill: what does this log in development with StrictMode, and why?</summary>
+    <div class="answer">
+      <p>Setup: a component whose body has <code>console.log('render')</code> and a <code>useEffect(() =&gt; { console.log('setup'); return () =&gt; console.log('cleanup'); }, [])</code>, mounted once. Dev + StrictMode logs: <code>render, render, setup, cleanup, setup</code> — StrictMode double-invokes the function body (purity check) and runs the mount effect's setup → cleanup → setup cycle (remount-survivability check). Production logs: <code>render, setup</code>. Version wrinkle: React 18 suppressed the second render's console output (so people saw one "render"); React 19 shows it, dimmed, in DevTools. The deeper point to volunteer: if the doubled effect breaks the app (double subscription, doubled fetch), the effect is missing a cleanup or cancellation — the same bug that fires in production on any genuine remount or dep change.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>11. What's in a fiber node, and what is double buffering?</summary>
+    <div class="answer">
+      <p>A fiber holds identity (type, key, stateNode → the DOM node or class instance), structure as a linked list (child, sibling, return — the "virtual stack frame" pointers that make iterative, pausable traversal possible), state (pendingProps/memoizedProps, memoizedState — which for function components is the linked list of hooks in call order, the mechanical reason hook order must be stable), the updateQueue, and scheduling data (lanes bitmask, effect flags, alternate). Double buffering: React maintains two trees — <code>current</code> (on screen) and <code>workInProgress</code> (being built), each fiber paired with its alternate. Rendering mutates only the WIP tree; commit is an atomic <code>root.current</code> pointer flip. Benefits: no half-rendered UI is ever visible, abandoned concurrent renders cost nothing to discard, and node pairs are recycled so allocation churn stays low.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>12. Render phase vs commit phase — what runs in each, and where do getSnapshotBeforeUpdate, useLayoutEffect, and useEffect fall relative to paint?</summary>
+    <div class="answer">
+      <p>Render phase: component functions, state-queue reduction, reconciliation — pure, no DOM contact, interruptible/restartable in concurrent lanes. Commit phase, synchronous, three sub-phases: before-mutation runs getSnapshotBeforeUpdate against the <em>old</em> DOM (capture scroll positions); mutation applies DOM changes, detaches refs of removed nodes, and runs layout-effect cleanups, ending with the current-tree pointer flip; layout attaches refs then runs useLayoutEffect setups and componentDidMount/Update against the <em>new but unpainted</em> DOM. Then the browser paints. Then useEffect (passive) cleanups + setups flush. So: snapshot = pre-mutation, layout effects = post-mutation pre-paint (can measure and synchronously re-render without flicker, but block paint), passive effects = post-paint by default (with the caveat that React may flush them early before the next sync work).</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>13. What changed about batching in React 18? Predict the render counts.</summary>
+    <div class="answer">
+      <p>React ≤17 batched only inside React event handlers; updates from setTimeout, promise/await continuations, and native listeners each flushed a separate synchronous render. React 18 with createRoot batches automatically everywhere. Drill: a handler calls setA then setB → one render in both versions. The same two setters inside <code>setTimeout</code> → two renders on 17, one on 18. Inside an async function, setA before an <code>await</code> and setB after it → two renders even in 18 (opposite sides of an await are different ticks, hence different batches), but two setters both after the same await → one render. Escape hatch: flushSync forces a synchronous render+commit per wrapped call when you must read the committed DOM between updates. Also note batching respects priority — updates in different lanes don't merge into one render.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>14. Output drill: three setCount(count + 1) calls in one handler vs three functional updates — final values and why.</summary>
+    <div class="answer">
+      <p>With <code>count === 0</code>: three <code>setCount(count + 1)</code> calls enqueue three <em>replacement</em> updates, each computed from the same stale closure snapshot — the queue is [replace 1, replace 1, replace 1], so the next render shows 1. Three <code>setCount(c =&gt; c + 1)</code> calls enqueue <em>updater functions</em>; React reduces the queue in order, feeding each updater the running result: 0→1→2→3, next render shows 3. Mixed forms reduce strictly in order — <code>setCount(5); setCount(c =&gt; c + 1); setCount(42)</code> ends at 42. The rule: functional form whenever next state depends on previous state; it's also the fix for stale closures in intervals and <code>useCallback([], …)</code> handlers, and it usually lets you drop the state from dependency arrays.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>15. When is flushSync justified, and what does it cost?</summary>
+    <div class="answer">
+      <p>Justified when the very next synchronous line must observe the committed DOM: scrolling a just-added list item into view, focusing a just-mounted input, window.print() after a state change, or handing a final DOM to an imperative third-party library. It forces React to render and commit the wrapped updates before returning — breaking batching, running at max priority, potentially force-flushing pending effects, and turning what could have been interruptible work into a main-thread block. So: rare, commented, and never in a loop or render path (React warns if called during rendering). Also worth saying: flushSync updates the committed DOM and fiber state, but your current closure's state variables are still the old snapshot — it is not a way to "read state synchronously."</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>16. Why does StrictMode double-invoke renders and effects, and what bug classes does it surface?</summary>
+    <div class="answer">
+      <p>It stress-tests the two contracts React's model depends on: renders are pure (safe to run twice — and concurrent React genuinely does re-run renders it discards), and effects are symmetric (setup/cleanup pairs that survive an unmount/remount — which real apps hit on navigation, key changes, Fast Refresh, and future features like <code>&lt;Activity&gt;</code> offscreen trees). Bug classes surfaced: missing effect cleanup (double WebSocket/interval/subscription after the simulated remount), impure renders (module-level mutation, render-time id generation, array pushes — duplicated visibly), and uncancelled fetches in effects (doubled requests reveal the response race you already had). Dev-only; production gets single invocation. The senior kicker: deleting StrictMode to "fix" doubled effects just re-hides a real bug — the correct fix is a cleanup/AbortController.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>17. Where does React attach event listeners, and what changed in React 17?</summary>
+    <div class="answer">
+      <p>React uses delegation: one native listener per event type attached to the root container (the createRoot element) — not per component. Your onClick props are just data on fibers; when a native event bubbles to the root, React walks the target's fiber ancestry, collecting onXCapture handlers (dispatched top-down) and onX handlers (bottom-up), and invokes them with a SyntheticEvent. React 17 moved delegation from <code>document</code> to the root container — enabling multiple React versions on one page (each root owns its events) and making stopPropagation interop with non-React code saner. 17 also removed event pooling (e.persist() became a no-op), switched onFocus/onBlur to focusin/focusout internally, and stopped onScroll bubbling. Exceptions to delegation exist: non-bubbling/special events (scroll, media, load/error) attach directly to elements.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>18. A React onClick mysteriously never fires, but only inside one widget. Likely cause?</summary>
+    <div class="answer">
+      <p>Prime suspect: a <em>native</em> listener between that widget and the React root calling <code>e.stopPropagation()</code>. React's handlers run only when the native event reaches the root listener; a native stopPropagation below the root starves React of the event entirely — classic offenders are third-party embeds, jQuery-era plugins, or hand-rolled "close on outside click" code using addEventListener. Diagnosis: log a native capture-phase listener on document to confirm the event fires, then bisect down the DOM. Related traps for the same conversation: native listeners on inner nodes always fire before React bubble handlers (React waits for the root); React's e.stopPropagation also halts the native event above the root; and React's root touch/wheel listeners are passive, so preventDefault can't cancel scrolling from React handlers — attach a native non-passive listener when you genuinely need that.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>19. Why does passing an expensive subtree as children skip its re-renders? What's the mechanism?</summary>
+    <div class="answer">
+      <p>Element referential identity. JSX creates element objects, and they're created by whoever writes the JSX — so in <code>&lt;Wrapper&gt;&lt;Heavy/&gt;&lt;/Wrapper&gt;</code>, the parent of Wrapper creates the Heavy element and passes it in as the children prop. When Wrapper's own state changes and it re-renders, it returns the <em>same children object</em> it received — Wrapper's render didn't re-execute the JSX that created Heavy. Reconciliation sees new element === old element and bails out: elements are immutable, so an identical reference proves the props can't have changed, and the entire subtree is skipped without rendering or diffing. Requirements: the element must be created outside the re-rendering component, and not cloned en route (cloneElement mints a new object). It's memo-grade optimization from pure structure — no comparator, no dependency arrays — and it generalizes to any element-valued "slot" prop.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>20. When exactly is ref.current set, and what do callback refs add — including React 19's change?</summary>
+    <div class="answer">
+      <p>Timeline: during render, refs are not usable (null on mount; stale on updates). In the commit's mutation sub-phase, refs on removed/replaced nodes are detached; in the layout sub-phase, refs attach — before useLayoutEffect runs. So layout effects and everything after (paint, passive effects, event handlers) can rely on the node. Callback refs run at those same attach/detach moments and are the tool for reacting to a node's appearance — attaching ResizeObserver/IntersectionObserver, measuring conditionally-rendered nodes. Pre-19 the callback was invoked with the node on attach and null on detach (and an inline callback's changing identity caused a null+node re-invocation every render). React 19 lets the callback return a cleanup function — effect-style symmetry, no null branch — and also makes ref an ordinary prop on function components, deprecating forwardRef. And never read/write refs during render: lazy init is the one idempotent exception.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>21. A modal rendered through a portal into document.body — where do its click events go?</summary>
+    <div class="answer">
+      <p>Through the <em>React</em> tree, not the DOM tree. createPortal changes where the DOM nodes are placed, but the portal's fiber remains a child of the component that rendered it — so synthetic events bubble to the modal's React ancestors: an onClick on the component wrapping &lt;Modal&gt; fires for clicks inside the modal, even though in the DOM the modal is a sibling of the app root. Context, error boundaries, and Suspense behave the same way — logical tree wins. The flip side: native document-level listeners see the true DOM path, so a hand-rolled "close when clicking outside" using contains(e.target) on the trigger's DOM node will treat in-modal clicks as "outside" — the classic portal bug. Why portals exist at all: escaping overflow:hidden, stacking contexts, and transformed ancestors for modals/tooltips/dropdowns without breaking the component model.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>22. What's the difference between &lt;Comp /&gt; and calling {Comp()} directly in JSX?</summary>
+    <div class="answer">
+      <p><code>&lt;Comp /&gt;</code> creates an element — <code>{ type: Comp, props }</code> — and React later gives Comp its <em>own fiber</em>: its own state slots, its own position in the tree, its own bailout boundary. <code>{Comp()}</code> executes immediately during the parent's render and inlines Comp's <em>output</em>; React never knows Comp existed. Consequences: any hooks inside Comp attach to the parent's hook list — so conditionally calling it (or changing how many times it's called) corrupts hook order and throws the "rendered fewer hooks than expected" error; it can't be memoized, keyed, or shown in DevTools as a component; its "state" merges into the parent's, resetting in surprising ways. The same trap wears a disguise in render-prop and hook-returning-JSX patterns. Rule: components are called by React, always through elements.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>23. Can a render happen and never reach the screen? What follows from that?</summary>
+    <div class="answer">
+      <p>Yes, two ways: bailouts (Object.is-equal state updates may run one reconfirming render that commits nothing) and, more importantly, concurrent rendering — a transition/deferred render in progress is abandoned wholesale when a higher-priority update arrives, then restarted against fresh state; StrictMode's dev double-render simulates exactly this. What follows: render-phase code must be side-effect free, because it can run 0, 1, or N times per visible update — analytics fired in render double-counts, module-level mutation corrupts, render-generated random ids mismatch. It also creates the tearing problem: an interruptible render reading a mutable external store can see one value early in the pass and another late (an urgent update mutated the store mid-render), rendering an inconsistent tree — which is precisely what useSyncExternalStore solves by snapshotting the store per render and forcing consistency checks. Effects and event handlers, by contrast, run only for committed updates.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>24. Why can't hooks be called conditionally? Answer from the data structure.</summary>
+    <div class="answer">
+      <p>Hook state lives on the component's fiber as a <strong>linked list in call order</strong> — memoizedState points at hook node #1, which points at #2, and so on. Hooks carry no names or keys; the only thing binding <em>this</em> useState call to <em>that</em> state node is "it was the third hook called." On every render React walks the list in parallel with your calls: call #1 reads node #1, call #2 reads node #2. Skip a hook behind a condition and every subsequent call reads its neighbor's node — a useState suddenly returns an effect's deps array, or your count becomes your username. React detects list-length mismatches and throws, but same-length misalignment would be silent corruption, hence the lint rule enforcing it statically. Postscript: React 19's <code>use()</code> is the deliberate exception — readable conditionally because it doesn't allocate a slot in the hook list.</p>
+    </div>
+  </details>
+
+  <!-- ============================================================ -->
+  <h2 id="exercises">13. Hands-on exercises</h2>
+
+  <div class="exercise">
+    <h4>Exercise 1 — Predict the render counts</h4>
+    <p>Without running it: when the button is clicked once, which components re-render, and how many times does each function body execute (production build, React 18 createRoot)?</p>
+    <pre><code><span class="kw">const</span> MemoC = React.memo(<span class="kw">function</span> C({ style }) { <span class="kw">return</span> &lt;div /&gt;; });
+
+<span class="kw">function</span> D() { <span class="kw">return</span> &lt;div /&gt;; }               <span class="com">// takes no props</span>
+
+<span class="kw">function</span> B({ children }) {
+  <span class="kw">const</span> [n, setN] = useState(<span class="num">0</span>);
+  <span class="kw">return</span> (
+    &lt;&gt;
+      &lt;button onClick={() =&gt; { setN(n + <span class="num">1</span>); setN(n + <span class="num">1</span>); }}&gt;{n}&lt;/button&gt;
+      &lt;MemoC style={{ color: <span class="str">'red'</span> }} /&gt;
+      &lt;D /&gt;
+      {children}
+    &lt;/&gt;
+  );
+}
+
+<span class="kw">function</span> App() {
+  <span class="kw">return</span> &lt;B&gt;&lt;E /&gt;&lt;/B&gt;;   <span class="com">// E is an ordinary, un-memoized component</span>
+}</code></pre>
+    <details>
+      <summary>Solution</summary>
+      <p><strong>App: 0.</strong> Parents never re-render because a child's state updated. <strong>B: 1.</strong> Both setN calls are in one batch; both enqueue replacement updates computed from the same snapshot (n+1), so one render and n goes up by exactly 1 — not 2. <strong>MemoC: 1 — it re-renders.</strong> memo compares props shallowly, and <code>style={{color:'red'}}</code> is a fresh object every render of B; Object.is fails, memo is defeated. <strong>D: 1.</strong> No props doesn't matter — its parent rendered and nothing bails it out. <strong>E: 0.</strong> It came through <code>children</code>: App created that element, App didn't render, so B returns the identical element object and React's same-element bailout skips the subtree. Fixes worth narrating: hoist the style object (or memoize it) to make MemoC bail; use functional updates (<code>setN(c =&gt; c + 1)</code> twice) if the intent was +2.</p>
+    </details>
+  </div>
+
+  <div class="exercise">
+    <h4>Exercise 2 — Fix the key bug</h4>
+    <p>Users report: "when I delete a player, the next player's score input shows the deleted player's draft text." Reproduce the mechanism on paper, then fix it. Also explain why the reverse-sort button makes every row flash its CSS transition.</p>
+    <pre><code><span class="kw">function</span> Scoreboard({ players, onDelete }) {   <span class="com">// players: [{id, name}]</span>
+  <span class="kw">return</span> (
+    &lt;ul&gt;
+      {players.map((p, i) =&gt; (
+        &lt;li key={i} className=<span class="str">"row-appear"</span>&gt;
+          {p.name}
+          &lt;input defaultValue=<span class="str">""</span> placeholder=<span class="str">"score draft"</span> /&gt;
+          &lt;button onClick={() =&gt; onDelete(p.id)}&gt;✕&lt;/button&gt;
+        &lt;/li&gt;
+      ))}
+    &lt;/ul&gt;
+  );
+}</code></pre>
+    <details>
+      <summary>Solution</summary>
+      <p>Mechanism: keys are the array index, so deleting players[1] from [A,B,C] produces new keys [0,1] where key 0 = A and key 1 = <em>C</em>. React matches by key: fiber 0 (A) reused; fiber 1 — previously B — reused for C with patched text; fiber 2 deleted. The &lt;input&gt; is uncontrolled: its value lives in the DOM node, and fiber 1's DOM node (holding B's typed draft) survives — C's name now renders beside B's draft. The reverse-sort flash: reversing the array with index keys means every key now maps to different content — React patches every row's text and (if list length changed) mounts rows that re-trigger the row-appear animation; with id keys a reverse is pure moves — DOM nodes relocate, no content patch, no animation restart.</p>
+      <pre><code><span class="com">// The fix — identity keys:</span>
+{players.map((p) =&gt; (
+  &lt;li key={p.id} className=<span class="str">"row-appear"</span>&gt;
+    {p.name}
+    &lt;input defaultValue=<span class="str">""</span> placeholder=<span class="str">"score draft"</span> /&gt;
+    &lt;button onClick={() =&gt; onDelete(p.id)}&gt;✕&lt;/button&gt;
+  &lt;/li&gt;
+))}
+<span class="com">// Now delete(B): React unmounts exactly B's fiber and B's DOM node —</span>
+<span class="com">// drafts, focus, and animations stay with their player.</span>
+<span class="com">// If data had no ids: mint them when items ENTER state</span>
+<span class="com">// (crypto.randomUUID()), never during render.</span></code></pre>
+    </details>
+  </div>
+
+  <div class="exercise">
+    <h4>Exercise 3 — Build a render-logging harness</h4>
+    <p>Implement <code>useRenderLog(name, props)</code>: logs every render of a component, numbers them, and prints <em>which props changed by reference</em> since the last render (a mini why-did-you-render). It must not violate render purity. Where must the logging happen, and why?</p>
+    <details>
+      <summary>Solution</summary>
+      <p>The diffing state lives in refs (survives renders, triggers nothing). The log itself is a side effect, so it belongs in an effect — logging in the render body would double-fire misleadingly under StrictMode and would also fire for renders that never commit under concurrent rendering. Running the effect with no dependency array makes it fire after every committed render — exactly the definition of what we're counting.</p>
+      <pre><code><span class="kw">function</span> useRenderLog(name, props) {
+  <span class="kw">const</span> count = useRef(<span class="num">0</span>);
+  <span class="kw">const</span> prev = useRef(props);
+
+  useEffect(() =&gt; {              <span class="com">// no deps → runs after EVERY commit</span>
+    count.current += <span class="num">1</span>;
+    <span class="kw">const</span> changed = {};
+    <span class="kw">const</span> keys = <span class="kw">new</span> Set([...Object.keys(prev.current), ...Object.keys(props)]);
+    <span class="kw">for</span> (<span class="kw">const</span> k <span class="kw">of</span> keys) {
+      <span class="kw">if</span> (!Object.is(prev.current[k], props[k])) {
+        changed[k] = { from: prev.current[k], to: props[k] };
+      }
+    }
+    console.log(
+      <span class="str">`[${name}] render #${count.current}`</span>,
+      Object.keys(changed).length ? changed : <span class="str">'(no prop changes — parent render or state/context)'</span>
+    );
+    prev.current = props;
+  });
+}
+
+<span class="com">// Usage: function Row(props) { useRenderLog('Row', props); … }</span></code></pre>
+      <p>Reading the output is the real lesson: "no prop changes" on a storm of renders means the parent is cascading (fix structurally or with memo); the same prop flagged every render with deep-equal values means an inline object/function/array is being re-created — the memo-defeat signature. Bonus discussion: this counts <em>committed</em> renders; to observe render-phase executions (StrictMode's double-invoke), you'd log in the body — accepting that it's an impurity you'd never ship, or use the React DevTools Profiler which reports "why did this render" without any harness.</p>
+    </details>
+  </div>
+
+  <div class="exercise">
+    <h4>Exercise 4 — The children firewall, demonstrated</h4>
+    <p>This ticker re-renders <code>&lt;ExpensiveTree /&gt;</code> (measured: 40ms) every second. Eliminate that without memo, useMemo, or useCallback — then explain, in reconciliation terms, why your version bails out. Finally: what single change to your solution would silently break the optimization again?</p>
+    <pre><code><span class="kw">function</span> Clock() {
+  <span class="kw">const</span> [now, setNow] = useState(() =&gt; <span class="kw">new</span> Date());
+  useEffect(() =&gt; {
+    <span class="kw">const</span> id = setInterval(() =&gt; setNow(<span class="kw">new</span> Date()), <span class="num">1000</span>);
+    <span class="kw">return</span> () =&gt; clearInterval(id);
+  }, []);
+  <span class="kw">return</span> (
+    &lt;div&gt;
+      &lt;time&gt;{now.toLocaleTimeString()}&lt;/time&gt;
+      &lt;ExpensiveTree /&gt;
+    &lt;/div&gt;
+  );
+}</code></pre>
+    <details>
+      <summary>Solution</summary>
+      <pre><code><span class="com">// Lift the content up: Clock keeps the ticking state but receives</span>
+<span class="com">// the expensive subtree as children, created by its parent.</span>
+<span class="kw">function</span> Clock({ children }) {
+  <span class="kw">const</span> [now, setNow] = useState(() =&gt; <span class="kw">new</span> Date());
+  useEffect(() =&gt; {
+    <span class="kw">const</span> id = setInterval(() =&gt; setNow(<span class="kw">new</span> Date()), <span class="num">1000</span>);
+    <span class="kw">return</span> () =&gt; clearInterval(id);
+  }, []);
+  <span class="kw">return</span> (
+    &lt;div&gt;
+      &lt;time&gt;{now.toLocaleTimeString()}&lt;/time&gt;
+      {children}
+    &lt;/div&gt;
+  );
+}
+
+<span class="kw">function</span> App() {
+  <span class="kw">return</span> (
+    &lt;Clock&gt;
+      &lt;ExpensiveTree /&gt;   <span class="com">// element created by App — once per APP render</span>
+    &lt;/Clock&gt;
+  );
+}</code></pre>
+      <p>Why it bails: each tick re-runs only Clock's body. Clock returns the same <code>children</code> element object it received — App didn't render, so that object is the very reference from last time. Reconciliation compares new child element vs old at that position, finds <code>===</code>, and since elements are immutable, identical reference proves unchanged props — React reuses the fiber and skips the whole subtree: no render, no diff. Verify in the Profiler: per-tick commits show only Clock (&lt;1ms); ExpensiveTree stays gray.</p>
+      <p>What breaks it silently: any re-creation of the element between App and the bailout. The classic: making App re-render every second too (e.g. moving the ticking state up), or "enhancing" Clock with <code>React.Children.map(children, c =&gt; cloneElement(c, {…}))</code> — cloneElement mints a fresh element object per render, the reference check fails, and the 40ms render is back with zero visual difference. That's why this pattern deserves a comment in real code.</p>
+    </details>
+  </div>
+
+  <div class="exercise">
+    <h4>Exercise 5 — Batching prediction drill</h4>
+    <p>For each handler, predict (React 18, createRoot, production): how many renders occur, and what the console shows. Then modify handler C so the DOM scrollHeight read is guaranteed correct.</p>
+    <pre><code><span class="kw">const</span> [n, setN] = useState(<span class="num">0</span>);
+<span class="com">// A</span>
+<span class="kw">function</span> a() {
+  setN(n + <span class="num">1</span>); setN(n + <span class="num">1</span>);
+  console.log(<span class="str">'A'</span>, n);
+}
+<span class="com">// B</span>
+<span class="kw">async function</span> b() {
+  setN(c =&gt; c + <span class="num">1</span>);
+  <span class="kw">await</span> Promise.resolve();
+  setN(c =&gt; c + <span class="num">1</span>);
+  setN(c =&gt; c + <span class="num">1</span>);
+}
+<span class="com">// C — appends a row then measures the list</span>
+<span class="kw">function</span> c() {
+  setRows(r =&gt; [...r, makeRow()]);
+  console.log(listRef.current.scrollHeight);   <span class="com">// intended: NEW height</span>
+}</code></pre>
+    <details>
+      <summary>Solution</summary>
+      <p><strong>A:</strong> one render (both setters batch), final n increases by 1 — both replacement updates were computed from the same snapshot. The log prints the <em>old</em> n: the closure's constant, unchanged regardless of batching. <strong>B:</strong> two renders total. The first setter batches alone (nothing else before the await yields); the two setters after the await are in the same continuation tick and batch together into the second render. Final n: +3 — functional updaters all apply, batching affects render count, never update count. <strong>C:</strong> one render, but the log prints the <em>old</em> scrollHeight: the setter only enqueued an update — reconciliation and the commit happen after the handler returns, so the DOM hasn't changed yet when the read executes.</p>
+      <pre><code><span class="com">// Fix C — two idiomatic options:</span>
+
+<span class="com">// 1. flushSync: force render+commit before the read (costs a sync flush)</span>
+<span class="kw">import</span> { flushSync } <span class="kw">from</span> <span class="str">'react-dom'</span>;
+<span class="kw">function</span> c() {
+  flushSync(() =&gt; setRows(r =&gt; [...r, makeRow()]));
+  console.log(listRef.current.scrollHeight);       <span class="com">// ✅ new height</span>
+}
+
+<span class="com">// 2. Better when it fits: move the read to where committed DOM is guaranteed —</span>
+<span class="com">// an effect keyed on the data (post-paint) or useLayoutEffect (pre-paint):</span>
+useLayoutEffect(() =&gt; {
+  console.log(listRef.current.scrollHeight);       <span class="com">// runs after commit, before paint</span>
+}, [rows]);</code></pre>
+      <p>Grading note: knowing <em>that</em> flushSync works is table stakes; preferring the effect (declarative, no forced sync flush, survives refactors that add more setters) unless the very next line genuinely needs the value is the senior answer.</p>
+    </details>
+  </div>
+
+</main></body></html>

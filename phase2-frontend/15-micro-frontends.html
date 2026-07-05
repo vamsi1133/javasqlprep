@@ -1,0 +1,1546 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>15 — Micro-Frontends | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <div class="breadcrumb"><a href="index.html">← Course Home</a></div>
+    <h1>15 — Micro-Frontends</h1>
+    <p>An organizational architecture wearing a technical costume — when to split, how to compose, and what it really costs.</p>
+  </div>
+</header>
+
+<main class="container">
+
+  <section>
+    <h2>Why interviewers ask this</h2>
+    <p>
+      Micro-frontends (MFE) is on senior job descriptions everywhere, and it's one of the highest-signal
+      architecture questions an interviewer can ask — because it separates people who can <em>configure
+      Module Federation</em> from people who understand <strong>why the architecture exists, what it costs,
+      and when it's the wrong call</strong>. The failure mode interviewers are screening against is real:
+      teams of eight engineers adopting MFE because a conference talk made it sound modern, then drowning
+      in duplicated React copies, drifting design systems, and un-debuggable cross-app state.
+    </p>
+    <p>
+      At FAANG scale, the question is usually a system-design prompt: "we have 12 teams shipping into one
+      dashboard — design the frontend architecture." At product startups it's often the inverse trap:
+      "should we adopt micro-frontends?" where the expected senior answer is <em>probably not, and here's
+      the framework for deciding</em>. Both are testing the same muscle: can you connect <strong>team
+      topology to architecture</strong> (Conway's law), enumerate honest costs, and defend a default of
+      simplicity? This tutorial builds that judgment first, then goes deep on the mechanics — because once
+      you've correctly decided to split, the mechanics (shared singletons, remoteEntry flow, routing
+      ownership, contract testing) are where senior candidates get probed line by line.
+    </p>
+    <div class="tier-legend">
+      <span class="tier tier-1">T1 — must be airtight</span>
+      <span class="tier tier-2">T2 — senior differentiator</span>
+      <span class="tier tier-3">T3 — awareness is enough</span>
+    </div>
+  </section>
+
+  <div class="toc">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#why-mfe">Why MFE — and why usually not</a></li>
+      <li><a href="#composition">Composition approaches — the taxonomy</a></li>
+      <li><a href="#module-federation">Module Federation — deep dive</a></li>
+      <li><a href="#cross-cutting">Cross-MFE concerns — routing, state, auth, design, CSS</a></li>
+      <li><a href="#performance">Performance in an MFE world</a></li>
+      <li><a href="#delivery">Delivery &amp; governance</a></li>
+      <li><a href="#ecosystem">Ecosystem literacy</a></li>
+      <li><a href="#narrative">The interview narrative — a rehearsable answer</a></li>
+      <li><a href="#qa">Interview Q&amp;A</a></li>
+      <li><a href="#exercises">Hands-on exercises</a></li>
+    </ol>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="why-mfe">1. Why MFE — and why usually not <span class="tier tier-1">T1</span></h2>
+
+  <p>
+    Start every MFE conversation with this sentence, because it reframes the entire discussion:
+    <strong>micro-frontends solve an organizational problem, not a technical one.</strong>
+    Nothing about splitting a frontend into independently deployed pieces makes it faster, smaller,
+    or more reliable — in fact it usually makes all three <em>worse</em>. What it buys you is the ability
+    for <em>many teams to ship into one product surface without coordinating deploys</em>.
+  </p>
+
+  <h3>The actual problem being solved</h3>
+  <p>
+    When one frontend codebase is shared by many teams, three organizational pains compound:
+  </p>
+  <ul>
+    <li><strong>Deploy contention.</strong> Team A's release is blocked because Team B's flaky test is red
+      on main. Release trains form; lead time balloons; "who broke the build" becomes a full-time
+      conversation. This is the single most common trigger.</li>
+    <li><strong>Coupled tech evolution.</strong> Upgrading React, the router, or the build tool requires
+      every team to move at once. The slowest team sets the pace for everyone. MFE lets one team run
+      React 19 while another is still finishing its React 17 migration.</li>
+    <li><strong>Ownership ambiguity.</strong> Conway's law says your architecture will mirror your
+      communication structure whether you like it or not. If five teams share one app with no enforced
+      boundaries, you get five teams' worth of conventions smeared across one codebase. MFE makes team
+      boundaries <em>physical</em>: each team owns build, deploy, on-call, and roadmap for its slice.</li>
+  </ul>
+
+<pre>
+  THE PROBLEM MFE SOLVES (organizational, not technical)
+
+  Monolith frontend, 6 teams:            MFE, 6 teams:
+
+  ┌────────────────────────────┐         ┌──────┐ ┌──────┐ ┌──────┐
+  │      one repo, one CI,     │         │team A│ │team B│ │team C│
+  │      one deploy pipeline   │         │deploy│ │deploy│ │deploy│
+  │  A  B  C  D  E  F all wait │         └──┬───┘ └──┬───┘ └──┬───┘
+  │  for the same release gate │            │        │        │
+  └─────────────┬──────────────┘         ┌──▼────────▼────────▼──┐
+                │                        │   composed at runtime │
+           one deploy/day                │   into ONE product    │
+        (slowest team's pace)            └───────────────────────┘
+                                          each team deploys when ready
+</pre>
+
+  <h3>The honest cost list</h3>
+  <p>
+    A senior answer names the costs unprompted. Every one of these is a recurring tax, not a one-time
+    setup fee:
+  </p>
+  <table>
+    <thead>
+      <tr><th>Cost</th><th>What it looks like in practice</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Bundle duplication</strong></td>
+        <td>Without disciplined dependency sharing, every MFE ships its own React, router, date library,
+        design system. Users pay in bytes and parse time; two React copies on one page breaks hooks and
+        context outright (§3).</td>
+      </tr>
+      <tr>
+        <td><strong>UX consistency drift</strong></td>
+        <td>Independent teams + independent release cadences = buttons that look 90% the same, three
+        subtly different modals, inconsistent spacing. Requires an actively governed design system to
+        counteract — which is itself a team's worth of ongoing work.</td>
+      </tr>
+      <tr>
+        <td><strong>Cross-MFE state pain</strong></td>
+        <td>Anything two MFEs both need — auth, cart, feature flags, locale — now crosses a deployment
+        boundary. Every shared value becomes a versioned contract between separately deployed artifacts.</td>
+      </tr>
+      <tr>
+        <td><strong>Operational complexity</strong></td>
+        <td>N pipelines, N monitoring dashboards, N rollback procedures, and failure modes that only
+        appear in specific <em>combinations</em> of deployed versions ("checkout 4.2 + shell 1.9 breaks,
+        neither is broken alone").</td>
+      </tr>
+      <tr>
+        <td><strong>Local dev orchestration</strong></td>
+        <td>"Run the app locally" now means running 2–8 servers or pointing your local remote at staging
+        versions of everything else. Onboarding time and dev-loop friction go up measurably.</td>
+      </tr>
+      <tr>
+        <td><strong>Testing across seams</strong></td>
+        <td>Unit tests stay easy; the integration surface between MFEs is where bugs hide, and no single
+        team's suite covers it. You need contract tests and a centrally owned e2e critical path (§6).</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="senior">
+    The tell of a senior engineer in this conversation: they describe MFE as <em>buying deployment
+    independence with user-facing and operational currency</em>, and they can say exactly when that trade
+    is worth it. The tell of a mid-level engineer: they lead with Module Federation config and treat the
+    costs as footnotes.
+  </div>
+
+  <h3>The senior default: modular monolith first</h3>
+  <p>
+    The default answer for most teams is a <strong>modular monolith in a monorepo with enforced
+    boundaries</strong>: one deployable artifact, but internal packages with explicit public APIs, import
+    rules enforced by tooling (Nx module boundaries, ESLint <code>no-restricted-imports</code>, Turborepo
+    package graphs), and per-package code ownership. You get 80% of the organizational benefit — clear
+    ownership, independent code review, parallel work — with none of the runtime composition tax.
+    Crucially, a well-boundaried monolith is <em>MFE-ready</em>: if team growth later forces the split,
+    the seams already exist.
+  </p>
+
+<pre>
+  THE MIGRATION LADDER (climb only as far as the org forces you)
+
+  1. Monolith            one repo, tangled imports        ← where most start
+  2. Modular monolith    one deploy, enforced package     ← the senior default
+                         boundaries + code ownership
+  3. Route-split MFE     independent deploys, each team   ← when deploy contention
+                         owns whole routes                   becomes the bottleneck
+  4. Fragment MFE        multiple teams composing one     ← rare; only at serious
+                         page at runtime                     scale (10s of teams)
+</pre>
+
+  <h3>Decision framework — the triggers that justify the split</h3>
+  <ul>
+    <li><strong>Team count and contention:</strong> roughly 3–4+ frontend teams with measurable deploy
+      contention (release trains, merge queues backing up, teams blocking each other weekly). Below that,
+      the coordination cost of MFE exceeds the coordination cost it removes.</li>
+    <li><strong>Genuinely independent release cadences:</strong> e.g., a regulated payments team that
+      ships monthly with compliance review, next to a growth team shipping ten times a day. Forcing them
+      through one pipeline hurts both.</li>
+    <li><strong>Acquisitions / legacy integration:</strong> you bought a company; its Vue app must appear
+      inside your React product next quarter. Runtime composition is often the only realistic option.</li>
+    <li><strong>Gradual migration — the strangler fig:</strong> often the <em>strongest</em> justification.
+      You have a legacy app (jQuery, AngularJS, old Rails views) that cannot be rewritten big-bang.
+      An app shell + MFE seams let you replace it route by route, shipping value continuously, with the
+      legacy app itself mounted as just another "remote" until it withers away (§8 has the full story).</li>
+  </ul>
+
+  <div class="pitfall">
+    "We want micro-frontends for performance" is a red flag answer. MFE almost always <em>costs</em>
+    performance (duplication, extra network hops, runtime composition overhead). If someone cites
+    performance as the motivation, they've confused MFE with code-splitting — which a monolith does
+    fine with <code>import()</code> and route-level chunks.
+  </div>
+
+  <div class="note">
+    A useful interview litmus test to cite: <em>"could two of these teams realistically want to deploy
+    at different times and be blocked by each other today?"</em> If the answer is no — because it's one
+    team, or deploys aren't contended — MFE is solving a problem you don't have.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="composition">2. Composition approaches — the taxonomy <span class="tier tier-1">T1</span></h2>
+
+  <p>
+    "Micro-frontends" is a family of composition techniques, not one technology. Interviewers expect you
+    to lay out the option space before advocating for one. The two axes that matter:
+    <strong>when composition happens</strong> (build time → server → client runtime) and
+    <strong>what granularity teams own</strong> (whole routes vs fragments of a page).
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>Approach</th><th>Composed</th><th>Isolation</th><th>Deploy independence</th><th>Best for</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Build-time (npm packages)</td><td>At build</td><td>None (one bundle)</td><td>✗ — host must rebuild/redeploy</td><td>Small orgs; shared UI libs; "not really MFE" but often correct</td></tr>
+      <tr><td>Client-side runtime (Module Federation, import maps)</td><td>In browser</td><td>JS-level only</td><td>✓ full</td><td>SPA-heavy products, many teams, shared framework</td></tr>
+      <tr><td>Server-side composition (SSI/ESI, BFF-assembled)</td><td>On server/edge</td><td>Per-fragment</td><td>✓ full</td><td>Content/commerce sites where SSR + SEO dominate</td></tr>
+      <tr><td>iframes</td><td>In browser</td><td>Total (separate document)</td><td>✓ full</td><td>Payments, 3rd-party embeds, hostile/untrusted code</td></tr>
+      <tr><td>Web components</td><td>In browser</td><td>Shadow DOM (styles)</td><td>✓ full</td><td>Framework-neutral contract between teams on different stacks</td></tr>
+    </tbody>
+  </table>
+
+  <h3>2.1 Build-time composition (npm packages)</h3>
+<pre>
+  BUILD-TIME COMPOSITION
+
+  team-a/  ──publish──▶  @org/feature-a  ──┐
+  team-b/  ──publish──▶  @org/feature-b  ──┤──▶  host app: npm install,
+  team-c/  ──publish──▶  @org/feature-c  ──┘     ONE build, ONE deploy
+                                                 ONE bundle graph (deduped!)
+  ✓ perfect dedupe, typechecked seams, trivial local dev
+  ✗ shipping feature-a's fix still requires a HOST release
+</pre>
+  <p>
+    Publishing features as npm packages and composing them in one host build is <em>not</em> micro-frontends
+    by the strict definition — deploys are still coupled through the host. But say this in the interview:
+    <strong>it's frequently the right answer anyway.</strong> You get versioned contracts, full type safety
+    across seams, and perfect dependency dedupe. Its real weakness is release latency: a package fix reaches
+    users only when the host rebuilds and redeploys — which reintroduces exactly the contention MFE exists
+    to remove. So it fits orgs where deploy contention isn't (yet) the bottleneck.
+  </p>
+
+  <h3>2.2 Client-side runtime composition</h3>
+<pre>
+  CLIENT-SIDE RUNTIME COMPOSITION (Module Federation / import maps)
+
+  Browser
+  ┌───────────────────────────────────────────────────┐
+  │  App Shell (host)  ← loaded from shell.cdn.com    │
+  │  ┌─────────────────────────────────────────────┐  │
+  │  │ 1. fetch remoteEntry.js from each remote    │  │
+  │  │ 2. negotiate shared deps (one React!)       │  │
+  │  │ 3. dynamically import exposed modules       │  │
+  │  └─────────────────────────────────────────────┘  │
+  │   ┌───────────────┐   ┌────────────────────────┐  │
+  │   │ checkout MFE  │   │ catalog MFE            │  │
+  │   │ checkout.cdn… │   │ catalog.cdn…           │  │
+  │   └───────────────┘   └────────────────────────┘  │
+  └───────────────────────────────────────────────────┘
+  Each remote deployed independently; browser assembles the app.
+</pre>
+  <p>
+    The dominant flavor today. Two main mechanisms: <strong>Module Federation</strong> (webpack 5+/Rspack —
+    §3 in depth) where bundles expose and consume modules at runtime with dependency-sharing negotiation;
+    and <strong>import maps + native ESM</strong>, where the browser itself resolves bare specifiers
+    (<code>import "catalog/App"</code>) to versioned URLs — simpler, standards-based, but with cruder
+    dependency sharing (you share exactly what the import map pins, no version negotiation).
+  </p>
+
+  <h3>2.3 Server-side composition</h3>
+<pre>
+  SERVER-SIDE COMPOSITION
+
+  Browser ──GET /product/42──▶ ┌──────────────────────────┐
+                               │  Composition layer        │
+                               │  (edge / BFF / gateway)   │
+                               │   ├─▶ header service ─────┼─▶ &lt;header html&gt;
+                               │   ├─▶ product service ────┼─▶ &lt;product html&gt;
+                               │   └─▶ recs service ───────┼─▶ &lt;recs html&gt;
+                               │  stitches fragments into  │
+                               │  ONE streamed HTML page   │
+                               └──────────────────────────┘
+</pre>
+  <p>
+    Each team runs a service that renders HTML fragments; a composition layer stitches them per request.
+    Lineage: SSI (Server Side Includes), ESI (Edge Side Includes — Akamai/Fastly-era), then
+    Zalando's <strong>Tailor</strong> and Finn.no's <strong>Podium</strong> as the node-era frameworks, and
+    today often just a BFF that fetches fragments and streams. Strengths: real SSR per fragment (SEO, fast
+    first paint), no client framework coupling. Costs: you now operate a composition tier; client-side
+    interactivity across fragments still needs a client contract; and per-fragment latency is summed or
+    streamed carefully to avoid the slowest team's fragment stalling the page.
+  </p>
+
+  <h3>2.4 iframes — the strongest isolation</h3>
+<pre>
+  IFRAME COMPOSITION
+
+  ┌─ parent document (shell) ────────────────────────┐
+  │   ┌─ iframe: payments.other-corp.com ─────────┐  │
+  │   │  separate document, JS realm, CSS world,  │  │
+  │   │  cookies, CSP — a different UNIVERSE      │  │
+  │   └───────────────▲───────────────────────────┘  │
+  │        postMessage│(the ONLY bridge)             │
+  └───────────────────┴──────────────────────────────┘
+</pre>
+  <p>
+    Unfashionable but genuinely correct in one niche: <strong>when isolation is the requirement</strong> —
+    payment forms (PCI scope containment: Stripe Elements is an iframe MFE), embedding third-party or
+    acquired apps you don't trust, plugin systems running arbitrary code. Nothing else gives you a separate
+    JS realm, style universe, and security boundary. The seams are the price, and interviewers like hearing
+    them named: <strong>resize</strong> (the iframe doesn't size to content — you need a postMessage height
+    protocol or <code>ResizeObserver</code> relay), <strong>focus/keyboard</strong> (tab order and focus
+    trapping across documents is painful, screen-reader context resets), <strong>routing</strong> (inner
+    navigation doesn't update the outer URL without an explicit sync protocol), and
+    <strong>postMessage</strong> as an untyped, stringly, async-only API — always validate
+    <code>event.origin</code> and wrap it in a typed client.
+  </p>
+
+  <h3>2.5 Web components as the neutral contract</h3>
+  <p>
+    Custom elements give teams a <strong>framework-agnostic interface</strong>: the contract is
+    "an element named <code>&lt;checkout-widget&gt;</code> with these attributes/properties and these
+    DOM events," not "a React component with these props." Inside, a team can use React, Vue, Svelte,
+    or vanilla — and swap it later without the host noticing. Shadow DOM adds real style encapsulation
+    (outer CSS can't leak in, inner can't leak out — themable via CSS custom properties, which pierce
+    intentionally). Costs: SSR of shadow DOM (Declarative Shadow DOM helps but is newer), passing rich
+    data (attributes are strings; you need property assignment conventions), and framework event
+    interop (largely solved — React 19 finally handles custom element properties/events natively).
+    In practice web components often serve as the <em>wrapper contract</em> around MFEs that are
+    internally framework-rendered.
+  </p>
+
+  <h3>2.6 Route-based vs fragment-based — the granularity axis</h3>
+<pre>
+  ROUTE-BASED (common, simpler)          FRAGMENT-BASED (rare, harder)
+
+  /catalog/*   → Team Catalog MFE        ┌─ one page ──────────────┐
+  /checkout/*  → Team Checkout MFE       │ [header — Team Platform]│
+  /account/*   → Team Account MFE        │ [search — Team Discovery]│
+                                         │ [cart   — Team Checkout]│
+  App shell: nav chrome + router +       │ [recs   — Team ML]      │
+  auth + which-MFE-owns-which-prefix.    └─────────────────────────┘
+  Only ONE team's code runs per page     4 teams' code composing,
+  (plus the shell).                      sharing, colliding per page
+</pre>
+  <p>
+    <strong>Route-based split is the simplest and most common real-world deployment</strong>: a thin app
+    shell owns chrome, auth, and top-level routing; each team owns entire route subtrees. Cross-team
+    interaction is minimized because only one MFE is active at a time — most of the hard problems in §4
+    shrink dramatically. <strong>Fragment-based</strong> (multiple teams' components live on one page)
+    is where MFE gets genuinely hard: shared rendering context, style collisions, event coordination,
+    combinatorial version testing. Recommend route-based by default; treat fragment composition as an
+    escalation you accept only for specific high-value pages (e.g., a commerce product page genuinely
+    assembled by search, pricing, and recommendations teams).
+  </p>
+
+  <div class="senior">
+    A crisp interview formulation: "composition approach is a spectrum of <em>when</em> you pay the
+    integration cost. Build-time pays it in release coupling, server-side pays it in infrastructure,
+    client-side pays it in runtime complexity and bytes, iframes pay it in UX seams. I pick based on
+    which currency the org can most afford."
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="module-federation">3. Module Federation — deep dive <span class="tier tier-1">T1</span></h2>
+
+  <h3>The mental model</h3>
+  <p>
+    Module Federation (webpack 5, now also Rspack and others) lets separately built and deployed bundles
+    behave like one module graph <strong>at runtime</strong>. Each build produces a
+    <strong>container</strong> that can <em>expose</em> some of its modules and <em>consume</em> modules
+    from other containers. A <strong>host</strong> is a container that consumes; a <strong>remote</strong>
+    is one that exposes (any app can be both — federation is bidirectional).
+  </p>
+  <p>
+    The linchpin is <code>remoteEntry.js</code>: a small manifest file each remote emits. It does
+    <em>not</em> contain the remote's application code — it contains the container's runtime interface:
+    the list of exposed modules, which chunks implement them, and which shared dependencies this remote
+    provides or needs. The host loads remoteEntry, negotiates shared dependencies, then lazily fetches
+    only the chunks for modules it actually imports.
+  </p>
+
+<pre>
+  MODULE FEDERATION RUNTIME FLOW
+
+  HOST (shell.example.com)                REMOTE (checkout.example.com)
+  ────────────────────────                ─────────────────────────────
+  1. page load: host bundle runs
+  2. sees import("checkout/Cart")
+  3. ──GET checkout.example.com/remoteEntry.js──▶  (tiny manifest, ~5–30KB)
+  4. container.init(sharedScope)  ◀── host and remote register what they
+        │                             PROVIDE and REQUIRE into a shared
+        │                             scope object {react: {18.3.1: …}}
+  5. version negotiation: "host provides react@18.3.1, remote requires
+     ^18.2.0 → satisfied → remote will USE THE HOST'S react, its own
+     react chunk is never downloaded"
+  6. container.get("./Cart") ──▶ returns a factory
+  7. ──GET only the chunks Cart needs (cart.[hash].js …)──▶
+  8. host renders &lt;Cart /&gt; — one React instance, one module graph
+</pre>
+
+  <h3>Configuration — the canonical example</h3>
+<pre><code>// ── remote: checkout app ── webpack.config.js
+const { ModuleFederationPlugin } = require("webpack").container;
+
+module.exports = {
+  output: { publicPath: "auto" },       // critical: chunks resolve relative
+  plugins: [                             // to wherever remoteEntry was loaded
+    new ModuleFederationPlugin({
+      name: "checkout",                  // global container name
+      filename: "remoteEntry.js",        // the manifest artifact
+      exposes: {
+        "./Cart": "./src/components/Cart",     // public API of this MFE —
+        "./routes": "./src/routes",            // treat like a published pkg
+      },
+      shared: {
+        react:        { singleton: true, requiredVersion: "^18.2.0" },
+        "react-dom":  { singleton: true, requiredVersion: "^18.2.0" },
+        "react-router-dom": { singleton: true, requiredVersion: "^6.20.0" },
+        "@org/design-system": { singleton: true, requiredVersion: "^4.0.0" },
+      },
+    }),
+  ],
+};
+
+// ── host: app shell ── webpack.config.js
+new ModuleFederationPlugin({
+  name: "shell",
+  remotes: {
+    // "name@URL" — name must match the remote's `name`
+    checkout: "checkout@https://checkout.cdn.example.com/remoteEntry.js",
+    catalog:  "catalog@https://catalog.cdn.example.com/remoteEntry.js",
+  },
+  shared: {
+    react:       { singleton: true, eager: true, requiredVersion: "^18.2.0" },
+    "react-dom": { singleton: true, eager: true, requiredVersion: "^18.2.0" },
+  },
+});
+
+// ── consuming, in the shell ──
+const Cart = React.lazy(() => import("checkout/Cart"));
+</code></pre>
+
+  <div class="note">
+    Detail interviewers like: because the host imports from remotes asynchronously, the host's own entry
+    usually needs to be async too — the classic pattern is a tiny <code>index.js</code> containing only
+    <code>import("./bootstrap")</code>, giving webpack an async boundary in which to negotiate shared
+    modules before any React code runs. <code>eager: true</code> on the host's shared deps is the
+    alternative: bundle them into the entry so they're available synchronously (host pays bytes up front;
+    typical for the shell, wrong for remotes).
+  </div>
+
+  <h3>Shared dependencies — the crux</h3>
+  <p>
+    This is the part of federation interviews probe hardest, because it's where real-world MFE breaks.
+    The <code>shared</code> config populates a runtime <strong>share scope</strong>: an in-memory registry,
+    keyed by package name, where every container advertises the versions it <em>can provide</em> and the
+    ranges it <em>requires</em>. On first use of a shared module, the runtime picks a provider —
+    by default the <strong>highest available version that satisfies the consumer's
+    <code>requiredVersion</code> range</strong> — and hands the same module instance to everyone
+    compatible with it. Each remote still ships its own copy as a fallback chunk; that chunk is simply
+    never downloaded if the scope already satisfies the requirement. That's the dedupe mechanism: not
+    build-time, but a runtime auction.
+  </p>
+  <table>
+    <thead><tr><th>Option</th><th>Semantics</th><th>When / why</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>singleton: true</code></td>
+        <td>At most ONE instance in the share scope, ever. If a container requires an incompatible
+        version, it does NOT load its own copy — it gets the existing one plus a console warning
+        (or a hard error with <code>strictVersion: true</code>).</td>
+        <td>Mandatory for react, react-dom, the router, any context-carrying or global-state library.</td>
+      </tr>
+      <tr>
+        <td><code>requiredVersion</code></td>
+        <td>The semver range this container needs. Drives negotiation and mismatch warnings. Defaults
+        from your package.json if omitted — pin it explicitly in shared configs to avoid surprises.</td>
+        <td>Always set explicitly for singletons; it's your compatibility contract.</td>
+      </tr>
+      <tr>
+        <td><code>eager: true</code></td>
+        <td>Bundle the shared module into the entry chunk, available synchronously — no async boundary
+        needed, but no dedupe benefit for that container (it always ships its copy).</td>
+        <td>Host/shell only. On remotes it defeats the purpose and bloats every remote.</td>
+      </tr>
+      <tr>
+        <td><code>strictVersion: true</code></td>
+        <td>Throw at runtime instead of warning when the negotiated version violates
+        <code>requiredVersion</code>.</td>
+        <td>Prefer failing loudly in staging over silently running a version a team never tested against.</td>
+      </tr>
+      <tr>
+        <td><code>version</code> / fallback</td>
+        <td>What this container offers to the scope, and the local copy used if nothing in scope
+        satisfies the requirement (non-singleton case: multiple versions can coexist, each consumer
+        getting a compatible one).</td>
+        <td>Fine for leaf utilities (lodash, date-fns) where two instances are wasteful but harmless.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    <strong>Why singleton for React is non-negotiable:</strong> two React copies on one page is not a
+    performance bug, it's a <em>correctness</em> bug. Hooks work via a shared internal dispatcher — a
+    component rendered by React-copy-A calling hooks from React-copy-B throws the infamous
+    "Invalid hook call" error. Context is identity-based: a <code>ThemeContext</code> created in copy A
+    is a different object in copy B, so every <code>useContext</code> across the boundary silently returns
+    the default value — auth contexts, theme, router context all break. Two ReactDOMs also mean two event
+    systems and two schedulers fighting over the same document. The same identity argument applies to
+    react-router (router context), and to any shared store whose "sharedness" depends on module-instance
+    identity.
+  </p>
+
+  <div class="pitfall">
+    The subtle production failure: everything works in staging, then one team ships a remote requiring
+    <code>react@^19</code> while the shell still provides 18. With <code>singleton: true</code> and no
+    <code>strictVersion</code>, that remote silently runs on React 18 — a version it never tested —
+    and breaks in ways its own CI could never catch. Mitigations: <code>strictVersion</code> in
+    non-prod, a platform-team-owned policy for coordinated framework upgrades (singletons are the one
+    place MFE teams <em>must</em> move together), and contract tests that assert each remote's
+    requiredVersion against the shell's provided versions at deploy time.
+  </div>
+
+  <h3>Dynamic remotes — runtime URL resolution</h3>
+  <p>
+    Hardcoding remote URLs in webpack config couples environments to builds. Production setups resolve
+    remotes at runtime: from env config, a manifest service, or per-request (which also enables canarying
+    a remote by serving different remoteEntry URLs to different cohorts — §6).
+  </p>
+<pre><code>// Dynamic remote loading — no `remotes` config needed in the host
+async function loadRemote(scope, module, url) {
+  await __webpack_init_sharing__("default");       // populate share scope
+  await loadScript(url);                            // adds window[scope]
+  const container = window[scope];                  // e.g. window.checkout
+  await container.init(__webpack_share_scopes__.default); // negotiate deps
+  const factory = await container.get(module);      // e.g. "./Cart"
+  return factory();
+}
+
+// URLs come from config, not from the build:
+const manifest = await fetch("/mfe-manifest.json").then(r => r.json());
+// { "checkout": "https://checkout.cdn…/v437/remoteEntry.js", … }
+const Cart = React.lazy(async () => ({
+  default: (await loadRemote("checkout", "./Cart",
+                             manifest.checkout)).default ?? …
+}));
+</code></pre>
+  <p>
+    (Module Federation 2.0's runtime — <code>@module-federation/enhanced</code> — wraps exactly this in a
+    first-class API: <code>init({ remotes })</code> + <code>loadRemote("checkout/Cart")</code>, plus
+    runtime plugins for retries, fallbacks, and manifest-driven resolution.)
+  </p>
+
+  <h3>Federation + TypeScript — the types-drift problem</h3>
+  <p>
+    <code>import("checkout/Cart")</code> has no types: the module exists only at runtime, so TypeScript
+    can't see across the seam, and worse, <strong>types drift</strong> — the remote redeploys with a
+    changed prop contract and the host's stale type declarations still compile green. Approaches, in
+    increasing automation: (1) hand-maintained <code>declare module "checkout/Cart"</code> ambient files —
+    drift guaranteed; (2) a <strong>shared types package</strong> per seam (<code>@org/checkout-contracts</code>)
+    that both sides depend on — the contract is versioned and reviewed like an API, my usual
+    recommendation because it forces contract <em>thinking</em>, not just type sync; (3) automated type
+    extraction — <code>@module-federation/typescript</code> / the 2.0 <code>dts-plugin</code>, which emits a
+    types archive alongside remoteEntry and syncs it into consumers, keeping <code>tsc</code> honest against
+    the deployed reality. Even with (3), remember types check at build time but remotes change after —
+    contract tests remain necessary (§6).
+  </p>
+
+  <h3>Ecosystem awareness: MF 2.0, Rspack, Vite</h3>
+  <ul>
+    <li><strong>Module Federation 2.0 / <code>@module-federation/enhanced</code>:</strong> federation
+      extracted from webpack into a standalone spec + runtime — a manifest protocol richer than raw
+      remoteEntry, runtime plugins (retry, fallback, telemetry hooks), first-class dynamic remotes, and
+      the dts plugin for type sync. Backed by ByteDance's production usage; the direction of travel.</li>
+    <li><strong>Rspack:</strong> the Rust webpack-compatible bundler ships native Module Federation
+      support — the practical answer to "federation locks me into slow webpack builds."</li>
+    <li><strong>Vite:</strong> <code>@originjs/vite-plugin-federation</code> and the newer
+      <code>@module-federation/vite</code> implement the same host/remote model over ESM output.
+      Interop across bundlers works but is the least-paved path — a fully aligned toolchain
+      (or the 2.0 runtime as the common denominator) saves pain.</li>
+  </ul>
+
+  <h3>Failure handling — remotes go down</h3>
+  <p>
+    A remote is now a runtime network dependency: CDN hiccup, bad deploy, corporate proxy — the import
+    can reject. Unhandled, one team's outage becomes a blank page for the whole product. The pattern is
+    error boundary + fallback module, plus retry:
+  </p>
+<pre><code>class RemoteBoundary extends React.Component {
+  state = { failed: false };
+  static getDerivedStateFromError() { return { failed: true }; }
+  componentDidCatch(err) { reportToTeam(this.props.owner, err); }
+  render() {
+    return this.state.failed ? this.props.fallback : this.props.children;
+  }
+}
+
+const Cart = React.lazy(() =>
+  import("checkout/Cart").catch(() => {
+    // remoteEntry unreachable or chunk failed — degrade, don't die
+    return import("./fallbacks/CartUnavailable");   // local stub module
+  })
+);
+
+&lt;RemoteBoundary owner="team-checkout" fallback={&lt;CartUnavailable /&gt;}&gt;
+  &lt;Suspense fallback={&lt;CartSkeleton /&gt;}&gt;
+    &lt;Cart /&gt;
+  &lt;/Suspense&gt;
+&lt;/RemoteBoundary&gt;
+</code></pre>
+  <p>
+    Both layers matter: the <code>.catch</code> on the dynamic import handles <em>load</em> failures
+    (network, missing chunk), the boundary handles <em>render</em> failures (the remote loaded but throws).
+    Decide the degraded UX per seam deliberately — a dead recommendations rail can vanish silently; a dead
+    checkout needs an apologetic retry screen and a page.
+  </p>
+
+  <div class="senior">
+    Framing that lands well: "Module Federation turns a build-time dependency graph into a distributed
+    system. Everything we know about distributed systems applies: version skew, partial failure,
+    contracts, observability per node. Teams that adopt it as 'just webpack config' get distributed-systems
+    problems without distributed-systems discipline."
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="cross-cutting">4. Cross-MFE concerns — the hard parts <span class="tier tier-2">T2</span></h2>
+
+  <p>
+    Loading remote code is the easy 20%. Interviewers dig here because these seams — routing, state,
+    auth, design, CSS — are where MFE projects actually bleed. For each: the options, the recommendation,
+    and the cost.
+  </p>
+
+  <h3>4.1 Routing</h3>
+<pre>
+  ROUTING OWNERSHIP MODELS
+
+  A) Shell owns the (only) router          B) Each remote owns its router
+  ┌─ shell: BrowserRouter ──────────┐      ┌─ shell: tiny prefix matcher ──┐
+  │  /catalog/*  → &lt;CatalogApp/&gt;    │      │ /checkout/* → mount checkout  │
+  │  /checkout/* → &lt;CheckoutApp/&gt;   │      │   ┌─ checkout MFE ─────────┐  │
+  │  remotes register route trees   │      │   │ own Router(basename=   │  │
+  │  or render &lt;Routes&gt; against     │      │   │  "/checkout") on the   │  │
+  │  the SHARED router context      │      │   │  same history — or a   │  │
+  └─────────────────────────────────┘      │   │  MEMORY router + sync  │  │
+  needs router as shared singleton;        │   └────────────────────────┘  │
+  one nav model, deep links "just work"    └───────────────────────────────┘
+                                           looser coupling; history-sync
+                                           protocol needed between levels
+</pre>
+  <p>
+    <strong>Model A (shell owns the router)</strong> is the right default for route-based MFE on one
+    framework: the shell creates the single history/router; remotes expose route <em>definitions</em>
+    (an exposed <code>./routes</code> module) or render their own <code>&lt;Routes&gt;</code> subtree
+    against the shared router context. Requires the router library as a shared singleton (context identity
+    again). One coherent model for links, transitions, guards, scroll restoration.
+    <strong>Model B</strong> — each remote instantiates its own router, either on the real history with a
+    <code>basename</code>, or a memory router with an explicit two-way sync to the shell's URL — buys
+    framework/version independence (a Vue remote inside a React shell) at the cost of a synchronization
+    protocol you now own, and it's where deep-linking bugs breed.
+  </p>
+  <div class="pitfall">
+    Deep-linking is the classic demo-vs-production gap: clicking around works, but a cold load of
+    <code>/checkout/payment?step=2</code> 404s or loses state because (a) the CDN/server isn't rewriting
+    all paths to the shell's index.html, (b) the remote's internal router never initialized from the URL
+    (memory-router setups), or (c) the remote treated in-app state as implicit instead of URL-encoded.
+    Test cold-load and refresh on <em>every</em> route depth, not just top-level navigation. Also watch
+    for double history entries when two routers both push for one navigation.
+  </div>
+
+  <h3>4.2 State &amp; communication — ranked</h3>
+  <p>
+    The governing principle: <strong>every piece of shared state is a coupling between independently
+    deployed artifacts</strong> — the exact thing MFE was adopted to remove. So: share as little as
+    possible, prefer duplication over coupling for anything cheap to duplicate, and rank mechanisms by
+    how loosely they couple:
+  </p>
+  <ol>
+    <li><strong>The URL (first choice).</strong> Selected product, filters, tab, step — if it describes
+      "where the user is," put it in the URL. It's a contract both MFEs already honor, it survives
+      refresh, it deep-links, it's debuggable in the address bar, and it couples nobody to a library.</li>
+    <li><strong>Custom events / a typed event bus (second choice).</strong> For fire-and-forget facts:
+      "item added to cart," "user logged out." Pub/sub over <code>window</code> CustomEvents keeps MFEs
+      unaware of each other — they share only the event contract. Make the contract typed and versioned:</li>
+  </ol>
+<pre><code>// @org/event-contracts — a versioned package BOTH sides depend on
+export interface EventMap {
+  "cart:item-added":   { sku: string; qty: number };
+  "auth:logged-out":   { reason: "expired" | "user" };
+}
+
+export function emit&lt;K extends keyof EventMap&gt;(type: K, detail: EventMap[K]) {
+  window.dispatchEvent(new CustomEvent(type, { detail }));
+}
+
+export function on&lt;K extends keyof EventMap&gt;(
+  type: K, handler: (detail: EventMap[K]) =&gt; void
+): () =&gt; void {
+  const fn = (e: Event) =&gt; handler((e as CustomEvent).detail);
+  window.addEventListener(type, fn);
+  return () =&gt; window.removeEventListener(type, fn);   // unsubscribe
+}
+
+// team-checkout emits…            // team-header listens…
+emit("cart:item-added",            const off = on("cart:item-added",
+     { sku: "A1", qty: 2 });            d =&gt; setBadge(b =&gt; b + d.qty));
+</code></pre>
+  <ol start="3">
+    <li><strong>Shared store singleton (last resort — coupling alarm).</strong> A shared Redux/Zustand
+      store exposed by the shell technically works, but now every consumer is coupled to the store's
+      shape, its library version (singleton!), and its update semantics — you've rebuilt the monolith's
+      tangle across deploy boundaries, where a shape change is a breaking cross-team API change. If
+      unavoidable, keep it to a tiny, explicitly versioned slice (auth/user/feature-flags), expose it
+      behind a narrow accessor API rather than raw store shape, and treat changes like public API
+      changes with deprecation windows.</li>
+  </ol>
+  <div class="senior">
+    "Duplicate over couple" is worth saying explicitly: if two MFEs both need the user's display name,
+    letting each fetch it (or read it from a token claim) is usually cheaper long-term than building a
+    shared user store both deploy against. Redundant fetches are visible and cheap; hidden coupling is
+    invisible and expensive.
+  </div>
+
+  <h3>4.3 Auth</h3>
+<pre>
+  AUTH TOPOLOGIES
+
+  A) Cookie-domain strategy               B) Shell-managed token + bridge
+  httpOnly cookie on .example.com         ┌─ shell: owns login, holds     ─┐
+     │                                    │  tokens in memory, runs THE   │
+     ├─▶ shell        (sends cookie)      │  ONE silent-refresh loop      │
+     ├─▶ catalog API  (sends cookie)      │   ├─ getToken(): Promise      │
+     └─▶ checkout API (sends cookie)      │   └─ provided to remotes via  │
+  MFEs never touch tokens at all —        │      context / injected client│
+  the browser is the auth bridge          └───────────────────────────────┘
+</pre>
+  <p>
+    <strong>Strategy A — cookie on a shared parent domain</strong> — is the cleanest when all MFEs and
+    their APIs live under one registrable domain: an httpOnly, Secure, SameSite cookie set on
+    <code>.example.com</code> rides along on every request from every MFE. No token ever exists in JS
+    (XSS can't exfiltrate it), and no MFE contains auth logic. Costs: CSRF discipline, and it breaks
+    across unrelated domains (acquisitions again). <strong>Strategy B — shell-managed tokens</strong> —
+    the shell owns the OAuth/OIDC dance, keeps the access token in memory, and hands remotes either the
+    token via a context bridge or, better, a pre-authenticated fetch client (narrower contract: remotes
+    can make calls but never see or store the token). Either way, the non-negotiable rule:
+    <strong>silent refresh runs in exactly one place</strong> — the shell. Five MFEs independently
+    refreshing the same session produce token races, refresh-token reuse errors, and random logouts
+    that are miserable to debug.
+  </p>
+
+  <h3>4.4 Design consistency</h3>
+  <p>
+    Design drift is the most <em>visible</em> MFE failure — users don't see your deploy topology, but
+    they instantly see three different button styles. Countermeasures, in layers:
+  </p>
+  <ul>
+    <li><strong>A shared design-system package</strong> (<code>@org/design-system</code>) as the primary
+      tool, with an explicit <strong>versioning policy: teams may run at most one major behind
+      (allow N-1)</strong>. Without a policy you get a team frozen on v2 for two years; forcing exact
+      lockstep reintroduces coupled deploys. N-1 with a stated deprecation window is the workable middle.
+      Decide consciously whether it's a shared singleton at runtime (dedupe, but versions must be
+      compatible) or bundled per MFE (duplication, but true independence) — for an N-1 policy,
+      per-MFE bundling with shared <em>tokens</em> is often the honest choice.</li>
+    <li><strong>Design tokens as the lowest common denominator.</strong> Colors, spacing, typography,
+      radii as CSS custom properties published from one source. Even a rogue MFE on a different framework
+      version — or a different framework — consumes tokens, so the worst-case drift is component
+      <em>behavior</em>, not the brand palette.</li>
+    <li><strong>Icon/font dedupe:</strong> the shell loads brand fonts once (with
+      <code>font-display</code> and preload); icons ship as a shared sprite/package, not re-bundled per
+      MFE — otherwise users download your icon set N times and fonts flash per-MFE.</li>
+  </ul>
+
+  <h3>4.5 CSS isolation</h3>
+  <table>
+    <thead><tr><th>Technique</th><th>Isolation strength</th><th>Cost</th></tr></thead>
+    <tbody>
+      <tr><td>CSS Modules / styled-components / vanilla-extract</td><td>Good — hashed class names can't collide</td><td>None new; but does NOT stop global styles a team ships (resets, element selectors)</td></tr>
+      <tr><td>Naming/scoping convention (prefix per MFE, layers)</td><td>Convention-strength only</td><td>Lint enforcement needed; humans forget</td></tr>
+      <tr><td>Tailwind with per-MFE <code>prefix</code> + scoped preflight</td><td>Good for utilities</td><td>Preflight (global reset) must ship ONCE — from the shell — or be disabled per remote; utility duplication across bundles</td></tr>
+      <tr><td>Shadow DOM</td><td>Hard boundary both directions</td><td>SSR friction, portal/tooltip escapes, theming only via custom properties, some tooling assumes light DOM</td></tr>
+    </tbody>
+  </table>
+  <p>
+    The pragmatic default: hashed-class tooling everywhere + a hard rule that <strong>only the shell may
+    ship global styles</strong> (reset, base typography, tokens) — enforced by lint/review, because the
+    classic incident is a remote bundling its own CSS reset and subtly restyling the entire page the
+    moment it loads. Reach for shadow DOM when composing fragments from teams you can't hold to the
+    convention (third parties, acquisitions).
+  </p>
+
+  <!-- ============================================================ -->
+  <h2 id="performance">5. Performance in an MFE world <span class="tier tier-2">T2</span></h2>
+
+  <p>
+    MFE starts performance-negative; the job is clawing it back to parity. Four fronts:
+  </p>
+
+  <h3>5.1 Framework dedupe</h3>
+  <p>
+    Covered mechanically in §3 — <code>shared</code> singletons are the tool — but own the outcome:
+    <strong>audit what actually ships.</strong> Run bundle analysis across the composed page, not per
+    repo; per-repo analysis is how three copies of a date library hide. Common leaks: a remote pinning a
+    dependency version outside every other range (negotiation fails → fallback chunk downloads), heavy
+    transitive deps nobody listed in <code>shared</code>, and <code>eager: true</code> cargo-culted onto
+    remotes.
+  </p>
+
+  <h3>5.2 Caching remoteEntry correctly</h3>
+<pre>
+  THE remoteEntry CACHING DILEMMA — and its resolution
+
+  Stable URL: /remoteEntry.js            Versioned URL via manifest:
+    must be no-cache (it's the            /mfe-manifest.json  (no-cache, tiny)
+    deploy pointer!) → a network            └─ "checkout": ".../v437/remoteEntry.js"
+    round-trip on EVERY page load                              └─ immutable,
+    per remote, before its code                                   cache forever ✓
+    can even start downloading           deploy = publish new manifest;
+                                         rollback = point back to v436 ✓
+</pre>
+  <p>
+    The trap: remoteEntry is the <em>mutable pointer</em> to a remote's current deploy, so it can't be
+    long-cached at a stable URL — but fetching it fresh per pageview per remote adds latency exactly on
+    the critical path. Resolution: <strong>versioned, immutable remoteEntry URLs</strong>
+    (<code>…/v437/remoteEntry.js</code>, <code>Cache-Control: immutable</code>) discovered through one
+    tiny non-cached manifest (or short-TTL edge config). Bonus: the manifest <em>is</em> your deploy,
+    rollback, and canary mechanism — flipping a pointer, not moving files. A remote's inner chunks are
+    already content-hashed and cache-forever as usual.
+  </p>
+
+  <h3>5.3 The waterfall risk</h3>
+<pre>
+  NAIVE MFE LOAD — a three-hop waterfall
+  t0 ── shell HTML ──▶ t1 ── shell JS runs, discovers route needs
+       "checkout" ──▶ t2 ── fetch remoteEntry ──▶ t3 ── negotiate,
+       fetch cart chunks ──▶ t4 ── fetch cart's lazy children… ──▶ render
+
+  MITIGATED
+  t0 ── shell HTML carries hints for the LIKELY route:
+        &lt;link rel="preload" href=".../v437/remoteEntry.js" as="script"&gt;
+        (server/edge knows the URL path → knows which remote → injects hints)
+     ── shell JS + remoteEntry + first chunks download IN PARALLEL
+     ── prefetch other remotes' entries on idle / on nav hover
+</pre>
+  <p>
+    Each hop is discovered only after the previous finishes — shell, then remoteEntry, then chunks —
+    which is how MFE pages lose seconds of LCP versus a monolith whose route chunk was one hop.
+    Mitigations: edge-injected <code>preload</code> hints for the route's remote (the server knows the
+    URL → knows the owning remote → can hint before any JS runs), <code>preconnect</code> to remote CDN
+    origins, idle-time prefetch of remoteEntry for likely next remotes (nav hover is a good trigger),
+    and keeping remotes' own internal code-splitting shallow on the critical path.
+  </p>
+
+  <h3>5.4 Budgets, attribution, and loading UX</h3>
+  <ul>
+    <li><strong>Per-MFE performance budgets</strong>, enforced in each remote's CI (size-limit /
+      bundlesize on the exposed-module chunks) — with N teams, an unowned global budget degrades by
+      diffusion of responsibility; per-team budgets keep regressions attributable at the PR that
+      caused them.</li>
+    <li><strong>Attribute Web Vitals per team:</strong> tag RUM data with the owning MFE and its deployed
+      version (route ownership makes this easy; fragment MFEs need element-level attribution — LoAF
+      script attribution and marking INP targets help). "LCP regressed" is a meeting; "checkout v437
+      regressed LCP 400ms" is a rollback.</li>
+    <li><strong>Skeleton/fallback UX during remote load:</strong> remote loading is real user-visible
+      latency, so design it — route-shaped skeletons in <code>Suspense</code> fallbacks (shell owns them,
+      so they paint instantly), stable layout dimensions to avoid CLS when the remote lands, and a
+      timeout path into the §3 error fallback rather than an infinite skeleton.</li>
+  </ul>
+
+  <!-- ============================================================ -->
+  <h2 id="delivery">6. Delivery &amp; governance <span class="tier tier-2">T2</span></h2>
+
+  <p>
+    MFE's whole payoff is delivery independence — so the delivery system is where the architecture is
+    actually won or lost. Interviewers use this section to check whether you've <em>operated</em> MFE
+    or just built a demo.
+  </p>
+
+  <h3>Independent CI/CD + contract tests at the seams</h3>
+<pre>
+  PER-MFE PIPELINE
+
+  team repo ─▶ build ─▶ unit/CT ─▶ CONTRACT TESTS ─▶ publish v438 ─▶ flip
+                                   ├ exposed modules still exist     manifest
+                                   ├ props/events match contract pkg  pointer
+                                   ├ requiredVersions ⊆ shell provides
+                                   └ (no other team's suite runs — that's
+                                      the point AND the risk being managed)
+</pre>
+  <p>
+    Each MFE ships from its own pipeline with no other team in the loop — that's the point. The risk it
+    creates (integration breakage nobody's suite covers) is managed by <strong>contract tests at the
+    seams</strong>: assertions that the remote still exposes the modules the shell imports, that exposed
+    components accept the contracted props and emit the contracted events (the
+    <code>@org/*-contracts</code> packages from §4 make these executable), and that the remote's shared
+    <code>requiredVersion</code> ranges are satisfiable by the shell's provided versions. Cheap, fast,
+    and they catch the majority of cross-team breaks before deploy.
+  </p>
+
+  <h3>Versioned deploys, rollback, and canarying a single MFE</h3>
+  <p>
+    Because deploys are manifest-pointer flips (§5.2), <strong>rollback is instant and per-remote</strong>
+    — point checkout back at v437 without touching anyone else. The same mechanism gives you
+    <strong>per-MFE canarying</strong>: the manifest service (or edge worker) serves v438's remoteEntry
+    URL to 5% of sessions and v437 to the rest, while RUM and error tracking are segmented by
+    remote+version. One subtlety worth naming: with N independently canarying remotes, users run version
+    <em>combinations</em> no one explicitly tested — keep singleton/shared contracts conservative, and
+    log the full remote-version vector with every error report so "checkout 4.38 + shell 1.9" failures
+    are diagnosable.
+  </p>
+
+  <h3>Ownership boundaries — who owns the shell</h3>
+  <p>
+    The shell (router, auth, shared-dependency policy, manifest service, design tokens, error/RUM
+    plumbing) must not be orphaned or owned by whichever feature team touched it last. The standard
+    answer is a <strong>platform team</strong> that treats the shell and shared tooling as an internal
+    product: feature teams are its customers, changes to shared contracts go through it, and it owns the
+    singleton-upgrade choreography (the React 18→19 migration across all remotes is <em>their</em>
+    program to run). Without this, shared decisions decay into tragedy-of-the-commons.
+  </p>
+
+  <h3>Documentation and contracts as artifacts</h3>
+  <ul>
+    <li><strong>Typed event contracts</strong> and exposed-module type packages, versioned and
+      changelogged — the §4 event bus is only as good as the discipline around its contract package.</li>
+    <li><strong>Semver discipline on exposed modules:</strong> an exposed module is a published API.
+      Renaming <code>./Cart</code> or changing its props is a major version; breaking changes ship
+      behind a deprecation window (expose both, announce, remove) because you cannot atomically update
+      your consumers — they deploy independently, that's the whole premise.</li>
+    <li>A living <strong>ownership map</strong>: which team owns which routes/fragments/events —
+      the first thing an on-call engineer needs at 3am.</li>
+  </ul>
+
+  <h3>E2E across MFEs</h3>
+  <p>
+    Full-matrix e2e across N independently deploying remotes is combinatorially doomed — don't promise
+    it. The workable pattern: a <strong>thin, centrally owned critical-path suite</strong> (login →
+    browse → add to cart → pay; ~10–20 journeys) running against the integrated environment on every
+    remote's deploy and on a schedule, owned by the platform team with a hard flakiness budget. Teams
+    keep everything else (unit, component, their own e2e) inside their own boundary. Depth belongs to
+    contract tests; the central suite only proves the seams hold on the paths that pay the bills.
+  </p>
+
+  <!-- ============================================================ -->
+  <h2 id="ecosystem">7. Ecosystem literacy <span class="tier tier-3">T3</span></h2>
+
+  <p>
+    You need a sentence or two on each of these — enough to place them on the map and say when you'd
+    reach for them. Depth is not expected; mislabeling them is a yellow flag.
+  </p>
+
+  <table>
+    <thead><tr><th>Tool</th><th>One-liner</th><th>Placement</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><strong>single-spa</strong></td>
+        <td>An <em>orchestrator</em>, not a module loader: registers apps with lifecycle functions —
+        <code>bootstrap</code> / <code>mount</code> / <code>unmount</code> — and activates them by URL.
+        Framework-agnostic by design (React, Vue, Angular apps side by side).</td>
+        <td>Complementary to Module Federation: MF answers "how does code get here," single-spa answers
+        "who is mounted when." Common combo: MF loads, single-spa orchestrates.</td>
+      </tr>
+      <tr>
+        <td><strong>qiankun</strong></td>
+        <td>Ant Financial's opinionated layer over single-spa: HTML-entry loading, JS sandboxing
+        (proxied <code>window</code> per app), scoped styles out of the box. Huge in the Chinese
+        ecosystem, especially for wrapping legacy apps.</td>
+        <td>When you want single-spa's model plus batteries-included isolation.</td>
+      </tr>
+      <tr>
+        <td><strong>Piral</strong></td>
+        <td>A full "app shell as a product" framework: the shell is a Piral instance, features ship as
+        "pilets" delivered through a feed service with a built-in dev/publish workflow.</td>
+        <td>Portal/plugin-style products where third parties or many internal teams ship modules into
+        one host.</td>
+      </tr>
+      <tr>
+        <td><strong>Luigi</strong></td>
+        <td>SAP's framework, notable for being iframe-based by default — composition with hard isolation,
+        plus a navigation/context bridge across frames.</td>
+        <td>Enterprise suites integrating heterogeneous (often legacy) apps where isolation beats
+        seamlessness.</td>
+      </tr>
+      <tr>
+        <td><strong>Import maps + native ESM</strong></td>
+        <td>No-bundler-runtime federation: the browser resolves <code>import "catalog/App"</code> via an
+        import map to versioned URLs (esm.sh-style CDN or your own). Deploy = update the map. Standards-
+        based, minimal machinery; sharing is exact-pin only (no version negotiation à la MF).</td>
+        <td>Attractive for smaller MFE setups and teams allergic to bundler lock-in.</td>
+      </tr>
+      <tr>
+        <td><strong>Next.js Multi-Zones</strong></td>
+        <td>Route-based MFE for Next apps: several independent Next deployments stitched under one domain
+        via <code>rewrites</code>/proxy — each zone owns path prefixes. Hard navigation between zones
+        (full page load); no shared runtime, so no singleton problems either.</td>
+        <td>The pragmatic answer when the product is already several Next apps and the split is per-route.</td>
+      </tr>
+      <tr>
+        <td><strong>Monorepo-with-boundaries</strong></td>
+        <td>Nx module boundary rules / Turborepo package graphs enforcing "who may import whom" inside
+        one deployable — the <em>MFE-ready monolith</em> from §1.</td>
+        <td>Not an MFE tool — the alternative to MFE, and the correct baseline to compare against in any
+        design discussion.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="note">
+    Map answer for "single-spa vs Module Federation?": different layers. Module Federation is a
+    <em>code delivery + dependency sharing</em> mechanism; single-spa is a <em>lifecycle
+    orchestrator</em>. They compose — and each is also usable without the other (MF with a hand-rolled
+    shell; single-spa loading via SystemJS/import maps).
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="narrative">8. The interview narrative — a rehearsable answer <span class="tier tier-1">T1</span></h2>
+
+  <p>
+    You will get some version of <em>"would you introduce micro-frontends here?"</em> Have this
+    five-beat answer internalized — not memorized word-for-word, but as a structure you can walk
+    under pressure:
+  </p>
+
+<pre>
+  THE FIVE-BEAT MFE ANSWER
+
+  1. ASK ABOUT TEAMS FIRST      "How many frontend teams? Do they block
+     (before any tech talk)      each other's deploys today? Different
+                                 release cadences? Any legacy/acquired
+                                 apps to integrate?"
+
+  2. NAME THE TRIGGER            "MFE is an organizational tool. I'd adopt
+     (or the absence of one)     it for deploy contention across 4+ teams,
+                                 forced legacy integration, or a strangler
+                                 migration — otherwise: modular monolith
+                                 with enforced boundaries."
+
+  3. PROPOSE THE SHAPE           route-based split + app shell
+     (concrete, boring, right)   + Module Federation with react/react-dom/
+                                   router as shared singletons
+                                 + design-system package (N-1 policy) + tokens
+                                 + URL-first communication, typed events second
+                                 + shell-owned auth, one silent refresh
+
+  4. NAME COSTS + GUARDRAILS     costs: duplication, drift, seams, ops load
+                                 guardrails: per-MFE budgets, contract tests,
+                                 platform team owns the shell, versioned
+                                 remoteEntry + manifest for rollback/canary,
+                                 thin central e2e on the critical path
+
+  5. EXIT CRITERIA               "If teams merge or contention disappears,
+     (the staff-level beat)      we fold remotes back into the shell repo —
+                                 route-based seams make that cheap. The
+                                 architecture serves the org chart, and
+                                 org charts change."
+</pre>
+
+  <p>
+    Beat 1 is where the signal is: a candidate who asks about <em>team topology before technology</em>
+    has already passed the real question. Beat 5 is rare and memorable — almost nobody talks about
+    <em>reversing</em> an architecture decision, and it proves you see MFE as a means, not an identity.
+  </p>
+
+  <h3>The migration story — strangler fig, rehearsed</h3>
+  <p>
+    Also have a migration narrative ready, because "we have a legacy app" is the most common real-world
+    MFE prompt and the strongest justification for the pattern:
+  </p>
+
+<pre>
+  STRANGLER-FIG MIGRATION: legacy jQuery app → React, route by route
+
+  Phase 0                Phase 1                  Phase N
+  ┌─ legacy app ─┐       ┌─ shell (new) ───────┐  ┌─ shell ─────────────┐
+  │ owns every   │  ──▶  │ /search/* → React   │  │ /search/*  → React  │
+  │ route        │       │            remote ✨│  │ /account/* → React  │
+  │              │       │ /* (rest) → legacy  │  │ /checkout/*→ React  │
+  └──────────────┘       │    app AS A REMOTE  │  │ (legacy: deleted 🎉)│
+                         └─────────────────────┘  └─────────────────────┘
+  step 1: put a thin shell (or edge router) IN FRONT; legacy becomes
+          the catch-all "remote" — zero user-visible change, fully
+          reversible, and the riskiest step is done first while stakes
+          are lowest
+  step 2: pick ONE route — high value, low coupling — rebuild in React,
+          point the shell at it; bridge auth (shared cookie domain) and
+          the handful of cross-boundary events through a typed adapter
+  step 3: repeat per route, priority order; delete legacy code as routes
+          move (measure progress in ROUTES MIGRATED, not % rewritten)
+  step 4: when the catch-all serves nothing, remove it — and then ask
+          honestly whether the remotes should stay separate (multiple
+          teams?) or fold into one app (the seams were scaffolding)
+</pre>
+
+  <p>
+    The strengths to voice: value ships continuously from week one (no two-year rewrite that launches to
+    a changed business), risk is bounded per route with instant rollback (repoint the shell), the two
+    stacks never share a page (route granularity means no jQuery-and-React-fighting-over-DOM incidents),
+    and the seams are temporary scaffolding you're allowed to remove at the end. Name the honest costs
+    too: users pay a double-runtime tax mid-migration, auth/session must bridge both worlds from day one,
+    and the middle phase — where every incident starts with "is it legacy or new?" — must be actively
+    kept short rather than allowed to become the permanent state.
+  </p>
+
+  <!-- ============================================================ -->
+  <h2 id="qa">Interview Q&amp;A</h2>
+
+  <details class="qa">
+    <summary>Q1. What problem do micro-frontends actually solve?</summary>
+    <div class="answer">
+      <p>An organizational one: many teams shipping into one product surface without blocking each
+      other. Concretely — independent deploys (no release trains or shared merge queues), independent
+      tech evolution (teams upgrade frameworks on their own schedule), and physical ownership boundaries
+      that align architecture with team structure (Conway's law). MFE does <em>not</em> solve technical
+      problems — it typically makes performance, consistency, and operational simplicity worse. If a
+      candidate's motivation is "smaller bundles" or "faster pages," they've confused MFE with
+      code-splitting, which a monolith already does with dynamic <code>import()</code>.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q2. When would you advise AGAINST micro-frontends?</summary>
+    <div class="answer">
+      <p>Most of the time. Specifically: fewer than ~3–4 frontend teams; no measurable deploy contention;
+      one team that just wants "better modularity" (use a modular monolith — monorepo, enforced package
+      boundaries via Nx/ESLint rules, code ownership); performance as the stated goal; or a team without
+      the platform capacity to own the shell, shared-dependency governance, and contract testing. The
+      costs — bundle duplication, UX drift, cross-MFE state pain, N pipelines, local dev orchestration,
+      seam testing — are a permanent tax; the benefit only exceeds it when inter-team coordination is
+      the actual bottleneck. Strong closing line: "the modular monolith is MFE-ready — I'd build the
+      boundaries now and split only when the org forces it."</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q3. Walk me through what happens at runtime when a Module Federation host renders a remote component.</summary>
+    <div class="answer">
+      <p>(1) Host code hits <code>import("checkout/Cart")</code>. (2) The federation runtime fetches the
+      remote's <code>remoteEntry.js</code> — a small manifest exposing the container interface, not the
+      app code. (3) Host calls <code>container.init(sharedScope)</code>: both sides register the shared
+      dependencies they provide/require into a common share scope. (4) Version negotiation: for each
+      shared package, the runtime picks a satisfying provider (e.g., remote requires
+      <code>react@^18.2</code>, host provides 18.3.1 → remote uses the host's React; its own React
+      fallback chunk is never downloaded). (5) <code>container.get("./Cart")</code> returns a module
+      factory; only the chunks implementing Cart are fetched. (6) The component renders inside the
+      host's tree with a single React instance. Bonus points: mention the async boundary
+      (<code>import("./bootstrap")</code> pattern) or <code>eager</code> shared deps on the host, and
+      <code>publicPath: "auto"</code> so the remote's chunks resolve relative to where remoteEntry
+      was loaded.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q4. Why must React be a singleton in the shared config? What actually breaks with two copies?</summary>
+    <div class="answer">
+      <p>Correctness, not just bytes. Hooks: React resolves hooks through an internal dispatcher tied to
+      the rendering React instance — a component from copy A rendered by copy B throws "Invalid hook
+      call." Context: context objects are compared by identity, so a provider created in copy A is
+      invisible to a <code>useContext</code> in copy B — auth, theme, and router context silently return
+      defaults, which is worse than crashing because it half-works. Also: two ReactDOM event systems and
+      two schedulers on one document. <code>singleton: true</code> guarantees one instance in the share
+      scope; pair it with an explicit <code>requiredVersion</code> and (in non-prod) <code>strictVersion:
+      true</code> so incompatibilities fail loudly instead of silently running an untested version.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q5. A remote declares <code>requiredVersion: "^19.0.0"</code> for React but the shell provides 18.3. What happens?</summary>
+    <div class="answer">
+      <p>Depends on config. With <code>singleton: true</code> (the correct setting for React) and default
+      options: the remote still receives the shell's React 18.3 — singletons never load a second copy —
+      and the runtime logs a version-mismatch warning. That's dangerous: the remote runs against a major
+      version it never tested. With <code>strictVersion: true</code> it throws instead, which you'd
+      catch with the load-failure fallback. Without <code>singleton</code>, the remote would load its
+      own React 19 fallback — two Reacts, see Q4, worse. The real answer is organizational: framework
+      majors on singletons are the one coordinated migration MFE can't dodge, so the platform team runs
+      it as a program, and deploy-time contract checks assert every remote's ranges against what the
+      shell provides.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q6. How do you handle a remote that fails to load in production?</summary>
+    <div class="answer">
+      <p>Two failure layers, two tools. Load failures (remoteEntry unreachable, chunk 404 after a bad
+      deploy): <code>.catch</code> on the dynamic import, returning a local fallback module — optionally
+      with a retry (once, with backoff) before degrading. Render failures (remote loaded but throws): a
+      React error boundary around the mount point, tagged with the owning team for alerting. UX per seam
+      is a product decision: a recommendations rail can disappear silently; checkout gets an apology +
+      retry screen and pages the owning team. Senior addition: this is why versioned remoteEntry URLs
+      matter — a "remote down" incident is usually a bad deploy, and rollback is repointing the manifest,
+      seconds not minutes.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q7. Route-based vs fragment-based composition — how do you choose?</summary>
+    <div class="answer">
+      <p>Default to route-based: shell owns chrome/auth/top-level routing; each team owns whole route
+      subtrees; only one team's MFE is active per page. This minimizes every hard problem — style
+      collisions, shared state, event coordination, version-combination testing — because the MFEs
+      barely coexist. Fragment-based (multiple teams composing one page at runtime) is an order of
+      magnitude harder and only justified when a single high-value page is genuinely built by multiple
+      teams — e.g., a commerce product page with search, pricing, and recommendations teams. Even then,
+      scope fragment composition to those specific pages rather than making it the default platform
+      capability.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q8. How should micro-frontends communicate? Rank the options.</summary>
+    <div class="answer">
+      <p>Ranked by coupling, ascending: (1) <strong>the URL</strong> — anything describing "where the
+      user is" (selection, filters, step) belongs there; it's refresh-safe, deep-linkable, and couples
+      nobody. (2) <strong>Typed custom events / event bus</strong> — fire-and-forget facts
+      ("cart:item-added"), with the event map in a versioned contracts package both sides depend on, so
+      the coupling is to a reviewed contract, not to each other. (3) <strong>Shared store singleton</strong>
+      — a coupling alarm: every consumer binds to store shape, library version, and update semantics
+      across deploy boundaries. If forced, keep it a tiny slice (auth/user/flags) behind a narrow
+      accessor API. Overarching principle: minimize shared state, and prefer duplicating cheap data over
+      coupling — redundant fetches are visible and cheap; hidden coupling is invisible and expensive.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q9. How does routing work across MFEs, and what goes wrong?</summary>
+    <div class="answer">
+      <p>Two models. (A) Shell owns the single router; remotes expose route definitions or render
+      subtrees against the shared router context — requires the router as a shared singleton, gives one
+      coherent navigation model; the right default for one-framework, route-based setups. (B) Each remote
+      runs its own router — real history with a basename, or a memory router synced to the shell —
+      buying framework independence at the cost of an explicit history-sync protocol. Classic failures:
+      deep links that 404 on cold load (missing catch-all rewrite to the shell's index.html), memory
+      routers that ignore the initial URL, state kept in JS instead of the URL so refresh loses it, and
+      double history entries when two routers both push for one navigation. Test cold-load and refresh
+      at every route depth.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q10. How do you keep UX consistent across independently shipping teams?</summary>
+    <div class="answer">
+      <p>Layered defense. (1) A shared design-system package with an explicit version policy — allow N-1
+      major with a stated deprecation window; lockstep reintroduces coupled deploys, no policy yields
+      teams frozen years behind. (2) Design tokens (colors/spacing/type as CSS custom properties) as the
+      lowest common denominator — even an MFE on a divergent DS version or different framework consumes
+      tokens, capping worst-case drift at component behavior, not brand. (3) Dedupe fonts and icons
+      through the shell so they load once. (4) Governance: the platform/design-system team tracks
+      adoption versions per MFE and runs upgrade windows. Honest caveat: some drift is the price of
+      independent shipping — you manage it, you don't eliminate it.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q11. Design auth for a micro-frontend product.</summary>
+    <div class="answer">
+      <p>If all MFEs and APIs share a registrable domain: an httpOnly Secure cookie on
+      <code>.example.com</code> — no token in JS at all, every MFE's requests carry it automatically,
+      plus CSRF protections. Otherwise: the shell owns the OIDC flow and holds tokens in memory,
+      exposing either the token via a context bridge or — better — a pre-authenticated fetch client so
+      remotes can call APIs without ever seeing the token. Non-negotiable either way: exactly one silent
+      refresh loop, in the shell. Multiple MFEs refreshing independently cause token races and
+      refresh-token-reuse revocations — random logouts that are brutal to debug. Login/logout state
+      changes propagate as typed events ("auth:logged-out") so remotes react without polling.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q12. How do you prevent shipping three copies of React and two design systems to users?</summary>
+    <div class="answer">
+      <p>Mechanism: Module Federation <code>shared</code> — singletons for react/react-dom/router/DS,
+      version negotiation so remotes reuse the host-provided instance and never download their fallback
+      chunks. Process: audit the <em>composed</em> page, not per-repo bundles (per-repo analysis is
+      where duplicates hide); per-MFE size budgets in CI on exposed chunks; watch for negotiation
+      failures (a remote pinning outside everyone's range silently pulls its fallback) and cargo-culted
+      <code>eager: true</code> on remotes. For non-singleton utilities (lodash, date-fns), sharing is
+      nice-to-have — duplication there is waste, not breakage. And the honest note: perfect dedupe is a
+      monolith property; MFE approaches it asymptotically with ongoing effort.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q13. How do you cache remoteEntry.js? It seems to need to be both fresh and fast.</summary>
+    <div class="answer">
+      <p>That tension is the point of the question. remoteEntry at a stable URL is the mutable pointer to
+      the remote's current deploy → must be <code>no-cache</code> → a blocking network round-trip per
+      remote per page load. Resolution: publish remoteEntry at <strong>versioned immutable URLs</strong>
+      (<code>/v437/remoteEntry.js</code>, <code>Cache-Control: immutable</code>) and discover them
+      through one tiny non-cached manifest (or short-TTL edge config). Deploy = flip the manifest
+      pointer; rollback = flip it back; canary = serve different pointers per cohort. Inner chunks are
+      content-hashed and cache-forever as usual. This one answer demonstrates you've run MFE in
+      production — it's the kind of thing demos never surface.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q14. What does <code>eager: true</code> do in shared config, and where is it appropriate?</summary>
+    <div class="answer">
+      <p>It bundles the shared module directly into the consuming container's entry chunk so it's
+      available synchronously — removing the need for an async boundary before first use. Cost: that
+      container always ships its own copy of the module, forfeiting dedupe for itself. Appropriate on
+      the host/shell (something must provide React up front, and the shell loads exactly once), often
+      paired with — or instead of — the <code>import("./bootstrap")</code> async-entry pattern. Wrong on
+      remotes: an eager remote ships React inside every remote bundle, exactly the duplication federation
+      exists to prevent. A crisp mnemonic: <em>eager on the provider-of-first-resort, lazy everywhere
+      else.</em></p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q15. Testing strategy for a system of 6 MFEs — what runs where?</summary>
+    <div class="answer">
+      <p>Push depth to the edges, keep the center thin. Inside each MFE (team-owned): unit + component
+      tests as usual, plus its own e2e against its routes with seams stubbed. At the seams (the MFE-
+      specific layer): <strong>contract tests</strong> — exposed modules exist with contracted
+      props/events (executable via shared contract packages), event payloads match the typed event map,
+      shared requiredVersion ranges are satisfiable by the shell. Center (platform-owned): one thin
+      critical-path e2e suite (~10–20 journeys: login → browse → buy) against the integrated env, run on
+      every remote deploy, with a strict flakiness budget. Anti-pattern to call out: attempting
+      full-matrix e2e across independently versioned remotes — combinatorially impossible; that's what
+      contracts and per-remote canaries with good RUM segmentation are for.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q16. How would you canary just the checkout MFE without touching the rest of the product?</summary>
+    <div class="answer">
+      <p>The manifest/edge layer that resolves remote URLs is the control point: serve
+      <code>checkout/v438/remoteEntry.js</code> to 5% of sessions (sticky per session — mixing versions
+      within a session confuses users and telemetry) and v437 to the rest. Segment RUM, errors, and
+      business metrics (conversion!) by remote+version; auto-halt on threshold breach by flipping the
+      pointer back — rollback is instant because old versions remain published at immutable URLs. The
+      subtlety worth volunteering: with several remotes canarying independently, users experience
+      version <em>combinations</em> nobody explicitly tested — log the full remote-version vector on
+      every error so combination-specific failures ("checkout 438 + shell 1.9") are diagnosable, and
+      keep shared/singleton contracts conservative for exactly this reason.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q17. When are iframes the right micro-frontend answer, and what are the seams?</summary>
+    <div class="answer">
+      <p>When <em>isolation is the requirement</em>, not a nice-to-have: payment capture (PCI scope
+      containment — Stripe Elements is an iframe MFE), embedding untrusted/third-party/acquired apps,
+      plugin systems running arbitrary code. Nothing else provides a separate document, JS realm, style
+      universe, and security boundary (plus CSP/sandbox attributes). The seams to name: resize (no
+      content-based sizing — you need a postMessage height protocol), focus/keyboard (tab order and
+      focus trapping across documents, screen-reader context resets), routing (inner navigation doesn't
+      reflect in the outer URL without an explicit sync), and postMessage itself — async-only, untyped,
+      requires origin validation, so wrap it in a typed client. Everywhere else, the UX seams make
+      iframes the wrong default.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q18. single-spa vs Module Federation — do they compete?</summary>
+    <div class="answer">
+      <p>No — different layers, commonly combined. Module Federation is a <em>code delivery and
+      dependency-sharing</em> mechanism: how separately built bundles load each other's modules and
+      negotiate one React. single-spa is a <em>lifecycle orchestrator</em>: apps register
+      bootstrap/mount/unmount functions and it activates/deactivates them by URL, framework-agnostically
+      (React next to Vue next to Angular). A shell can use MF to fetch remotes and single-spa to decide
+      who's mounted when; equally, single-spa can load via import maps/SystemJS with no MF, and MF works
+      with a hand-rolled shell and no single-spa. Distinguishing these two roles cleanly is a reliable
+      literacy check.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q19. How do you keep TypeScript honest across federation boundaries?</summary>
+    <div class="answer">
+      <p>The problem: federated imports exist only at runtime, so tsc can't see them, and any local type
+      declarations drift as the remote redeploys — stale types compile green against a changed contract.
+      Options, increasingly automated: hand-written ambient <code>declare module</code> files (drift
+      guaranteed); a versioned <strong>shared contracts package</strong> per seam that both sides depend
+      on — my default recommendation, because it forces contract review, not just type sync; or automated
+      extraction — <code>@module-federation/typescript</code> / MF 2.0's dts plugin, which publishes a
+      types archive next to remoteEntry and syncs it into consumers. Key senior caveat: types are checked
+      at build time but remotes change <em>after</em> your build — so types reduce drift, but runtime
+      contract tests at deploy time remain necessary.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q20. Walk me through migrating a legacy jQuery app to React using micro-frontend techniques.</summary>
+    <div class="answer">
+      <p>Strangler fig, route by route. (1) Put a thin shell — or just an edge router — in front; the
+      legacy app becomes the catch-all "remote." Zero user-visible change; the riskiest infrastructure
+      step lands first while stakes are lowest, and it's fully reversible. (2) Bridge cross-cutting
+      concerns once: shared-domain auth cookie so both worlds share the session; a small typed event
+      adapter for the few facts that must cross (e.g., cart count). (3) Pick one route — high value, low
+      coupling — rebuild it as a React remote, point the shell at it; rollback is repointing. (4) Repeat
+      in priority order, deleting legacy code as routes move — progress measured in routes migrated, not
+      "% rewritten." (5) When the catch-all serves nothing, remove it — then decide honestly whether the
+      remotes stay separate (multiple teams?) or fold into one app, because the seams were scaffolding.
+      Costs to volunteer: double-runtime payload mid-migration, and the "is it legacy or new?" incident-
+      triage phase, which you keep deliberately short. Route granularity is what keeps jQuery and React
+      from ever fighting over the same DOM.</p>
+    </div>
+  </details>
+
+  <!-- ============================================================ -->
+  <h2 id="exercises">Hands-on exercises</h2>
+
+  <div class="exercise">
+    <h4>Exercise 1 — Design drill: "Should we split?"</h4>
+    <p>
+      You join a company with a single Next.js e-commerce app: 40 frontend engineers in 6 teams
+      (catalog, search, checkout, account, growth, platform). Deploys go out twice a week through a
+      release train; teams regularly slip a full cycle because another team's regression froze the
+      train. Checkout has PCI-driven compliance review on its releases. Leadership asks: "micro-frontends?"
+      Spend 20 minutes producing: your clarifying questions, a go/no-go with reasoning, and — if go —
+      the target architecture with its cost list and guardrails. Then compare.
+    </p>
+    <details>
+      <summary>Model answer</summary>
+      <p><strong>Clarifying questions first:</strong> How much of the slippage is frontend-caused vs
+      backend/infra (don't fix the wrong bottleneck)? Do teams own disjoint route surfaces already?
+      Any near-term framework migrations? Does platform have capacity to own a shell as a product?</p>
+      <p><strong>Verdict: a justified split — this scenario clears the bar.</strong> Six teams, chronic
+      deploy contention with quantifiable lead-time cost, and one team (checkout) with a genuinely
+      different release cadence (compliance review) — that's two independent triggers from §1. An
+      8-engineer/2-team version of this company should get a modular-monolith answer instead; say that
+      contrast out loud.</p>
+      <p><strong>Shape:</strong> route-based split — this is Next.js, so lead with <strong>Next.js
+      Multi-Zones</strong> (each team an independent Next deployment owning path prefixes, stitched by
+      rewrites) as the lowest-machinery option; Module Federation only if heavy intra-page composition
+      across teams emerges later. Sequence by value: <em>checkout first</em> (its compliance cadence is
+      the sharpest pain and its boundary is naturally clean), then search/growth (highest deploy
+      frequency), then the rest — don't split all six at once. Shared: design-system package with N-1
+      policy + tokens; auth via cookie on the shared domain; URL-first communication (with hard
+      navigation between zones, cross-MFE runtime state barely exists — a feature, not a bug).</p>
+      <p><strong>Costs to state:</strong> hard navigations between zones; duplicated framework payload
+      per zone (no shared runtime); 6 pipelines and dashboards; local dev orchestration; drift risk.
+      <strong>Guardrails:</strong> platform team owns the edge router/rewrites map + tokens + the thin
+      critical-path e2e; per-zone Web Vitals attribution and budgets; contract = URL structure + cookie
+      + design tokens, all documented. <strong>Exit criteria:</strong> if team topology consolidates,
+      zones fold back — route seams make that cheap.</p>
+    </details>
+  </div>
+
+  <div class="exercise">
+    <h4>Exercise 2 — Debugging drill: the broken singleton</h4>
+    <p>
+      A federated app: shell (React 18.3) + remotes <code>catalog</code> and <code>reviews</code>.
+      After reviews ships a release, production shows: "Invalid hook call" errors sourced to reviews'
+      components, <em>and</em> — intermittently, only when a user visits reviews first — the catalog MFE
+      renders logged-out UI despite a valid session. The reviews team swears their code is unchanged
+      except "dependency bumps." Network tab shows an extra <code>react.[hash].js</code> chunk loading
+      from the reviews CDN. Diagnose the root cause, explain BOTH symptoms mechanically, and specify the
+      fix plus the guardrails that would have caught it pre-deploy.
+    </p>
+    <details>
+      <summary>Model answer</summary>
+      <p><strong>Root cause:</strong> the reviews release bumped React to 19 in its package.json, and its
+      shared config either lost <code>singleton: true</code> (e.g., a webpack config refactor replaced
+      the explicit shared block with a helper that defaults it off) or never pinned
+      <code>requiredVersion</code> — so negotiation failed and the reviews container loaded its own React
+      fallback chunk. The extra <code>react.[hash].js</code> from the reviews CDN is the smoking gun:
+      with a working singleton, that chunk is never downloaded.</p>
+      <p><strong>Symptom 1 (invalid hook call):</strong> components created against reviews' React copy
+      end up rendered in a tree driven by the shell's React (or share elements across copies — e.g.,
+      shell-provided children rendered inside reviews' tree). Hooks resolve through the per-instance
+      dispatcher, so crossing copies throws.</p>
+      <p><strong>Symptom 2 (logged-out catalog, only when reviews loads first):</strong> context identity.
+      When reviews initializes first, share-scope resolution can leave parts of the graph bound to
+      reviews' React/module instances; the shell's <code>AuthContext</code> object in copy A is a
+      different identity than what consumers bound to copy B look up, so <code>useContext</code> falls
+      back to the default value — <code>{ user: null }</code> — rendering logged-out UI with a valid
+      session. Order-dependence ("only when visited first") is the classic tell of share-scope
+      resolution varying by load order.</p>
+      <p><strong>Fix:</strong> restore <code>singleton: true</code> + explicit <code>requiredVersion</code>
+      on react/react-dom in the reviews config; roll back the remote via manifest pointer immediately
+      (instant, per-remote); coordinate the React 19 move as a platform-run program across all remotes,
+      shell last-or-first per plan — never one remote unilaterally.</p>
+      <p><strong>Guardrails that would have caught it:</strong> deploy-time contract check asserting each
+      remote's shared config (singleton flags + ranges) against shell-provided versions; <code>strictVersion:
+      true</code> in staging so the mismatch throws before prod; a composed-page bundle audit alerting on
+      any second framework chunk; and centralizing the shared-deps block in a platform-owned preset
+      package so individual teams can't silently drop <code>singleton</code>.</p>
+    </details>
+  </div>
+
+  <div class="exercise">
+    <h4>Exercise 3 — Migration drill: the acquired Vue app</h4>
+    <p>
+      Your React product (app shell + MF remotes, React 18 singletons, react-router owned by the shell)
+      just acquired a company whose product is a Vue 3 SPA with its own auth (separate domain, its own
+      OIDC client) and its own design language. The business wants it reachable at
+      <code>/portfolio/*</code> inside your product within one quarter, with a "feels integrated"
+      experience within a year. Design the integration in two phases: what ships this quarter, and the
+      path to real integration. Name the routing, auth, styling, and dependency-sharing decisions and
+      their costs at each phase.
+    </p>
+    <details>
+      <summary>Model answer</summary>
+      <p><strong>Phase 1 (this quarter): integrate at the coarsest viable seam — do NOT federate Vue into
+      the React runtime.</strong> Two defensible options; pick by auth feasibility. (a) <em>iframe
+      mount:</em> the shell owns <code>/portfolio/*</code> and renders the Vue app in an iframe —
+      strongest isolation, zero style/dependency interaction, fastest to ship; pay the seams with a
+      postMessage protocol for height, inner-route→outer-URL sync, and auth handoff. (b) <em>Route-zone
+      mount (better if domains can converge):</em> serve the Vue app under your domain via edge rewrite
+      at <code>/portfolio/*</code>, hard navigation between worlds — no iframe seams, but requires moving
+      it behind your domain now. Either way, <strong>no shared dependencies</strong>: React and Vue don't
+      share anything; MF's shared scope is irrelevant across frameworks — say this explicitly, it's a
+      common interview trap ("just federate it" — federation transports modules, it doesn't make Vue
+      components React components). <strong>Auth:</strong> quarter-1 minimum is SSO at the IdP level
+      (same OIDC provider, token exchange or a session-bridge endpoint) so users log in once, even if
+      the Vue app keeps its own client. <strong>Styling:</strong> ship design tokens (CSS custom
+      properties) into the Vue app immediately — colors/type/spacing converge for cheap while components
+      stay untouched.</p>
+      <p><strong>Phase 2 (the year): strangler-fig the Vue app itself, only where justified.</strong>
+      First move it fully behind your domain + shared cookie auth, deleting its OIDC client (one
+      refresh loop — the shell's). Then apply the §1 decision framework <em>to each part</em> of the
+      portfolio app: screens the acquired team keeps owning long-term can stay Vue indefinitely behind
+      the route seam (a perfectly good MFE end-state — the interviewer is checking you don't assume
+      "integration = rewrite"); screens moving to your existing teams' roadmaps get rebuilt as React
+      remotes route-by-route, each rebuilt route repointed at the shell. "Feels integrated" is delivered
+      by tokens + shared chrome (shell-owned header/nav around both worlds) + URL/deep-link coherence —
+      not by framework uniformity. <strong>Costs to state:</strong> double framework payload on
+      cross-world navigation for the whole period; two component libraries maintained; iframe
+      accessibility seams if (a) was chosen — which is a reason to prefer (b) once domains allow; and an
+      explicit end-state decision — leaving "temporary" bridges undecided is how integrations calcify.</p>
+    </details>
+  </div>
+
+  <nav class="page-nav">
+    <a href="14-nextjs-rendering.html">← Prev: Next.js &amp; Rendering</a>
+    <a href="16-build-tooling-modules.html">Next: Build Tooling &amp; Modules →</a>
+  </nav>
+
+</main>
+</body>
+</html>

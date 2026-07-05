@@ -1,0 +1,2373 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>12 — Component Patterns &amp; Forms | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <div class="breadcrumb"><a href="index.html">← Course Home</a></div>
+    <h1>12 — Component Patterns &amp; Forms</h1>
+    <p>Designing component APIs people can't misuse — compound components, controlled/uncontrolled, react-hook-form, error boundaries, and the pattern history you'll be quizzed on.</p>
+  </div>
+</header>
+
+<main class="container">
+
+  <section>
+    <h2>Why interviewers ask this</h2>
+    <p>
+      After seven years, nobody doubts you can <em>build</em> a tabs widget. What senior interviews probe is whether
+      you can design its <strong>API</strong>: the props, the composition surface, the controlled/uncontrolled contract,
+      the accessibility guarantees, the escape hatches. "Design a reusable Modal/Select/Tabs" is the frontend
+      equivalent of a system-design round — there's no single correct answer, and the interviewer is watching
+      <em>which trade-offs you name unprompted</em>. Do you reach for a boolean prop or for <code>children</code>?
+      Do you know why Radix supports both <code>value</code> and <code>defaultValue</code>? Can you explain what an
+      error boundary <em>can't</em> catch without being asked twice?
+    </p>
+    <p>
+      Machine-coding rounds (very common at product startups, increasingly at FAANG) make this concrete: 45–60 minutes,
+      "build an accessible accordion / star rating / modal with a focus trap", graded on correctness, API design,
+      keyboard support, and code organization — in that order of frequency but <em>reverse</em> order of what
+      actually separates candidates. Forms are the other half of this tutorial because forms are where component
+      patterns meet real product pain: controlled vs uncontrolled is the most misunderstood dichotomy in React,
+      and <code>react-hook-form</code> + <code>zod</code> is the de-facto industry stack you're expected to know cold.
+      This tutorial covers the patterns, the flagship implementations, and the history (HOC → render props → hooks)
+      that still shows up as a knowledge-check question.
+    </p>
+    <div class="tier-legend">
+      <span class="tier tier-1">T1 — must be airtight</span>
+      <span class="tier tier-2">T2 — senior differentiator</span>
+      <span class="tier tier-3">T3 — awareness is enough</span>
+    </div>
+  </section>
+
+  <div class="toc">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#api-design">Component API design principles</a></li>
+      <li><a href="#compound">Compound components — the flagship senior pattern</a></li>
+      <li><a href="#forms">Controlled vs uncontrolled forms</a></li>
+      <li><a href="#rhf">React Hook Form — the de-facto standard</a></li>
+      <li><a href="#form-architecture">Form architecture beyond RHF</a></li>
+      <li><a href="#error-boundaries">Error boundaries</a></li>
+      <li><a href="#portals">Portals</a></li>
+      <li><a href="#legacy">Legacy pattern literacy: HOC → render props → hooks</a></li>
+      <li><a href="#headless">The headless UI pattern</a></li>
+      <li><a href="#composition">Composition techniques</a></li>
+      <li><a href="#misc">Advanced misc patterns</a></li>
+      <li><a href="#machine-coding">Machine-coding challenges</a></li>
+      <li><a href="#qa">Interview Q&amp;A</a></li>
+      <li><a href="#exercises">Hands-on exercises</a></li>
+    </ol>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="api-design">1. Component API design principles <span class="tier tier-1">T1</span></h2>
+
+  <h3>Props are the contract</h3>
+  <p>
+    A component's props are a public API. Everything you know about API design applies: minimal surface area,
+    sensible defaults, hard to misuse, easy to evolve without breaking callers. The single most useful framing in an
+    interview: <strong>every prop you add is a promise you must keep forever</strong> (or break with a migration).
+    Good component APIs are <em>small</em> and lean on composition; bad ones accrete a boolean per feature request.
+  </p>
+
+  <h3>The boolean-props explosion smell</h3>
+  <p>
+    The classic evolution of a Button in a codebase without API discipline:
+  </p>
+  <pre><code>// Year 1
+&lt;Button label="Save" /&gt;
+
+// Year 3 — configuration over composition, the smell in full bloom
+&lt;Button
+  label="Save"
+  icon="check"
+  iconPosition="left"
+  showSpinner={isSaving}
+  spinnerSize="sm"
+  truncateLabel
+  tooltipText="Saves the record"
+  badgeCount={3}
+/&gt;</code></pre>
+  <p>
+    Each prop exists because <em>one</em> caller needed it, and now every caller pays for it — in bundle size,
+    in cognitive load, in impossible prop combinations (<code>icon</code> + <code>showSpinner</code>: which wins?).
+    The fix is <strong>composition over configuration</strong>: accept <code>children</code> and let the caller own
+    the markup.
+  </p>
+  <pre><code>// Composition: the Button knows about button-ness, nothing else
+&lt;Button&gt;
+  {isSaving ? &lt;Spinner size="sm" /&gt; : &lt;CheckIcon /&gt;}
+  Save
+  &lt;Badge count={3} /&gt;
+&lt;/Button&gt;</code></pre>
+  <div class="senior">
+    <strong>Senior signal:</strong> articulate the rule of thumb — <em>props for behavior and variants the component
+    must know about</em> (<code>variant="danger"</code>, <code>disabled</code>, <code>onClick</code>);
+    <em>children/slots for content the component merely positions</em>. When two boolean props can conflict, that's
+    the API telling you it wants a <code>variant</code> enum or a composition seam instead. A quick heuristic
+    interviewers love: if adding a feature means adding a prop AND an <code>if</code> inside the component, ask
+    whether a slot would let the caller do it with zero component changes.
+  </div>
+
+  <h3>Controlled vs uncontrolled — the component design version</h3>
+  <p>
+    This is not just about <code>&lt;input&gt;</code>. Any stateful component (Tabs, Accordion, Modal, Select) faces
+    the same choice: who owns the state? The React community converged on a naming convention, and you should follow
+    it letter-for-letter because it's what every library user expects:
+  </p>
+  <table>
+    <thead>
+      <tr><th>Mode</th><th>Props</th><th>State owner</th><th>Use when</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Uncontrolled</strong></td>
+        <td><code>defaultValue</code> (+ optional <code>onChange</code> for notification)</td>
+        <td>The component (internal <code>useState</code>)</td>
+        <td>Caller doesn't care about the value mid-flight; simplest usage</td>
+      </tr>
+      <tr>
+        <td><strong>Controlled</strong></td>
+        <td><code>value</code> + <code>onChange</code> (required together)</td>
+        <td>The caller</td>
+        <td>Caller needs to read, sync, veto, or derive from the value (URL sync, analytics, cross-component coordination)</td>
+      </tr>
+    </tbody>
+  </table>
+  <p>
+    A production-grade component supports <strong>both</strong>, like Radix does internally with
+    <code>useControllableState</code>. The sketch below is a top-tier interview answer to
+    "how would you let callers optionally control your Tabs?":
+  </p>
+  <pre><code>function useControllableState({ value, defaultValue, onChange }) {
+  const [internal, setInternal] = React.useState(defaultValue);
+  const isControlled = value !== undefined;      // presence of `value` decides, once
+  const current = isControlled ? value : internal;
+
+  const setValue = React.useCallback(
+    (next) =&gt; {
+      // Support functional updates against the *resolved* current value
+      const resolved = typeof next === 'function' ? next(current) : next;
+      if (!isControlled) setInternal(resolved);  // uncontrolled: we own it
+      onChange?.(resolved);                      // always notify
+    },
+    [isControlled, current, onChange]
+  );
+
+  return [current, setValue];
+}
+
+// Usage inside Tabs:
+const [activeTab, setActiveTab] = useControllableState({
+  value: props.value,
+  defaultValue: props.defaultValue ?? firstTabId,
+  onChange: props.onValueChange,
+});</code></pre>
+  <div class="pitfall">
+    <strong>Pitfall:</strong> a component must not <em>switch</em> between controlled and uncontrolled during its
+    lifetime — that's the source of React's famous warning. Decide based on whether <code>value !== undefined</code>
+    on <em>first render</em> and treat a later flip as a caller bug (Radix and MUI both warn in dev when this happens).
+    The most common way callers trip this: <code>value=&#123;data?.name&#125;</code> where <code>data</code> starts as
+    <code>undefined</code> — the input mounts uncontrolled, then becomes controlled when data arrives.
+  </div>
+
+  <h3>Rest props + <code>ComponentPropsWithoutRef</code> — the design-system button</h3>
+  <p>
+    A wrapper around a native element should accept <em>everything the native element accepts</em> —
+    <code>aria-*</code>, <code>data-*</code>, <code>onMouseEnter</code>, <code>form</code>, <code>type</code> — without
+    you enumerating them. TypeScript's <code>ComponentPropsWithoutRef&lt;'button'&gt;</code> gives you the full native
+    prop set; spread the rest onto the element and merge the props you also use yourself:
+  </p>
+  <pre><code>import { forwardRef, type ComponentPropsWithoutRef } from 'react';
+import { clsx } from 'clsx';
+
+type ButtonProps = ComponentPropsWithoutRef&lt;'button'&gt; &amp; {
+  variant?: 'primary' | 'secondary' | 'danger';
+  size?: 'sm' | 'md' | 'lg';
+  isLoading?: boolean;
+};
+
+export const Button = forwardRef&lt;HTMLButtonElement, ButtonProps&gt;(
+  function Button(
+    { variant = 'primary', size = 'md', isLoading, className, children, disabled, ...rest },
+    ref
+  ) {
+    return (
+      &lt;button
+        ref={ref}
+        type="button"                         // safe default: don't submit forms accidentally
+        className={clsx('btn', `btn-${variant}`, `btn-${size}`, className)}
+        disabled={disabled || isLoading}
+        aria-busy={isLoading || undefined}
+        {...rest}                             // caller can still override type, aria-*, handlers
+      &gt;
+        {isLoading &amp;&amp; &lt;Spinner aria-hidden /&gt;}
+        {children}
+      &lt;/button&gt;
+    );
+  }
+);</code></pre>
+  <p>Design decisions worth narrating in an interview:</p>
+  <ul>
+    <li><strong>Spread order matters.</strong> <code>{...rest}</code> after your own props means callers can override
+      defaults (like <code>type</code>); before means they can't. Pick deliberately and be consistent — Radix spreads
+      last so consumers win.</li>
+    <li><strong>Destructure what you consume</strong> (<code>className</code>, <code>disabled</code>) so it doesn't get
+      double-applied by the spread; <em>merge</em> rather than clobber (<code>clsx(..., className)</code>).</li>
+    <li><strong><code>forwardRef</code></strong> so the button works with focus management, tooltips, and form libs.
+      (In React 19, <code>ref</code> is a regular prop and <code>forwardRef</code> is no longer needed — mention this,
+      it's a current-events point — but you'll maintain forwardRef code for years.)</li>
+    <li><strong><code>ComponentPropsWithoutRef</code> vs <code>ComponentProps</code>:</strong> the former excludes
+      <code>ref</code> from the props type, which you want because <code>forwardRef</code> handles ref separately.
+      <code>ComponentPropsWithRef</code> exists for the rare case you're typing something that passes ref through as
+      a prop.</li>
+  </ul>
+
+  <h3>The polymorphic <code>as</code> prop</h3>
+  <p>
+    Design systems often let one component render as different elements: <code>&lt;Text as="label"&gt;</code>,
+    <code>&lt;Button as="a" href="..."&gt;</code>. The typed sketch:
+  </p>
+  <pre><code>import type { ComponentPropsWithoutRef, ElementType, ReactNode } from 'react';
+
+type PolymorphicProps&lt;E extends ElementType&gt; = {
+  as?: E;
+  children?: ReactNode;
+} &amp; Omit&lt;ComponentPropsWithoutRef&lt;E&gt;, 'as' | 'children'&gt;;
+
+function Text&lt;E extends ElementType = 'span'&gt;({ as, ...rest }: PolymorphicProps&lt;E&gt;) {
+  const Component = as ?? 'span';
+  return &lt;Component {...rest} /&gt;;
+}
+
+// TS now knows href is valid here and invalid on the default span:
+&lt;Text as="a" href="/docs"&gt;Docs&lt;/Text&gt;   // ✅
+&lt;Text href="/docs"&gt;Docs&lt;/Text&gt;          // ❌ type error</code></pre>
+  <p><strong>Trade-offs to volunteer:</strong></p>
+  <ul>
+    <li>Fully general polymorphic types (with ref forwarding) get gnarly fast and are notoriously slow for the TS
+      compiler in large design systems — some teams (and Radix, via its <code>asChild</code> pattern instead) moved
+      away from <code>as</code> for exactly this reason.</li>
+    <li><code>asChild</code> (Radix/Slot): instead of <code>as="a"</code>, you pass the element as the child and the
+      component <em>merges its props onto it</em>. Cleaner types, works with custom components like router
+      <code>&lt;Link&gt;</code>, at the cost of a slightly odd mental model.</li>
+    <li>Semantics risk: <code>&lt;Button as="div"&gt;</code> silently loses keyboard and a11y behavior. A good API
+      constrains <code>as</code> to sensible elements or re-adds behavior (<code>role="button"</code>,
+      <code>tabIndex</code>, key handlers) when it can't.</li>
+  </ul>
+
+  <h3>className / style escape hatches</h3>
+  <p>
+    Every styled component in a design system eventually meets a layout it didn't anticipate. Accepting
+    <code>className</code> and <code>style</code> and <em>merging</em> them is the pressure-release valve that keeps
+    consumers from wrapping your component in three divs or forking it. The senior nuance: escape hatches are for
+    <em>positioning and one-off spacing</em>, not for re-theming — if consumers routinely override internals, your
+    variants API is missing a case. Some teams intentionally omit <code>className</code> on leaf components to keep
+    the design language closed; know that this is a deliberate spectrum (open like Radix ↔ closed like some internal
+    DS) and name where you'd sit and why.
+  </p>
+  <div class="note">
+    <strong>Interview framing:</strong> when asked "design a reusable X", spend the first two minutes on the contract
+    before writing code: What's controlled/uncontrolled? What's composition vs props? What native props pass through?
+    What are the a11y guarantees? Interviewers consistently rate candidates who lay out the API first far above those
+    who start typing JSX.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="compound">2. Compound components — the flagship senior pattern <span class="tier tier-1">T1</span></h2>
+
+  <p>
+    Compound components are a set of components that work together sharing implicit state, the way
+    <code>&lt;select&gt;</code> and <code>&lt;option&gt;</code> do in HTML. The parent owns state and shares it via
+    <strong>context</strong>; children read it. The payoff: the <em>caller owns the markup</em> — they can reorder,
+    wrap, style, and interleave pieces — while the component owns the behavior. This is the single most-requested
+    pattern in senior React interviews ("build Tabs where consumers control the layout").
+  </p>
+
+  <h3>Full implementation: Tabs / TabList / Tab / TabPanel</h3>
+  <pre><code>import {
+  createContext, useContext, useId, useState, useCallback,
+  type ReactNode,
+} from 'react';
+
+type TabsContextValue = {
+  activeValue: string;
+  setActiveValue: (v: string) =&gt; void;
+  baseId: string;            // for wiring aria-controls/aria-labelledby
+};
+
+const TabsContext = createContext&lt;TabsContextValue | null&gt;(null);
+
+function useTabsContext(component: string) {
+  const ctx = useContext(TabsContext);
+  if (!ctx) {
+    // Fail loudly and helpfully — this error message is itself API design
+    throw new Error(`&lt;${component}&gt; must be rendered inside &lt;Tabs&gt;`);
+  }
+  return ctx;
+}
+
+export function Tabs({
+  value, defaultValue, onValueChange, children,
+}: {
+  value?: string;
+  defaultValue?: string;
+  onValueChange?: (v: string) =&gt; void;
+  children: ReactNode;
+}) {
+  // Controlled + uncontrolled support (see useControllableState in §1)
+  const [internal, setInternal] = useState(defaultValue ?? '');
+  const isControlled = value !== undefined;
+  const activeValue = isControlled ? value : internal;
+  const baseId = useId();
+
+  const setActiveValue = useCallback((v: string) =&gt; {
+    if (!isControlled) setInternal(v);
+    onValueChange?.(v);
+  }, [isControlled, onValueChange]);
+
+  return (
+    &lt;TabsContext.Provider value={{ activeValue, setActiveValue, baseId }}&gt;
+      {children}
+    &lt;/TabsContext.Provider&gt;
+  );
+}
+
+export function TabList({ children, label }: { children: ReactNode; label: string }) {
+  // Roving tabindex keyboard nav: ArrowLeft/Right move focus AND activate (APG "automatic activation")
+  const onKeyDown = (e: React.KeyboardEvent&lt;HTMLDivElement&gt;) =&gt; {
+    const tabs = Array.from(
+      e.currentTarget.querySelectorAll&lt;HTMLButtonElement&gt;('[role="tab"]:not([disabled])')
+    );
+    const i = tabs.indexOf(document.activeElement as HTMLButtonElement);
+    if (i === -1) return;
+    let next = i;
+    if (e.key === 'ArrowRight') next = (i + 1) % tabs.length;
+    else if (e.key === 'ArrowLeft') next = (i - 1 + tabs.length) % tabs.length;
+    else if (e.key === 'Home') next = 0;
+    else if (e.key === 'End') next = tabs.length - 1;
+    else return;
+    e.preventDefault();
+    tabs[next].focus();
+    tabs[next].click();       // automatic activation on focus move
+  };
+
+  return (
+    &lt;div role="tablist" aria-label={label} onKeyDown={onKeyDown}&gt;
+      {children}
+    &lt;/div&gt;
+  );
+}
+
+export function Tab({ value, children, disabled }: {
+  value: string; children: ReactNode; disabled?: boolean;
+}) {
+  const { activeValue, setActiveValue, baseId } = useTabsContext('Tab');
+  const selected = activeValue === value;
+  return (
+    &lt;button
+      role="tab"
+      id={`${baseId}-tab-${value}`}
+      aria-selected={selected}
+      aria-controls={`${baseId}-panel-${value}`}
+      tabIndex={selected ? 0 : -1}          // roving tabindex: one tab stop for the whole list
+      disabled={disabled}
+      onClick={() =&gt; setActiveValue(value)}
+    &gt;
+      {children}
+    &lt;/button&gt;
+  );
+}
+
+export function TabPanel({ value, children }: { value: string; children: ReactNode }) {
+  const { activeValue, baseId } = useTabsContext('TabPanel');
+  const selected = activeValue === value;
+  return (
+    &lt;div
+      role="tabpanel"
+      id={`${baseId}-panel-${value}`}
+      aria-labelledby={`${baseId}-tab-${value}`}
+      hidden={!selected}
+      tabIndex={0}                          // panel is focusable so keyboard users can reach content
+    &gt;
+      {children}
+    &lt;/div&gt;
+  );
+}</code></pre>
+  <p>Consumer code — note the total markup freedom, the reason this pattern exists:</p>
+  <pre><code>&lt;Tabs defaultValue="account"&gt;
+  &lt;div className="header-row"&gt;
+    &lt;TabList label="Settings sections"&gt;
+      &lt;Tab value="account"&gt;Account&lt;/Tab&gt;
+      &lt;Tab value="billing"&gt;Billing &lt;ProBadge /&gt;&lt;/Tab&gt;
+      &lt;Tab value="danger" disabled={!isAdmin}&gt;Danger zone&lt;/Tab&gt;
+    &lt;/TabList&gt;
+    &lt;SearchBox /&gt;                {/* arbitrary siblings — impossible with a config API */}
+  &lt;/div&gt;
+  &lt;TabPanel value="account"&gt;&lt;AccountForm /&gt;&lt;/TabPanel&gt;
+  &lt;TabPanel value="billing"&gt;&lt;BillingTable /&gt;&lt;/TabPanel&gt;
+  &lt;TabPanel value="danger"&gt;&lt;DangerZone /&gt;&lt;/TabPanel&gt;
+&lt;/Tabs&gt;</code></pre>
+
+  <h3>Compound components vs configuration-object API</h3>
+  <pre><code>// The alternative: configuration over composition
+&lt;Tabs
+  items={[
+    { value: 'account', label: 'Account', content: &lt;AccountForm /&gt; },
+    { value: 'billing', label: 'Billing', content: &lt;BillingTable /&gt; },
+  ]}
+/&gt;</code></pre>
+  <table>
+    <thead>
+      <tr><th></th><th>Compound components</th><th>Configuration object (<code>items</code>)</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Markup flexibility</strong></td>
+        <td>Total — wrap, reorder, interleave, add badges/tooltips per tab</td>
+        <td>Only what the schema anticipates; every new need = new config field</td>
+      </tr>
+      <tr>
+        <td><strong>Data-driven rendering</strong></td>
+        <td>Needs a <code>.map()</code> in consumer code (fine, but more verbose)</td>
+        <td>Natural fit — tabs from an API response in one prop</td>
+      </tr>
+      <tr>
+        <td><strong>Invariant enforcement</strong></td>
+        <td>Weaker — consumer can forget a TabPanel; guard with dev warnings</td>
+        <td>Strong — the component controls all rendering</td>
+      </tr>
+      <tr>
+        <td><strong>Best for</strong></td>
+        <td>Design systems, libraries, anywhere consumers vary</td>
+        <td>App-internal components with one known shape; virtualized lists (you need the data, not elements)</td>
+      </tr>
+    </tbody>
+  </table>
+  <div class="senior">
+    <strong>Senior answer:</strong> they're not enemies — mature libraries often ship compound primitives and a
+    convenience config wrapper <em>built on top of them</em> (<code>&lt;SimpleTabs items={...}/&gt;</code> internally
+    renders the compound parts). Offering the low-level composable API plus a high-level ergonomic one is exactly how
+    Radix (primitives) relates to shadcn/ui (prebuilt compositions). Also note: a config API is effectively mandatory
+    when the component must <em>own iteration</em> — e.g. a virtualized tab strip with 10,000 tabs can't accept 10,000
+    child elements.
+  </div>
+
+  <h3>Static properties vs named exports</h3>
+  <pre><code>// Style A: static properties (dot notation)
+Tabs.List = TabList; Tabs.Tab = Tab; Tabs.Panel = TabPanel;
+&lt;Tabs.Tab value="a"&gt;A&lt;/Tabs.Tab&gt;
+
+// Style B: named exports (what Radix does)
+export { Tabs, TabList, Tab, TabPanel };</code></pre>
+  <p>
+    Dot notation reads nicely and namespaces the parts, but historically hurt tree-shaking (properties on a function
+    object are hard for bundlers to prove unused) and confused <code>React.lazy</code>/HMR edge cases. Named exports
+    tree-shake cleanly and play better with code splitting; most modern libraries chose them. Knowing <em>why</em> the
+    ecosystem shifted is the differentiator, not which one you pick.
+  </p>
+
+  <h3>Handling non-direct children</h3>
+  <p>
+    A naive compound implementation that walks <code>React.Children</code> + <code>cloneElement</code> to inject props
+    breaks the moment a consumer wraps a Tab in their own component or a fragment:
+  </p>
+  <pre><code>&lt;TabList label="…"&gt;
+  {tabs.map(t =&gt; &lt;Tab key={t.id} value={t.id}&gt;{t.label}&lt;/Tab&gt;)}  {/* array — fine with context */}
+  &lt;Tooltip content="Admins only"&gt;                                   {/* wrapper component */}
+    &lt;Tab value="admin"&gt;Admin&lt;/Tab&gt;                              {/* cloneElement-based impls break here */}
+  &lt;/Tooltip&gt;
+&lt;/TabList&gt;</code></pre>
+  <p>
+    This is <em>the</em> argument for context over <code>cloneElement</code>: context reaches any depth, survives
+    wrappers, fragments, and <code>.map()</code>, and doesn't create an implicit "I will secretly add props to you"
+    contract. <code>cloneElement</code>-based compounds only work with direct children of an exact type — a fragility
+    the React docs now explicitly warn about (§10 covers cloneElement's problems in detail).
+  </p>
+
+  <div class="senior">
+    Finish the compound-components answer with the escape hatch: export the context hook (a public
+    <code>useTabs()</code>) alongside the parts. That converts "the library didn't anticipate my piece" from a fork
+    into a feature — consumers can build their own <code>&lt;TabIndicator&gt;</code> or analytics-reporting tab on the
+    same shared state. Compound components + a public context hook is the complete pattern; the shipped components are
+    just the default consumers of that context.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="forms">3. Controlled vs uncontrolled forms <span class="tier tier-1">T1</span></h2>
+
+  <h3>The input-level definition — say it precisely</h3>
+  <p>
+    For form elements the terms have an exact meaning. A <strong>controlled input</strong> has its value driven by
+    React state: <code>value={state}</code> + <code>onChange</code>. The DOM input is a dumb display; React state is
+    the single source of truth, and every keystroke round-trips through React (event → <code>setState</code> →
+    re-render → new <code>value</code> painted). An <strong>uncontrolled input</strong> keeps its value in the DOM,
+    where inputs have kept their value since 1995; React sets an initial <code>defaultValue</code> and reads the value
+    on demand via a ref or <code>FormData</code>. The interview one-liner: <em>controlled = React owns the value on
+    every render; uncontrolled = the DOM owns it and you sample it.</em>
+  </p>
+  <pre><code>// Controlled — state is the source of truth
+const [email, setEmail] = useState('');
+&lt;input value={email} onChange={(e) =&gt; setEmail(e.target.value)} /&gt;
+
+// Uncontrolled — the DOM is the source of truth, sample when needed
+const emailRef = useRef&lt;HTMLInputElement&gt;(null);
+&lt;input defaultValue="a@b.co" ref={emailRef} /&gt;
+// later: emailRef.current!.value
+
+// Uncontrolled at the FORM level — no refs at all, read everything at submit:
+function onSubmit(e: React.FormEvent&lt;HTMLFormElement&gt;) {
+  e.preventDefault();
+  const data = new FormData(e.currentTarget);     // reads every named field
+  api.post('/signup', Object.fromEntries(data));  // { email: '...', plan: '...' }
+}
+&lt;form onSubmit={onSubmit}&gt;
+  &lt;input name="email" type="email" required /&gt;   {/* name attributes are the API */}
+  &lt;select name="plan" defaultValue="pro"&gt;…&lt;/select&gt;
+&lt;/form&gt;</code></pre>
+
+  <h3>What controlled buys you — and what it costs</h3>
+  <p>
+    You need controlled when the UI must <em>react to the value as it changes</em>: live validation messages,
+    character counters, input masking/formatting (uppercase, phone formatting), enabling a button when a field is
+    valid, filtering a list as the user types, or vetoing input (rejecting non-digits). None of that is possible by
+    sampling at submit. The cost is re-renders: every keystroke re-renders the component that owns the state — and if
+    that component is a 40-field form, every keystroke re-renders <strong>all 40 fields</strong> plus everything else
+    in the component. On fast machines with small forms nobody notices; on a long form with expensive rows (selects
+    with hundreds of options, rich validation UI) typing latency becomes visible, and interviewers know it because
+    they've all felt it.
+  </p>
+  <pre><code>// The classic scale problem:
+function BigForm() {
+  const [form, setForm] = useState(initial40Fields);
+  const update = (k) =&gt; (e) =&gt; setForm(f =&gt; ({ ...f, [k]: e.target.value }));
+  // EVERY keystroke in ANY field re-renders all 40 inputs + labels + errors.
+  // Mitigations, in escalating order:
+  //  1. memo() each field row and pass stable handlers (helps, adds ceremony)
+  //  2. split state per field / per section (helps, loses single-object ergonomics)
+  //  3. move the value out of React state entirely — uncontrolled — which is
+  //     exactly what react-hook-form productizes (§4).
+}</code></pre>
+
+  <h3>When uncontrolled + refs/FormData is the right call</h3>
+  <ul>
+    <li><strong>Submit-only forms:</strong> login, search, contact, "add a comment" — nothing reacts per-keystroke, so
+      paying per-keystroke renders buys nothing. <code>FormData</code> + <code>name</code> attributes + native
+      validation attributes (<code>required</code>, <code>type="email"</code>, <code>minLength</code>,
+      <code>pattern</code>) covers a surprising amount for free, including a11y (the browser announces validation
+      errors).</li>
+    <li><strong>File inputs:</strong> <code>&lt;input type="file"&gt;</code> is uncontrolled by design — its value
+      can't be set programmatically for security reasons. It's the proof that "everything controlled" was never a
+      rule.</li>
+    <li><strong>Integration with non-React code</strong> or progressive enhancement: a form that must also work when
+      JS fails (or before hydration) needs <code>name</code>s and a real <code>action</code> anyway — which is
+      exactly where React 19 form actions pick up (below).</li>
+    <li><strong>Performance-critical big forms</strong> — via react-hook-form rather than hand-rolled refs.</li>
+  </ul>
+
+  <h3>Mixed strategies — the pragmatic senior answer</h3>
+  <p>
+    The dichotomy is per-<em>input</em>, not per-form. A registration form can keep 18 fields uncontrolled and control
+    the two that need live behavior: the password field (strength meter) and the username (async availability check).
+    Similarly, "uncontrolled with notifications" is a legitimate middle: leave the value in the DOM but attach an
+    <code>onChange</code> purely for side effects (analytics, dirty-tracking) without storing the value in state —
+    <code>onChange</code> does <em>not</em> make an input controlled; providing <code>value</code> does. That
+    distinction — <em>controlled is defined by the <code>value</code> prop, not by having handlers</em> — is a
+    reliable knowledge check.
+  </p>
+  <div class="pitfall">
+    <code>value</code> without <code>onChange</code> makes a read-only input (React warns; the DOM ignores
+    keystrokes). <code>value={undefined}</code> then <code>value={"x"}</code> later is the
+    uncontrolled-to-controlled warning from §1 — endemic with async-loaded edit forms. Fix by not rendering the form
+    until data exists, keying the form on the record id, or using a form library's <code>reset(data)</code>. And
+    never "fix" it with <code>value={data?.name ?? ''}</code> scattered across 30 fields when
+    <code>defaultValues</code> + <code>reset</code> exists.
+  </div>
+
+  <h3>React 19 form actions — the calculus shifts back toward uncontrolled</h3>
+  <p>
+    React 19 made forms a first-class primitive again. You can pass a <em>function</em> to
+    <code>&lt;form action&gt;</code>; React calls it with the form's <code>FormData</code>, resets the form on
+    success (for uncontrolled inputs), and exposes pending state through hooks:
+  </p>
+  <pre><code>function Signup() {
+  // useActionState: wraps the action, returns [state, wrappedAction, isPending]
+  const [result, submitAction, isPending] = useActionState(
+    async (prev, formData: FormData) =&gt; {
+      const res = await api.signup(Object.fromEntries(formData));
+      if (!res.ok) return { error: res.message, values: Object.fromEntries(formData) };
+      return { success: true };
+    },
+    null
+  );
+
+  return (
+    &lt;form action={submitAction}&gt;
+      &lt;input name="email" type="email" required
+             defaultValue={result?.values?.email} /&gt;   {/* repopulate on error */}
+      {result?.error &amp;&amp; &lt;p role="alert"&gt;{result.error}&lt;/p&gt;}
+      &lt;SubmitButton /&gt;
+    &lt;/form&gt;
+  );
+}
+
+function SubmitButton() {
+  // useFormStatus: reads the nearest parent &lt;form&gt;'s pending state — no prop drilling.
+  // Must be rendered INSIDE the form, in a child component.
+  const { pending } = useFormStatus();
+  return &lt;button disabled={pending}&gt;{pending ? 'Signing up…' : 'Sign up'}&lt;/button&gt;;
+}</code></pre>
+  <p>
+    Points to make in an interview: (1) this model is <strong>uncontrolled-first</strong> — the action receives
+    <code>FormData</code>, so <code>name</code> attributes matter again and per-keystroke state is unnecessary for
+    plain submit flows; (2) in a server-components framework the same <code>action</code> can be a <em>server
+    function</em>, giving progressive enhancement (the form posts and works before hydration); (3)
+    <code>useOptimistic</code> pairs with actions for optimistic UI; (4) it does <em>not</em> replace form libraries
+    for rich client validation, dependent fields, dirty tracking, or arrays — RHF and actions compose (RHF's
+    <code>handleSubmit</code> inside a transition, or RHF validation before calling the action). The senior framing:
+    <em>form actions move submission and pending/error plumbing into React; field-level interaction state is still
+    yours to manage — with the same controlled/uncontrolled judgment as before.</em>
+  </p>
+
+  <!-- ============================================================ -->
+  <h2 id="rhf">4. React Hook Form — the de-facto standard <span class="tier tier-1">T1</span></h2>
+
+  <p>
+    react-hook-form (RHF) won the form-library war (Formik is in maintenance mode; Redux Form is a cautionary tale —
+    form state in a global store, every keystroke a dispatched action). You're expected to know RHF's API <em>and</em>
+    its architecture, because "why is RHF fast?" is the real question behind every RHF question.
+  </p>
+
+  <h3>The core: register = uncontrolled inputs + a subscription system</h3>
+  <pre><code>import { useForm } from 'react-hook-form';
+
+type FormValues = { email: string; password: string };
+
+function Login() {
+  const { register, handleSubmit, formState: { errors, isSubmitting } } =
+    useForm&lt;FormValues&gt;({ defaultValues: { email: '', password: '' } });
+
+  const onSubmit = async (data: FormValues) =&gt; {   // runs only if validation passed
+    await api.login(data);
+  };
+
+  return (
+    &lt;form onSubmit={handleSubmit(onSubmit)} noValidate&gt;
+      &lt;label htmlFor="email"&gt;Email&lt;/label&gt;
+      &lt;input id="email" type="email"
+        aria-invalid={!!errors.email || undefined}
+        {...register('email', {
+          required: 'Email is required',
+          pattern: { value: /^\S+@\S+$/, message: 'Enter a valid email' },
+        })}
+      /&gt;
+      {errors.email &amp;&amp; &lt;p role="alert"&gt;{errors.email.message}&lt;/p&gt;}
+
+      &lt;input type="password" {...register('password', { required: true, minLength: 8 })} /&gt;
+
+      &lt;button disabled={isSubmitting}&gt;Log in&lt;/button&gt;
+    &lt;/form&gt;
+  );
+}</code></pre>
+  <p>
+    What <code>register('email', rules)</code> actually returns: <code>{ name, ref, onChange, onBlur }</code>. The
+    <code>ref</code> lets RHF grab the DOM node and read <code>input.value</code> directly; the handlers update RHF's
+    <em>internal, non-React</em> store of values and validation state. Typing does <strong>not</strong> call
+    <code>setState</code> — the value lives in the DOM, RHF's store mirrors it, and React renders nothing. That is
+    the entire performance story: <strong>RHF is fast because keystrokes bypass React rendering entirely.</strong>
+    Re-renders happen only when something you <em>subscribed to</em> changes.
+  </p>
+  <p>
+    The subscription mechanism is the senior detail: <code>formState</code> is a <strong>Proxy</strong>. When you
+    destructure <code>formState.errors</code> or read <code>formState.isDirty</code>, the proxy records that this
+    component cares about that slice, and RHF re-renders it only when that slice changes. Read nothing → the form
+    component re-renders roughly twice for an entire fill-and-submit session. This is also a footgun: because
+    subscription is read-based, <code>const { formState } = useForm()</code> passed down and read conditionally can
+    miss updates — destructure what you use at the top level.
+  </p>
+
+  <h3>Controller — the bridge to controlled UI libraries</h3>
+  <p>
+    <code>register</code> needs a real DOM input to attach a ref to. Component libraries (MUI's
+    <code>Select</code>, react-select, date pickers, rich editors) expose <code>value</code>/<code>onChange</code>
+    props instead — they're controlled components. <code>Controller</code> adapts them: it holds that one field's
+    value in RHF's store and feeds it to the child as a controlled prop, isolating the re-render to that field:
+  </p>
+  <pre><code>import { Controller, useForm } from 'react-hook-form';
+
+&lt;Controller
+  name="country"
+  control={control}
+  rules={{ required: 'Pick a country' }}
+  render={({ field, fieldState }) =&gt; (
+    &lt;Select
+      {...field}                         // value, onChange, onBlur, ref, name
+      options={countries}
+      aria-invalid={fieldState.invalid || undefined}
+    /&gt;
+  )}
+/&gt;
+// useController(name, control) is the hook form of the same thing — use it when
+// building your own reusable form-field components instead of inlining render props.</code></pre>
+  <div class="note">
+    The architecture takeaway to say out loud: RHF is <em>uncontrolled by default, controlled per-field where
+    required</em> — the mixed strategy from §3, productized. Fields under <code>Controller</code> re-render on their
+    own changes; <code>register</code>ed fields never do. That's why a 60-field RHF form with two Controller-wrapped
+    selects stays fast.
+  </div>
+
+  <h3>Validation modes</h3>
+  <table>
+    <thead>
+      <tr><th>Option</th><th>Validates when</th><th>Notes</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>mode: 'onSubmit'</code></td><td>First validation at submit (default)</td><td>Least noisy; errors appear late</td></tr>
+      <tr><td><code>mode: 'onBlur'</code></td><td>When a field loses focus</td><td>Good UX default for most forms</td></tr>
+      <tr><td><code>mode: 'onChange'</code></td><td>Every keystroke</td><td>Most feedback, most validation runs (and re-renders for error changes)</td></tr>
+      <tr><td><code>mode: 'onTouched'</code></td><td>First blur, then every change</td><td>The "reward early, punish late" pattern most design teams want</td></tr>
+      <tr><td><code>reValidateMode</code></td><td>After the first failed submit</td><td>Defaults to <code>onChange</code> — errors clear as the user fixes them</td></tr>
+    </tbody>
+  </table>
+
+  <h3>zodResolver — schema-first forms and end-to-end types</h3>
+  <pre><code>import { z } from 'zod';
+import { zodResolver } from '@hookform/resolvers/zod';
+
+const schema = z.object({
+  email: z.string().email('Enter a valid email'),
+  password: z.string().min(8, 'At least 8 characters'),
+  confirm: z.string(),
+  age: z.coerce.number().int().min(18, 'Must be 18+'),   // coerce: inputs give strings!
+}).refine((d) =&gt; d.password === d.confirm, {
+  message: 'Passwords must match',
+  path: ['confirm'],                       // attach the error to a field, not the root
+});
+
+type FormValues = z.infer&lt;typeof schema&gt;;  // ONE source of truth for types + rules
+
+const { register, handleSubmit, formState } = useForm&lt;FormValues&gt;({
+  resolver: zodResolver(schema),
+  mode: 'onTouched',
+});</code></pre>
+  <p>
+    Why schema-first is the industry default: the schema is a plain value — reusable on the server for the API
+    boundary (validate the same shape twice, trust nothing from the client), testable without rendering, and the
+    single source of truth for the TypeScript type via <code>z.infer</code>. Inline <code>register</code> rules
+    scatter validation across JSX; a schema centralizes it. Cross-field rules (<code>refine</code> with
+    <code>path</code>) and coercion (form inputs always produce strings) are the two details that separate people
+    who've used it from people who've read about it.
+  </p>
+
+  <h3>useFieldArray — dynamic rows</h3>
+  <pre><code>const { control, register } = useForm&lt;{ phones: { number: string }[] }&gt;({
+  defaultValues: { phones: [{ number: '' }] },
+});
+const { fields, append, remove, move } = useFieldArray({ control, name: 'phones' });
+
+{fields.map((field, index) =&gt; (
+  &lt;div key={field.id}&gt;                       {/* field.id, NEVER index — see below */}
+    &lt;input {...register(`phones.${index}.number` as const)} /&gt;
+    &lt;button type="button" onClick={() =&gt; remove(index)}&gt;Remove&lt;/button&gt;
+  &lt;/div&gt;
+))}
+&lt;button type="button" onClick={() =&gt; append({ number: '' })}&gt;Add phone&lt;/button&gt;</code></pre>
+  <div class="pitfall">
+    Two field-array traps: (1) <code>key={index}</code> breaks removal — React reconciles by position, so deleting
+    row 2 makes row 3's DOM state bleed into row 2; RHF generates a stable <code>field.id</code> for exactly this.
+    (2) <code>fields</code> is a snapshot for rendering — read current values with <code>watch</code>/
+    <code>getValues</code>, not from <code>fields</code>, which only updates on array operations.
+  </div>
+
+  <h3>watch vs useWatch — know the re-render scope</h3>
+  <pre><code>// watch — subscribes THIS component (the one calling useForm) to changes:
+const plan = watch('plan');                  // re-renders the whole form component per change
+
+// useWatch — subscribes only the calling component; isolate it in a child:
+function PriceSummary({ control }) {
+  const plan = useWatch({ control, name: 'plan' });   // ONLY PriceSummary re-renders
+  return &lt;p&gt;Total: {priceFor(plan)}&lt;/p&gt;;
+}
+
+// getValues() — reads without subscribing at all (event handlers, onSubmit helpers).</code></pre>
+  <p>
+    The rule: <code>watch</code> at the top of a big form reintroduces the controlled-form problem you adopted RHF to
+    escape — every change to the watched field re-renders everything. Push reactive displays into small children with
+    <code>useWatch</code>, and use <code>getValues</code> when you need a value only at interaction time. Saying this
+    unprompted is a strong signal you've profiled a real form.
+  </p>
+
+  <h3>FormProvider — form context for nested components</h3>
+  <pre><code>const methods = useForm&lt;FormValues&gt;({ resolver: zodResolver(schema) });
+
+&lt;FormProvider {...methods}&gt;
+  &lt;form onSubmit={methods.handleSubmit(onSubmit)}&gt;
+    &lt;AddressFields prefix="billing" /&gt;      {/* nested, reusable, no prop drilling */}
+    &lt;AddressFields prefix="shipping" /&gt;
+  &lt;/form&gt;
+&lt;/FormProvider&gt;
+
+function AddressFields({ prefix }: { prefix: string }) {
+  const { register, formState: { errors } } = useFormContext&lt;FormValues&gt;();
+  return &lt;input {...register(`${prefix}.city`)} /&gt;;   // deeply nested, still uncontrolled
+}</code></pre>
+  <p>
+    This is the compound-component pattern (§2) applied to forms: the form owns state, nested field groups consume it
+    via context. It's how design systems ship <code>&lt;FormField&gt;</code>/<code>&lt;FormMessage&gt;</code>
+    wrappers (shadcn/ui's form components are exactly this: FormProvider + Controller + context-wired
+    aria attributes).
+  </p>
+
+  <!-- ============================================================ -->
+  <h2 id="form-architecture">5. Form architecture beyond RHF <span class="tier tier-2">T2</span></h2>
+
+  <p>
+    Library fluency gets you through the syntax questions; the differentiator is the architecture questions — "design
+    a 5-step onboarding wizard", "how do server errors reach the right field", "make this form accessible". These are
+    small system-design rounds and they're where seven years of experience should show.
+  </p>
+
+  <h3>Multi-step wizards — the two decisions that matter</h3>
+  <p>
+    <strong>Decision 1: where does accumulated data live?</strong> Options, in order of preference:
+  </p>
+  <ul>
+    <li><strong>One <code>useForm</code> for the whole wizard, steps as views.</strong> All fields registered in one
+      form (unmounted steps kept via <code>shouldUnregister: false</code>, the default); the step is just UI state.
+      Simplest data flow, free whole-form validation at the end, dirty tracking across steps. Works until steps are
+      truly independent forms or the wizard is huge.</li>
+    <li><strong>One form per step + an accumulator.</strong> Each step is a self-contained
+      <code>useForm</code> + per-step zod schema; on step submit, merge into a parent-owned accumulator
+      (<code>useReducer</code>, or a small Zustand store persisted to <code>sessionStorage</code> so refresh resumes
+      — see tutorial 11's wizard exercise). Cleaner isolation, per-step code splitting, steps testable alone.</li>
+    <li><strong>Server-persisted draft.</strong> Each step submit PATCHes a draft resource. Mandatory when steps must
+      survive devices/sessions or when later steps depend on server computation (pricing, eligibility). The wizard
+      becomes a sequence of small forms over server state — often the honest answer for enterprise onboarding.</li>
+  </ul>
+  <p>
+    <strong>Decision 2: per-step validation.</strong> Validate <em>only the current step's fields</em> before
+    advancing: with one big form, call <code>await trigger(['email', 'password'])</code> (RHF validates just those
+    names) or give each step its own schema; never run the full-form schema on step 1 — you'll show errors for fields
+    the user hasn't seen. Guard deep links: landing on step 3 with no step-1 data redirects to the first incomplete
+    step (derivable from the accumulator — don't store a separate "completed steps" flag that can drift).
+  </p>
+
+  <h3>Server errors → fields</h3>
+  <p>
+    Client validation is UX; the server revalidates and returns its own errors ("email already taken",
+    "coupon expired"). The pattern: map the server's error payload onto fields with <code>setError</code>, reserving a
+    <code>root</code> error for non-field failures:
+  </p>
+  <pre><code>const onSubmit = async (data: FormValues) =&gt; {
+  const res = await api.signup(data);
+  if (!res.ok) {
+    // Expected payload: { errors: { email: 'Already registered', ... } }
+    for (const [field, message] of Object.entries(res.errors ?? {})) {
+      if (field in data) {
+        setError(field as keyof FormValues, { type: 'server', message });
+      }
+    }
+    if (res.formError) {
+      setError('root.serverError', { message: res.formError });  // not tied to a field
+    }
+    return;
+  }
+};
+
+{errors.root?.serverError &amp;&amp; &lt;p role="alert"&gt;{errors.root.serverError.message}&lt;/p&gt;}</code></pre>
+  <div class="senior">
+    Two refinements interviewers reward: (1) treat the server's field names as an API contract — if the backend
+    returns <code>user_email</code> and the form has <code>email</code>, put the mapping in one translation function,
+    not scattered ifs; (2) decide when server errors <em>clear</em> — RHF clears a field's error when its rules
+    re-pass, but a <code>type: 'server'</code> error has no client rule, so clear it manually on change of that field
+    (or rely on <code>reValidateMode</code> + a schema that can't re-validate uniqueness — meaning you clear it
+    optimistically and let the next submit re-check).
+  </div>
+
+  <h3>Async validation — debounce and cancellation</h3>
+  <pre><code>// RHF supports async validate fns; the missing piece is debounce + stale-response safety.
+const checkUsername = useMemo(() =&gt; {
+  let timer: ReturnType&lt;typeof setTimeout&gt;;
+  let latest = 0;
+  return (value: string) =&gt;
+    new Promise&lt;boolean | string&gt;((resolve) =&gt; {
+      clearTimeout(timer);
+      const callId = ++latest;
+      timer = setTimeout(async () =&gt; {
+        const taken = await api.isUsernameTaken(value);
+        if (callId !== latest) return;         // a newer keystroke superseded us — drop
+        resolve(taken ? 'Username is taken' : true);
+      }, 400);
+    });
+}, []);
+
+&lt;input {...register('username', { validate: checkUsername })} /&gt;</code></pre>
+  <p>
+    Name the three concerns and you've passed: <strong>debounce</strong> (don't hit the API per keystroke),
+    <strong>staleness</strong> (a slow response for "jo" must not overwrite the verdict for "john" — last-write-wins
+    guard or AbortController), and <strong>UX state</strong> (show "checking…" via <code>isValidating</code>, and
+    don't block typing). Also mention placement: uniqueness is ultimately the server's call at submit time anyway —
+    async field validation is an optimization, not the enforcement point.
+  </p>
+
+  <h3>Dynamic forms from config</h3>
+  <p>
+    Admin builders, CMS-driven surveys, per-tenant fields: the form isn't known at build time. The standard shape —
+    a schema array driving both rendering and validation:
+  </p>
+  <pre><code>type FieldConfig =
+  | { kind: 'text'; name: string; label: string; required?: boolean; maxLength?: number }
+  | { kind: 'select'; name: string; label: string; options: { value: string; label: string }[] }
+  | { kind: 'checkbox'; name: string; label: string };
+
+function DynamicForm({ config, onSubmit }: { config: FieldConfig[]; onSubmit: SubmitHandler&lt;any&gt; }) {
+  const zodShape = Object.fromEntries(config.map((f) =&gt; [f.name, zodFor(f)]));  // config → zod
+  const methods = useForm({ resolver: zodResolver(z.object(zodShape)) });
+
+  return (
+    &lt;FormProvider {...methods}&gt;
+      &lt;form onSubmit={methods.handleSubmit(onSubmit)}&gt;
+        {config.map((f) =&gt; &lt;Field key={f.name} config={f} /&gt;)}   {/* one renderer per kind */}
+      &lt;/form&gt;
+    &lt;/FormProvider&gt;
+  );
+}</code></pre>
+  <p>
+    The interview discussion points: derive <em>both</em> the zod schema and the UI from one config so they can't
+    drift; a registry mapping <code>kind → component</code> (open for extension without touching the renderer);
+    conditional visibility as data (<code>visibleWhen: { field, equals }</code>) evaluated against
+    <code>useWatch</code>; and the honest limit — past a point (cross-field rules, layout, wizards-in-config) you're
+    building a worse programming language in JSON, and the answer is code.
+  </p>
+
+  <h3>Form accessibility — the checklist that gets graded</h3>
+  <ul>
+    <li><strong>Every input has a label</strong> — <code>&lt;label htmlFor&gt;</code> (or <code>aria-label</code> as
+      a last resort). Placeholder is not a label: it vanishes on input and fails contrast.</li>
+    <li><strong>Errors are linked, not just adjacent:</strong> <code>aria-invalid</code> on the input +
+      <code>aria-describedby</code> pointing at the error element's id, so screen readers announce the message when
+      the field is focused.</li>
+    <li><strong>Announce errors when they appear:</strong> <code>role="alert"</code> (or
+      <code>aria-live="assertive"</code>) on error messages/summary so they're read without moving focus.</li>
+    <li><strong>Focus management on failed submit:</strong> move focus to the first invalid field (RHF does this by
+      default for <code>register</code>ed inputs — <code>shouldFocusError: true</code>) or to an error-summary box at
+      the top that links to each field (the GOV.UK pattern — the strongest answer for long forms).</li>
+    <li><strong>Group related controls:</strong> <code>&lt;fieldset&gt;</code> + <code>&lt;legend&gt;</code> for radio
+      groups and address blocks; the legend is announced with each field inside.</li>
+    <li><strong>Don't disable the submit button as your only invalid-state signal</strong> — a disabled button gives
+      no feedback about <em>why</em>. Prefer enabled submit → validate → announce + focus errors.</li>
+  </ul>
+  <pre><code>&lt;label htmlFor="email"&gt;Email&lt;/label&gt;
+&lt;input
+  id="email"
+  type="email"
+  aria-invalid={errors.email ? true : undefined}
+  aria-describedby={errors.email ? 'email-error' : undefined}
+  {...register('email')}
+/&gt;
+{errors.email &amp;&amp; (
+  &lt;p id="email-error" role="alert"&gt;{errors.email.message}&lt;/p&gt;
+)}</code></pre>
+
+  <!-- ============================================================ -->
+  <h2 id="error-boundaries">6. Error boundaries <span class="tier tier-1">T1</span></h2>
+
+  <h3>What they are — and why they're still classes</h3>
+  <p>
+    An error boundary is a component that catches errors thrown <strong>during rendering, in lifecycle methods, and
+    in constructors of its child tree</strong>, and renders a fallback instead of unmounting the whole app (React's
+    default since 16: an uncaught render error unmounts the entire root — a blank page). Boundaries are the
+    <em>only</em> remaining must-write-a-class API: there is still no hook equivalent of
+    <code>getDerivedStateFromError</code>/<code>componentDidCatch</code> as of React 19 (the team has said hooks for
+    this may come; interviewers like hearing that you know it's a known gap, which is why everyone uses the
+    <code>react-error-boundary</code> package instead of hand-rolling).
+  </p>
+  <pre><code>class ErrorBoundary extends React.Component&lt;
+  { fallback: React.ReactNode; children: React.ReactNode },
+  { hasError: boolean }
+&gt; {
+  state = { hasError: false };
+
+  // Render phase: derive fallback state from the error. Must be PURE — no side effects.
+  static getDerivedStateFromError(_error: unknown) {
+    return { hasError: true };
+  }
+
+  // Commit phase: side effects allowed — log to Sentry/Datadog here.
+  componentDidCatch(error: unknown, info: React.ErrorInfo) {
+    logger.error(error, { componentStack: info.componentStack });
+  }
+
+  render() {
+    return this.state.hasError ? this.props.fallback : this.props.children;
+  }
+}</code></pre>
+  <p>
+    Why two methods: <code>getDerivedStateFromError</code> runs during <em>render</em> so React can paint the
+    fallback in the same pass (important under concurrent rendering — pure, may be retried);
+    <code>componentDidCatch</code> runs during <em>commit</em>, so it's the safe place for logging side effects and
+    it receives <code>componentStack</code>. Use both, for their respective jobs.
+  </p>
+
+  <h3>What error boundaries do NOT catch — the guaranteed follow-up</h3>
+  <table>
+    <thead>
+      <tr><th>Not caught</th><th>Why</th><th>What to do instead</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Event handlers</strong></td>
+        <td>They don't run during render — React has already painted; the error can't corrupt the tree</td>
+        <td>Ordinary <code>try/catch</code>; or <code>showBoundary(err)</code> to route it into a boundary deliberately</td>
+      </tr>
+      <tr>
+        <td><strong>Async code</strong> (<code>setTimeout</code>, promise rejections, fetch callbacks)</td>
+        <td>The call stack when it throws is not React's render stack</td>
+        <td>Catch and set state; or rethrow <em>inside render</em> (the trick query libraries use — below)</td>
+      </tr>
+      <tr>
+        <td><strong>SSR</strong></td>
+        <td>Class lifecycle differs on the server; server render errors are handled by the framework/stream (React 18 streaming SSR can degrade a Suspense boundary's subtree to client rendering)</td>
+        <td>Framework error handling (Next.js <code>error.tsx</code> covers both via its own boundary + server plumbing)</td>
+      </tr>
+      <tr>
+        <td><strong>The boundary itself</strong></td>
+        <td>A boundary can't catch its own render errors</td>
+        <td>The error propagates to the <em>next boundary up</em> — keep fallbacks dead simple so they can't throw</td>
+      </tr>
+    </tbody>
+  </table>
+  <pre><code>// The async trick: an error boundary CAN catch async errors if you re-throw in render.
+function useAsyncError() {
+  const [, setState] = useState();
+  return useCallback((err: unknown) =&gt; {
+    setState(() =&gt; { throw err; });     // throws during the next render → boundary catches
+  }, []);
+}
+// react-error-boundary ships this as useErrorBoundary().showBoundary(error).
+// TanStack Query's throwOnError: true does the same internally — the query hook
+// rethrows the fetch error during render, converting async failure into render failure.</code></pre>
+
+  <h3>Granularity strategy — where do boundaries go?</h3>
+  <p>
+    "One boundary at the root" and "a boundary around everything" are both wrong. The senior answer is
+    <strong>three deliberate levels</strong>:
+  </p>
+  <ul>
+    <li><strong>Root/app level</strong> — last resort, full-page "something went wrong" + reload action. Should almost
+      never be seen.</li>
+    <li><strong>Route/page level</strong> — each route wrapped (Next.js <code>error.tsx</code>, or a boundary in your
+      route config). A broken page doesn't take down navigation, header, or other tabs the user has context in.</li>
+    <li><strong>Widget level</strong> — around independent, failure-prone islands: third-party embeds, charts over
+      unreliable data, comments sections, anything lazy-loaded. The product question that decides placement:
+      <em>"if this crashes, what's the largest UI area that is genuinely useless?"</em> — that's your boundary. A
+      crashed related-products carousel should not blank a checkout page.</li>
+  </ul>
+
+  <h3>react-error-boundary — the production idioms</h3>
+  <pre><code>import { ErrorBoundary } from 'react-error-boundary';
+
+&lt;ErrorBoundary
+  fallbackRender={({ error, resetErrorBoundary }) =&gt; (
+    &lt;div role="alert"&gt;
+      &lt;p&gt;Couldn't load the dashboard.&lt;/p&gt;
+      &lt;pre&gt;{error.message}&lt;/pre&gt;
+      &lt;button onClick={resetErrorBoundary}&gt;Try again&lt;/button&gt;
+    &lt;/div&gt;
+  )}
+  onError={(error, info) =&gt; logger.error(error, info)}   // centralized reporting
+  onReset={() =&gt; refetch()}                              // fix the cause before re-render
+  resetKeys={[userId, filters]}                          // auto-reset when inputs change
+&gt;
+  &lt;Dashboard userId={userId} filters={filters} /&gt;
+&lt;/ErrorBoundary&gt;</code></pre>
+  <p>
+    The two idioms that make retries actually work: <strong><code>onReset</code></strong> runs when
+    <code>resetErrorBoundary()</code> is called — this is where you fix the underlying cause (refetch, clear a cache
+    entry, reset local state); resetting without fixing the cause just re-throws instantly.
+    <strong><code>resetKeys</code></strong> auto-resets the boundary when listed values change — the user navigates to
+    a different <code>userId</code>, so the error state for the old one is no longer relevant. Without it, boundaries
+    "stick": the tree stays in fallback even though the failing input is gone.
+  </p>
+
+  <h3>Pairing with Suspense — the declarative loading/error grammar</h3>
+  <pre><code>import { QueryErrorResetBoundary } from '@tanstack/react-query';
+
+&lt;QueryErrorResetBoundary&gt;
+  {({ reset }) =&gt; (
+    &lt;ErrorBoundary onReset={reset} fallbackRender={({ resetErrorBoundary }) =&gt; (
+      &lt;RetryCard onRetry={resetErrorBoundary} /&gt;
+    )}&gt;
+      &lt;Suspense fallback={&lt;Skeleton /&gt;}&gt;
+        &lt;Projects /&gt;          {/* useSuspenseQuery: pending → Suspense, error → boundary */}
+      &lt;/Suspense&gt;
+    &lt;/ErrorBoundary&gt;
+  )}
+&lt;/QueryErrorResetBoundary&gt;</code></pre>
+  <p>
+    The mental model to state: <strong>Suspense catches the pending state, error boundaries catch the failure state
+    </strong> — together they let data components render only the happy path, with both other states handled
+    declaratively by ancestors. <code>QueryErrorResetBoundary</code> wires "try again" to actually reset the failed
+    query (otherwise the boundary resets, the query is still in error state, and it immediately re-throws). React 19
+    also added root-level <code>onCaughtError</code>/<code>onUncaughtError</code> options — centralized reporting
+    hooks at <code>createRoot</code>, complementing (not replacing) boundaries.
+  </p>
+  <div class="pitfall">
+    Don't wrap every component "for safety." Each boundary is a place the UI can silently degrade; too many and real
+    bugs hide in half-rendered pages nobody reports. Boundaries are a <em>product decision</em> about failure blast
+    radius, plus mandatory reporting in <code>onError</code> — a fallback without telemetry is a bug muffler.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="portals">7. Portals <span class="tier tier-2">T2</span></h2>
+
+  <h3>createPortal — render there, behave here</h3>
+  <pre><code>import { createPortal } from 'react-dom';
+
+function Modal({ children, onClose }: { children: React.ReactNode; onClose: () =&gt; void }) {
+  return createPortal(
+    &lt;div className="overlay" onClick={onClose}&gt;
+      &lt;div className="dialog" onClick={(e) =&gt; e.stopPropagation()}&gt;
+        {children}
+      &lt;/div&gt;
+    &lt;/div&gt;,
+    document.body           // physically mounted here, logically still a child of Modal's parent
+  );
+}</code></pre>
+  <p>
+    A portal renders children into a <em>different DOM container</em> while keeping them in the <em>same React
+    tree</em>. Everything React-level flows as if the portal weren't there: context is read from the React parent,
+    state and lifecycles are unaffected, and — the flagship interview fact — <strong>events bubble through the React
+    tree, not the DOM tree</strong>. React attaches its listeners at the root and dispatches synthetic events along
+    the component hierarchy, so a click inside a portal fires <code>onClick</code> on the portal's React ancestors
+    even though the DOM node lives in <code>document.body</code>.
+  </p>
+  <pre><code>&lt;div onClick={() =&gt; console.log('React parent sees this')}&gt;   {/* fires! */}
+  &lt;Modal&gt;&lt;button&gt;Inside portal&lt;/button&gt;&lt;/Modal&gt;
+&lt;/div&gt;
+// But a NATIVE listener on that div's DOM node does NOT fire —
+// the DOM ancestor of the button is document.body. React tree ≠ DOM tree.
+// Practical bite: "close on outside click" via a document mousedown listener will
+// see clicks INSIDE the portal as "outside" if you test containment with
+// panelDomNode.contains(e.target) against the trigger's subtree. Check containment
+// against the portal's own node too.</code></pre>
+
+  <h3>Why portals exist: overflow, stacking contexts, z-index</h3>
+  <p>
+    Modals, dropdowns, tooltips, and toasts must visually escape their container. Rendered in place, they get
+    clipped by any ancestor with <code>overflow: hidden/auto</code>, and — the deeper problem — trapped by
+    <strong>stacking contexts</strong>: an ancestor with <code>transform</code>, <code>filter</code>,
+    <code>opacity &lt; 1</code>, or <code>will-change</code> creates a stacking context, and <em>no z-index inside it
+    can escape above content outside it</em>. <code>z-index: 999999</code> doesn't help; it's a hierarchy problem,
+    not a number problem. Portaling to <code>document.body</code> exits every ancestor stacking context and clip —
+    that's the whole trick. (Corollary: a <code>transform</code> on <code>body</code> or an app-wide wrapper breaks
+    even portaled <code>position: fixed</code> children — worth mentioning as a war story.)
+  </p>
+
+  <h3>Focus management + inert — where modal implementations get graded</h3>
+  <p>Portals move DOM, not focus. A production modal must handle:</p>
+  <ul>
+    <li><strong>Initial focus</strong> into the dialog on open (first focusable element, or the dialog itself with
+      <code>tabIndex={-1}</code> for reading order).</li>
+    <li><strong>Focus trap</strong>: Tab/Shift+Tab cycle within the dialog — because the portal sits at the end of
+      <code>body</code>, tabbing past its last element otherwise dumps focus into the browser chrome or the page
+      behind.</li>
+    <li><strong>Return focus</strong> to the triggering element on close (store
+      <code>document.activeElement</code> on open).</li>
+    <li><strong>Escape closes</strong>, overlay click closes (product decision), and background scroll is locked.</li>
+    <li><strong>Background made inert</strong>: <code>aria-hidden</code> alone hides the background from screen
+      readers but not from Tab. The modern answer is the <code>inert</code> attribute on the app root while the modal
+      is open — unfocusable <em>and</em> invisible to assistive tech in one attribute (broad browser support since
+      2023). This is what libraries polyfilled for years with focus-trap walls.</li>
+  </ul>
+  <pre><code>useEffect(() =&gt; {
+  if (!open) return;
+  const appRoot = document.getElementById('root')!;
+  const previouslyFocused = document.activeElement as HTMLElement | null;
+  appRoot.inert = true;                        // background: unfocusable + hidden from AT
+  document.body.style.overflow = 'hidden';     // scroll lock
+  dialogRef.current?.focus();
+  return () =&gt; {
+    appRoot.inert = false;
+    document.body.style.overflow = '';
+    previouslyFocused?.focus();                // return focus — the step everyone forgets
+  };
+}, [open]);</code></pre>
+  <div class="note">
+    Two current-events points: the native <code>&lt;dialog&gt;</code> element with <code>showModal()</code> gives
+    focus trapping, Escape handling, <code>::backdrop</code>, and top-layer rendering (above all stacking contexts —
+    no portal needed) for free, and the Popover API covers lighter-weight overlays; know they exist and why libraries
+    still wrap them (styling control, animation coordination, older-browser support). And toasts: a single portal
+    container with <code>aria-live="polite"</code> so announcements happen without focus theft — focus-stealing
+    toasts are an a11y bug interviewers love to probe.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="legacy">8. Legacy pattern literacy: HOC → render props → hooks <span class="tier tier-3">T3</span></h2>
+
+  <p>
+    All three patterns answer the same question — <em>how do we share stateful logic between components?</em> — and
+    the progression is a favorite knowledge-check because it tests whether you understand <em>why</em> the ecosystem
+    moved, not just that it did. You'll also read all three in any codebase older than ~2019.
+  </p>
+
+  <h3>Higher-order components</h3>
+  <pre><code>// A HOC is a function: Component in → enhanced Component out.
+function withAuth&lt;P extends object&gt;(Wrapped: React.ComponentType&lt;P &amp; { user: User }&gt;) {
+  return function WithAuth(props: P) {
+    const user = useCurrentUser();               // (modern HOCs use hooks inside)
+    if (!user) return &lt;LoginRedirect /&gt;;
+    return &lt;Wrapped {...props} user={user} /&gt;;   // inject props
+  };
+}
+
+const AccountPage = withAuth(AccountPageInner);
+// Pre-hooks equivalents: connect(mapState, mapDispatch)(Component), withRouter(Component)</code></pre>
+  <p>Its problems, each worth naming precisely:</p>
+  <ul>
+    <li><strong>Wrapper hell:</strong> <code>withAuth(withTheme(withRouter(connect(...)(Page))))</code> — deep
+      devtools trees, and composition order can matter invisibly.</li>
+    <li><strong>Prop collisions:</strong> injected props share one flat namespace. Two HOCs injecting
+      <code>data</code>, or an injected <code>user</code> clobbering a real prop — silent, no type error in the JS
+      era.</li>
+    <li><strong>Indirection:</strong> reading the component tells you nothing about where <code>user</code> comes
+      from; you must find the wrapping call.</li>
+    <li><strong>Static hoisting &amp; refs:</strong> the wrapper doesn't automatically carry the inner component's
+      statics (hence the <code>hoist-non-react-statics</code> package) and swallows refs (hence
+      <code>forwardRef</code> plumbing in every serious HOC).</li>
+    <li><strong>Don't call inside render:</strong> <code>withAuth(Foo)</code> inside a component creates a new type
+      per render → full remount of that subtree every time. HOCs are module-scope decorations.</li>
+  </ul>
+
+  <h3>Render props</h3>
+  <pre><code>// Share logic by passing a FUNCTION that receives the state and returns UI.
+class MouseTracker extends React.Component {
+  state = { x: 0, y: 0 };
+  handleMove = (e) =&gt; this.setState({ x: e.clientX, y: e.clientY });
+  render() {
+    return &lt;div onMouseMove={this.handleMove}&gt;{this.props.children(this.state)}&lt;/div&gt;;
+  }
+}
+
+&lt;MouseTracker&gt;
+  {({ x, y }) =&gt; &lt;Crosshair x={x} y={y} /&gt;}     {/* explicit — no hidden injection */}
+&lt;/MouseTracker&gt;</code></pre>
+  <p>
+    Render props fixed HOCs' worst sins — the data flow is <em>explicit</em> (you see exactly what you receive and
+    name it yourself, so no collisions) and composition happens at usage site, dynamically. The new problem: consuming
+    several sources nests into a pyramid of closures ("callback hell, JSX edition"), and everything below the render
+    prop re-renders whenever the provider updates, with awkward memoization ergonomics.
+  </p>
+
+  <h3>Why hooks won</h3>
+  <pre><code>// The same logic as a hook: flat, explicit, composable, typed.
+function useMouse() {
+  const [pos, setPos] = useState({ x: 0, y: 0 });
+  useEffect(() =&gt; {
+    const onMove = (e: MouseEvent) =&gt; setPos({ x: e.clientX, y: e.clientY });
+    window.addEventListener('mousemove', onMove);
+    return () =&gt; window.removeEventListener('mousemove', onMove);
+  }, []);
+  return pos;
+}
+
+function Page() {
+  const { x, y } = useMouse();     // three sources = three lines, not three wrappers
+  const user = useAuth();
+  const theme = useTheme();
+}</code></pre>
+  <p>
+    Hooks share <em>logic</em> without imposing <em>structure</em>: no extra components in the tree, no namespace to
+    collide (you name the return value), values traceable to an import, composition is sequential lines instead of
+    nesting, and TypeScript inference is natural. The cost — "rules of hooks" (top-level only, consistent order) —
+    exists precisely because hooks rely on call order for state identity, which is the trade the ecosystem accepted.
+  </p>
+
+  <h3>When you still see HOCs and render props — legitimately</h3>
+  <ul>
+    <li><strong><code>React.memo</code></strong> is a HOC. So is <code>forwardRef</code> (pre-19). The <em>shape</em>
+      never died — component-in, component-out is still how you decorate a component wholesale.</li>
+    <li><strong>Cross-cutting wrappers that gate rendering:</strong> <code>withAuth</code>/<code>withPermission</code>
+      around route components remain reasonable — a hook can't <em>prevent</em> a component from rendering; a wrapper
+      can. (Error boundaries, similarly, are structural and often applied as <code>withErrorBoundary(Widget)</code>.)</li>
+    <li><strong>Render props survive where UI depends on values only the component can provide per-render:</strong>
+      Downshift's prop getters, TanStack Virtual's row callbacks, <code>&lt;Formik&gt;</code>/<code>Controller</code>'s
+      <code>render</code> — a render prop is just "component-as-prop with arguments" (§10) and is still idiomatic.</li>
+    <li><strong>Legacy migration reading:</strong> <code>connect</code> → <code>useSelector/useDispatch</code>;
+      <code>withRouter</code> → <code>useNavigate/useParams</code>; a <code>class + render prop</code> logic provider →
+      a custom hook. In interviews about legacy codebases, propose incremental strangler migration, never a rewrite.</li>
+  </ul>
+
+  <!-- ============================================================ -->
+  <h2 id="headless">9. The headless UI pattern <span class="tier tier-2">T2</span></h2>
+
+  <h3>Logic and accessibility without styles</h3>
+  <p>
+    A headless component ships <strong>behavior, state, and accessibility — and no visual opinion</strong>. The
+    insight behind the pattern: in a Select or Combobox, the styling is the easy 20% and the <em>hard 80% is
+    invisible</em> — keyboard interaction per the WAI-ARIA Authoring Practices, focus management, ARIA wiring,
+    type-ahead, portal positioning, touch/screen-reader quirks. Headless libraries let you buy the hard 80% and own
+    the 20% that differentiates your product. The major players, on a spectrum of "how much do they render":
+  </p>
+  <table>
+    <thead>
+      <tr><th>Library</th><th>Form</th><th>Notes</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Radix Primitives</strong></td>
+        <td>Unstyled compound components</td>
+        <td>Renders real DOM with ARIA + keyboard done; style via className/data-attributes; <code>asChild</code> for
+          composition. The base of shadcn/ui.</td>
+      </tr>
+      <tr>
+        <td><strong>Headless UI</strong></td>
+        <td>Unstyled components (render-prop state)</td>
+        <td>Tailwind Labs; exposes state like <code>{ open, active }</code> to className callbacks.</td>
+      </tr>
+      <tr>
+        <td><strong>React Aria</strong></td>
+        <td><em>Hooks</em> (+ newer components)</td>
+        <td>Adobe; maximum control — <code>useButton</code>, <code>useComboBox</code> return prop bags you spread onto
+          your own JSX; deepest a11y/i18n rigor.</td>
+      </tr>
+      <tr>
+        <td><strong>TanStack Table</strong></td>
+        <td>Hook, renders <em>nothing</em></td>
+        <td>Pure table state machine (sorting, filtering, grouping, pagination); you render every
+          <code>&lt;td&gt;</code>. Fully headless — works with divs, canvas, anything.</td>
+      </tr>
+      <tr>
+        <td><strong>Downshift</strong></td>
+        <td>Hook + prop getters</td>
+        <td>The pattern's ancestor (Kent C. Dodds); origin of prop getters and the state reducer.</td>
+      </tr>
+    </tbody>
+  </table>
+  <p>
+    Why design systems build on headless bases rather than forking a styled kit: a styled library (MUI, Ant) bakes in
+    a design language you then fight with overrides — every override is a fragile coupling to its internal DOM.
+    Headless flips the ownership: your design system owns 100% of the visuals and none of the behavior maintenance.
+    The trade-offs to volunteer: more assembly required (you write the styled layer), bundle scrutiny per primitive,
+    and you inherit the library's compound API shape as your API's foundation.
+  </p>
+
+  <h3>The state reducer pattern — inversion of control, final form</h3>
+  <p>
+    Prop like <code>onChange</code> lets callers <em>observe</em> state changes; a <strong>state reducer</strong> lets
+    callers <em>intercept and modify</em> them. The component runs every proposed state transition through a
+    caller-supplied reducer, so consumers can veto or alter behavior the author never anticipated — without new props:
+  </p>
+  <pre><code>// Inside the headless component (Downshift-style):
+function useToggle({ stateReducer = (s, a) =&gt; a.changes } = {}) {
+  const [state, dispatch] = useReducer((state, action) =&gt; {
+    const changes = toggleReducer(state, action);          // 1. default logic proposes
+    return stateReducer(state, { ...action, changes });    // 2. caller gets final say
+  }, { on: false });
+
+  return {
+    on: state.on,
+    toggle: () =&gt; dispatch({ type: 'toggle' }),
+    setOff: () =&gt; dispatch({ type: 'setOff' }),
+  };
+}
+
+// Consumer: "clicking outside should NOT close the menu while an item is being dragged"
+// — a requirement the author never imagined, solved with zero library changes:
+useSelect({
+  stateReducer: (state, action) =&gt; {
+    if (action.type === 'blur' &amp;&amp; isDragging) {
+      return { ...action.changes, isOpen: state.isOpen };  // override just that field
+    }
+    return action.changes;                                  // everything else: default
+  },
+});</code></pre>
+  <div class="senior">
+    Present the escalation ladder of control APIs: <code>onChange</code> (observe) → controlled props (own one value)
+    → state reducer (intercept <em>every transition</em>). Each step hands the consumer more control and costs more
+    API surface — action types become public API you must version. The state reducer is the "ultimate inversion of
+    control" answer, and citing Downshift as its origin (and noting Kent Dodds designed it after drowning in
+    feature-request props) shows you know the lineage, not just the trick.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="composition">10. Composition techniques <span class="tier tier-2">T2</span></h2>
+
+  <h3>children and named slots</h3>
+  <pre><code>// children: the single-slot default.
+&lt;Card&gt;{anything}&lt;/Card&gt;
+
+// Named slots: multiple insertion points via element-typed props.
+function Layout({ sidebar, header, children }: {
+  sidebar: React.ReactNode; header: React.ReactNode; children: React.ReactNode;
+}) {
+  return (
+    &lt;div className="layout"&gt;
+      &lt;header&gt;{header}&lt;/header&gt;
+      &lt;aside&gt;{sidebar}&lt;/aside&gt;
+      &lt;main&gt;{children}&lt;/main&gt;
+    &lt;/div&gt;
+  );
+}
+&lt;Layout header={&lt;SearchBar /&gt;} sidebar={&lt;Nav /&gt;}&gt;…&lt;/Layout&gt;</code></pre>
+  <p>
+    Slots-as-props vs compound children (<code>&lt;Layout.Header&gt;</code>): slots are simpler and typed trivially;
+    compounds read more like HTML and allow interleaving with arbitrary markup. For fixed structural layouts, slots;
+    for widgets where callers own arrangement, compounds. Also remember the performance footnote from tutorial 07:
+    element props are created by the <em>parent</em>, so they don't re-render when the receiving component's own
+    state changes — composition is a performance tool, not just an ergonomics one.
+  </p>
+
+  <h3>Component-as-prop vs element-as-prop vs render callback</h3>
+  <pre><code>&lt;Table
+  emptyState={&lt;EmptyIllustration /&gt;}           // ELEMENT: caller configures it fully, now
+  rowActions={(row) =&gt; &lt;Actions id={row.id} /&gt;} // RENDER CALLBACK: needs per-row data
+  icon={StarIcon}                               // COMPONENT (capitalized type): Table
+/&gt;                                              // instantiates it with ITS chosen props</code></pre>
+  <p>
+    The rule: pass an <strong>element</strong> when the caller can fully configure it up front; pass a
+    <strong>render callback</strong> when it needs data only the component has (row, index, state); pass a
+    <strong>component type</strong> when the component must control the props (e.g. it decides the icon's size and
+    color per state). Naming which of the three a design calls for — and why — is a very cheap way to sound senior in
+    a machine-coding round.
+  </p>
+
+  <h3>cloneElement — the problems in detail (the §2 promise)</h3>
+  <p>
+    <code>cloneElement(child, newProps)</code> copies an element with merged props. Legacy compound components used it
+    to inject state into children. The React docs now mark it "uncommon and can lead to fragile code" — here is the
+    precise indictment:
+  </p>
+  <ul>
+    <li><strong>Implicit contract.</strong> The child receives props nobody passed in the visible JSX.
+      <code>&lt;Tab&gt;</code> works only because a parent secretly injects <code>isActive</code>/<code>onSelect</code>
+      — unreadable at the call site, undiscoverable in types (the injected props must be optional in the child's
+      props type, weakening it for every other consumer).</li>
+    <li><strong>Direct-child fragility.</strong> The parent walks <code>React.Children</code> — one level deep. Wrap a
+      Tab in a Tooltip, a fragment, or your own <code>&lt;UpgradeTab /&gt;</code> abstraction and injection hits the
+      wrapper instead of the Tab. Consumers discover this as "my component broke when I refactored my own JSX", the
+      worst kind of API violation. (Also: filtering children by <code>child.type === Tab</code> breaks across
+      module duplication, HMR, and wrapping in <code>memo</code>.)</li>
+    <li><strong>Merge hazards.</strong> <code>cloneElement</code> shallow-merges: injected props <em>overwrite</em>
+      same-named child props. Both parent and consumer set <code>onClick</code> or <code>className</code>? One
+      silently wins — correct merging (compose handlers, concat classNames, merge styles) is manual work
+      cloneElement doesn't do.</li>
+    <li><strong>Refs and keys.</strong> <code>ref</code> and <code>key</code> aren't ordinary props; preserving a
+      consumer's ref while attaching your own requires deliberate ref-composition. Naive clones drop or clobber
+      refs.</li>
+  </ul>
+  <p><strong>Modern alternatives, by use case:</strong></p>
+  <ul>
+    <li><strong>Sharing state with descendants → context</strong> (compound components, §2): any depth, explicit
+      consumption via hook, type-safe, survives wrappers.</li>
+    <li><strong>Rendering as a different element while keeping behavior → the <code>asChild</code>/Slot
+      pattern</strong> (Radix): the component renders its child <em>as</em> its root and merges props
+      <em>correctly</em> — event handlers composed (both run), classNames concatenated, styles merged, refs composed.
+      Same power as cloneElement, but opt-in, single-child, with defined merge semantics:</li>
+  </ul>
+  <pre><code>// Radix Slot in essence:
+import { Slot } from '@radix-ui/react-slot';
+
+function Button({ asChild, ...props }: ButtonProps &amp; { asChild?: boolean }) {
+  const Comp = asChild ? Slot : 'button';
+  return &lt;Comp {...props} /&gt;;      // Slot merges props ONTO the child element
+}
+
+// Consumer: Button's classes/handlers land on the router Link — one DOM node, no nesting:
+&lt;Button asChild&gt;
+  &lt;Link to="/settings"&gt;Settings&lt;/Link&gt;
+&lt;/Button&gt;</code></pre>
+  <ul>
+    <li><strong>Per-datum rendering → render callbacks</strong>, and <strong>caller-owned markup → children</strong>
+      — both make the data flow visible instead of injected.</li>
+  </ul>
+  <div class="note">
+    Interview sequencing tip: if asked "how did libraries build compound components before context was cheap?",
+    describe cloneElement fairly (it worked, and reading it is still required literacy), then pivot to why context +
+    Slot replaced it. Dismissing legacy patterns without being able to operate them reads as shallow.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="misc">11. Advanced misc patterns <span class="tier tier-3">T3</span></h2>
+
+  <h3>Lazy initialization</h3>
+  <pre><code>// ❌ runs the expensive fn on EVERY render (result discarded after mount)
+const [state] = useState(buildInitialState(props.bigBlob));
+
+// ✅ initializer fn: runs once, on mount only
+const [state] = useState(() =&gt; buildInitialState(props.bigBlob));
+
+// Same idea for useReducer's third argument:
+const [state, dispatch] = useReducer(reducer, props.raw, initFromRaw);
+
+// And for expensive refs (before React 19's simpler stories):
+const storeRef = useRef&lt;Store&gt;();
+if (!storeRef.current) storeRef.current = createStore();   // guard, not useRef(createStore())</code></pre>
+
+  <h3>Ref forwarding and useImperativeHandle — sparingly</h3>
+  <pre><code>type VideoHandle = { play: () =&gt; void; seek: (t: number) =&gt; void };
+
+const VideoPlayer = forwardRef&lt;VideoHandle, Props&gt;(function VideoPlayer(props, ref) {
+  const el = useRef&lt;HTMLVideoElement&gt;(null);
+  useImperativeHandle(ref, () =&gt; ({
+    play: () =&gt; el.current?.play(),
+    seek: (t) =&gt; { if (el.current) el.current.currentTime = t; },
+  }), []);
+  return &lt;video ref={el} {...props} /&gt;;
+});
+// Parent: playerRef.current?.play()</code></pre>
+  <p>
+    <code>useImperativeHandle</code> curates what a ref exposes — a narrow imperative API instead of the raw DOM node.
+    Legitimate uses are <em>verbs that don't map to state</em>: <code>focus()</code>, <code>scrollIntoView()</code>,
+    <code>play()</code>, <code>openPicker()</code>. The senior framing: imperative handles are an escape hatch —
+    if you're exposing <code>setValue</code>-style handles, the data should have been props. React 19 note:
+    <code>ref</code> is a normal prop now (<code>function VideoPlayer({ ref, ...props })</code>), so
+    <code>forwardRef</code> is legacy-in-place; the <em>judgment</em> about imperative APIs is unchanged.
+  </p>
+
+  <h3>The controlled-prop pattern — the full contract</h3>
+  <p>Pulling §1 and §2 together, the contract every reusable stateful component should honor:</p>
+  <ul>
+    <li><code>value</code> present → controlled: render from the prop, never from internal state; call
+      <code>onChange</code> with the <em>proposed</em> value and change nothing yourself. (The caller can veto by not
+      updating — that's a feature.)</li>
+    <li><code>defaultValue</code> only → uncontrolled: internal state seeded once; <code>defaultValue</code> changes
+      after mount are ignored (callers wanting reset should <code>key</code> the component).</li>
+    <li>Both provided → controlled wins; warn in dev.</li>
+    <li>Mode switch after mount (value: <code>undefined</code> → defined or back) → warn in dev, keep first-render
+      mode. This is the exact warning React gives for inputs, generalized.</li>
+  </ul>
+  <pre><code>if (process.env.NODE_ENV !== 'production') {
+  const wasControlled = useRef(value !== undefined).current;
+  const isControlled = value !== undefined;
+  if (wasControlled !== isControlled) {
+    console.warn(
+      `Select is changing from ${wasControlled ? 'controlled' : 'uncontrolled'} to ` +
+      `${isControlled ? 'controlled' : 'uncontrolled'}. Decide once for the component's lifetime.`
+    );
+  }
+}</code></pre>
+
+  <h3>Provider composition</h3>
+  <pre><code>// The pyramid every app grows:
+&lt;QueryClientProvider client={qc}&gt;
+  &lt;ThemeProvider&gt;&lt;AuthProvider&gt;&lt;FlagsProvider&gt;&lt;Router&gt;…&lt;/Router&gt;&lt;/FlagsProvider&gt;&lt;/AuthProvider&gt;&lt;/ThemeProvider&gt;
+&lt;/QueryClientProvider&gt;
+
+// Flatten with a composer — order still matters (later depends on earlier):
+function composeProviders(...providers) {
+  return ({ children }) =&gt;
+    providers.reduceRight((kids, [Provider, props]) =&gt;
+      &lt;Provider {...props}&gt;{kids}&lt;/Provider&gt;, children);
+}
+const AppProviders = composeProviders(
+  [QueryClientProvider, { client: qc }], [ThemeProvider, {}], [AuthProvider, {}],
+);</code></pre>
+  <p>
+    The nesting itself is harmless (providers are cheap); the real reviewable concerns are <strong>order</strong>
+    (Auth may need QueryClient; Router position affects what hooks are usable where) and <strong>value
+    stability</strong> per tutorial 11 — each provider memoizes its value or its consumers pay.
+  </p>
+
+  <h3>Prop getters</h3>
+  <pre><code>// Headless hooks return FUNCTIONS that produce prop bags, merging your props correctly:
+const { getToggleButtonProps, getMenuProps } = useSelect(...);
+
+&lt;button
+  {...getToggleButtonProps({
+    onClick: () =&gt; analytics.track('opened'),   // COMPOSED with internal onClick, not clobbered
+    className: 'my-btn',                        // merged
+  })}
+/&gt;
+
+// Inside the library — the merge is the point:
+function getToggleButtonProps(userProps = {}) {
+  return {
+    ...internalProps,
+    ...userProps,
+    onClick: callAll(internalProps.onClick, userProps.onClick),  // both run
+  };
+}
+const callAll = (...fns) =&gt; (...args) =&gt; fns.forEach((fn) =&gt; fn?.(...args));</code></pre>
+  <p>
+    Prop getters exist because spreading two prop objects clobbers handlers — the getter owns the merge policy
+    (compose handlers, concat classes). They're the hook-era answer to the same problem cloneElement mishandled, and
+    <code>callAll</code> is a two-line implementation interviewers sometimes ask for verbatim.
+  </p>
+
+  <!-- ============================================================ -->
+  <h2 id="machine-coding">12. Machine-coding challenges <span class="tier tier-1">T1</span></h2>
+
+  <p>
+    The classic senior round: 45–60 minutes, a working widget, your own machine or a bare sandbox, usually no
+    libraries. The rotation is small — <strong>Tabs, Accordion, Modal, Autocomplete/Typeahead, Star rating, OTP
+    input</strong>, plus occasional Carousel, Toast system, Nested comments, and Infinite scroll. Tabs was fully built
+    in §2; below are complete Accordion, Modal, and Star rating implementations, then attack notes for Autocomplete
+    and OTP, and the rubric interviewers actually grade with.
+  </p>
+
+  <h3>What's actually being graded</h3>
+  <ul>
+    <li><strong>State design first.</strong> Minimal state, derived values computed not stored, impossible states
+      unrepresentable. Narrate it before typing: "state is one <code>openItems: Set&lt;string&gt;</code>; everything
+      else derives."</li>
+    <li><strong>API design.</strong> Controlled + uncontrolled support, composition surface, sensible defaults —
+      §1 and §2 applied live.</li>
+    <li><strong>Accessibility.</strong> Correct roles/ARIA, full keyboard operation, focus management. This is the
+      sharpest differentiator — most candidates skip it; naming the APG pattern you're following is worth more than a
+      pixel-perfect UI.</li>
+    <li><strong>Edge cases.</strong> Empty data, one item, disabled items, rapid clicks, unmount during async,
+      Escape/outside-click interplay.</li>
+    <li><strong>Code organization under time pressure.</strong> Small components, clear names, no dead code. Working
+      and ugly beats broken and beautiful — get it working, then refactor aloud.</li>
+  </ul>
+
+  <h3>Build 1 — Accordion (compound, single or multiple expand, full keyboard)</h3>
+  <pre><code>import { createContext, useContext, useId, useState, type ReactNode } from 'react';
+
+type AccordionCtx = {
+  openItems: Set&lt;string&gt;;
+  toggle: (v: string) =&gt; void;
+  baseId: string;
+};
+const Ctx = createContext&lt;AccordionCtx | null&gt;(null);
+const useAccordion = (part: string) =&gt; {
+  const ctx = useContext(Ctx);
+  if (!ctx) throw new Error(`&lt;${part}&gt; must be inside &lt;Accordion&gt;`);
+  return ctx;
+};
+
+export function Accordion({
+  children, multiple = false, defaultOpen = [],
+}: { children: ReactNode; multiple?: boolean; defaultOpen?: string[] }) {
+  const [openItems, setOpen] = useState(() =&gt; new Set(defaultOpen));
+  const baseId = useId();
+
+  const toggle = (value: string) =&gt;
+    setOpen((prev) =&gt; {
+      const next = new Set(prev);
+      if (next.has(value)) next.delete(value);
+      else {
+        if (!multiple) next.clear();          // single mode: close others
+        next.add(value);
+      }
+      return next;                            // new Set: state must be a new reference
+    });
+
+  return &lt;Ctx.Provider value={{ openItems, toggle, baseId }}&gt;{children}&lt;/Ctx.Provider&gt;;
+}
+
+export function AccordionItem({ value, title, children }: {
+  value: string; title: ReactNode; children: ReactNode;
+}) {
+  const { openItems, toggle, baseId } = useAccordion('AccordionItem');
+  const open = openItems.has(value);
+  const headerId = `${baseId}-${value}-header`;
+  const panelId  = `${baseId}-${value}-panel`;
+
+  return (
+    &lt;div className="accordion-item"&gt;
+      &lt;h3&gt;                                    {/* heading wrapper: real document outline */}
+        &lt;button
+          id={headerId}
+          aria-expanded={open}
+          aria-controls={panelId}
+          onClick={() =&gt; toggle(value)}
+        &gt;
+          {title}
+          &lt;span aria-hidden="true"&gt;{open ? '−' : '+'}&lt;/span&gt;
+        &lt;/button&gt;
+      &lt;/h3&gt;
+      &lt;div id={panelId} role="region" aria-labelledby={headerId} hidden={!open}&gt;
+        {children}
+      &lt;/div&gt;
+    &lt;/div&gt;
+  );
+}</code></pre>
+  <p>Points to narrate while building:</p>
+  <ul>
+    <li><strong>A real <code>&lt;button&gt;</code> inside a heading</strong> gives Enter/Space activation, focusability,
+      and screen-reader semantics for free — a <code>div onClick</code> is the instant-fail version.
+      <code>aria-expanded</code> on the trigger + <code>aria-controls</code> to the panel is the APG accordion
+      contract; keyboard is just Tab between triggers (roving arrows are optional for accordions, required for tabs).</li>
+    <li><strong><code>Set</code> unifies single/multiple modes</strong> — single mode is "clear before add", not a
+      different state shape. <code>hidden</code> keeps closed panels in the DOM (find-in-page, no remount cost);
+      conditional rendering is the right call instead when panels are heavy — say the trade-off out loud.</li>
+    <li>Extensions to offer unprompted: controlled mode (<code>value/onValueChange</code> via
+      <code>useControllableState</code>), <code>disabled</code> items, animation (grid-rows or
+      <code>max-height</code> trick, since <code>height: auto</code> doesn't transition).</li>
+  </ul>
+
+  <h3>Build 2 — Modal (portal + focus trap + scroll lock)</h3>
+  <pre><code>import { useEffect, useRef, type ReactNode } from 'react';
+import { createPortal } from 'react-dom';
+
+const FOCUSABLE =
+  'a[href], button:not([disabled]), input:not([disabled]), select, textarea, [tabindex]:not([tabindex="-1"])';
+
+export function Modal({ open, onClose, title, children }: {
+  open: boolean; onClose: () =&gt; void; title: string; children: ReactNode;
+}) {
+  const dialogRef = useRef&lt;HTMLDivElement&gt;(null);
+
+  useEffect(() =&gt; {
+    if (!open) return;
+    const previouslyFocused = document.activeElement as HTMLElement | null;
+    const dialog = dialogRef.current!;
+
+    // Initial focus: first focusable inside, else the dialog itself
+    const focusables = dialog.querySelectorAll&lt;HTMLElement&gt;(FOCUSABLE);
+    (focusables[0] ?? dialog).focus();
+
+    const onKeyDown = (e: KeyboardEvent) =&gt; {
+      if (e.key === 'Escape') { e.stopPropagation(); onClose(); return; }
+      if (e.key !== 'Tab') return;
+      // Focus trap: wrap Tab at the edges
+      const list = dialog.querySelectorAll&lt;HTMLElement&gt;(FOCUSABLE);
+      if (list.length === 0) return;
+      const first = list[0], last = list[list.length - 1];
+      if (e.shiftKey &amp;&amp; document.activeElement === first) { e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey &amp;&amp; document.activeElement === last) { e.preventDefault(); first.focus(); }
+    };
+
+    document.addEventListener('keydown', onKeyDown);
+    document.body.style.overflow = 'hidden';                 // scroll lock
+    return () =&gt; {
+      document.removeEventListener('keydown', onKeyDown);
+      document.body.style.overflow = '';
+      previouslyFocused?.focus();                            // return focus
+    };
+  }, [open, onClose]);
+
+  if (!open) return null;
+
+  return createPortal(
+    &lt;div className="overlay" onMouseDown={(e) =&gt; { if (e.target === e.currentTarget) onClose(); }}&gt;
+      &lt;div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="modal-title"
+        tabIndex={-1}
+        className="dialog"
+      &gt;
+        &lt;h2 id="modal-title"&gt;{title}&lt;/h2&gt;
+        {children}
+        &lt;button onClick={onClose} aria-label="Close dialog"&gt;×&lt;/button&gt;
+      &lt;/div&gt;
+    &lt;/div&gt;,
+    document.body
+  );
+}</code></pre>
+  <ul>
+    <li><strong>The five behaviors that make or break it</strong> (recite before coding): initial focus in, focus
+      trapped, focus returned on close, Escape closes, background scroll locked. <code>role="dialog"</code> +
+      <code>aria-modal="true"</code> + a label; add <code>inert</code> on the app root (§7) as the modern upgrade over
+      the Tab-wrap trap.</li>
+    <li><strong>Overlay close uses <code>e.target === e.currentTarget</code></strong> on <code>mousedown</code> — the
+      classic bug is closing when a click <em>starts</em> inside the dialog (text selection) and ends on the overlay;
+      mousedown-based checks avoid it.</li>
+    <li>Mention without building: stacking multiple modals (a manager stack; Escape closes topmost), the native
+      <code>&lt;dialog&gt;.showModal()</code> alternative and why you're hand-rolling (the exercise), and unmount vs
+      <code>hidden</code> for the closed state (unmount resets form state — often desirable).</li>
+  </ul>
+
+  <h3>Build 3 — Star rating (the radio-group insight)</h3>
+  <pre><code>export function StarRating({
+  max = 5, value, onChange, name = 'rating',
+}: { max?: number; value: number; onChange: (v: number) =&gt; void; name?: string }) {
+  const [hover, setHover] = useState&lt;number | null&gt;(null);
+  const display = hover ?? value;
+
+  return (
+    &lt;fieldset
+      role="radiogroup"
+      aria-label="Rating"
+      onMouseLeave={() =&gt; setHover(null)}
+      className="stars"
+    &gt;
+      {Array.from({ length: max }, (_, i) =&gt; {
+        const starValue = i + 1;
+        return (
+          &lt;label key={starValue} onMouseEnter={() =&gt; setHover(starValue)}&gt;
+            &lt;input
+              type="radio"
+              name={name}
+              value={starValue}
+              checked={value === starValue}
+              onChange={() =&gt; onChange(starValue)}
+              className="visually-hidden"
+            /&gt;
+            &lt;span aria-hidden="true"&gt;{starValue &lt;= display ? '★' : '☆'}&lt;/span&gt;
+            &lt;span className="visually-hidden"&gt;
+              {starValue} star{starValue &gt; 1 ? 's' : ''}
+            &lt;/span&gt;
+          &lt;/label&gt;
+        );
+      })}
+    &lt;/fieldset&gt;
+  );
+}
+// .visually-hidden = clip-path/1px-clip CSS, keeps inputs focusable &amp; announced.
+// display:none would remove them from tab order and break everything.</code></pre>
+  <p>
+    The senior move here is recognizing the widget <em>is a radio group</em>: native radios give you arrow-key
+    selection, Tab as one stop, form participation (<code>name=rating</code> in FormData), and screen-reader
+    announcements — for free. Hover preview is the only genuinely custom state (<code>display = hover ?? value</code>
+    — derived, not stored twice). Candidates who build div-stars and then bolt on <code>tabIndex</code>, key handlers,
+    and ARIA are re-implementing the platform, badly, on the clock.
+  </p>
+
+  <h3>Attack notes — Autocomplete and OTP input</h3>
+  <p><strong>Autocomplete/Typeahead</strong> (the hardest of the set — usually a strong-senior filter):</p>
+  <ul>
+    <li>State: <code>query</code>, <code>results</code>, <code>isOpen</code>, <code>activeIndex</code> (keyboard
+      highlight). Derived: nothing stored that can be computed.</li>
+    <li>Async discipline is the real test: debounce (~300ms), <strong>stale-response guard</strong> (AbortController
+      or a request-id check — the "results for 'par' overwrite results for 'paris'" bug is what they're fishing for),
+      empty-query short-circuit, loading/empty/error states.</li>
+    <li>Keyboard: ArrowDown/Up move <code>activeIndex</code> (with wrap), Enter selects, Escape closes, input keeps
+      DOM focus the whole time — highlight is <em>virtual</em> (<code>aria-activedescendant</code> pointing at the
+      active option's id), not real focus movement.</li>
+    <li>ARIA combobox pattern: input has <code>role="combobox"</code>, <code>aria-expanded</code>,
+      <code>aria-controls</code>; the list is <code>role="listbox"</code> with <code>role="option"</code> children +
+      <code>aria-selected</code>. Outside-click closes (mousedown listener; remember the portal containment caveat
+      from §7 if the list is portaled).</li>
+  </ul>
+  <p><strong>OTP input</strong> (6 boxes, one digit each):</p>
+  <ul>
+    <li>State: a single <code>string</code> (or array) of length ≤ 6 — not six useStates. Each box renders one char;
+      one source of truth makes paste and delete tractable.</li>
+    <li>Behaviors graded: typing a digit advances focus; Backspace on an empty box focuses the previous box and
+      clears it; <strong>paste of "492817" distributes across boxes</strong> (handle <code>onPaste</code> on the
+      container, slice to length, focus the next empty); arrow keys navigate; non-digits rejected
+      (<code>inputMode="numeric"</code>, <code>pattern="[0-9]*"</code>, filter in the handler).</li>
+    <li>A11y: each input labeled ("Digit 1 of 6"), or — the pragmatic alternative worth mentioning — one visually
+      segmented single input with <code>autocomplete="one-time-code"</code> so SMS autofill works; a hidden combined
+      value for the form either way.</li>
+    <li>Refs: an array of refs (<code>refs.current[i]</code>) for focus control — a natural place to show you know
+      callback refs.</li>
+  </ul>
+
+  <div class="senior">
+    Round management, which is graded even though it isn't on the rubric: restate requirements and get agreement on
+    scope ("controlled or uncontrolled? multiple open at once?"); state your plan and state shape before typing; build
+    in vertical slices that always run (static markup → state → keyboard → a11y polish); test in the browser as you
+    go, don't debug a 200-line dump at minute 40; and when time runs out, spend the last two minutes listing what
+    you'd do next (animation, virtualization, RTL, tests) — a prioritized backlog is senior signal, silence is not.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="qa">Interview Q&amp;A</h2>
+
+  <details class="qa">
+    <summary>Q1. "What are compound components and when would you choose them over a props-based API?"</summary>
+    <div class="answer">
+      <p>A set of components sharing implicit state through context — parent owns state, children consume it —
+      modeled on <code>&lt;select&gt;/&lt;option&gt;</code>. Choose them when consumers need to own the markup:
+      reorder parts, interleave arbitrary elements, style structurally. A configuration API (<code>items</code> prop)
+      wins when rendering is data-driven or the component must own iteration (virtualized lists). They're not
+      exclusive: libraries ship compound primitives plus a convenience wrapper built on them. I'd also mention the
+      invariant trade: config APIs can enforce structure; compounds trade that for freedom, so guard with a
+      context-missing error that names the fix ("Tab must be inside Tabs").</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q2. "Why implement compound components with context instead of React.Children + cloneElement?"</summary>
+    <div class="answer">
+      <p>cloneElement injection only reaches <em>direct children of the expected type</em> — wrap a Tab in a Tooltip,
+      a fragment, or the consumer's own abstraction and the injected props hit the wrapper, silently breaking. It's
+      also an implicit contract (props appear that no JSX passed), shallow-merges so same-named props clobber
+      (onClick, className), and mishandles refs/keys. Context reaches any depth, survives wrappers and
+      <code>.map()</code>, is consumed explicitly via a hook, and types cleanly. The React docs themselves now flag
+      cloneElement as fragile and suggest context, render props, or plain data instead.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q3. "Define controlled vs uncontrolled inputs precisely. What makes an input controlled?"</summary>
+    <div class="answer">
+      <p>The <code>value</code> prop — not the presence of handlers. <code>value={state}</code> +
+      <code>onChange</code> makes React state the source of truth: the DOM displays whatever the last render said,
+      and every keystroke round-trips through setState. <code>defaultValue</code> (or nothing) leaves the value in
+      the DOM; you sample it via ref or FormData. An <code>onChange</code> without <code>value</code> is still
+      uncontrolled — handlers are notifications, not control. Corollaries: <code>value</code> without
+      <code>onChange</code> is read-only (React warns), and <code>value</code> flipping between undefined and defined
+      across renders triggers the controlled/uncontrolled switch warning — usually async data feeding
+      <code>value={data?.field}</code>.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q4. "When is an uncontrolled form the right engineering call?"</summary>
+    <div class="answer">
+      <p>When nothing needs to react per-keystroke: login, search, contact forms — read everything at submit with
+      <code>FormData</code> and name attributes, lean on native validation attributes, and pay zero re-renders while
+      typing. File inputs are uncontrolled by necessity. Progressive-enhancement forms (must work pre-hydration)
+      need names and a real action anyway, which is the model React 19 form actions embrace. Controlled earns its
+      cost only for live behavior: masking, character counters, dependent fields, filter-as-you-type, veto logic.
+      And the dichotomy is per-input — a mostly-uncontrolled form with two controlled fields is often the right
+      answer, which is exactly RHF's architecture.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q5. "Why is react-hook-form fast? What does register actually do?"</summary>
+    <div class="answer">
+      <p><code>register(name, rules)</code> returns <code>{ name, ref, onChange, onBlur }</code>. The ref gives RHF
+      the DOM node; values stay in the DOM (uncontrolled), and the handlers update RHF's internal non-React store —
+      no setState per keystroke, so React renders nothing while you type. Re-renders are subscription-based:
+      <code>formState</code> is a Proxy that records which slices you actually read (<code>errors</code>,
+      <code>isDirty</code>…) and re-renders only when those change. Contrast with Formik's model — form values in
+      React state, whole form re-renders per keystroke. The escape valves keep the model honest:
+      <code>Controller</code> makes one field controlled for UI libraries, <code>useWatch</code> scopes reactive
+      reads to a child component, <code>getValues</code> reads without subscribing.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q6. "watch vs useWatch vs getValues — when does each re-render?"</summary>
+    <div class="answer">
+      <p><code>watch('field')</code> subscribes the component that called <code>useForm</code> — typically the whole
+      form — so every change of that field re-renders everything; fine for small forms, a self-inflicted wound in big
+      ones. <code>useWatch({ control, name })</code> subscribes only the component calling it, so you isolate the
+      reactive UI (price summary, conditional section) in a small child that re-renders alone.
+      <code>getValues()</code> never subscribes — a point-in-time read for event handlers and submit logic. The
+      pattern: render from useWatch in leaves, decide from getValues in handlers, and reserve watch for genuinely
+      form-wide reactions.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q7. "Why schema validation with zod over inline rules, and how do types flow?"</summary>
+    <div class="answer">
+      <p>A zod schema is a value: one definition yields the validation rules (via <code>zodResolver</code>), the
+      TypeScript type (<code>z.infer&lt;typeof schema&gt;</code> feeding <code>useForm&lt;T&gt;</code>), and a
+      server-side validator for the same payload — client validation is UX, server validation is enforcement, and a
+      shared schema keeps them from drifting. It also centralizes cross-field rules (<code>refine</code> with a
+      <code>path</code> to attach the error to a field) and coercion (<code>z.coerce.number()</code> — inputs emit
+      strings). Inline register rules scatter logic through JSX, can't be reused server-side, and don't produce a
+      type. The one-liner: schema-first means the form's contract is data, not markup.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q8. "Design a 5-step signup wizard. Where does state live and how does validation work?"</summary>
+    <div class="answer">
+      <p>Decide two things. Data location: either one <code>useForm</code> spanning all steps (steps are views;
+      simplest, good for short wizards) or per-step forms merging into an accumulator
+      (<code>useReducer</code>/small store, sessionStorage-persisted so refresh resumes) — and if drafts must survive
+      devices or later steps depend on server computation, a server-persisted draft resource. Validation: per-step —
+      either <code>trigger([...stepFields])</code> on the single form or a zod schema per step; never full-form
+      validation on step 1. Guard deep links by deriving the furthest-reachable step from accumulated data and
+      clamping. The step indicator goes in the URL; the form data never does. Submission state is a state
+      (<code>'submitting'</code>), not a boolean, so double-submit dies structurally.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q9. "The server rejects a submitted form. How do errors reach the right fields?"</summary>
+    <div class="answer">
+      <p>Map the server's error payload with <code>setError(field, { type: 'server', message })</code>, translated
+      through one function if backend names differ from form names, plus <code>setError('root.serverError')</code>
+      for failures that belong to no field, rendered near the submit button with <code>role="alert"</code>. Two
+      subtleties: server errors have no client rule to clear them, so clear on change of that field (or on next
+      submit); and focus management — send focus to the first server-errored field or an error summary, same as
+      client validation. Also validate the same schema server-side regardless: client checks are UX, the server is
+      the enforcement point, and "email taken" can only ever be known there.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q10. "What do React 19 form actions and useActionState/useFormStatus change?"</summary>
+    <div class="answer">
+      <p><code>&lt;form action={fn}&gt;</code> accepts a function receiving <code>FormData</code>;
+      <code>useActionState</code> wraps it returning <code>[state, wrappedAction, isPending]</code> for error/result
+      plumbing; <code>useFormStatus</code> lets any child of the form read pending state without prop drilling
+      (submit buttons especially). The calculus shift: submission, pending, and error state move into React's
+      primitive, and the model is uncontrolled-first — FormData and name attributes, not per-keystroke state. In RSC
+      frameworks the action can be a server function, giving progressively-enhanced forms that work before hydration.
+      What it doesn't replace: rich client-side field interaction — live validation, dependent fields, arrays, dirty
+      tracking — which stays RHF territory; they compose rather than compete.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q11. "What can't error boundaries catch, and what do you do about each gap?"</summary>
+    <div class="answer">
+      <p>Four gaps. Event handlers — they run after render, so use try/catch, or route into a boundary deliberately
+      with <code>showBoundary</code>. Async code (timeouts, promises, fetch callbacks) — the throw isn't on React's
+      render stack; catch it and either set error state or rethrow during render (the
+      <code>setState(() =&gt; { throw err })</code> trick; TanStack Query's <code>throwOnError</code> does exactly
+      this). Server-side rendering — handled by the framework layer (Next's <code>error.tsx</code>). And the
+      boundary's own render — errors propagate to the next boundary up, so keep fallbacks trivially simple. Bonus
+      points for the mechanism split: <code>getDerivedStateFromError</code> is the pure render-phase state update,
+      <code>componentDidCatch</code> is the commit-phase side-effect slot for logging.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q12. "How do you decide where error boundaries go in an app?"</summary>
+    <div class="answer">
+      <p>By failure blast radius, at three deliberate levels: a root boundary as the never-seen last resort; a
+      boundary per route so a broken page leaves navigation and app shell alive; and widget boundaries around
+      independent failure-prone islands — third-party embeds, charts, comments — where the question is "if this
+      crashes, what's the largest area that's genuinely useless?" Each boundary needs an owner story: reporting in
+      <code>onError</code> (a fallback without telemetry muffles bugs), a reset path wired to fix the cause
+      (<code>onReset</code> refetching, <code>resetKeys</code> on the inputs so navigating away auto-clears), not
+      just a re-render button. Anti-pattern: wrapping everything — you get half-rendered pages that hide real
+      failures.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q13. "A click inside a portal — which onClick handlers fire?"</summary>
+    <div class="answer">
+      <p>Every <code>onClick</code> on the portal's <em>React</em> ancestors, even though the DOM node lives in
+      document.body — React events propagate through the component tree, since React attaches listeners at the root
+      and dispatches synthetically along the React hierarchy. Native DOM listeners on the original ancestors do
+      <em>not</em> fire; the DOM ancestor chain is body-side. Practical consequences: an "outside click" detector
+      using a document listener plus <code>container.contains(e.target)</code> will misclassify clicks inside a
+      portaled dropdown as outside unless you also test containment against the portal node; and a modal that
+      shouldn't trigger its React parent's click handlers needs <code>stopPropagation</code> at the dialog — the
+      React tree carries the event up regardless of the DOM location.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q14. "Why does a modal need a portal at all? z-index: 9999 exists."</summary>
+    <div class="answer">
+      <p>Because z-index competes only within a stacking context. Any ancestor with transform, filter, opacity below
+      1, or will-change creates one, and nothing inside can render above content outside it, whatever its z-index —
+      it's a hierarchy problem, not a magnitude problem. Ancestor <code>overflow: hidden</code> clips too. Portaling
+      to document.body exits every ancestor stacking context and clip, which is the entire point. Follow-ups worth
+      volunteering: the native <code>&lt;dialog&gt;.showModal()</code> renders in the top layer — above all stacking
+      contexts, no portal needed — plus free focus trapping and Escape; and portals move DOM only, so focus
+      management (initial focus, trap or <code>inert</code> background, return focus) is still on you.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q15. "Compare HOCs, render props, and hooks for sharing logic. Why did hooks win?"</summary>
+    <div class="answer">
+      <p>All three share stateful logic. HOCs decorate a component (component in, enhanced component out) but inject
+      props implicitly — namespace collisions, wrapper hell, static/ref plumbing, and you can't tell where a prop
+      comes from. Render props made the flow explicit (you receive and name values at the call site) but nest into
+      pyramids and put logic in JSX. Hooks share logic with no structural footprint: values are named local
+      variables traceable to an import, composition is sequential lines, no extra tree nodes, natural TypeScript.
+      The trade: rules of hooks, because state identity rides on call order. Still-legitimate HOCs: memo, connect,
+      withAuth-style gates (a wrapper can prevent rendering; a hook can't), error-boundary wrappers. Render props
+      survive as prop getters and per-datum render callbacks.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q16. "What does 'headless UI' mean and why would a design system build on Radix or React Aria?"</summary>
+    <div class="answer">
+      <p>Behavior, state, and accessibility shipped without visual opinion — the consumer owns 100% of styling. The
+      economics: in a combobox, styles are the easy part; the WAI-ARIA keyboard contract, focus management, screen
+      reader wiring, and positioning are person-years of edge cases that aren't your product. Styled kits (MUI)
+      bundle a design language you fight via overrides coupled to their DOM; headless libraries invert ownership.
+      Spectrum to name: Radix (unstyled compound components, asChild), Headless UI, React Aria (hooks returning prop
+      bags — maximum control), TanStack Table (renders literally nothing). Trade-offs: you build and maintain the
+      styled layer, and their compound API becomes your API's foundation. shadcn/ui is the proof of pattern: styled
+      copy-paste components over Radix primitives.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q17. "Explain the state reducer pattern. What problem does it solve that props can't?"</summary>
+    <div class="answer">
+      <p>The component computes each proposed state transition, then passes it through a consumer-supplied reducer
+      that gets the final say: <code>stateReducer(state, { ...action, changes })</code>. That lets consumers modify
+      behaviors the author never anticipated — "don't close the menu on blur while dragging" — without a new prop per
+      feature request, which is exactly the failure mode it was invented to stop (Downshift). It's the top of the
+      control ladder: onChange observes, controlled props own a value, the state reducer intercepts every transition.
+      Cost: your action types become public, versioned API. It's the signature move of headless libraries because
+      inversion of control is their whole thesis.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q18. "Spell out the value/defaultValue/onChange contract for a reusable component."</summary>
+    <div class="answer">
+      <p><code>value</code> present on first render → controlled: render from the prop only, report intents via
+      <code>onChange</code> with the proposed value, mutate nothing internal — the caller may veto by not updating.
+      Only <code>defaultValue</code> → uncontrolled: seed internal state once; later defaultValue changes are ignored
+      (resets are the caller's job via <code>key</code>). Both → controlled wins, dev warning. Switching modes
+      mid-lifetime → dev warning, keep first-render mode; the classic trigger is <code>value={data?.x}</code> with
+      async data. Implementation is <code>useControllableState</code>: <code>isControlled = value !== undefined</code>,
+      current = controlled ? prop : internal, setter updates internal only when uncontrolled but always notifies.
+      Radix and MUI both ship exactly this.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q19. "What are prop getters and why do headless hooks return them instead of prop objects?"</summary>
+    <div class="answer">
+      <p>Functions that produce prop bags while merging the consumer's props with correct policy:
+      <code>getToggleButtonProps({ onClick: mine })</code> composes my handler with the internal one
+      (<code>callAll(internal, mine)</code> — both run), concatenates classNames, and keeps ARIA wiring intact. A
+      plain returned object can't do that — spreading consumer props after it clobbers the internal onClick, before
+      it clobbers the consumer's. So the getter owns the merge, the exact problem cloneElement handled badly
+      (silent overwrite). Also worth saying: a getter can accept options that change what it returns
+      (<code>getItemProps({ index })</code>), which a static object can't. Two-line implementation of
+      <code>callAll</code> is a common follow-up — be able to write it.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q20. "In a machine-coding round for an accessible Tabs/Accordion, what separates a senior submission?"</summary>
+    <div class="answer">
+      <p>Sequence and invisible correctness. Seniors clarify the contract first (controlled? multiple open? keyboard
+      spec?), state the minimal state shape aloud (one active value / one Set — everything else derived), then build
+      in always-running slices. The a11y layer is the separator: real buttons, aria-expanded/aria-controls for
+      accordion; role=tablist/tab/tabpanel with aria-selected, roving tabindex, arrow-key navigation for tabs —
+      naming the APG pattern signals you didn't memorize attributes. Then edge cases unprompted: disabled items,
+      zero/one item, rapid toggling, focus after activation. Finally API quality — context-based compound parts with
+      a helpful missing-context error — and a spoken backlog when time expires. Juniors ship divs with onClick and
+      perfect CSS; it fails the round.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q21. "How do you make form validation errors accessible?"</summary>
+    <div class="answer">
+      <p>Four wires. Every input gets a real label (<code>htmlFor</code>; placeholder is not a label). Invalid
+      fields get <code>aria-invalid</code> plus <code>aria-describedby</code> pointing at the error message's id, so
+      the message is announced with the field on focus. Newly appearing errors announce without focus theft via
+      <code>role="alert"</code>/aria-live. On failed submit, move focus to the first invalid field
+      (RHF's <code>shouldFocusError</code> default) or to an error-summary block at the top linking to each field —
+      the GOV.UK pattern, strongest for long forms. Plus judgment calls: don't rely on color alone, don't make a
+      disabled submit button the only invalid signal (no feedback about why), and validate onTouched-ish so users
+      aren't punished mid-typing.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q22. "Your Autocomplete shows results for a previous query. What happened and how do you fix it?"</summary>
+    <div class="answer">
+      <p>A race: responses resolve out of order — the request for "par" returns after the request for "paris" and
+      overwrites newer results. Fixes, strongest first: AbortController — abort the in-flight request whenever a new
+      one starts (and on unmount), so stale responses die at the network layer; or a last-write-wins guard — capture
+      a request id/the query in the closure and ignore responses that aren't the latest. Layer debounce on top so
+      you're not firing per keystroke, and short-circuit empty queries. This generalizes: it's the same stale-closure
+      race as any effect-driven fetch, and the reason query libraries key requests by input — with TanStack Query,
+      <code>queryKey: ['search', term]</code> makes stale responses land in a different cache entry, dissolving the
+      bug structurally.</p>
+    </div>
+  </details>
+
+  <!-- ============================================================ -->
+  <h2 id="exercises">Hands-on exercises</h2>
+
+  <div class="exercise">
+    <h4>Exercise 1 — Build a compound Accordion with controlled mode</h4>
+    <p>Extend the §12 Accordion: support <em>both</em> uncontrolled (<code>defaultOpen</code>) and controlled
+    (<code>open: string[]</code> + <code>onOpenChange</code>) usage via a <code>useControllableState</code>-style
+    hook; warn in dev if the caller switches modes mid-lifetime; add a <code>disabled</code> prop on items; and make
+    single-vs-multiple mode a prop. Verify with two consumers: one fully uncontrolled, one syncing the open set to
+    the URL.</p>
+    <details>
+      <summary>Solution sketch &amp; check</summary>
+      <pre><code>function useControllableSet({ value, defaultValue = [], onChange }) {
+  const [internal, setInternal] = useState(() =&gt; new Set(defaultValue));
+  const isControlled = value !== undefined;
+  const current = isControlled ? new Set(value) : internal;
+
+  if (process.env.NODE_ENV !== 'production') {
+    const wasControlled = useRef(isControlled).current;
+    if (wasControlled !== isControlled)
+      console.warn('Accordion switched controlled mode mid-lifetime');
+  }
+
+  const set = (next: Set&lt;string&gt;) =&gt; {
+    if (!isControlled) setInternal(next);
+    onChange?.([...next]);
+  };
+  return [current, set] as const;
+}
+// toggle() builds the next Set (respecting single/multiple + disabled), then calls set().
+// Checks: (1) in controlled mode, NOT updating parent state must freeze the accordion
+// (caller veto works — you render only from props); (2) URL-sync consumer: open state
+// survives refresh, and back button changes panels — you get undo for free; (3) the
+// dev warning fires if a consumer passes open={maybeUndefined}. If you stored
+// "isOpen" per item component instead of one Set at the root, controlled mode was
+// impossible — state design was the exercise.</code></pre>
+    </details>
+  </div>
+
+  <div class="exercise">
+    <h4>Exercise 2 — Convert a controlled form to RHF + zod</h4>
+    <p>Take (or write) a 10-field signup form implemented with one <code>useState</code> object and hand-rolled
+    validation ifs. Convert it to react-hook-form with a zod schema (including a cross-field password-confirm rule
+    and a coerced number field), <code>mode: 'onTouched'</code>, and a Controller-wrapped custom Select. Add a render
+    counter to each field row and compare before/after re-renders while typing.</p>
+    <details>
+      <summary>Solution sketch &amp; check</summary>
+      <pre><code>const schema = z.object({
+  username: z.string().min(3),
+  age: z.coerce.number().int().min(18),      // input gives "42", not 42
+  password: z.string().min(8),
+  confirm: z.string(),
+  country: z.string().min(1, 'Pick one'),
+  /* ... */
+}).refine((d) =&gt; d.password === d.confirm,
+          { message: 'Passwords must match', path: ['confirm'] });
+
+const { register, control, handleSubmit, formState: { errors } } =
+  useForm&lt;z.infer&lt;typeof schema&gt;&gt;({ resolver: zodResolver(schema), mode: 'onTouched' });
+
+// Text inputs: {...register('username')} — uncontrolled.
+// Custom Select: &lt;Controller name="country" control={control}
+//   render={({ field }) =&gt; &lt;Select {...field} options={countries} /&gt;} /&gt;
+// Render-counter findings to verify: BEFORE — typing in any field re-renders all
+// 10 rows (one state object at the top). AFTER — typing in registered fields
+// re-renders zero rows; the Controller'd Select re-renders only itself on change;
+// error appearance re-renders only because you read formState.errors (Proxy
+// subscription). Bonus check: put watch('password') at the form top and watch the
+// counters light up again — then fix it by moving the strength meter into a child
+// using useWatch.</code></pre>
+    </details>
+  </div>
+
+  <div class="exercise">
+    <h4>Exercise 3 — Error boundary with working retry</h4>
+    <p>Build (or install) an error boundary and wrap a widget whose fetch fails 50% of the time. Requirements: the
+    fallback shows a "Try again" button that actually refetches (not just re-renders), errors are logged once with
+    component stack, navigating to a different <code>userId</code> auto-clears the error, and an async click-handler
+    error also reaches the boundary. Use TanStack Query with <code>throwOnError</code> or a hand-rolled rethrow.</p>
+    <details>
+      <summary>Solution sketch &amp; check</summary>
+      <pre><code>&lt;QueryErrorResetBoundary&gt;
+  {({ reset }) =&gt; (
+    &lt;ErrorBoundary
+      onReset={reset}                          // resets the FAILED QUERY, not just UI
+      resetKeys={[userId]}                     // new user → error no longer relevant
+      onError={(e, info) =&gt; log(e, info.componentStack)}
+      fallbackRender={({ resetErrorBoundary }) =&gt; (
+        &lt;div role="alert"&gt;
+          Failed. &lt;button onClick={resetErrorBoundary}&gt;Try again&lt;/button&gt;
+        &lt;/div&gt;
+      )}&gt;
+      &lt;Suspense fallback={&lt;Skeleton /&gt;}&gt;
+        &lt;UserWidget userId={userId} /&gt;        {/* useSuspenseQuery / throwOnError */}
+      &lt;/Suspense&gt;
+    &lt;/ErrorBoundary&gt;
+  )}
+&lt;/QueryErrorResetBoundary&gt;
+// Async handler → boundary: const { showBoundary } = useErrorBoundary();
+//   onClick={async () =&gt; { try { await risky() } catch (e) { showBoundary(e) } }}
+// Checks that catch real bugs: without onReset={reset}, "Try again" re-renders,
+// the query is still in error state, and the boundary re-trips instantly — verify
+// you saw that failure mode before wiring reset. Without resetKeys, switch userId
+// while in fallback and note the error sticks. And confirm a plain thrown error in
+// onClick WITHOUT showBoundary never reaches the boundary — the gap is real.</code></pre>
+    </details>
+  </div>
+
+  <div class="exercise">
+    <h4>Exercise 4 — Accessible Modal from scratch (portal + focus trap)</h4>
+    <p>Implement the §12 Modal without libraries, then verify with keyboard only: focus enters the dialog on open;
+    Tab and Shift+Tab cycle inside it; Escape closes; focus returns to the trigger button; the background can't be
+    scrolled or tabbed to; clicking the overlay closes but starting a text-selection drag inside the dialog does
+    not. Then swap the Tab-wrap trap for <code>inert</code> on the app root and re-verify.</p>
+    <details>
+      <summary>Solution sketch &amp; check</summary>
+      <pre><code>// Core pieces (full code in §12): createPortal to document.body; role="dialog"
+// aria-modal="true" aria-labelledby; effect that on open (a) stores
+// document.activeElement, (b) focuses first focusable, (c) keydown listener for
+// Escape + Tab-wrapping, (d) locks body scroll — and on cleanup restores all three.
+// Overlay close: onMouseDown with e.target === e.currentTarget (not click!) so a
+// drag that ENDS on the overlay doesn't close.
+//
+// The inert upgrade:
+useEffect(() =&gt; {
+  if (!open) return;
+  const root = document.getElementById('root')!;   // modal portal is OUTSIDE #root
+  root.inert = true;                                // unfocusable + hidden from AT
+  return () =&gt; { root.inert = false; };
+}, [open]);
+// With inert you can DELETE the Tab-wrap handler: the browser now has nowhere else
+// to send focus. Keyboard-only test script: open with Enter on trigger → focus
+// visibly inside; Tab past the last control wraps (or stays contained via inert);
+// Escape → dialog gone AND focus back on the trigger (the step everyone forgets);
+// screen reader sanity: dialog announces its title on open. Common bug you should
+// hit once: putting the portal container inside #root makes inert freeze the modal
+// itself — container placement is part of the design.</code></pre>
+    </details>
+  </div>
+
+  <div class="exercise">
+    <h4>Exercise 5 — Implement the state reducer pattern</h4>
+    <p>Build <code>useToggle({ stateReducer })</code>: default reducer handles <code>toggle/setOn/setOff</code>
+    actions; every proposed transition flows through the consumer's reducer with
+    <code>(state, { type, changes })</code>. Then, as a consumer and without modifying the hook: (a) build a switch
+    that can be turned ON at most 3 times, then ignores further toggles; (b) build a switch that can't be turned off
+    while a "locked" flag is true. Add prop getters (<code>getTogglerProps</code>) that compose consumer onClick with
+    the internal one.</p>
+    <details>
+      <summary>Solution</summary>
+      <pre><code>const callAll = (...fns) =&gt; (...args) =&gt; fns.forEach((fn) =&gt; fn?.(...args));
+
+function toggleReducer(state, action) {
+  switch (action.type) {
+    case 'toggle': return { on: !state.on };
+    case 'setOn':  return { on: true };
+    case 'setOff': return { on: false };
+    default: return state;
+  }
+}
+
+function useToggle({ stateReducer = (s, a) =&gt; a.changes } = {}) {
+  const [state, dispatch] = useReducer(
+    (state, action) =&gt; stateReducer(state, { ...action, changes: toggleReducer(state, action) }),
+    { on: false }
+  );
+  const toggle = () =&gt; dispatch({ type: 'toggle' });
+  const getTogglerProps = ({ onClick, ...props } = {}) =&gt; ({
+    'aria-pressed': state.on,
+    onClick: callAll(onClick, toggle),         // consumer handler AND ours
+    ...props,
+  });
+  return { on: state.on, toggle, getTogglerProps };
+}
+
+// (a) max 3 activations — consumer-side only:
+const [count, setCount] = useState(0);
+const { on, getTogglerProps } = useToggle({
+  stateReducer: (state, action) =&gt; {
+    if (action.type === 'toggle' &amp;&amp; !state.on &amp;&amp; count &gt;= 3) return state; // veto
+    return action.changes;
+  },
+});
+// track activations: &lt;button {...getTogglerProps({ onClick: () =&gt; !on &amp;&amp; setCount(c =&gt; c + 1) })}&gt;
+
+// (b) can't turn off while locked:
+useToggle({
+  stateReducer: (state, action) =&gt;
+    locked &amp;&amp; state.on &amp;&amp; action.changes.on === false ? state : action.changes,
+});
+// Check the design intuition: both features required ZERO new props on useToggle —
+// that's the pattern's entire argument. Then note the cost you just took on:
+// 'toggle'/'setOn'/'setOff' strings are now public API; renaming one is a breaking
+// change. Compare with the alternative you avoided: maxActivations and lockedOff
+// props — and decide which API you'd actually ship for a design system.</code></pre>
+    </details>
+  </div>
+
+  <nav class="page-nav">
+    <a href="11-state-management.html">← Prev: State Management</a>
+    <a href="13-frontend-testing.html">Next: Frontend Testing →</a>
+  </nav>
+
+</main>
+</body>
+</html>

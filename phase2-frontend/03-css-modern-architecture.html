@@ -1,0 +1,999 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 — Modern CSS &amp; Architecture | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <div class="breadcrumb"><a href="index.html">← Course Home</a></div>
+    <h1>03 — Modern CSS &amp; Architecture</h1>
+    <p>Container queries, :has(), layers, typed custom properties, compositor-friendly animation, and how to argue styling architecture like a senior.</p>
+  </div>
+</header>
+
+<main class="container">
+
+<section>
+  <h2 id="why">Why interviewers ask this</h2>
+  <p>CSS questions at the senior level are rarely about memorizing property names. They are a <strong>currency check</strong> and an <strong>architecture check</strong>:</p>
+  <ul>
+    <li><strong>Currency:</strong> CSS has changed more between 2021 and 2025 than in the previous decade — container queries, <code>:has()</code>, cascade layers, native nesting, <code>@property</code>, <code>oklch()</code>, view transitions. Interviewers probe whether you kept up or whether your knowledge froze at "flexbox and BEM."</li>
+    <li><strong>Architecture:</strong> "How would you style a large React app?" is a classic senior screen. The wrong answer is naming one tool with religious conviction. The right answer names the axes (runtime cost, scoping, SSR/RSC compatibility, design-system maturity, team scale), argues trade-offs, and then commits to a default with reasons.</li>
+    <li><strong>Performance:</strong> Animation and rendering questions ("why is transform cheaper than top?") test whether you understand the browser pipeline, which transfers directly to debugging jank in production.</li>
+  </ul>
+  <div class="note">Tier legend: <span class="tier-1">Tier 1</span> = asked constantly, must be fluent. <span class="tier-2">Tier 2</span> = frequent at senior level, differentiates candidates. <span class="tier-3">Tier 3</span> = occasional, awareness is enough.</div>
+</section>
+
+<div class="toc">
+  <strong>On this page</strong>
+  <ul>
+    <li><a href="#container-queries">Container queries</a></li>
+    <li><a href="#has">:has() — the parent selector</a></li>
+    <li><a href="#layers">Cascade layers (@layer)</a></li>
+    <li><a href="#custom-props">Custom properties, deeply</a></li>
+    <li><a href="#fluid">Modern sizing &amp; fluid design</a></li>
+    <li><a href="#modern-selectors">Modern selectors &amp; features rapid tour</a></li>
+    <li><a href="#animations">Animations &amp; rendering performance</a></li>
+    <li><a href="#architecture">Styling architecture at scale</a></li>
+    <li><a href="#tokens">Design tokens &amp; theming</a></li>
+    <li><a href="#sass">Sass in 2026</a></li>
+    <li><a href="#qa">Interview Q&amp;A</a></li>
+    <li><a href="#exercises">Hands-on exercises</a></li>
+  </ul>
+</div>
+
+<!-- ============================================================ -->
+<section>
+  <h2 id="container-queries">Container queries <span class="tier-2">Tier 2</span></h2>
+
+  <h3>The problem media queries cannot solve</h3>
+  <p>Media queries respond to the <em>viewport</em>. But in a component-driven world, the same component renders in wildly different contexts: a <code>&lt;ProductCard&gt;</code> might live in a full-width hero, a 3-column grid, or a 280px sidebar — <em>all on the same viewport width</em>. A media query cannot distinguish those. For years, design systems worked around this with prop-driven variants (<code>&lt;Card layout="compact" /&gt;</code>) or JS-based <code>ResizeObserver</code> hacks, both of which push a layout concern into component APIs.</p>
+  <p><strong>Container queries let a component respond to the size of its own container.</strong> The card decides for itself: "if I have less than 400px of inline space, stack vertically."</p>
+
+  <h3>Establishing a container: <code>container-type</code></h3>
+  <pre><code><span class="com">/* 1. Mark an ancestor as a query container */</span>
+.card-slot {
+  <span class="kw">container-type</span>: inline-size;   <span class="com">/* query the inline axis (width in LTR/RTL) */</span>
+  <span class="kw">container-name</span>: card;          <span class="com">/* optional, lets descendants target it by name */</span>
+  <span class="com">/* shorthand: container: card / inline-size; */</span>
+}
+
+<span class="com">/* 2. Descendants query the nearest (or named) container */</span>
+@container card (<span class="kw">width</span> &lt; <span class="num">400px</span>) {
+  .card        { <span class="kw">flex-direction</span>: column; }
+  .card__image { <span class="kw">aspect-ratio</span>: <span class="num">16</span> / <span class="num">9</span>; <span class="kw">width</span>: <span class="num">100%</span>; }
+  .card__title { <span class="kw">font-size</span>: <span class="num">1rem</span>; }
+}
+
+@container card (<span class="kw">width</span> &gt;= <span class="num">400px</span>) {
+  .card        { <span class="kw">flex-direction</span>: row; <span class="kw">gap</span>: <span class="num">1.5rem</span>; }
+  .card__image { <span class="kw">width</span>: <span class="num">40%</span>; }
+}</code></pre>
+
+  <h3><code>size</code> vs <code>inline-size</code> — and why containment is required</h3>
+  <p>This is the part interviewers use to separate people who have shipped container queries from people who read a blog post. To query a container's size, the browser must be able to compute that size <em>without looking at the container's contents</em> — otherwise you get circularity (contents change → container resizes → query flips → contents change → …). So <code>container-type</code> applies <strong>containment</strong>:</p>
+  <table>
+    <thead>
+      <tr><th>Value</th><th>What you can query</th><th>Containment applied</th><th>Practical implication</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>inline-size</code></td>
+        <td>Inline axis only (width, typically)</td>
+        <td>Layout, style, and <em>inline-size</em> containment</td>
+        <td>Element still grows vertically with content. <strong>This is what you want 95% of the time.</strong></td>
+      </tr>
+      <tr>
+        <td><code>size</code></td>
+        <td>Both axes (width and height)</td>
+        <td>Layout, style, and full <em>size</em> containment</td>
+        <td>Element <strong>no longer sizes from its content in either axis</strong> — you must give it an explicit height or it collapses. Rarely what you want.</td>
+      </tr>
+      <tr>
+        <td><code>normal</code></td>
+        <td>Style queries only (<code>@container style(--x: y)</code>)</td>
+        <td>None for size</td>
+        <td>Default; the element is not a size query container.</td>
+      </tr>
+    </tbody>
+  </table>
+  <div class="pitfall">A common bug: developers slap <code>container-type: inline-size</code> directly on a grid <em>item</em> that was being sized by its content, and layout subtly changes because inline-size containment makes the element's intrinsic inline size behave as if it had no contents (auto-width shrink-to-fit breaks). Rule of thumb: put containment on a dedicated wrapper ("slot") element whose size is determined by the surrounding layout, not by its own children.</div>
+
+  <h3>Container query length units</h3>
+  <p>Inside (and even outside) <code>@container</code> rules, you can size things relative to the queried container:</p>
+  <pre><code>.card__title {
+  <span class="com">/* 1cqi = 1% of the container's inline size */</span>
+  <span class="kw">font-size</span>: <span class="kw">clamp</span>(<span class="num">1rem</span>, <span class="num">4cqi</span>, <span class="num">1.75rem</span>);
+}</code></pre>
+  <ul>
+    <li><code>cqw</code> / <code>cqh</code> — 1% of container width / height</li>
+    <li><code>cqi</code> / <code>cqb</code> — 1% of container inline / block size (logical; prefer these)</li>
+    <li><code>cqmin</code> / <code>cqmax</code> — smaller / larger of <code>cqi</code> and <code>cqb</code></li>
+  </ul>
+  <p>These enable <em>container-relative fluid typography</em>: a card headline that scales with the card, not the viewport — huge for design systems.</p>
+
+  <h3>Style queries (awareness)</h3>
+  <p>Beyond size, <code>@container style(--theme: dark)</code> queries a container's <em>custom property value</em>. Style queries on custom properties shipped in Chromium and have been rolling out elsewhere; treat them as "know it exists" rather than production-default as of 2025/2026.</p>
+
+  <h3>Browser support &amp; migration strategy</h3>
+  <ul>
+    <li><strong>Support:</strong> size container queries and cq units are supported in all evergreen browsers since early 2023 (Chrome/Edge 105+, Safari 16+, Firefox 110+). By 2025/2026 they are safely production-default for evergreen-browser audiences.</li>
+    <li><strong>Migration strategy:</strong> don't rewrite; migrate <em>component by component</em>. Start with design-system leaf components that already have "variant" props purely for sizing (card, media object, stat tile). Keep media queries for <em>page-level layout</em> (how many columns the grid has); use container queries for <em>component-level adaptation</em> (how the card lays out inside its cell). That division of labor is the senior framing: <em>media queries for macro layout, container queries for micro layout</em>.</li>
+    <li><strong>Fallback:</strong> <code>@supports (container-type: inline-size)</code> if you must support older browsers; the unqueried styles are your mobile-first baseline.</li>
+  </ul>
+  <div class="senior">Interview sound bite: "Container queries fix the coupling between a component's responsive behavior and its page context. Before them, our design system leaked layout context into component APIs as variant props; after them, the card owns its own breakpoints. Media queries didn't go away — they moved up to page-level composition."</div>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <h2 id="has">:has() — the "parent selector" <span class="tier-2">Tier 2</span></h2>
+
+  <p><code>:has()</code> was the most-requested CSS feature for two decades: <strong>select an element based on what it contains (or what follows it)</strong>. It's a functional pseudo-class taking a relative selector list. Supported in all evergreen browsers since Firefox 121 (Dec 2023); production-safe by 2025.</p>
+
+  <h3>Canonical real-world uses</h3>
+  <pre><code><span class="com">/* 1. Form field wrapper reacts to its input's validity */</span>
+.field:has(:invalid)          { <span class="kw">border-color</span>: <span class="kw">var</span>(--color-danger); }
+.field:has(:focus-visible)    { <span class="kw">outline</span>: <span class="num">2px</span> solid <span class="kw">var</span>(--color-focus); }
+.field:has(:user-invalid) .field__error { <span class="kw">display</span>: block; }
+
+<span class="com">/* 2. Card adapts depending on whether it contains an image */</span>
+.card:has(&gt; img)       { <span class="kw">grid-template-rows</span>: <span class="num">200px</span> <span class="num">1fr</span>; }
+.card:not(:has(&gt; img)) { <span class="kw">padding-block-start</span>: <span class="num">2rem</span>; }
+
+<span class="com">/* 3. Quantity queries: style a list differently once it has 5+ items */</span>
+.tab-list:has(&gt; :nth-child(<span class="num">5</span>)) {
+  <span class="kw">font-size</span>: <span class="num">0.875rem</span>;
+  <span class="kw">gap</span>: <span class="num">0.25rem</span>;
+}
+
+<span class="com">/* 4. Previous-sibling styling (impossible before :has) */</span>
+label:has(+ input:focus) { <span class="kw">color</span>: <span class="kw">var</span>(--color-accent); }
+
+<span class="com">/* 5. Page-level state without JS: dim the page when a dialog is open */</span>
+html:has(dialog[open]) { <span class="kw">overflow</span>: hidden; }</code></pre>
+
+  <p>Pattern 1 is worth internalizing: combined with <code>:user-invalid</code> (only matches after user interaction), you get accessible inline validation styling with <em>zero</em> JavaScript state.</p>
+
+  <h3>Performance considerations</h3>
+  <ul>
+    <li>Browsers match selectors right-to-left; <code>:has()</code> forces the engine to look <em>down and sideways</em> from candidate elements, which is inherently more work. Engines heavily optimize it (invalidation sets, bloom filters), so typical usage is fine.</li>
+    <li>The expensive pattern is <strong>broad subject + deep, unanchored argument</strong>: <code>*:has(.foo .bar)</code> or <code>body:has(.deeply .nested :hover)</code> — every DOM mutation anywhere can force re-checking. Keep the subject specific (<code>.field:has(...)</code>) and the inner selector shallow (child combinator <code>&gt;</code> where possible).</li>
+    <li><code>:has()</code> cannot be nested inside another <code>:has()</code>, and pseudo-elements are not valid inside it.</li>
+  </ul>
+
+  <h3>Composing :has() with :not()</h3>
+  <p>Order matters semantically:</p>
+  <pre><code><span class="com">/* "cards that do NOT contain an image" */</span>
+.card:not(:has(img)) { ... }
+
+<span class="com">/* "cards that contain something that is not an image"
+   — almost always true; almost never what you meant */</span>
+.card:has(:not(img)) { ... }</code></pre>
+  <div class="pitfall"><code>:has(:not(img))</code> vs <code>:not(:has(img))</code> is a favorite interviewer gotcha. The first matches a card containing <em>any non-image element</em> (a title counts). The second matches a card containing <em>no image at all</em>. Say it back in English before writing it.</div>
+  <div class="note">Specificity: like <code>:is()</code>, <code>:has()</code> takes the specificity of the most specific selector in its argument list — it is not zero-cost like <code>:where()</code>.</div>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <h2 id="layers">Cascade layers — <code>@layer</code> <span class="tier-2">Tier 2</span></h2>
+
+  <h3>The problem: specificity wars</h3>
+  <p>In a large codebase, the cascade is fought with escalation: a reset gets overridden by the framework, which gets overridden by component styles, which get overridden by page overrides — each layer of intent enforced by <em>accidental</em> specificity (<code>.btn.btn.btn</code>, <code>#app .card</code>, <code>!important</code>). The intent was always "this category of styles should beat that category," but pre-layers CSS had no way to express priority <em>between categories</em>; only per-selector specificity.</p>
+  <p><code>@layer</code> makes that priority explicit: <strong>layer order beats specificity</strong>. A selector in a later layer wins even if a selector in an earlier layer is more specific.</p>
+
+  <pre><code><span class="com">/* Declare order up front — first line of your entry stylesheet.
+   Later layers win. */</span>
+@layer reset, tokens, base, components, utilities, overrides;
+
+@layer reset {
+  * { <span class="kw">margin</span>: <span class="num">0</span>; <span class="kw">box-sizing</span>: border-box; }
+}
+
+@layer components {
+  .btn { <span class="kw">background</span>: <span class="kw">var</span>(--color-primary); }
+}
+
+@layer utilities {
+  <span class="com">/* wins over .some #very .specific .btn selector in `components`,
+     despite lower specificity — layer order decides first */</span>
+  .bg-transparent { <span class="kw">background</span>: transparent; }
+}
+
+<span class="com">/* Layers also work with imports: */</span>
+@import url(<span class="str">"vendor/datepicker.css"</span>) layer(vendor);</code></pre>
+
+  <h3>The rules that get asked</h3>
+  <ul>
+    <li><strong>Unlayered styles beat all layered styles</strong> (for normal declarations). This is the crucial migration property: you can wrap a third-party library in a layer and know your unlayered app styles always win, regardless of the library's selector specificity.</li>
+    <li><strong><code>!important</code> inverts layer order.</strong> Important declarations in <em>earlier</em> layers beat important declarations in later layers (and important layered beats important unlayered). Mnemonic: <code>!important</code> reverses everything — so a reset layer's <code>!important</code> is the strongest thing on the page. This is a deliberate design: it lets low-level layers make guarantees that app code cannot casually stomp.</li>
+    <li>Specificity still applies <em>within</em> a layer — layers settle the fight <em>between</em> categories, then specificity settles it inside one.</li>
+    <li>Layers can nest: <code>@layer components.card { ... }</code>.</li>
+  </ul>
+
+  <h3><code>revert-layer</code></h3>
+  <pre><code>@layer overrides {
+  .card--plain {
+    <span class="com">/* roll this property back to whatever previous layers said,
+       as if this layer never declared it */</span>
+    <span class="kw">box-shadow</span>: revert-layer;
+  }
+}</code></pre>
+  <p>Complete the keyword family for interviews: <code>initial</code> (spec default) → <code>inherit</code> (parent's computed value) → <code>unset</code> (inherit if inherited property, else initial) → <code>revert</code> (roll back to user-agent/user styles) → <code>revert-layer</code> (roll back one cascade layer).</p>
+
+  <h3>How design systems use layers</h3>
+  <p>The emerging convention: the design system ships everything inside layers (<code>@layer ds.reset, ds.tokens, ds.components</code>), consumers import it into a layer, and consumer styles — layered later or unlayered — always win without specificity hacks. Open props, Bootstrap 5.3+, and many internal systems adopted this. It also finally gives a principled home for utility classes: put them in the last layer instead of marking every utility <code>!important</code> (Tailwind v4 organizes its output with <code>@layer theme, base, components, utilities</code>).</p>
+  <p><strong>Support:</strong> all evergreen browsers since March 2022 — one of the fastest-adopted features ever. Fully production-safe.</p>
+  <div class="senior">Senior framing: "Layers turn the cascade from an accident into an architecture. Specificity was always a proxy for 'how authoritative is this style' — layers state that authority directly. The migration killer feature is that unlayered beats layered, so you can layer vendor CSS today with zero risk to existing styles."</div>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <h2 id="custom-props">Custom properties, deeply <span class="tier-1">Tier 1</span></h2>
+  <p>Every senior candidate "knows" custom properties. Interviews probe the <em>edges</em>: inheritance semantics, failure modes, typing, and theming architecture.</p>
+
+  <h3>Inheritance and the <code>*</code> misconception</h3>
+  <p>Custom properties are ordinary <em>inherited properties</em>. Declared on <code>:root</code>, they're available everywhere via inheritance — not because <code>:root</code> is magic, but because inheritance flows down the tree. The classic misconception is defining them with <code>*</code>:</p>
+  <pre><code><span class="com">/* BAD: sets the property directly on EVERY element.
+   Direct values beat inheritance, so overriding --gap on a parent
+   no longer cascades to children — every element has its own copy. */</span>
+* { --gap: <span class="num">1rem</span>; }
+
+<span class="com">/* GOOD: define at root, override at subtree scope */</span>
+:root      { --gap: <span class="num">1rem</span>; }
+.compact   { --gap: <span class="num">0.5rem</span>; }   <span class="com">/* everything inside .compact inherits 0.5rem */</span></code></pre>
+  <p>This "override at subtree scope" behavior is the superpower: custom properties are the only CSS mechanism where a parent can parameterize arbitrary descendants — effectively props for CSS.</p>
+
+  <h3>Fallbacks</h3>
+  <pre><code>.btn {
+  <span class="kw">color</span>: <span class="kw">var</span>(--btn-color, <span class="kw">var</span>(--color-text, <span class="num">#222</span>));
+  <span class="com">/* fallback only applies when the property is NOT DEFINED (guaranteed-invalid),
+     not when it's defined with a junk value */</span>
+}</code></pre>
+
+  <h3>Invalid at computed-value time — why var misuse fails <em>silently and weirdly</em></h3>
+  <p>This is the deepest interview question in this section. Normal CSS has parse-time error recovery: <code>color: 16px</code> is dropped at parse time, and the <em>previous cascaded value</em> wins. But <code>var()</code> substitution happens at <strong>computed-value time</strong>, after parsing and after the cascade already picked a winner. If substitution produces garbage:</p>
+  <pre><code>:root { --size: <span class="num">16px</span>; }
+p {
+  <span class="kw">color</span>: red;                 <span class="com">/* cascaded, then discarded below */</span>
+  <span class="kw">color</span>: <span class="kw">var</span>(--size);        <span class="com">/* 16px is not a color... */</span>
+}
+<span class="com">/* Result: color is NOT red. The declaration is "invalid at
+   computed-value time": too late to fall back to the previous
+   declaration, so the property becomes `unset` —
+   → inherited value for inherited properties (color inherits: parent's color)
+   → initial value otherwise.
+   The red declaration is gone; the cascade already threw it away. */</span></code></pre>
+  <div class="pitfall">Symptom in the wild: "my button text turned black/inherited and my earlier fallback declaration didn't apply." Because <code>var()</code> failure resolves to inherit/initial rather than the previous declaration, defensive "old value first, var() second" progressive enhancement does <strong>not</strong> work for custom properties the way it does for e.g. <code>width: 90%; width: clamp(...)</code>. Use the <code>var(--x, fallback)</code> second argument or <code>@property</code> instead.</div>
+
+  <h3>Custom properties in media queries — no; <code>@property</code> — yes to typing</h3>
+  <p>You <strong>cannot</strong> use <code>var()</code> in a media query condition (<code>@media (min-width: var(--bp))</code> is invalid — media queries are evaluated outside any element, and custom properties only have values <em>on elements</em>). The spec-track answer for reusable environment values is Media Query Variables / custom environment variables, still emerging; today you preprocess breakpoints (Sass/PostCSS) or use container queries where they fit.</p>
+  <p><code>@property</code> registers a custom property with a <strong>type, initial value, and inheritance behavior</strong> — which fixes two things: invalid values now fall back to the typed initial value at computed-value time, and the property becomes <strong>animatable</strong> because the engine knows how to interpolate it:</p>
+  <pre><code>@property --gradient-angle {
+  <span class="kw">syntax</span>: <span class="str">"&lt;angle&gt;"</span>;
+  <span class="kw">inherits</span>: false;
+  <span class="kw">initial-value</span>: <span class="num">0deg</span>;
+}
+
+.fancy-border {
+  <span class="kw">background</span>: conic-gradient(from <span class="kw">var</span>(--gradient-angle), <span class="num">#f0f</span>, <span class="num">#0ff</span>, <span class="num">#f0f</span>);
+  <span class="kw">transition</span>: --gradient-angle <span class="num">0.6s</span> ease;   <span class="com">/* impossible for untyped props:
+     untyped custom properties interpolate discretely (they just flip) */</span>
+}
+.fancy-border:hover { --gradient-angle: <span class="num">180deg</span>; }</code></pre>
+  <p>Support: Chromium since 2020, Safari 16.4+, Firefox 128+ (mid-2024) — Baseline as of 2024, safe for evergreen audiences.</p>
+
+  <h3>Theming architecture: semantic tokens over raw values</h3>
+  <pre><code><span class="com">/* Layer 1 — primitives (never referenced by components) */</span>
+:root {
+  --blue-600: oklch(<span class="num">0.55</span> <span class="num">0.18</span> <span class="num">255</span>);
+  --gray-900: oklch(<span class="num">0.25</span> <span class="num">0.02</span> <span class="num">255</span>);
+}
+
+<span class="com">/* Layer 2 — semantic tokens (what components consume) */</span>
+:root {
+  --color-bg: white;
+  --color-text: <span class="kw">var</span>(--gray-900);
+  --color-accent: <span class="kw">var</span>(--blue-600);
+}
+
+<span class="com">/* Dark mode = re-mapping the SEMANTIC layer only */</span>
+[data-theme=<span class="str">"dark"</span>] {
+  --color-bg: <span class="kw">var</span>(--gray-900);
+  --color-text: oklch(<span class="num">0.95</span> <span class="num">0.01</span> <span class="num">255</span>);
+}
+
+.card { <span class="kw">background</span>: <span class="kw">var</span>(--color-bg); <span class="kw">color</span>: <span class="kw">var</span>(--color-text); }</code></pre>
+  <p>Because tokens live in the cascade, dark mode requires <em>zero component changes</em> and re-themes subtrees (theme a single modal by putting <code>data-theme</code> on it). This is the single strongest argument for custom-property-based theming over compile-time theming.</p>
+
+  <h3>Custom properties + React</h3>
+  <pre><code><span class="com">// Custom props are the clean bridge for dynamic values in React:</span>
+<span class="com">// one static CSS rule, per-instance value via inline style.</span>
+<span class="kw">function</span> ProgressBar({ percent }) {
+  <span class="kw">return</span> (
+    &lt;div
+      className=<span class="str">"progress"</span>
+      style={{ <span class="str">'--progress'</span>: <span class="str">`${percent}%`</span> }}
+    /&gt;
+  );
+}
+
+<span class="com">/* CSS — stays cacheable and static: */</span>
+<span class="com">/* .progress::after { width: var(--progress); } */</span></code></pre>
+  <p>Compare with generating a new class per value (CSS-in-JS runtime cost) or setting <code>width</code> inline directly (loses the ability for CSS to mediate — transitions, clamping, pseudo-elements). This pattern is the standard answer to "how do you pass dynamic values into CSS Modules / Tailwind codebases."</p>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <h2 id="fluid">Modern sizing &amp; fluid design <span class="tier-2">Tier 2</span></h2>
+
+  <h3><code>clamp()</code> fluid typography — and the zoom-safety formula</h3>
+  <pre><code><span class="com">/* clamp(MIN, PREFERRED, MAX) */</span>
+h1 {
+  <span class="kw">font-size</span>: <span class="kw">clamp</span>(<span class="num">1.75rem</span>, <span class="num">1rem</span> + <span class="num">2.5vw</span>, <span class="num">3rem</span>);
+}</code></pre>
+  <p>Why <code>1rem + 2.5vw</code> and not just <code>4vw</code>? <strong>Accessibility.</strong> A purely viewport-based preferred value doesn't respond to the user's font-size preference or browser zoom text scaling — WCAG 1.4.4 requires text to be resizable up to 200%. Mixing a <code>rem</code> component in guarantees the value still scales when the root font size changes. Deriving the numbers: pick font size at two viewport widths (e.g. 28px @ 400px, 48px @ 1200px), the slope is <code>(48−28)/(1200−400) = 0.025 → 2.5vw</code>, and the rem intercept is <code>28 − 0.025×400 = 18px ≈ 1.125rem</code>. Tools like Utopia automate this "fluid type scale."</p>
+
+  <h3><code>min()</code> / <code>max()</code></h3>
+  <pre><code>.container {
+  <span class="kw">width</span>: <span class="kw">min</span>(<span class="num">90%</span>, <span class="num">72rem</span>);        <span class="com">/* replaces width:90%; max-width:72rem */</span>
+  <span class="kw">padding-inline</span>: <span class="kw">max</span>(<span class="num">1rem</span>, env(safe-area-inset-left));
+}</code></pre>
+  <p>Mnemonic that interviewers appreciate: <code>min()</code> acts as an <em>upper bound</em> (it picks the smaller), <code>max()</code> acts as a <em>lower bound</em>. <code>clamp(a, x, b)</code> ≡ <code>max(a, min(x, b))</code>.</p>
+
+  <h3><code>aspect-ratio</code></h3>
+  <pre><code>.video-embed { <span class="kw">aspect-ratio</span>: <span class="num">16</span> / <span class="num">9</span>; <span class="kw">width</span>: <span class="num">100%</span>; }
+.avatar      { <span class="kw">aspect-ratio</span>: <span class="num">1</span>; <span class="kw">inline-size</span>: <span class="num">3rem</span>; }</code></pre>
+  <p>Kills the old <code>padding-top: 56.25%</code> hack. Note it sets a <em>preferred</em> ratio: if both dimensions are constrained, or content overflows, the ratio yields. Also key for CLS: giving images <code>width</code>/<code>height</code> attributes lets the browser derive an aspect ratio and reserve space before load.</p>
+
+  <h3>Logical properties — the i18n/RTL benefit</h3>
+  <pre><code><span class="com">/* Physical (breaks in RTL) */</span>       <span class="com">/* Logical (writing-mode aware) */</span>
+margin-left: auto;                     <span class="kw">margin-inline-start</span>: auto;
+padding: <span class="num">0</span> <span class="num">1rem</span>;                      <span class="kw">padding-inline</span>: <span class="num">1rem</span>;
+width / height;                        <span class="kw">inline-size</span> / <span class="kw">block-size</span>;
+top / left (insets);                   <span class="kw">inset-block-start</span> / <span class="kw">inset-inline-start</span>;
+border-left;                           <span class="kw">border-inline-start</span>;
+text-align: left;                      <span class="kw">text-align</span>: start;</code></pre>
+  <p>With logical properties, flipping the entire UI for Arabic/Hebrew is <code>dir="rtl"</code> on <code>&lt;html&gt;</code> — no <code>[dir=rtl]</code> override stylesheets, no RTLCSS build step. Any company shipping internationally treats this as table stakes; using <code>margin-left</code> in a new design system in 2026 is a review comment.</p>
+
+  <h3><code>text-wrap: balance</code> / <code>pretty</code></h3>
+  <pre><code>h1, h2, .card__title { <span class="kw">text-wrap</span>: balance; }  <span class="com">/* equalizes line lengths; engines cap
+                                                  it around ~6 lines — headings only */</span>
+p                     { <span class="kw">text-wrap</span>: pretty; }   <span class="com">/* better breaks; avoids single-word
+                                                  orphan last lines */</span></code></pre>
+  <p>Pure progressive enhancement — unsupported browsers ignore it. <code>balance</code> is Baseline (2023/24); <code>pretty</code> shipped in Chromium and Safari with Firefox following. Note <code>pretty</code> trades a little layout performance for quality; applying it to <em>everything</em> on a huge page is measurable, headings and body copy are fine.</p>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <h2 id="modern-selectors">Modern selectors &amp; features — rapid tour <span class="tier-2">Tier 2</span></h2>
+
+  <h3><code>:is()</code> vs <code>:where()</code> — the specificity difference</h3>
+  <pre><code><span class="com">/* Both match the same elements: */</span>
+:is(h1, h2, h3) a      { ... }  <span class="com">/* specificity of the MOST specific argument
+                                   — here (0,0,1) from hN + (0,0,1) = (0,0,2) */</span>
+:where(h1, h2, h3) a   { ... }  <span class="com">/* :where contributes ZERO specificity
+                                   → total (0,0,1) — trivially overridable */</span></code></pre>
+  <ul>
+    <li><code>:is()</code> = grouping sugar; also "forgiving" — one invalid selector in the list doesn't kill the rule (unlike a plain selector list, where one bad selector invalidates the whole rule).</li>
+    <li><code>:where()</code> = the tool for <strong>resets and library defaults</strong>: styles that should exist but lose to literally anything the consumer writes. Modern resets (e.g. Andy Bell's) wrap everything in <code>:where()</code> for this reason.</li>
+  </ul>
+
+  <h3>Native CSS nesting</h3>
+  <pre><code>.card {
+  <span class="kw">padding</span>: <span class="num">1rem</span>;
+
+  &amp;:hover { <span class="kw">box-shadow</span>: <span class="kw">var</span>(--shadow-2); }
+
+  .card__title { <span class="kw">font-weight</span>: <span class="num">600</span>; }   <span class="com">/* implicit &amp; — works since the
+                                            relaxed syntax (2023/24) */</span>
+
+  @media (<span class="kw">width</span> &gt;= <span class="num">48rem</span>) {              <span class="com">/* at-rules nest too */</span>
+    <span class="kw">padding</span>: <span class="num">2rem</span>;
+  }
+}</code></pre>
+  <p>Gotchas vs Sass nesting:</p>
+  <ul>
+    <li><strong>No string concatenation:</strong> <code>&amp;__title</code> does NOT build <code>.card__title</code>. <code>&amp;</code> is a live selector reference, not text. BEM authored via nesting doesn't port.</li>
+    <li>Nested selectors desugar to <code>:is(.card) .card__title</code>-style matching, so the parent part carries <code>:is()</code> specificity semantics (most-specific-argument), which can differ subtly from Sass output when the outer selector is a list.</li>
+    <li>Same maintainability caution as Sass: deep nesting couples CSS to DOM structure and inflates specificity. Two levels is a good review guideline.</li>
+    <li>Baseline since late 2023 (relaxed syntax through 2024); production-safe evergreen. Sass now passes native nesting through.</li>
+  </ul>
+
+  <h3>Color: <code>oklch()</code> and <code>color-mix()</code></h3>
+  <pre><code>:root {
+  <span class="com">/* oklch(Lightness Chroma Hue) — perceptually uniform */</span>
+  --accent: oklch(<span class="num">0.65</span> <span class="num">0.2</span> <span class="num">250</span>);
+  --accent-hover: oklch(from <span class="kw">var</span>(--accent) calc(l - <span class="num">0.1</span>) c h); <span class="com">/* relative color syntax */</span>
+  --accent-soft: color-mix(in oklch, <span class="kw">var</span>(--accent) <span class="num">15%</span>, white);
+}</code></pre>
+  <p>Why perceptual uniformity matters for design systems: in HSL, <code>hsl(60 100% 50%)</code> (yellow) and <code>hsl(240 100% 50%)</code> (blue) have the same "lightness" number but wildly different perceived brightness — so a palette generated by holding HSL lightness constant has inconsistent contrast across hues, and contrast ratios break. In OKLCH, equal L is (approximately) equal perceived lightness across all hues, so you can generate a 50–950 scale per hue by varying only L and get <em>consistent contrast behavior</em> — which is why Tailwind v4, Radix Colors, and most new token systems moved to OKLCH. It also unlocks wide-gamut P3 colors that hex/sRGB can't express. <code>color-mix()</code> replaces Sass <code>darken()</code>/<code>lighten()</code>/<code>rgba()</code> tricks at runtime — meaning it works <em>with custom properties</em>, which Sass functions never could.</p>
+
+  <h3><code>:user-valid</code> / <code>:user-invalid</code></h3>
+  <p><code>:invalid</code> matches immediately on page load (an empty required field is invalid before the user touches it) — the classic red-form-on-arrival bug. <code>:user-invalid</code>/<code>:user-valid</code> only match <em>after significant user interaction</em> (typically after change + blur). Baseline 2023. Combine with <code>:has()</code> on the field wrapper for JS-free validation UI.</p>
+
+  <h3><code>@supports</code> feature queries</h3>
+  <pre><code>@supports (<span class="kw">container-type</span>: inline-size) { ... }
+@supports selector(:has(a))              { ... }
+@supports not (<span class="kw">animation-timeline</span>: scroll()) { <span class="com">/* fallback */</span> }</code></pre>
+  <p>Senior nuance: prefer structuring CSS so fallback is the <em>unqueried default</em> and the enhancement sits inside <code>@supports</code> — never gate core layout on a positive query only old browsers fail.</p>
+
+  <h3>Awareness tier (know what they are, one sentence each)</h3>
+  <table>
+    <thead><tr><th>Feature</th><th>One-liner</th><th>Status (2025/26)</th></tr></thead>
+    <tbody>
+      <tr><td><strong>View Transitions API</strong></td><td>Browser snapshots old/new DOM state and animates between them; <code>document.startViewTransition()</code> for same-document, <code>@view-transition</code> for cross-document (MPA) navigations. React Router / Next.js integrate it.</td><td>Same-document: Chromium since 2023, Safari 18; Firefox shipped in 2025. Cross-document newer. Progressive enhancement only.</td></tr>
+      <tr><td><strong>Scroll-driven animations</strong></td><td><code>animation-timeline: scroll()</code> / <code>view()</code> binds a keyframe animation's progress to scroll position or an element's visibility — compositor-driven, replacing scroll-listener JS (reading progress bars, reveal-on-scroll).</td><td>Chromium since 115 (2023); Safari 26 (2025); Firefox in progress. Ship behind <code>@supports</code>.</td></tr>
+      <tr><td><strong>Anchor positioning</strong></td><td><code>anchor-name</code>/<code>position-anchor</code> + <code>anchor()</code> tether a positioned element (tooltip, dropdown) to another element with declarative flip/fallback (<code>position-try</code>) — replaces Floating UI/Popper for many cases, pairs with the Popover API.</td><td>Chromium since 125 (2024); Safari 26; Firefox in development. Not yet a cross-browser default; use with fallback.</td></tr>
+      <tr><td><strong>Style queries</strong></td><td><code>@container style(--variant: featured)</code> — query a container's custom property.</td><td>Chromium; partial elsewhere. Awareness.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <h2 id="animations">Animations &amp; rendering performance <span class="tier-1">Tier 1</span></h2>
+
+  <h3><code>transition</code> vs <code>animation</code>/<code>@keyframes</code></h3>
+  <table>
+    <thead><tr><th></th><th><code>transition</code></th><th><code>animation</code> + <code>@keyframes</code></th></tr></thead>
+    <tbody>
+      <tr><td>Trigger</td><td>Needs a state change (class toggle, :hover, prop change)</td><td>Runs as soon as applied; self-driving</td></tr>
+      <tr><td>Shape</td><td>A → B only</td><td>Multi-step keyframes, iteration, direction, alternate</td></tr>
+      <tr><td>Reversal</td><td>Automatic and graceful (reverses mid-flight)</td><td>Manual; removing an animation snaps unless handled</td></tr>
+      <tr><td>Use for</td><td>Interactive state feedback (hover, focus, open/close)</td><td>Ambient/looping motion, entrance choreography, spinners</td></tr>
+    </tbody>
+  </table>
+
+  <h3>The rendering pipeline — WHY transform/opacity are cheap</h3>
+  <p>Every frame the browser may run some or all of: <strong>Style → Layout → Paint → Composite</strong>.</p>
+  <ol>
+    <li><strong>Style:</strong> recompute which rules apply and computed values.</li>
+    <li><strong>Layout (reflow):</strong> compute geometry — position and size of every affected box. Expensive, and it <em>cascades</em>: resizing one element can relayout ancestors, siblings, and the whole document.</li>
+    <li><strong>Paint:</strong> rasterize pixels (text, colors, shadows, borders) into layer bitmaps.</li>
+    <li><strong>Composite:</strong> the compositor thread assembles already-painted layers on the GPU — position, scale, rotate, fade them — <em>without the main thread</em>.</li>
+  </ol>
+  <p>The property you animate determines where you enter this pipeline:</p>
+  <table>
+    <thead><tr><th>Animated property</th><th>Pipeline stages per frame</th><th>Cost</th></tr></thead>
+    <tbody>
+      <tr><td><code>width</code>, <code>height</code>, <code>top/left</code>, <code>margin</code>, <code>font-size</code></td><td>Layout → Paint → Composite</td><td>Worst — full pipeline every frame, on the main thread</td></tr>
+      <tr><td><code>background-color</code>, <code>color</code>, <code>box-shadow</code>, <code>border-radius</code></td><td>Paint → Composite</td><td>Medium — skips layout, still repaints</td></tr>
+      <tr><td><code>transform</code>, <code>opacity</code> (and <code>filter</code>, mostly)</td><td>Composite only</td><td>Cheapest — the element gets its own compositor layer; the GPU just re-blends existing bitmaps. Runs even while the main thread is blocked by JS.</td></tr>
+    </tbody>
+  </table>
+  <p>That last cell is the key sentence for interviews: <strong>compositor-only animations stay smooth even when the main thread is janked</strong>, because the compositor is a separate thread.</p>
+
+  <pre><code><span class="com">/* Layout thrash — relayouts the document 60×/second on the main thread: */</span>
+.drawer { <span class="kw">left</span>: <span class="num">-300px</span>; <span class="kw">transition</span>: left <span class="num">0.3s</span>; }
+.drawer.open { <span class="kw">left</span>: <span class="num">0</span>; }
+
+<span class="com">/* Compositor version — same visual, ~free: */</span>
+.drawer { <span class="kw">transform</span>: translateX(<span class="num">-100%</span>); <span class="kw">transition</span>: transform <span class="num">0.3s</span>; }
+.drawer.open { <span class="kw">transform</span>: translateX(<span class="num">0</span>); }</code></pre>
+  <p>Related JS-side thrash: interleaving reads (<code>offsetHeight</code>, <code>getBoundingClientRect</code>) with writes forces synchronous layout ("layout thrashing"). Batch reads, then writes — or use <code>requestAnimationFrame</code> phases.</p>
+
+  <h3><code>will-change</code> — sparingly</h3>
+  <pre><code>.drawer:hover, .drawer:focus-within { <span class="kw">will-change</span>: transform; }
+<span class="com">/* hint just-in-time, remove after — NOT: * { will-change: transform } */</span></code></pre>
+  <p>It pre-promotes the element to its own compositor layer so the first animation frame doesn't stall on layer creation. Cost: every layer is a GPU-memory bitmap (roughly width × height × 4 bytes × device-pixel-ratio²); blanket use exhausts GPU memory, especially on mobile, and can <em>cause</em> jank. Treat it like a profiler-driven fix, not a default. Modern engines auto-promote animating elements anyway, so its value is mostly avoiding the promotion hitch at animation start.</p>
+
+  <h3>FLIP — First, Last, Invert, Play</h3>
+  <p>The technique for animating <em>layout changes</em> (list reorder, grid→detail expand, shared-element moves) using only cheap transforms:</p>
+  <ol>
+    <li><strong>First:</strong> measure the element's position (<code>getBoundingClientRect</code>) before the change.</li>
+    <li><strong>Last:</strong> apply the state change (reorder the array, add the class), let layout land, measure again.</li>
+    <li><strong>Invert:</strong> apply a transform that visually moves it back to the old spot: <code>translate(firstX − lastX, firstY − lastY)</code>. The user still sees "before."</li>
+    <li><strong>Play:</strong> transition the transform to <code>none</code>. The element glides to its true position — one layout, then compositor-only animation.</li>
+  </ol>
+  <pre><code><span class="com">// React list-reorder sketch (the classic interview extension):</span>
+<span class="kw">const</span> positions = <span class="kw">new</span> Map();
+
+useLayoutEffect(() =&gt; {          <span class="com">// runs after DOM mutation, BEFORE paint</span>
+  <span class="kw">for</span> (<span class="kw">const</span> [id, node] <span class="kw">of</span> nodeRefs) {
+    <span class="kw">const</span> last = node.getBoundingClientRect();
+    <span class="kw">const</span> first = positions.get(id);
+    <span class="kw">if</span> (first) {
+      <span class="kw">const</span> dx = first.left - last.left, dy = first.top - last.top;
+      <span class="kw">if</span> (dx || dy) {
+        node.animate(                              <span class="com">// Web Animations API</span>
+          [{ transform: <span class="str">`translate(${dx}px, ${dy}px)`</span> }, { transform: <span class="str">'none'</span> }],
+          { duration: <span class="num">250</span>, easing: <span class="str">'ease-out'</span> }
+        );
+      }
+    }
+    positions.set(id, last);
+  }
+}, [items]);</code></pre>
+  <p><code>useLayoutEffect</code> matters: it runs before the browser paints the new layout, so the invert is applied without a flash. Libraries: Framer Motion's <code>layout</code> prop is FLIP under the hood; the View Transitions API is effectively browser-native FLIP with snapshots.</p>
+
+  <h3><code>prefers-reduced-motion</code> — a requirement, not a nicety</h3>
+  <p>Vestibular disorders make large parallax/zoom/spin motion physically nauseating; this is an accessibility requirement (WCAG 2.3.3) and a code-review blocker at mature orgs.</p>
+  <pre><code><span class="com">/* Strategy: motion is the enhancement, opt-in */</span>
+@media (prefers-reduced-motion: no-preference) {
+  .card { <span class="kw">transition</span>: transform <span class="num">0.3s</span>; }
+  .hero { <span class="kw">animation</span>: float <span class="num">6s</span> ease-in-out infinite; }
+}
+
+<span class="com">/* Reduced ≠ none: keep small opacity/color feedback,
+   kill translation/scale/parallax/autoplay. */</span></code></pre>
+  <p>Also respect it in JS: <code>matchMedia('(prefers-reduced-motion: reduce)')</code> before triggering Framer Motion/WAAPI sequences and smooth scrolling.</p>
+
+  <h3>Web Animations API (WAAPI) — awareness</h3>
+  <p><code>element.animate(keyframes, options)</code> gives CSS-quality (often compositor-driven) animations with a JS handle: <code>.pause()</code>, <code>.reverse()</code>, <code>.finished</code> promise, dynamic keyframe values (as in FLIP above). It's the primitive under Framer Motion's hood for many paths, and the right tool when keyframe values are only known at runtime.</p>
+
+  <h3><code>animation-timeline</code> — awareness</h3>
+  <pre><code>@supports (<span class="kw">animation-timeline</span>: scroll()) {
+  .reading-progress {
+    <span class="kw">animation</span>: grow linear;
+    <span class="kw">animation-timeline</span>: scroll(root);   <span class="com">/* progress bound to page scroll,
+                                            off the main thread */</span>
+  }
+}
+@keyframes grow { from { <span class="kw">transform</span>: scaleX(<span class="num">0</span>); } to { <span class="kw">transform</span>: scaleX(<span class="num">1</span>); } }</code></pre>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <h2 id="architecture">Styling architecture at scale <span class="tier-1">Tier 1</span></h2>
+  <p>This is <em>the</em> senior CSS discussion. The interviewer isn't grading your favorite tool; they're grading whether you can name the axes, argue trade-offs fairly, and commit to a contextual decision. Give every option a fair treatment.</p>
+
+  <h3>Option 1 — Plain CSS / Sass + BEM</h3>
+  <pre><code><span class="com">/* Block__Element--Modifier: scoping by naming convention */</span>
+.search-form { }
+.search-form__input { }
+.search-form__button--disabled { }</code></pre>
+  <ul>
+    <li><strong>Pros:</strong> zero runtime, zero build magic, fully cacheable static CSS, works everywhere (any framework, no framework), the platform never breaks it. Flat specificity (single class) keeps the cascade tame.</li>
+    <li><strong>Cons:</strong> scoping is a <em>social contract</em>, not a guarantee — nothing stops a collision or a "quick fix" targeting someone else's block. Naming discipline decays across teams and years; dead CSS accumulates because deletion is scary (who knows what still uses <code>.card--legacy</code>?). Dynamic styling requires class toggling gymnastics.</li>
+    <li><strong>Modern posture:</strong> pairs well with cascade layers and <code>:where()</code>-based resets; still an excellent choice for content sites, design-system CSS distribution, and small teams with discipline.</li>
+  </ul>
+
+  <h3>Option 2 — CSS Modules</h3>
+  <pre><code><span class="com">/* Card.module.css */</span>
+.card  { <span class="kw">padding</span>: <span class="num">1rem</span>; }
+.title { composes: heading <span class="kw">from</span> <span class="str">'./typography.module.css'</span>; }
+
+<span class="com">// Card.tsx</span>
+<span class="kw">import</span> styles <span class="kw">from</span> <span class="str">'./Card.module.css'</span>;
+<span class="com">// styles.card → "Card_card__x7f3a" — hashed, collision-proof</span>
+&lt;div className={styles.card}&gt;</code></pre>
+  <ul>
+    <li><strong>Pros:</strong> <em>build-time</em> scoping — collisions are impossible by construction, not convention. Zero runtime cost; output is plain static CSS. Deletion is safe (unused import = dead file, and typed CSS module plugins even flag it). <code>composes</code> gives real reuse. Was the React community default for most of a decade, and works cleanly with Server Components because there's nothing to execute.</li>
+    <li><strong>Cons:</strong> dynamic values need the custom-property bridge (<code>style={{'--x': v}}</code>) or class switching; global theming needs a parallel token system; naming <em>within</em> a file is still on you; co-location is two files per component.</li>
+    <li><strong>Verdict axis:</strong> the "boring, safe default" — the option you can commit to when nothing else in the context forces a different answer.</li>
+  </ul>
+
+  <h3>Option 3 — Tailwind (utility-first)</h3>
+  <pre><code>&lt;button <span class="kw">class</span>=<span class="str">"inline-flex items-center gap-2 rounded-lg bg-blue-600
+  px-4 py-2 text-sm font-medium text-white hover:bg-blue-700
+  focus-visible:ring-2 disabled:opacity-50"</span>&gt;
+  Save
+&lt;/button&gt;</code></pre>
+  <ul>
+    <li><strong>Pros:</strong> <em>consistency via constraints</em> — you compose from a finite design-token scale (spacing 4/8/12…, a fixed palette), so a 40-person team can't invent 40 shades of gray or 17 padding values. Total colocation: style lives with markup, no naming, no file-hopping, fearless deletion (delete the JSX, the styles are gone). JIT compilation means output CSS is only what you use — and crucially it <em>plateaus</em>: utilities are shared, so CSS size grows sub-linearly with app size, unlike per-component approaches. Zero runtime; v4 is CSS-first config with native cascade-layer output and OKLCH palette.</li>
+    <li><strong>Critiques and the standard answers:</strong>
+      <ul>
+        <li><em>"Unreadable class soup."</em> Answer: readability is local — everything affecting the element is right there, versus mentally joining 4 CSS files; editor tooling (sorting, hover previews) closes most of the gap. It's a real trade, though — templates are denser.</li>
+        <li><em>"It's just inline styles."</em> Answer: no — utilities support hover/focus/media/container states, come from a constrained token scale, and are cacheable in a stylesheet; inline styles are none of those.</li>
+        <li><em>"Duplication everywhere."</em> Answer: in a component framework, the component IS the reuse boundary — you repeat the classes once inside <code>&lt;Button&gt;</code> and render it 500 times. Tailwind without a component layer genuinely does duplicate; that's the honest caveat.</li>
+        <li><em><code>@apply</code>:</em> use with real caution — recreating semantic classes via <code>@apply</code> everywhere reintroduces exactly the naming/indirection Tailwind exists to remove, plus a proprietary dialect. Tailwind's own docs discourage broad use; acceptable for a handful of primitives when you can't componentize (CMS content, third-party markup).</li>
+      </ul>
+    </li>
+    <li><strong>Where it struggles:</strong> heavy dynamic styling (arbitrary runtime values need the CSS-variable bridge or <code>[--x:...]</code> arbitrary properties); design systems needing themable, consumer-overridable CSS output; teams whose designers don't work on the token scale.</li>
+  </ul>
+
+  <h3>Option 4 — Runtime CSS-in-JS (styled-components, Emotion)</h3>
+  <pre><code><span class="kw">const</span> Button = styled.button<span class="str">`
+  padding: 0.5rem 1rem;
+  background: ${p =&gt; p.$variant === <span class="str">'danger'</span> ? <span class="str">'crimson'</span> : <span class="str">'royalblue'</span>};
+`</span>;</code></pre>
+  <ul>
+    <li><strong>Pros (why it won 2017–2021):</strong> true colocation, real JS scoping and refactoring, effortlessly dynamic (styles are functions of props/theme), dead-style elimination for free, theming via context.</li>
+    <li><strong>Runtime cost:</strong> on every render, the library interpolates template strings, hashes them, generates class names, and injects <code>&lt;style&gt;</code> rules via CSSOM — main-thread work proportional to component count, on top of shipping the library (~10–20&nbsp;kB) and your styles <em>as JS</em> (parsed and executed, not just streamed like CSS). SSR requires per-request style extraction and doubles the payload (critical CSS + the same styles again in the JS bundle).</li>
+    <li><strong>The RSC incompatibility — why the ecosystem moved away:</strong> runtime CSS-in-JS fundamentally depends on client-side JS execution and, for theming, on React Context. <strong>Server Components don't re-render on the client, can't use context, and shouldn't ship style-generating JS.</strong> styled-components/Emotion therefore only work inside <code>"use client"</code> boundaries — meaning adopting them forces your styling choice to dictate your component architecture, backwards. Combined with the measured runtime cost (the widely-cited Spot/Emotion case study showed double-digit % render-time overhead), the ecosystem consensus shifted around 2022–2023 to zero-runtime approaches. styled-components was put into maintenance mode in 2025, which interviewers may expect you to know.</li>
+    <li><strong>Fair treatment:</strong> for a client-rendered SPA with heavy prop-driven dynamic styling and no RSC plans, it still <em>works</em> and existing large codebases are not "wrong" — the argument is about defaults for new projects and migration pressure, not retroactive shame.</li>
+  </ul>
+
+  <h3>Option 5 — Zero-runtime CSS-in-JS</h3>
+  <p>The "keep the DX, drop the runtime" generation — styles authored in TS, <strong>extracted to static CSS at build time</strong>:</p>
+  <ul>
+    <li><strong>vanilla-extract:</strong> <code>.css.ts</code> files, fully type-safe tokens/themes (<code>createTheme</code>), variants via <code>recipes</code>; output is plain CSS, RSC-compatible. Think "CSS Modules with a typed API."</li>
+    <li><strong>Linaria:</strong> styled-components-like syntax compiled away; dynamic values become CSS custom properties automatically — the clearest migration path off styled-components.</li>
+    <li><strong>StyleX (Meta):</strong> atomic compile-time styles — every declaration becomes a deduplicated atomic class (Tailwind-like output, typed-JS authoring), with deterministic "last-applied-wins" merging across component boundaries, which solves the specificity-of-overrides problem at Meta scale. Awareness-level unless you're interviewing at Meta.</li>
+    <li><strong>Panda CSS</strong> also fits here (Chakra's successor direction). Common thread: constraint — styles must be statically analyzable, so arbitrary runtime interpolation is out; dynamic values go through CSS variables.</li>
+  </ul>
+
+  <h3>Decision framework</h3>
+  <table>
+    <thead>
+      <tr><th>Context signal</th><th>Pushes toward</th><th>Because</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Large team / high contributor churn</td><td>Tailwind or CSS Modules</td><td>Consistency by constraint (Tailwind) or by construction (Modules) beats consistency by convention (BEM) as headcount grows</td></tr>
+      <tr><td>Next.js App Router / RSC / streaming SSR</td><td>CSS Modules, Tailwind, vanilla-extract</td><td>Zero-runtime is effectively a hard requirement; runtime CSS-in-JS confines you to client components</td></tr>
+      <tr><td>Mature design system with tokens</td><td>Tailwind (tokens = config) or vanilla-extract (tokens = typed theme contract)</td><td>Both make the token scale the only way to style</td></tr>
+      <tr><td>Design-system <em>library</em> shipped to third parties</td><td>Plain CSS + custom props + <code>@layer</code>, or CSS Modules</td><td>Consumers need overridability and no bundler assumptions; layers give them a clean override story</td></tr>
+      <tr><td>Highly dynamic, data-driven styling (dashboards, editors)</td><td>Any static approach + CSS custom-property bridge; runtime CSS-in-JS only if truly value-per-datum</td><td><code>style={{'--x': v}}</code> covers 95% of "dynamic" needs statically</td></tr>
+      <tr><td>Strict performance budget (commerce, emerging markets)</td><td>Zero-runtime, smallest CSS: Tailwind JIT or Modules + aggressive code-split</td><td>No style JS on the main thread; plateauing CSS size (Tailwind) or per-route CSS (Modules)</td></tr>
+      <tr><td>Content/marketing site, little interactivity</td><td>Plain modern CSS (+ layers, nesting)</td><td>The platform now covers scoping-by-layer, nesting, tokens; tooling adds little</td></tr>
+      <tr><td>Small team, strong CSS skills, long-lived product</td><td>Whatever they'll maintain — likely Modules or plain CSS</td><td>Tool choice matters less than discipline at small scale</td></tr>
+    </tbody>
+  </table>
+
+  <h3>How to answer "how would you style a large app?" like a senior</h3>
+  <div class="senior">
+    <p>Structure the answer in four beats:</p>
+    <ol>
+      <li><strong>Clarify context first</strong> (or state assumptions): rendering model (RSC? SPA?), team size, design-system maturity, perf budget, existing codebase. "It depends" alone is junior; "it depends on these four axes" is senior.</li>
+      <li><strong>Name the axes:</strong> scoping guarantee, runtime cost, dynamic-styling story, SSR/RSC compatibility, token/theming integration, deletability, hiring/onboarding familiarity.</li>
+      <li><strong>Commit to a default:</strong> e.g. "For a new Next.js product app with a design token scale and a team of 10+, my default is Tailwind for product surfaces plus CSS custom properties for theming, with a thin set of shared components as the reuse boundary. If the team has strong CSS ownership and dislikes utility HTML, CSS Modules with a token layer is the equally sound alternative — the non-negotiables are zero runtime and build-time scoping, not the syntax."</li>
+      <li><strong>Name what you'd avoid and why:</strong> "I'd avoid runtime CSS-in-JS for anything new because of RSC incompatibility and main-thread cost — while acknowledging existing styled-components codebases migrate via Linaria/vanilla-extract, not rewrites."</li>
+    </ol>
+  </div>
+  <div class="pitfall">Anti-patterns in this answer: religious advocacy ("Tailwind is objectively best"), tool-bashing without numbers, pretending one tool fits libraries and apps equally, or never actually committing. Interviewers deliberately push back on your choice — the test is whether you defend with trade-offs or fold instantly.</div>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <h2 id="tokens">Design tokens &amp; theming <span class="tier-2">Tier 2</span></h2>
+
+  <h3>Token tiers: primitive → semantic → component</h3>
+  <pre><code>:root {
+  <span class="com">/* Tier 1 — primitives: raw values, exhaustive, never used directly */</span>
+  --blue-500: oklch(<span class="num">0.62</span> <span class="num">0.19</span> <span class="num">255</span>);
+  --space-4: <span class="num">1rem</span>;
+  --radius-2: <span class="num">0.5rem</span>;
+
+  <span class="com">/* Tier 2 — semantic: meaning, not appearance. THE theming surface. */</span>
+  --color-action: <span class="kw">var</span>(--blue-500);
+  --color-surface: white;
+  --color-text-muted: <span class="kw">var</span>(--gray-500);
+
+  <span class="com">/* Tier 3 — component: only when a component needs an override point */</span>
+  --button-bg: <span class="kw">var</span>(--color-action);
+  --button-radius: <span class="kw">var</span>(--radius-2);
+}</code></pre>
+  <p>Why tiers matter: components consuming <em>semantic</em> tokens means (a) dark mode remaps one tier, (b) a rebrand swaps primitives without touching components, (c) component tokens give consumers a supported override API (<code>.my-btn { --button-bg: ... }</code>) instead of specificity fights. The W3C Design Tokens Community Group format standardizes the JSON source of truth; tools (Style Dictionary, Terrazzo) compile it to CSS custom props, TS constants, and native platform formats — one source, N targets.</p>
+
+  <h3>Dark mode strategies</h3>
+  <table>
+    <thead><tr><th>Strategy</th><th>Mechanism</th><th>Trade-offs</th></tr></thead>
+    <tbody>
+      <tr><td>System-only</td><td><code>@media (prefers-color-scheme: dark)</code> remaps semantic tokens</td><td>Zero JS, zero FOUC; but users can't override per-site — usually insufficient for products</td></tr>
+      <tr><td>Class/attribute-only</td><td><code>[data-theme="dark"]</code> on <code>&lt;html&gt;</code>, JS-toggled, persisted</td><td>Full user control; ignores system preference unless you sync it</td></tr>
+      <tr><td><strong>Hybrid (standard)</strong></td><td>Default follows system via media query; explicit <code>data-theme</code> overrides both directions; store choice ("light" / "dark" / "system")</td><td>Best UX; needs the FOUC guard below</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Avoiding dark-mode FOUC (flash of wrong theme)</h3>
+  <p>If theme is applied in a <code>useEffect</code>, SSR/static HTML paints light, then flashes dark. Fix: a tiny <strong>render-blocking inline script in <code>&lt;head&gt;</code></strong>, before any content paints:</p>
+  <pre><code>&lt;script&gt;
+  <span class="com">// Inline in &lt;head&gt; — runs before first paint, so no flash.</span>
+  <span class="kw">try</span> {
+    <span class="kw">const</span> stored = localStorage.getItem(<span class="str">'theme'</span>);
+    <span class="kw">const</span> system = matchMedia(<span class="str">'(prefers-color-scheme: dark)'</span>).matches ? <span class="str">'dark'</span> : <span class="str">'light'</span>;
+    document.documentElement.dataset.theme =
+      (stored === <span class="str">'light'</span> || stored === <span class="str">'dark'</span>) ? stored : system;
+  } <span class="kw">catch</span> (e) {}
+&lt;/script&gt;</code></pre>
+  <p>Also set <code>color-scheme: light dark</code> on <code>:root</code> so form controls, scrollbars, and the UA canvas match the theme — and know the newer <code>light-dark(lightVal, darkVal)</code> CSS function (Baseline 2024) that picks a value based on the resolved <code>color-scheme</code>, letting one declaration serve both themes.</p>
+
+  <h3>Density &amp; spacing scales</h3>
+  <p>Same token mechanics generalize beyond color: a spacing scale (<code>--space-1…--space-9</code>, usually a 4px base), type scale, radius scale. Density theming (comfortable vs compact tables for data-heavy screens) is just remapping the spacing tier under <code>[data-density="compact"]</code> — a pattern Material and enterprise design systems formalize. If components consume raw pixel values anywhere, density theming is impossible; that's the review argument for "no magic numbers, tokens only."</p>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <h2 id="sass">Sass in 2026 <span class="tier-3">Tier 3</span></h2>
+  <p>Interviewers occasionally ask "do you still need Sass?" to check whether you've noticed the platform catching up.</p>
+  <table>
+    <thead><tr><th>Sass feature</th><th>Native replacement</th><th>Verdict</th></tr></thead>
+    <tbody>
+      <tr><td><code>$variables</code></td><td>Custom properties — and they're <em>better</em>: runtime, cascade-aware, themable, visible in DevTools</td><td>Replaced (Sass vars remain only for values needed at compile time, e.g. inside media query params)</td></tr>
+      <tr><td>Nesting, <code>&amp;</code></td><td>Native CSS nesting (Baseline 2023/24)</td><td>Replaced — minus <code>&amp;__elem</code> string building</td></tr>
+      <tr><td><code>darken()</code>/<code>lighten()</code>/color math</td><td><code>color-mix()</code>, relative color syntax <code>oklch(from var(--c) …)</code></td><td>Replaced, and native works with custom properties (Sass never could)</td></tr>
+      <tr><td><code>@import</code> partials</td><td>Native <code>@import</code>/bundler concatenation, <code>@layer</code> for ordering</td><td>Mostly replaced (Sass <code>@import</code> is deprecated in favor of <code>@use</code> anyway)</td></tr>
+      <tr><td>Math (<code>$a / $b</code>)</td><td><code>calc()</code>, <code>min()</code>/<code>max()</code>/<code>clamp()</code>, <code>round()</code>, <code>pow()</code> etc.</td><td>Replaced</td></tr>
+      <tr><td><code>@mixin</code>/<code>@include</code> with arguments</td><td>Nothing equivalent yet (CSS <code>@function</code>/<code>@mixin</code> are being specced; Chromium is prototyping)</td><td><strong>Still Sass territory</strong></td></tr>
+      <tr><td><code>@each</code>/<code>@for</code> loops (generating utility/token sets)</td><td>Nothing native; usually the build tool's job now (Tailwind JIT, Style Dictionary codegen)</td><td>Still Sass — or moved to codegen</td></tr>
+      <tr><td>Compile-time logic (<code>@if</code>, functions, maps)</td><td>Partially <code>@supports</code>/custom props tricks; mostly no</td><td>Still Sass</td></tr>
+    </tbody>
+  </table>
+  <p><strong>Migration posture for interviews:</strong> "I wouldn't start a new project with Sass in 2026 — custom properties, nesting, and color functions cover the 90% case natively, and PostCSS/LightningCSS handles the build concerns. Existing Sass codebases: don't rewrite; freeze new Sass-variable usage in favor of custom properties (especially anything themable), let native nesting pass through, and keep Sass only where mixins/loops genuinely earn their keep — with an eye on native <code>@mixin</code>/<code>@function</code> proposals that may close even that gap."</p>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <h2 id="qa">Interview Q&amp;A</h2>
+
+  <details class="qa">
+    <summary>What problem do container queries solve that media queries can't?</summary>
+    <div class="answer"><p>Media queries respond to viewport size; components render in many container contexts on the same viewport (sidebar vs main column vs modal). Container queries let a component adapt to <em>its own container's</em> size, decoupling component responsive behavior from page layout. Before them, design systems leaked this into props (<code>variant="compact"</code>) or JS ResizeObserver hacks. Division of labor: media queries for page-level macro layout, container queries for component-level micro layout.</p></div>
+  </details>
+
+  <details class="qa">
+    <summary>Why does container-type: size require you to set an explicit height, while inline-size usually doesn't?</summary>
+    <div class="answer"><p>To avoid circularity (content changes container size → query flips → content changes), a query container's queried axis must be computable without looking at its contents — so <code>container-type</code> applies containment. <code>inline-size</code> only contains the inline axis, and block elements typically get inline size from their parent anyway, so height still grows with content. <code>size</code> contains both axes: the element no longer derives height from content, so with no explicit block size it collapses to zero. That's why <code>inline-size</code> is the default choice.</p></div>
+  </details>
+
+  <details class="qa">
+    <summary>What are container query units and when would you use cqi over cqw?</summary>
+    <div class="answer"><p><code>cqw/cqh/cqi/cqb/cqmin/cqmax</code> — percentages of the nearest size container's dimensions. <code>cqi</code> is the <em>logical inline</em> equivalent of <code>cqw</code>: identical in horizontal writing modes, but correct in vertical writing modes — same reasoning as preferring logical properties generally. Use case: container-relative fluid type, e.g. <code>font-size: clamp(1rem, 4cqi, 1.75rem)</code> so a card headline scales with the card, not the viewport.</p></div>
+  </details>
+
+  <details class="qa">
+    <summary>Explain the difference between .card:not(:has(img)) and .card:has(:not(img)).</summary>
+    <div class="answer"><p><code>.card:not(:has(img))</code>: cards containing <strong>no image anywhere</strong>. <code>.card:has(:not(img))</code>: cards containing <strong>at least one element that isn't an image</strong> — true for nearly every card (a title matches). The negation scope differs: negate the "contains" test vs negate the descendant type. Translate to English before writing.</p></div>
+  </details>
+
+  <details class="qa">
+    <summary>Is :has() a performance problem?</summary>
+    <div class="answer"><p>Not inherently — engines use invalidation-set optimizations, and typical usage (specific subject, shallow argument, ideally child combinator) is fine. The risky pattern is a broad subject with a deep unanchored argument (<code>body:has(.a .b:hover)</code>): any mutation or hover anywhere can trigger wide re-matching. Also note constraints: no nesting <code>:has()</code> inside <code>:has()</code>, no pseudo-elements inside, and it carries the specificity of its most specific argument (unlike <code>:where()</code>).</p></div>
+  </details>
+
+  <details class="qa">
+    <summary>How do cascade layers change the cascade algorithm? Where do unlayered styles and !important fit?</summary>
+    <div class="answer"><p>After origin/importance, the cascade compares <strong>layer order before specificity</strong>: a declaration in a later layer beats an earlier layer regardless of selector specificity; specificity only breaks ties within a layer. For normal declarations, <strong>unlayered author styles beat all layered ones</strong> (great for migration: layer vendor CSS, your styles win). For <code>!important</code> declarations the order <strong>inverts</strong>: important-in-earlier-layer beats important-in-later-layer, and important-layered beats important-unlayered — so foundational layers can make unstompable guarantees.</p></div>
+  </details>
+
+  <details class="qa">
+    <summary>Order these and explain: initial, inherit, unset, revert, revert-layer.</summary>
+    <div class="answer"><p><code>initial</code> = spec's initial value, ignoring everything. <code>inherit</code> = parent's computed value, always. <code>unset</code> = <code>inherit</code> for inherited properties, else <code>initial</code>. <code>revert</code> = roll back author styles, leaving user/UA styles (e.g. reverting <code>display</code> on a div gives <code>block</code>, not <code>inline</code> which is the true initial). <code>revert-layer</code> = roll back just the current cascade layer, letting earlier layers apply — the surgical one for layered architectures.</p></div>
+  </details>
+
+  <details class="qa">
+    <summary>Why does `color: red; color: var(--size)` (where --size is 16px) not render red?</summary>
+    <div class="answer"><p>Because <code>var()</code> substitution happens at <strong>computed-value time</strong>, after the cascade already discarded the <code>red</code> declaration in favor of the later one. When substitution yields an invalid value ("invalid at computed-value time"), the browser can't resurrect earlier declarations; the property behaves as <code>unset</code> — inherited value for inherited properties like <code>color</code>, initial otherwise. Mitigations: <code>var(--x, fallback)</code>, or register the property with <code>@property</code> so invalid values fall back to the typed <code>initial-value</code>.</p></div>
+  </details>
+
+  <details class="qa">
+    <summary>Why is `* { --gap: 1rem }` an anti-pattern?</summary>
+    <div class="answer"><p>It sets the property <em>directly on every element</em>, and direct declarations beat inheritance. So <code>.compact { --gap: .5rem }</code> only changes <code>.compact</code> itself — its children still get 1rem from the universal rule, breaking subtree theming. Declare tokens on <code>:root</code> and override at subtree scope; inheritance does the propagation.</p></div>
+  </details>
+
+  <details class="qa">
+    <summary>What does @property give you over a plain custom property?</summary>
+    <div class="answer"><p>Registration with <code>syntax</code> (type), <code>initial-value</code>, and <code>inherits</code>. Consequences: (1) the property becomes <strong>animatable</strong> — the engine knows how to interpolate an <code>&lt;angle&gt;</code> or <code>&lt;color&gt;</code>, whereas untyped custom properties flip discretely; (2) invalid values fall back to the typed initial value instead of the unset/inherit surprise; (3) you can opt out of inheritance. Classic demo: transitioning a gradient angle or gradient color stops, which is impossible otherwise. Baseline since Firefox 128 (2024).</p></div>
+  </details>
+
+  <details class="qa">
+    <summary>Can you use custom properties in media queries? What's the alternative?</summary>
+    <div class="answer"><p>No — <code>@media (min-width: var(--bp))</code> is invalid. Custom properties are resolved per-element via the cascade; a media query is evaluated against the environment with no element context. Alternatives: preprocess breakpoints (Sass/PostCSS variables at compile time), use container queries where component-relative logic fits, or await the specced custom environment variables. Distinguish this from <em>using</em> custom properties <strong>inside</strong> a media query block, which is fine and is exactly how responsive token remapping works.</p></div>
+  </details>
+
+  <details class="qa">
+    <summary>Write fluid typography with clamp() and explain why the middle value should mix rem with vw.</summary>
+    <div class="answer"><p><code>font-size: clamp(1.75rem, 1.125rem + 2.5vw, 3rem)</code>. A pure-<code>vw</code> preferred value doesn't scale when the user zooms text or raises their root font size — failing WCAG 1.4.4 (text resizable to 200%). Adding a rem term keeps the formula responsive to both viewport <em>and</em> user preference. Derivation: slope = Δfont / Δviewport between your two design points; rem intercept = size − slope × viewport at either point.</p></div>
+  </details>
+
+  <details class="qa">
+    <summary>:is() vs :where() — when do you reach for each?</summary>
+    <div class="answer"><p>Both group selectors and are forgiving of invalid list items. <code>:is()</code> takes the specificity of its most specific argument; <code>:where()</code> contributes <strong>zero</strong>. Use <code>:where()</code> for resets and library base styles that must lose to any consumer selector; use <code>:is()</code> as plain grouping sugar where normal specificity is fine. Bonus: native nesting desugars the parent reference with <code>:is()</code> semantics, which is why nested-rule specificity can differ from Sass output.</p></div>
+  </details>
+
+  <details class="qa">
+    <summary>What's different between native CSS nesting and Sass nesting?</summary>
+    <div class="answer"><p>Key gotchas: (1) <strong>no string concatenation</strong> — <code>&amp;__title</code> doesn't build <code>.card__title</code>; <code>&amp;</code> is a selector reference, so BEM-by-nesting doesn't port; (2) the implied parent behaves like <code>:is(parent)</code>, so with selector lists the specificity can differ from Sass's expanded output; (3) at-rules (<code>@media</code>, <code>@container</code>) nest natively too. Same discipline caveat as Sass: shallow nesting only, or you couple CSS to DOM structure and inflate specificity.</p></div>
+  </details>
+
+  <details class="qa">
+    <summary>Why did design systems move to OKLCH?</summary>
+    <div class="answer"><p>Perceptual uniformity: equal OKLCH lightness ≈ equal perceived brightness across hues, unlike HSL where yellow at L=50% looks far brighter than blue at L=50%. That means palette scales generated by varying L behave consistently for contrast/accessibility across every hue, hue rotations don't shift perceived lightness, and interpolation avoids muddy midpoints. It also expresses wide-gamut P3 colors that sRGB hex can't. Tailwind v4 and Radix rebuilt palettes on it. Pair with <code>color-mix(in oklch, …)</code> and relative color syntax for runtime color math that works with custom properties.</p></div>
+  </details>
+
+  <details class="qa">
+    <summary>Walk me through why animating transform is cheaper than animating top.</summary>
+    <div class="answer"><p>Pipeline: Style → Layout → Paint → Composite. Animating <code>top</code> changes geometry, so every frame runs layout (which can cascade to ancestors/siblings), repaint, composite — all main-thread work that competes with JS. Animating <code>transform</code> (or <code>opacity</code>) changes neither geometry nor pixels of the layer: the element is promoted to its own compositor layer and the <em>compositor thread</em> re-positions/re-blends existing GPU textures. Consequence worth stating: compositor animations stay smooth even while the main thread is blocked. That's also the whole motivation for FLIP.</p></div>
+  </details>
+
+  <details class="qa">
+    <summary>Explain FLIP and where React's useLayoutEffect fits in.</summary>
+    <div class="answer"><p>First-Last-Invert-Play animates layout changes with transforms only: measure old position (First), apply the real change and measure new position (Last), transform the element back by the delta so it appears unmoved (Invert), then transition the transform to none (Play) — one layout, then compositor-only motion. In React, do the Last+Invert inside <code>useLayoutEffect</code>: it fires after DOM mutation but <em>before paint</em>, so the user never sees the un-inverted frame. Framer Motion's <code>layout</code> prop and the View Transitions API are FLIP industrialized.</p></div>
+  </details>
+
+  <details class="qa">
+    <summary>When is will-change harmful?</summary>
+    <div class="answer"><p>Each hinted element gets its own compositor layer — a GPU bitmap costing roughly width × height × 4 bytes × dpr². Blanket <code>will-change</code> exhausts GPU memory (mobile especially), forces extra compositing work, and can create blurry text on transformed layers. Correct use: apply just before an animation is likely (e.g. on hover/focus of the trigger), remove after; treat it as a profiler-driven fix. Modern engines auto-promote animating elements, so its main value is avoiding the promotion hitch on the first frame.</p></div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you implement prefers-reduced-motion properly?</summary>
+    <div class="answer"><p>Treat motion as the enhancement: wrap non-essential animation in <code>@media (prefers-reduced-motion: no-preference)</code> so reduced is the default, not a bolted-on override. "Reduced" ≠ "none": keep small opacity/color feedback, remove translation, scale, parallax, autoplaying video. Mirror it in JS (<code>matchMedia</code>) before triggering WAAPI/Framer sequences and smooth scroll. Frame it as an accessibility requirement (vestibular disorders; WCAG 2.3.3), not polish.</p></div>
+  </details>
+
+  <details class="qa">
+    <summary>Why did the ecosystem move away from runtime CSS-in-JS?</summary>
+    <div class="answer"><p>Two compounding reasons. <strong>Runtime cost:</strong> styles are computed, hashed, and injected during render on the main thread, ship as JS (parse + execute, not streamable like CSS), and SSR needs per-request extraction plus double-shipping styles. <strong>RSC incompatibility:</strong> Server Components don't run client JS and can't use React Context, which runtime CSS-in-JS needs for injection and theming — so styled-components/Emotion only work in <code>"use client"</code> trees, letting the styling library dictate component architecture. The consensus shifted to zero-runtime options (CSS Modules, Tailwind, vanilla-extract, Linaria, StyleX); styled-components entered maintenance mode in 2025. Fair caveat: an existing client-only SPA using Emotion isn't broken — this is about defaults for new work.</p></div>
+  </details>
+
+  <details class="qa">
+    <summary>Tailwind's critics say "unreadable class soup" and "duplication." Steelman both sides.</summary>
+    <div class="answer"><p><strong>Critique steelman:</strong> long class strings hurt scanability and diff noise; markup and design concerns intermix; without a component layer, duplication is real and drift follows; <code>@apply</code> as an escape hatch recreates the naming problem in a proprietary dialect. <strong>Defense steelman:</strong> readability is <em>local</em> — no cross-file cascade archaeology; the constrained token scale is an enforced design system (the real win at team scale); components, not classes, are the reuse boundary in React, so duplication lives in one place; JIT output plateaus sub-linearly; deletion is fearless because styles die with markup. Senior close: Tailwind is a bet that consistency-via-constraint beats expressiveness for product UI teams — right for many app teams, wrong for shipped design-system libraries needing consumer overridability.</p></div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you pass a dynamic runtime value into a statically-extracted styling system (CSS Modules/Tailwind)?</summary>
+    <div class="answer"><p>The CSS custom-property bridge: <code>style={{'--progress': `${pct}%`}}</code> on the element, and static CSS consumes <code>var(--progress)</code>. The static rule stays cacheable; only the tiny value is inline. This handles the vast majority of "we need CSS-in-JS for dynamic styles" cases, works in RSC (it's just an attribute), and keeps transitions/pseudo-elements in CSS. Zero-runtime libraries (Linaria, vanilla-extract's <code>assignInlineVars</code>) automate exactly this pattern.</p></div>
+  </details>
+
+  <details class="qa">
+    <summary>Design a dark mode that respects system preference but allows user override, without a flash of wrong theme.</summary>
+    <div class="answer"><p>Semantic tokens as the theming surface; default dark mapping under <code>@media (prefers-color-scheme: dark)</code> scoped to "no explicit choice" (or resolve everything to <code>data-theme</code>). User override sets <code>data-theme="light|dark"</code> on <code>&lt;html&gt;</code>, persisted in localStorage with three states: light/dark/system. FOUC fix: a tiny render-blocking inline script in <code>&lt;head&gt;</code> that reads localStorage, falls back to <code>matchMedia</code>, and sets the attribute before first paint — a <code>useEffect</code> is too late by definition. Also set <code>color-scheme: light dark</code> for native controls, and know <code>light-dark()</code> as the newer one-declaration option.</p></div>
+  </details>
+
+  <details class="qa">
+    <summary>What are the three design-token tiers and why not just use primitives everywhere?</summary>
+    <div class="answer"><p>Primitive (raw values: <code>--blue-500</code>), semantic (intent: <code>--color-action</code>), component (override points: <code>--button-bg</code>). If components consume primitives directly, dark mode and rebrands require touching every component, and "why is this blue" has no answer in the code. Semantic tokens make theming a single-tier remap; component tokens give consumers a supported override API instead of specificity wars. Source of truth typically lives in the W3C DTCG JSON format, compiled by Style Dictionary to CSS/TS/native.</p></div>
+  </details>
+
+  <details class="qa">
+    <summary>Do you still need Sass in 2026?</summary>
+    <div class="answer"><p>Mostly no for new projects: custom properties replaced variables (and are more capable — runtime, themable), native nesting replaced nesting, <code>color-mix()</code>/relative color syntax replaced color functions, <code>calc()</code> family replaced math. What's left: parameterized <code>@mixin</code>s and loops for code generation — and native CSS <code>@function</code>/<code>@mixin</code> are on the standards track with Chromium prototypes. Posture: don't rewrite existing Sass; stop adding Sass variables for anything themable; keep Sass only where mixins/loops genuinely pay.</p></div>
+  </details>
+
+  <details class="qa">
+    <summary>What are view transitions, and how would you adopt them safely?</summary>
+    <div class="answer"><p>The browser snapshots the old and new DOM states and animates between them (default cross-fade; customizable per element via <code>view-transition-name</code> and <code>::view-transition-*</code> pseudo-elements). Same-document via <code>document.startViewTransition(cb)</code>; cross-document (MPA) via <code>@view-transition { navigation: auto }</code>. Adoption: strictly progressive enhancement — feature-detect (<code>if (!document.startViewTransition) { update(); return; }</code>), respect <code>prefers-reduced-motion</code>, and lean on framework integrations (React Router, Next, Astro). Same-document is broadly available across engines as of 2025; cross-document is newer.</p></div>
+  </details>
+
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <h2 id="exercises">Hands-on exercises</h2>
+
+  <div class="exercise">
+    <h3>Exercise 1 — Container-query card</h3>
+    <p>Build a <code>.media-card</code> (image + title + description + CTA) that renders horizontal (image left, 40%) when its container is ≥ 420px and stacked when narrower, with a container-relative fluid title. Place the same card in a 3-column grid and a 280px sidebar to prove it adapts with <em>zero</em> media queries or props.</p>
+    <details>
+      <summary>Solution</summary>
+      <pre><code>.card-slot { <span class="kw">container</span>: card / inline-size; }
+
+.media-card {
+  <span class="kw">display</span>: flex; <span class="kw">flex-direction</span>: column; <span class="kw">gap</span>: <span class="num">0.75rem</span>;
+}
+.media-card__img { <span class="kw">width</span>: <span class="num">100%</span>; <span class="kw">aspect-ratio</span>: <span class="num">16</span>/<span class="num">9</span>; <span class="kw">object-fit</span>: cover; }
+.media-card__title { <span class="kw">font-size</span>: <span class="kw">clamp</span>(<span class="num">1rem</span>, <span class="num">0.8rem</span> + <span class="num">2cqi</span>, <span class="num">1.5rem</span>); }
+
+@container card (<span class="kw">width</span> &gt;= <span class="num">420px</span>) {
+  .media-card { <span class="kw">flex-direction</span>: row; <span class="kw">gap</span>: <span class="num">1.25rem</span>; }
+  .media-card__img { <span class="kw">width</span>: <span class="num">40%</span>; <span class="kw">aspect-ratio</span>: <span class="num">4</span>/<span class="num">3</span>; }
+}</code></pre>
+      <p>Notes: containment lives on a dedicated <code>.card-slot</code> wrapper sized by the surrounding layout (grid cell / sidebar), never on the card itself; <code>2cqi</code> makes the title scale with the card. Mobile-first stacked styles are the unqueried baseline, so older browsers degrade gracefully.</p>
+    </details>
+  </div>
+
+  <div class="exercise">
+    <h3>Exercise 2 — JS-free form validation UI with :has() and :user-invalid</h3>
+    <p>Given <code>&lt;div class="field"&gt;&lt;label&gt;…&lt;/label&gt;&lt;input required type="email"&gt;&lt;p class="field__error"&gt;…&lt;/p&gt;&lt;/div&gt;</code>: (a) don't show errors on page load; (b) after the user interacts and leaves the field invalid, tint the wrapper border, color the label, and reveal the error; (c) show a success tint when user-valid; (d) highlight the wrapper on focus.</p>
+    <details>
+      <summary>Solution</summary>
+      <pre><code>.field { <span class="kw">border</span>: <span class="num">1px</span> solid <span class="kw">var</span>(--color-border); <span class="kw">border-radius</span>: <span class="num">0.5rem</span>; <span class="kw">padding</span>: <span class="num">0.75rem</span>; }
+.field__error { <span class="kw">display</span>: none; <span class="kw">color</span>: <span class="kw">var</span>(--color-danger); }
+
+.field:has(:focus-visible) { <span class="kw">outline</span>: <span class="num">2px</span> solid <span class="kw">var</span>(--color-focus); <span class="kw">outline-offset</span>: <span class="num">2px</span>; }
+
+<span class="com">/* :user-invalid, not :invalid — empty required fields are :invalid on load */</span>
+.field:has(:user-invalid) { <span class="kw">border-color</span>: <span class="kw">var</span>(--color-danger); }
+.field:has(:user-invalid) label { <span class="kw">color</span>: <span class="kw">var</span>(--color-danger); }
+.field:has(:user-invalid) .field__error { <span class="kw">display</span>: block; }
+
+.field:has(:user-valid) { <span class="kw">border-color</span>: <span class="kw">var</span>(--color-success); }</code></pre>
+      <p>Key insight for the interview: <code>:invalid</code> would flag the pristine form on arrival; <code>:user-invalid</code> waits for real interaction. Still pair with server-side validation and <code>aria-describedby</code>/<code>aria-invalid</code> for screen readers — CSS reveals the message visually but semantics need markup.</p>
+    </details>
+  </div>
+
+  <div class="exercise">
+    <h3>Exercise 3 — Layer a legacy vendor stylesheet</h3>
+    <p>A vendor datepicker stylesheet full of <code>#datepicker .day.selected</code>-grade selectors keeps beating your overrides, and your codebase has accumulated <code>!important</code>s to fight it. Restructure with <code>@layer</code> so all vendor CSS loses to your unlayered app styles, define a full layer order for the app, and use <code>revert-layer</code> to strip the vendor's box-shadow in one theme.</p>
+    <details>
+      <summary>Solution</summary>
+      <pre><code><span class="com">/* entry.css — order declared first; later wins */</span>
+@layer vendor, reset, tokens, components, utilities;
+
+@import url(<span class="str">"vendor/datepicker.css"</span>) layer(vendor);
+@import url(<span class="str">"reset.css"</span>) layer(reset);
+
+@layer components {
+  <span class="com">/* single class now beats #datepicker .day.selected —
+     layer order is compared before specificity */</span>
+  .day-selected { <span class="kw">background</span>: <span class="kw">var</span>(--color-action); }
+}
+
+@layer components {
+  [data-theme=<span class="str">"minimal"</span>] .datepicker {
+    <span class="kw">box-shadow</span>: revert-layer; <span class="com">/* falls back to vendor layer's value…
+      or wrap vendor tweaks in a later sub-layer to fully unset */</span>
+  }
+}</code></pre>
+      <p>Then delete the <code>!important</code>s incrementally. The migration is safe because <em>unlayered</em> existing app styles automatically beat everything you moved into layers — you can layer the vendor file on day one with zero visual risk, then move app CSS into layers gradually.</p>
+    </details>
+  </div>
+
+  <div class="exercise">
+    <h3>Exercise 4 — FLIP a React list reorder</h3>
+    <p>Given a list re-sorted by a button click, animate each item gliding to its new position at 60fps — no layout-animating libraries. Requirements: transforms only, <code>useLayoutEffect</code>, WAAPI, and skip the animation under <code>prefers-reduced-motion</code>.</p>
+    <details>
+      <summary>Solution</summary>
+      <pre><code><span class="kw">function</span> useFlip(items) {
+  <span class="kw">const</span> refs = useRef(<span class="kw">new</span> Map());   <span class="com">// id → node</span>
+  <span class="kw">const</span> prev = useRef(<span class="kw">new</span> Map());   <span class="com">// id → DOMRect</span>
+
+  useLayoutEffect(() =&gt; {           <span class="com">// after mutation, BEFORE paint</span>
+    <span class="kw">const</span> reduce = matchMedia(<span class="str">'(prefers-reduced-motion: reduce)'</span>).matches;
+    refs.current.forEach((node, id) =&gt; {
+      <span class="kw">const</span> last = node.getBoundingClientRect();
+      <span class="kw">const</span> first = prev.current.get(id);
+      <span class="kw">if</span> (first &amp;&amp; !reduce) {
+        <span class="kw">const</span> dx = first.left - last.left;
+        <span class="kw">const</span> dy = first.top - last.top;
+        <span class="kw">if</span> (dx || dy) node.animate(
+          [{ transform: <span class="str">`translate(${dx}px,${dy}px)`</span> }, { transform: <span class="str">'none'</span> }],
+          { duration: <span class="num">220</span>, easing: <span class="str">'cubic-bezier(.2,.8,.2,1)'</span> }
+        );
+      }
+      prev.current.set(id, last);
+    });
+  }, [items]);
+
+  <span class="kw">return</span> (id) =&gt; (node) =&gt; node ? refs.current.set(id, node) : refs.current.delete(id);
+}</code></pre>
+      <p>Talking points: keys must be stable ids (index keys would remount and kill FLIP); all reads happen before any animation write (no read/write interleaving = no forced synchronous layout); the animation is transform-only so after the single reorder layout, every frame is compositor work.</p>
+    </details>
+  </div>
+
+  <div class="exercise">
+    <h3>Exercise 5 — Token architecture + flashless hybrid dark mode</h3>
+    <p>Design the token sheet for a small app: primitive OKLCH grays/brand, semantic tier, dark remap that follows the system by default but honors a stored user override, the head script preventing FOUC, and <code>color-scheme</code> so native controls match.</p>
+    <details>
+      <summary>Solution</summary>
+      <pre><code>:root {
+  <span class="kw">color-scheme</span>: light dark;
+  <span class="com">/* primitives */</span>
+  --gray-100: oklch(<span class="num">0.97</span> <span class="num">0.005</span> <span class="num">260</span>);
+  --gray-900: oklch(<span class="num">0.22</span> <span class="num">0.02</span> <span class="num">260</span>);
+  --brand-500: oklch(<span class="num">0.62</span> <span class="num">0.19</span> <span class="num">255</span>);
+  <span class="com">/* semantic (light defaults) */</span>
+  --color-bg: <span class="kw">var</span>(--gray-100);
+  --color-text: <span class="kw">var</span>(--gray-900);
+  --color-action: <span class="kw">var</span>(--brand-500);
+}
+
+<span class="com">/* system dark, only when user hasn't chosen */</span>
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme=<span class="str">"light"</span>]) {
+    --color-bg: <span class="kw">var</span>(--gray-900);
+    --color-text: <span class="kw">var</span>(--gray-100);
+  }
+}
+<span class="com">/* explicit user choice wins either way */</span>
+[data-theme=<span class="str">"dark"</span>] {
+  --color-bg: <span class="kw">var</span>(--gray-900);
+  --color-text: <span class="kw">var</span>(--gray-100);
+}
+
+&lt;script&gt;<span class="com">/* inline in &lt;head&gt;, before first paint */</span>
+  <span class="kw">try</span> {
+    <span class="kw">const</span> t = localStorage.getItem(<span class="str">'theme'</span>);
+    <span class="kw">if</span> (t === <span class="str">'light'</span> || t === <span class="str">'dark'</span>)
+      document.documentElement.dataset.theme = t;
+  } <span class="kw">catch</span> (e) {}
+&lt;/script&gt;</code></pre>
+      <p>Notes: components only ever touch the semantic tier; the media query is scoped with <code>:not([data-theme="light"])</code> so "system" remains the default state (nothing stored → no attribute → media query governs); the script only sets the attribute for explicit choices, so it stays tiny and the flash is impossible because it's render-blocking in <code>&lt;head&gt;</code>.</p>
+    </details>
+  </div>
+
+</section>
+
+<nav class="page-nav">
+  <a href="02-css-core.html">← Prev: CSS Core Internals</a>
+  <a href="04-js-core-internals.html">Next: JS Core Internals →</a>
+</nav>
+
+</main>
+</body>
+</html>

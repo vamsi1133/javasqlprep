@@ -1,0 +1,1828 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>11 — State Management | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <div class="breadcrumb"><a href="index.html">← Course Home</a></div>
+    <h1>11 — State Management</h1>
+    <p>Classify the state first, then pick the tool — Redux/RTK internals, server-cache libraries, atomic stores, and the decision framework seniors are expected to recite.</p>
+  </div>
+</header>
+
+<main class="container">
+
+  <section>
+    <h2>Why interviewers ask this</h2>
+    <p>
+      State management is on your resume, which means it will be probed in a very specific way: not "do you know Redux
+      syntax" but <em>"can you justify an architecture?"</em> The junior tell is tool advocacy ("we use Zustand because
+      Redux is boilerplate"). The senior tell is <strong>classification before selection</strong>: you name the
+      <em>category</em> of state in front of you — server cache, shared client state, local UI state, URL state, form
+      state — and each category maps to a best-fit tool with known trade-offs. Interviewers will push on internals
+      (how does <code>useSelector</code> decide to re-render? what exactly does <code>staleTime</code> gate? how does
+      Immer make a "mutation" immutable?) precisely because internals are unfakeable — you either have the model or you don't.
+    </p>
+    <p>
+      At FAANG, expect mechanism questions and "design the state layer for X" system-design hybrids. At product
+      startups, expect war-story probing: "your app got slow — walk me through it," "you inherited a 400-reducer Redux
+      app — what now," "why did you pick TanStack Query over RTK Query." Both reward the same thing: a rehearsable
+      decision framework backed by exact mechanics. This tutorial builds both. Everything is current for
+      <strong>Redux Toolkit 2.x, TanStack Query v5, Zustand v5, React 18/19</strong>; legacy patterns (sagas, Recoil,
+      hand-rolled Redux) are covered as literacy because you'll meet them in real codebases and in "what would you
+      migrate first" questions.
+    </p>
+    <div class="tier-legend">
+      <span class="tier tier-1">T1 — must be airtight</span>
+      <span class="tier tier-2">T2 — senior differentiator</span>
+      <span class="tier tier-3">T3 — awareness is enough</span>
+    </div>
+  </section>
+
+  <div class="toc">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#taxonomy">The taxonomy — five kinds of state</a></li>
+      <li><a href="#builtins">React built-ins as tools — useState, useReducer, lifting, context</a></li>
+      <li><a href="#redux">Redux &amp; Redux Toolkit — deep</a></li>
+      <li><a href="#rtk-query">RTK Query — the server-cache half of RTK</a></li>
+      <li><a href="#tanstack">TanStack Query — the server-cache king</a></li>
+      <li><a href="#zustand">Zustand — the minimal-store pattern</a></li>
+      <li><a href="#jotai">Jotai and the atomic model (+ Recoil, MobX literacy)</a></li>
+      <li><a href="#url-state">URL as state</a></li>
+      <li><a href="#decision">The decision framework — the rehearsable answer</a></li>
+      <li><a href="#state-machines">State machines — XState literacy &amp; the reducer-lite pattern</a></li>
+      <li><a href="#rsc">RSC-era state management</a></li>
+      <li><a href="#qa">Interview Q&amp;A</a></li>
+      <li><a href="#exercises">Hands-on exercises</a></li>
+    </ol>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="taxonomy">1. The taxonomy — five kinds of state <span class="tier tier-1">T1</span></h2>
+
+  <p>
+    Open every state-management answer with this. It is the single highest-leverage framing in the whole topic,
+    because it converts "which library do you like" into an engineering classification problem. <strong>"State" is not
+    one thing.</strong> An app has at least five distinct categories, each with a different lifecycle, ownership, and
+    consistency model — and therefore a different best-fit tool:
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>Category</th><th>Examples</th><th>Owned by</th><th>Best-fit tools</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Local UI state</strong></td>
+        <td>is dropdown open, hover, input focus, accordion expanded</td>
+        <td>One component</td>
+        <td><code>useState</code> / <code>useReducer</code></td>
+      </tr>
+      <tr>
+        <td><strong>Shared client state</strong></td>
+        <td>cart contents, selected workspace, undo stack, feature toggles set client-side</td>
+        <td>The client — the browser is the source of truth</td>
+        <td>Lifted state → Context (low-frequency) → Zustand / Redux Toolkit / Jotai</td>
+      </tr>
+      <tr>
+        <td><strong>Server cache</strong></td>
+        <td>user profile, product list, search results, notifications</td>
+        <td><em>The server.</em> The client only holds a possibly-stale snapshot</td>
+        <td>TanStack Query, RTK Query, SWR — or RSC on the server</td>
+      </tr>
+      <tr>
+        <td><strong>URL state</strong></td>
+        <td>current route, filters, page number, active tab, selected item id</td>
+        <td>The address bar / history stack</td>
+        <td>Router search params (<code>useSearchParams</code>), path params</td>
+      </tr>
+      <tr>
+        <td><strong>Form state</strong></td>
+        <td>field values, dirty/touched flags, validation errors, submit status</td>
+        <td>The form, until submit</td>
+        <td>react-hook-form, TanStack Form; native uncontrolled + FormData for simple cases</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Server cache is not client state — the load-bearing distinction</h3>
+  <p>
+    Remote data has properties that client state never has: it is <strong>owned elsewhere</strong> (someone else can
+    change it while you're looking at it), it can be <strong>stale</strong>, it must be <strong>fetched
+    asynchronously</strong> (loading/error/success lifecycle), it should be <strong>deduplicated</strong> (two
+    components asking for the same user should trigger one request), it should be <strong>refetched</strong> on
+    signals (focus, reconnect, interval), and <strong>mutations</strong> must reconcile the local snapshot with the
+    server's truth (invalidation or optimistic patches). None of that is a state problem — it's a
+    <em>caching</em> problem, and hand-rolling a cache inside Redux means hand-writing request status flags,
+    dedup logic, staleness tracking, and invalidation for every endpoint.
+  </p>
+
+  <div class="senior">
+    The strongest one-liner in the topic: <em>"Most of the pain that historically drove teams to Redux was
+    misclassified server cache."</em> The 2016-era Redux store was 80% <code>isLoading</code>/<code>error</code>/
+    <code>data</code> triples and thunks that fetched into them. Move that to TanStack Query or RTK Query and the
+    global client store shrinks dramatically — often to the point where Context or Zustand covers what's left. Saying
+    this, unprompted, is how you signal you've lived through the shift rather than read about it.
+  </div>
+
+  <h3>The colocation principle</h3>
+  <p>
+    The second framing rule: <strong>keep state as close to where it's used as possible; lift it only when a second
+    consumer actually appears.</strong> ("Colocation" — Kent C. Dodds popularized the term.) Local state is easier to
+    delete, easier to reason about, resets naturally on unmount, and re-renders the smallest possible subtree. Global
+    state is a liability you take on deliberately: every reader couples to it, it outlives components (so you must
+    manage resetting it), and it widens the re-render blast radius. The failure mode interviewers are testing for is
+    the dev who reaches for the global store by default.
+  </p>
+
+  <pre><code>// Escalation ladder — move DOWN this list only when forced:
+// 1. useState in the component that uses it
+// 2. Lift to nearest common parent (two siblings need it)
+// 3. Composition / children props (avoid prop drilling without any library)
+// 4. Context (subtree-wide, low write frequency: theme, auth, locale)
+// 5. External store (app-wide, high frequency, or needs access outside React)
+//
+// Server data never enters this ladder — it goes to a server-cache library.</code></pre>
+
+  <div class="pitfall">
+    "We put everything in Redux so it's all in one place" is an anti-signal at senior level. Uniformity is not a
+    virtue when it means dropdown-open booleans live in a global singleton, survive navigation, need manual reset
+    actions, and force devtools noise on every keystroke. Consistency of <em>approach per category</em> is the goal,
+    not one bucket for everything.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="builtins">2. React built-ins as tools <span class="tier tier-1">T1</span></h2>
+
+  <p>
+    Before any library: React ships a complete toolkit for local and subtree state. Interviewers check that you treat
+    these as first-class tools with known limits, not as the thing you outgrow on day one.
+  </p>
+
+  <h3>useState vs useReducer</h3>
+  <p>
+    Both hold local state; the difference is <em>where update logic lives</em>. <code>useState</code> spreads logic
+    across event handlers; <code>useReducer</code> centralizes it in a pure function keyed by action. Reach for
+    <code>useReducer</code> when: (a) the next state depends on multiple pieces of the previous state, (b) several
+    handlers perform overlapping transitions, (c) you want to unit-test transitions without rendering, or (d) you're
+    encoding a lite state machine (<a href="#state-machines">§10</a>). Bonus mechanic worth citing:
+    <code>dispatch</code> has a stable identity, so passing it deep never invalidates <code>memo</code>'d children —
+    unlike a fresh callback closure.
+  </p>
+
+  <pre><code>type State = { items: CartItem[]; couponCode: string | null };
+
+type Action =
+  | { type: 'added'; item: CartItem }
+  | { type: 'removed'; id: string }
+  | { type: 'couponApplied'; code: string };
+
+function cartReducer(state: State, action: Action): State {
+  switch (action.type) {
+    case 'added': {
+      const existing = state.items.find(i =&gt; i.id === action.item.id);
+      return existing
+        ? { ...state, items: state.items.map(i =&gt;
+            i.id === action.item.id ? { ...i, qty: i.qty + 1 } : i) }
+        : { ...state, items: [...state.items, action.item] };
+    }
+    case 'removed':
+      return { ...state, items: state.items.filter(i =&gt; i.id !== action.id) };
+    case 'couponApplied':
+      return { ...state, couponCode: action.code };
+  }
+}
+
+const [state, dispatch] = useReducer(cartReducer, initialState);
+// Testable with zero React: expect(cartReducer(s, a)).toEqual(...)</code></pre>
+
+  <h3>Lifting state &amp; composition</h3>
+  <p>
+    When two siblings need the same value, lift it to the nearest common ancestor and pass it down. When the pain is
+    <em>drilling through layers that don't care</em>, the first fix is composition, not a store: pass the already-built
+    element as <code>children</code> so intermediate layers never see the data. This also has a rendering benefit
+    (children received as props aren't re-created when the wrapper re-renders — see tutorial 07).
+  </p>
+
+  <h3>Context — transport, not a state manager</h3>
+  <p>
+    Be precise about what Context <em>is</em>: a mechanism for making a value available to a subtree without prop
+    threading. It has no store semantics — no selectors, no update batching strategy, no subscription granularity.
+    <strong>Every consumer of a context re-renders whenever the provider's <code>value</code> is a new reference</strong>,
+    regardless of which part of the value it reads. That makes Context the right tool for
+    <em>low-write-frequency, app-wide values</em> — theme, locale, current user, feature flags, a dependency-injected
+    service client — and the wrong tool for anything updating per-keystroke or per-frame.
+  </p>
+
+  <pre><code>// The classic footgun: a fresh object every render invalidates ALL consumers
+&lt;AuthContext.Provider value={{ user, login, logout }}&gt;   // new {} each render!
+
+// Fixes, in order of preference:
+// 1. Memoize the value
+const value = useMemo(() =&gt; ({ user, login, logout }), [user]);
+
+// 2. Split contexts by update frequency / by concern
+&lt;UserContext.Provider value={user}&gt;          // changes rarely
+  &lt;AuthActionsContext.Provider value={actions}&gt; // stable forever
+    {children}
+
+// 3. Hold state ABOVE the provider so typing in a form inside the
+//    provider's subtree doesn't re-render the provider itself.</code></pre>
+
+  <div class="note">
+    The stock interview phrasing: <em>"Context is transport, not state management. It solves prop drilling; it does
+    not solve update granularity. If consumers need to subscribe to slices of a frequently-changing value, that's
+    exactly the gap external stores fill with selector-based subscriptions via
+    <code>useSyncExternalStore</code>."</em> (React's experimental <code>use(Context)</code> + context selectors have
+    been discussed for years; as of React 19 there is still no built-in selective subscription.)
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="redux">3. Redux &amp; Redux Toolkit — deep <span class="tier tier-1">T1</span></h2>
+
+  <p>
+    Redux is on your resume, so expect the deepest probing here: principles → why they exist → RTK's modern shape →
+    internals. Structure your answers the same way.
+  </p>
+
+  <h3>3.1 Core principles, and the <em>why</em> behind each</h3>
+  <ul>
+    <li><strong>Single store</strong> — one state tree per app. Why: one place to inspect, serialize, persist, and
+      hydrate; devtools can show the entire app's truth at a point in time.</li>
+    <li><strong>State is read-only; changes happen by dispatching actions</strong> — plain serializable objects
+      describing <em>what happened</em>. Why: every change has a name and a log entry; you can replay, record, and
+      ship the action log in a bug report.</li>
+    <li><strong>Changes are made by pure reducers</strong> — <code>(state, action) =&gt; newState</code>, no
+      mutation, no side effects. Why: purity makes transitions deterministic and testable; immutability makes change
+      detection a reference comparison (<code>prev !== next</code>) instead of a deep walk, and enables time-travel
+      because old states are never destroyed.</li>
+    <li><strong>Unidirectional flow</strong> — view dispatches → reducer computes → store notifies → view re-reads.
+      Why: no two-way binding spaghetti; you can always answer "what caused this state?"</li>
+  </ul>
+  <p>
+    The umbrella why: <strong>predictability as a product feature of the architecture</strong>. Time-travel debugging,
+    action replay, and "serialize the store into the bug ticket" all fall out of serializable actions + pure reducers
+    + immutable snapshots. When asked "why Redux over X," lead with the debugging/audit story, not the API.
+  </p>
+
+  <h3>3.2 Redux Toolkit is the standard — legacy vs createSlice</h3>
+  <p>
+    RTK has been the official recommended way to write Redux since ~2019; hand-rolled Redux (action-type constants,
+    action creators, switch reducers, manual immutable spreads, manual store setup) is <em>legacy you can read, not
+    style you should write</em>. The delta:
+  </p>
+
+  <pre><code>// LEGACY (recognize it, don't write it)
+const ADD_TODO = 'todos/ADD_TODO';
+const addTodo = (text) =&gt; ({ type: ADD_TODO, payload: { id: nanoid(), text } });
+function todosReducer(state = [], action) {
+  switch (action.type) {
+    case ADD_TODO:
+      return [...state, { ...action.payload, done: false }];
+    default:
+      return state;
+  }
+}
+
+// MODERN — createSlice generates action creators + types from reducer names
+import { createSlice, PayloadAction } from '@reduxjs/toolkit';
+
+const todosSlice = createSlice({
+  name: 'todos',
+  initialState: [] as Todo[],
+  reducers: {
+    // Looks like mutation. It is NOT — Immer runs inside createSlice.
+    todoAdded(state, action: PayloadAction&lt;string&gt;) {
+      state.push({ id: nanoid(), text: action.payload, done: false });
+    },
+    todoToggled(state, action: PayloadAction&lt;string&gt;) {
+      const todo = state.find(t =&gt; t.id === action.payload);
+      if (todo) todo.done = !todo.done;
+    },
+  },
+});
+
+export const { todoAdded, todoToggled } = todosSlice.actions; // 'todos/todoAdded'
+export default todosSlice.reducer;</code></pre>
+
+  <h3>3.3 How Immer works — the follow-up you must nail</h3>
+  <p>
+    Immer wraps your state in a <strong>Proxy</strong> (the "draft"). Your reducer "mutates" the draft; the proxy
+    traps every <code>get</code>/<code>set</code>. On a write, Immer <em>copies the touched object once</em>
+    (copy-on-write) and records that this node changed. When the reducer returns, Immer finalizes: changed nodes and
+    their ancestors up to the root are replaced with new objects; <strong>everything untouched keeps its original
+    reference</strong> — structural sharing. That last part is why memoized selectors and <code>React.memo</code>
+    keep working: unchanged branches are <em>reference-identical</em> across updates, exactly as if you'd hand-written
+    the spreads.
+  </p>
+
+  <div class="pitfall">
+    Two Immer traps interviewers fish for: (1) <strong>Mutate or return, never both.</strong> In a case where you
+    return a brand-new value (e.g. <code>return initialState</code>), don't also mutate the draft in the same code
+    path — Immer throws. (2) <strong><code>console.log(state)</code> inside a slice reducer prints a Proxy</strong>;
+    use <code>current(state)</code> from RTK/Immer to snapshot it. Also remember Immer only helps <em>inside</em>
+    <code>createSlice</code>/<code>createReducer</code> — mutating in a thunk or component is still a real bug.
+  </div>
+
+  <h3>3.4 configureStore</h3>
+  <pre><code>import { configureStore } from '@reduxjs/toolkit';
+
+export const store = configureStore({
+  reducer: { todos: todosReducer, filters: filtersReducer },
+  // Defaults you get for free (vs legacy createStore):
+  // - redux-thunk middleware
+  // - DevTools extension wiring (disabled in production builds)
+  // - serializableCheck + immutableCheck dev middleware that THROW on
+  //   non-serializable action payloads / accidental state mutation
+  middleware: (getDefault) =&gt; getDefault().concat(listenerMiddleware.middleware),
+});
+
+export type RootState = ReturnType&lt;typeof store.getState&gt;;
+export type AppDispatch = typeof store.dispatch;</code></pre>
+
+  <h3>3.5 createAsyncThunk — the request lifecycle</h3>
+  <p>
+    For async work that lands in the store (when you're not using RTK Query), <code>createAsyncThunk</code> generates
+    a three-phase action lifecycle: <code>pending</code> → <code>fulfilled</code> | <code>rejected</code>. You handle
+    the phases in <code>extraReducers</code>:
+  </p>
+
+  <pre><code>export const fetchUser = createAsyncThunk(
+  'users/fetchById',
+  async (userId: string, { rejectWithValue }) =&gt; {
+    const res = await fetch(`/api/users/${userId}`);
+    if (!res.ok) return rejectWithValue(await res.json());
+    return (await res.json()) as User;
+  }
+);
+
+const usersSlice = createSlice({
+  name: 'users',
+  initialState: { entity: null as User | null,
+                  status: 'idle' as 'idle'|'loading'|'succeeded'|'failed',
+                  error: null as string | null },
+  reducers: {},
+  extraReducers: (builder) =&gt; {
+    builder
+      .addCase(fetchUser.pending,   (s) =&gt; { s.status = 'loading'; s.error = null; })
+      .addCase(fetchUser.fulfilled, (s, a) =&gt; { s.status = 'succeeded'; s.entity = a.payload; })
+      .addCase(fetchUser.rejected,  (s, a) =&gt; { s.status = 'failed';
+                                                s.error = a.error.message ?? 'failed'; });
+  },
+});</code></pre>
+
+  <div class="senior">
+    Then immediately note: this hand-written status/error/entity triple <em>is the boilerplate RTK Query and TanStack
+    Query eliminate</em> — plus the dedup, caching, and refetching that <code>createAsyncThunk</code> never gives you
+    (dispatch the thunk from two components and you get two fetches). Showing you know when NOT to use
+    <code>createAsyncThunk</code> is worth more than the syntax.
+  </div>
+
+  <h3>3.6 Selectors, useSelector, and memoization — the re-render rule</h3>
+  <p>
+    The exact mechanic: after every dispatched action, <strong>react-redux runs your selector against the new state
+    and re-renders the component if the result is not reference-equal
+    (<code>===</code> by default) to the previous result.</strong> Two consequences:
+  </p>
+  <pre><code>// ✅ Fine: selecting a primitive or a stored reference
+const count = useSelector(s =&gt; s.cart.items.length);       // number: === works
+const items = useSelector(s =&gt; s.cart.items);              // same ref until items change
+
+// ❌ Re-renders on EVERY action, related or not:
+const names = useSelector(s =&gt; s.users.list.map(u =&gt; u.name)); // new array each call
+const pair  = useSelector(s =&gt; ({ a: s.a, b: s.b }));           // new object each call
+// (react-redux warns about these in dev: "Selector returned a different result
+//  when called with the same parameters")</code></pre>
+
+  <p>
+    Fixes: pass <code>shallowEqual</code> as the second arg for the object-pair case, or — the canonical answer —
+    <strong>memoize derived data with <code>createSelector</code></strong> (Reselect, re-exported by RTK):
+  </p>
+
+  <pre><code>import { createSelector } from '@reduxjs/toolkit';
+
+const selectItems  = (s: RootState) =&gt; s.cart.items;
+const selectCoupon = (s: RootState) =&gt; s.cart.couponCode;
+
+export const selectCartTotal = createSelector(
+  [selectItems, selectCoupon],           // input selectors
+  (items, coupon) =&gt; {                   // result fn: runs ONLY when an input ref changes
+    const subtotal = items.reduce((sum, i) =&gt; sum + i.price * i.qty, 0);
+    return coupon ? subtotal * 0.9 : subtotal;
+  }
+);
+// Mechanics: createSelector caches the last inputs + last result (cache size 1 by
+// default). If every input selector returns a reference-equal value, it returns
+// the CACHED result — same reference — so useSelector sees === and skips the render.</code></pre>
+
+  <p>
+    <strong>Selector factory</strong> — the cache-size-1 gotcha: one memoized selector shared by 50 list rows, each
+    calling it with a different <code>id</code>, thrashes the cache and memoizes nothing. Give each component its own
+    instance:
+  </p>
+
+  <pre><code>const makeSelectTodosByProject = () =&gt;
+  createSelector(
+    [(s: RootState) =&gt; s.todos.entities, (_: RootState, projectId: string) =&gt; projectId],
+    (entities, projectId) =&gt;
+      Object.values(entities).filter(t =&gt; t.projectId === projectId)
+  );
+
+function ProjectTodos({ projectId }: { projectId: string }) {
+  const selectTodos = useMemo(makeSelectTodosByProject, []); // per-instance cache
+  const todos = useSelector(s =&gt; selectTodos(s, projectId));
+  ...
+}
+// (Reselect 5 alternative: createSelector with weakMapMemoize handles
+// per-argument caching without the factory dance.)</code></pre>
+
+  <h3>3.7 Normalized state — createEntityAdapter</h3>
+  <p>
+    Store relational data like a database, not like the API response. Why normalize: (1) no deeply nested updates —
+    each entity is one flat record; (2) <strong>O(1) lookup by id</strong> instead of array scans; (3) a
+    <strong>single source of truth per entity</strong> — a comment's author isn't duplicated inside five posts, so
+    updating the author touches one record; (4) lists become arrays of ids, so reordering doesn't touch entities.
+  </p>
+
+  <pre><code>import { createEntityAdapter, createSlice } from '@reduxjs/toolkit';
+
+const todosAdapter = createEntityAdapter&lt;Todo&gt;({
+  sortComparer: (a, b) =&gt; b.createdAt - a.createdAt,
+});
+// State shape it manages: { ids: string[], entities: Record&lt;string, Todo&gt; }
+
+const todosSlice = createSlice({
+  name: 'todos',
+  initialState: todosAdapter.getInitialState({ status: 'idle' }), // extra fields ok
+  reducers: {
+    todoAdded: todosAdapter.addOne,
+    todoUpdated: todosAdapter.updateOne,   // { id, changes: {...} }
+    todosReceived(state, action: PayloadAction&lt;Todo[]&gt;) {
+      todosAdapter.setAll(state, action.payload);
+      state.status = 'succeeded';
+    },
+  },
+});
+
+export const {
+  selectAll: selectAllTodos,     // memoized: entities → sorted array
+  selectById: selectTodoById,    // O(1)
+  selectIds: selectTodoIds,
+} = todosAdapter.getSelectors((s: RootState) =&gt; s.todos);
+
+// List perf pattern: parent subscribes to selectTodoIds (stable when only an
+// entity's FIELDS change); each memo'd &lt;TodoRow id={id}/&gt; subscribes to
+// selectTodoById(s, id). Editing one todo re-renders exactly one row.</code></pre>
+
+  <h3>3.8 Side effects: listener middleware, and saga/observable literacy</h3>
+  <p>
+    <strong>Listener middleware</strong> (RTK-native) is the modern answer to "reactive side effects": run logic when
+    an action is dispatched or a predicate on state changes — with async, cancellation, and take/condition helpers —
+    without adding a generator runtime.
+  </p>
+
+  <pre><code>import { createListenerMiddleware } from '@reduxjs/toolkit';
+export const listenerMiddleware = createListenerMiddleware();
+
+listenerMiddleware.startListening({
+  actionCreator: todoAdded,
+  effect: async (action, api) =&gt; {
+    api.cancelActiveListeners();          // debounce-style: kill previous run
+    await api.delay(500);
+    await analytics.track('todo_added', { id: action.payload.id });
+    // api.dispatch / api.getState / api.condition(...) also available
+  },
+});</code></pre>
+
+  <p>
+    <strong>redux-saga</strong> — two-paragraph literacy for legacy codebases: sagas are long-running processes
+    written as <em>generator functions</em> that <code>yield</code> plain effect descriptions
+    (<code>call</code>, <code>put</code>, <code>take</code>, <code>select</code>, <code>fork</code>) which the saga
+    middleware interprets. Because a saga yields <em>descriptions</em> rather than executing directly, tests can step
+    the generator and assert on yielded effects without mocking I/O. Concurrency operators are the draw:
+    <code>takeLatest</code> (cancel the previous run — free race-condition handling for search-as-you-type),
+    <code>takeLeading</code>, <code>debounce</code>, <code>race</code>, and structured cancellation of forked tasks.
+  </p>
+  <p>
+    The cost: a second programming model inside your app, weak TypeScript ergonomics, and the realization that
+    ~90% of saga usage was "fetch on action" — which server-cache libraries now do better. <strong>redux-observable</strong>
+    is the same niche with RxJS: epics are functions <code>(action$) =&gt; action$</code> that map an action stream to
+    a stream of new actions (<code>switchMap</code> ≈ <code>takeLatest</code>). Interview stance: "I can read and
+    maintain sagas; for new code I'd use RTK Query for data and listener middleware for the residual reactive logic,
+    keeping sagas only for genuinely complex long-lived workflows until they're migrated."
+  </p>
+
+  <h3>3.9 Redux internals — store in ~20 lines, and how React subscribes</h3>
+  <pre><code>// The entire conceptual core of Redux: a closure over state + listeners.
+function createStore(reducer, preloadedState) {
+  let state = preloadedState;
+  let listeners = [];
+
+  function getState() { return state; }
+
+  function dispatch(action) {
+    state = reducer(state, action);        // synchronous, one at a time
+    listeners.forEach(l =&gt; l());           // notify AFTER state is replaced
+    return action;
+  }
+
+  function subscribe(listener) {
+    listeners.push(listener);
+    return function unsubscribe() {
+      listeners = listeners.filter(l =&gt; l !== listener);
+    };
+  }
+
+  dispatch({ type: '@@redux/INIT' });      // populate initial state
+  return { getState, dispatch, subscribe };
+}
+// Middleware = a wrapper around dispatch:
+//   (storeApi) =&gt; (next) =&gt; (action) =&gt; next(action)
+// composed right-to-left, so each middleware sees actions before the reducer.
+// Thunk is trivially: action typeof 'function' ? action(dispatch, getState) : next(action)</code></pre>
+
+  <p>
+    <strong>How react-redux connects this to React (v8+):</strong> <code>useSelector</code> is built on
+    <code>useSyncExternalStore</code>. It subscribes to the store; on every notify it runs the selector against
+    <code>getState()</code> and compares with the previous result; if unchanged, no re-render. <code>uSES</code> also
+    guarantees consistency with concurrent rendering — if the store changes <em>while</em> React is rendering, React
+    detects the tear and re-renders synchronously rather than committing a frame where two components read different
+    store versions. (Pre-v8 react-redux did this manually with subscriptions + forced updates and a top-down
+    subscription tree to avoid "zombie children" reading fresher state than their parents.)
+  </p>
+
+  <!-- ============================================================ -->
+  <h2 id="rtk-query">4. RTK Query — the server-cache half of RTK <span class="tier tier-1">T1</span></h2>
+
+  <p>
+    RTK Query is Redux Toolkit's built-in data-fetching layer (<code>@reduxjs/toolkit/query/react</code>). It stores
+    its cache <em>in the Redux store</em> (a slice you add), generates React hooks per endpoint, and handles dedup,
+    caching, invalidation, and lifecycle for you. If a team already runs Redux, this is the default answer for server
+    cache.
+  </p>
+
+  <pre><code>import { createApi, fetchBaseQuery } from '@reduxjs/toolkit/query/react';
+
+export const api = createApi({
+  reducerPath: 'api',
+  baseQuery: fetchBaseQuery({
+    baseUrl: '/api',
+    prepareHeaders: (headers, { getState }) =&gt; {
+      const token = (getState() as RootState).auth.token;
+      if (token) headers.set('authorization', `Bearer ${token}`);
+      return headers;
+    },
+  }),
+  tagTypes: ['Todo'],
+  endpoints: (build) =&gt; ({
+    getTodos: build.query&lt;Todo[], void&gt;({
+      query: () =&gt; '/todos',
+      // Tag the list AND each entity, so both can be invalidated precisely:
+      providesTags: (result) =&gt;
+        result
+          ? [...result.map(t =&gt; ({ type: 'Todo' as const, id: t.id })),
+             { type: 'Todo', id: 'LIST' }]
+          : [{ type: 'Todo', id: 'LIST' }],
+    }),
+    addTodo: build.mutation&lt;Todo, Partial&lt;Todo&gt;&gt;({
+      query: (body) =&gt; ({ url: '/todos', method: 'POST', body }),
+      invalidatesTags: [{ type: 'Todo', id: 'LIST' }],   // refetch list queries
+    }),
+    updateTodo: build.mutation&lt;Todo, { id: string; changes: Partial&lt;Todo&gt; }&gt;({
+      query: ({ id, changes }) =&gt; ({ url: `/todos/${id}`, method: 'PATCH', body: changes }),
+      invalidatesTags: (r, e, arg) =&gt; [{ type: 'Todo', id: arg.id }],  // just this one
+    }),
+  }),
+});
+
+export const { useGetTodosQuery, useAddTodoMutation, useUpdateTodoMutation } = api;
+
+// Store wiring:
+configureStore({
+  reducer: { [api.reducerPath]: api.reducer, ... },
+  middleware: (gDM) =&gt; gDM().concat(api.middleware),
+});</code></pre>
+
+  <p>
+    <strong>Tag invalidation is the core model:</strong> queries <em>provide</em> tags; mutations
+    <em>invalidate</em> tags; any active query providing an invalidated tag automatically refetches. The
+    id-plus-<code>LIST</code> convention above gives you both granular ("this todo changed → refetch queries that
+    provided it") and collection-level ("something was added → refetch the list") invalidation.
+  </p>
+
+  <p>
+    <strong>Cache lifetime:</strong> a cache entry is kept alive while any component holds a subscription to it
+    (i.e. a mounted hook). When the last subscriber unmounts, the entry survives for
+    <code>keepUnusedDataFor</code> seconds (default <strong>60</strong>) before removal — RTK Query's analogue of
+    TanStack's <code>gcTime</code>. Refetch-on-remount/focus behaviors exist but are opt-in
+    (<code>refetchOnMountOrArgChange</code>, <code>refetchOnFocus</code> + <code>setupListeners</code>) — a real
+    default-behavior difference from TanStack Query, which refetches stale data on those triggers by default.
+  </p>
+
+  <h3>Optimistic updates — onQueryStarted + patchResult</h3>
+  <pre><code>updateTodo: build.mutation&lt;Todo, { id: string; changes: Partial&lt;Todo&gt; }&gt;({
+  query: ({ id, changes }) =&gt; ({ url: `/todos/${id}`, method: 'PATCH', body: changes }),
+  async onQueryStarted({ id, changes }, { dispatch, queryFulfilled }) {
+    // Patch the cached getTodos data immediately; keep the inverse patch:
+    const patchResult = dispatch(
+      api.util.updateQueryData('getTodos', undefined, (draft) =&gt; {
+        const todo = draft.find(t =&gt; t.id === id);       // draft is an Immer draft
+        if (todo) Object.assign(todo, changes);
+      })
+    );
+    try {
+      await queryFulfilled;         // server confirmed — keep the patch
+    } catch {
+      patchResult.undo();           // server rejected — roll back
+      // Optionally: dispatch(api.util.invalidateTags([{ type: 'Todo', id }]))
+      // to re-sync with server truth instead of trusting the rollback.
+    }
+  },
+}),</code></pre>
+
+  <div class="note">
+    The same <code>onQueryStarted</code> hook with <code>await queryFulfilled</code> <em>before</em> patching gives
+    you "pessimistic" cache writes (update cache from the server response without a refetch). And
+    <code>onCacheEntryAdded</code> is where streaming updates live — subscribe to a WebSocket while the cache entry
+    exists, patch the entry on messages, tear down on <code>cacheEntryRemoved</code>.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="tanstack">5. TanStack Query — the server-cache king <span class="tier tier-1">T1</span></h2>
+
+  <p>
+    TanStack Query (formerly React Query; v5 current) is the most widely deployed dedicated server-cache library and
+    the deepest well of follow-up questions. Get the two clocks exactly right — it's the most commonly flubbed
+    mechanic in this entire topic.
+  </p>
+
+  <h3>5.1 queryKey design — keys are identity AND dependencies</h3>
+  <p>
+    A query is identified by its <code>queryKey</code> (an array, hashed structurally — object key order doesn't
+    matter). Two rules: (1) <strong>every variable the queryFn reads must be in the key</strong> — the key is the
+    dependency array of data fetching; change the key and you address a different cache entry, which triggers a fetch
+    for it. (2) <strong>Design keys hierarchically</strong>, generic → specific, because invalidation and cache
+    matching use prefix matching:
+  </p>
+
+  <pre><code>// Conventional key factory (avoids typo'd ad-hoc keys across the app):
+export const todoKeys = {
+  all:    ['todos'] as const,
+  lists:  () =&gt; [...todoKeys.all, 'list'] as const,
+  list:   (filters: Filters) =&gt; [...todoKeys.lists(), filters] as const,
+  detail: (id: string) =&gt; [...todoKeys.all, 'detail', id] as const,
+};
+
+useQuery({ queryKey: todoKeys.list({ status: 'open', page }), queryFn: ... });
+
+// Prefix matching in action:
+queryClient.invalidateQueries({ queryKey: todoKeys.all });     // everything todo-ish
+queryClient.invalidateQueries({ queryKey: todoKeys.lists() }); // all lists, no details</code></pre>
+
+  <h3>5.2 staleTime vs gcTime — the two clocks (exactly right)</h3>
+  <table>
+    <thead>
+      <tr><th></th><th><code>staleTime</code></th><th><code>gcTime</code> (v4: <code>cacheTime</code>)</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Question it answers</strong></td>
+        <td>"How long after a fetch is this data considered <em>fresh</em>?"</td>
+        <td>"After the <em>last observer unmounts</em>, how long does the unused entry stay in memory?"</td>
+      </tr>
+      <tr>
+        <td><strong>Clock starts</strong></td>
+        <td>When the fetch resolves</td>
+        <td>When the query becomes <em>inactive</em> (zero mounted observers)</td>
+      </tr>
+      <tr>
+        <td><strong>What it gates</strong></td>
+        <td><em>Whether refetch triggers do anything.</em> Fresh data is served from cache with <strong>no network
+            request</strong>; stale data is served instantly too, but a background refetch fires on triggers</td>
+        <td><em>Whether cached data still exists</em> to show instantly on the next mount</td>
+      </tr>
+      <tr>
+        <td><strong>Default</strong></td>
+        <td><code>0</code> — stale immediately</td>
+        <td>5 minutes</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    The narrative version: mount a query → data is served from cache <em>if present</em> (regardless of staleness —
+    stale-while-revalidate) → if the data is <strong>stale</strong>, a background refetch fires. The refetch
+    <strong>triggers</strong> — new observer mounts, window refocus, network reconnect, <code>refetchInterval</code> —
+    all share the same guard: <em>they only refetch stale queries</em>. So <code>staleTime</code> is your one dial for
+    "how chatty is this app": <code>staleTime: 30_000</code> means "within 30s of a fetch, everyone reads cache and
+    nobody hits the network." Set <code>gcTime</code> longer than <code>staleTime</code> where instant back-navigation
+    matters; <code>gcTime: 0</code> means "forget the moment nobody's looking" (rarely what you want).
+  </p>
+
+  <div class="pitfall">
+    The flub interviewers listen for: "cacheTime/gcTime is how long data is cached before refetching." No —
+    <strong>gcTime never causes a refetch; it's garbage collection of <em>inactive</em> entries.</strong> Staleness
+    (staleTime) decides refetching; gcTime decides memory. A query on screen all day is unaffected by gcTime.
+    Second flub: "refetchOnWindowFocus spams my API" — it only refires for <em>stale</em> queries; the fix is a
+    sensible staleTime, not <code>refetchOnWindowFocus: false</code> everywhere.
+  </div>
+
+  <h3>5.3 useQuery, dedup, and request lifecycle</h3>
+  <pre><code>const { data, isPending, isError, error, isFetching } = useQuery({
+  queryKey: todoKeys.detail(id),
+  queryFn: ({ signal }) =&gt; fetchTodo(id, { signal }),  // signal: auto-abort on unmount/key change
+  staleTime: 60_000,
+  enabled: !!id,                    // dependent query gate (see 5.6)
+});
+// isPending: no cached data yet (first load) — v5 rename of isLoading
+// isFetching: a fetch is in flight (including background refetches over stale data)
+// Distinguish these in interviews: skeleton vs subtle "refreshing" indicator.</code></pre>
+
+  <p>
+    <strong>Dedup mechanics:</strong> all <code>useQuery</code> observers for the same key attach to one shared
+    <code>Query</code> object in the <code>QueryClient</code>'s cache. If a fetch for that key is already in flight,
+    a newly mounted observer <em>joins the in-flight promise</em> instead of firing another request — render the same
+    <code>useQuery(userKey)</code> in ten components and you get one network call, ten subscribers. (Component
+    subscription itself is <code>useSyncExternalStore</code> under the hood, with tracked properties — the observer
+    only re-renders for fields you actually destructured.)
+  </p>
+
+  <h3>5.4 Mutations + invalidation — the bread-and-butter pattern</h3>
+  <pre><code>const queryClient = useQueryClient();
+
+const addTodo = useMutation({
+  mutationFn: (newTodo: NewTodo) =&gt; api.post('/todos', newTodo),
+  onSuccess: () =&gt; {
+    // Declarative re-sync: mark everything todo-related stale;
+    // active queries refetch immediately, inactive ones refetch when next used.
+    queryClient.invalidateQueries({ queryKey: todoKeys.all });
+  },
+});
+
+addTodo.mutate({ text: 'ship it' });</code></pre>
+
+  <h3>5.5 Optimistic updates — the full onMutate/context/rollback ceremony</h3>
+  <pre><code>const toggleTodo = useMutation({
+  mutationFn: (todo: Todo) =&gt; api.patch(`/todos/${todo.id}`, { done: !todo.done }),
+
+  onMutate: async (todo) =&gt; {
+    // 1. Cancel outgoing refetches so a slow response can't clobber our patch
+    await queryClient.cancelQueries({ queryKey: todoKeys.lists() });
+
+    // 2. Snapshot for rollback
+    const previous = queryClient.getQueryData&lt;Todo[]&gt;(todoKeys.list(filters));
+
+    // 3. Optimistically write the cache
+    queryClient.setQueryData&lt;Todo[]&gt;(todoKeys.list(filters), (old) =&gt;
+      old?.map(t =&gt; t.id === todo.id ? { ...t, done: !t.done } : t)
+    );
+
+    // 4. Whatever we return becomes `context` for onError/onSettled
+    return { previous };
+  },
+
+  onError: (_err, _todo, context) =&gt; {
+    if (context?.previous) {
+      queryClient.setQueryData(todoKeys.list(filters), context.previous); // rollback
+    }
+  },
+
+  onSettled: () =&gt; {
+    // 5. Success OR failure: re-sync with server truth
+    queryClient.invalidateQueries({ queryKey: todoKeys.lists() });
+  },
+});</code></pre>
+
+  <div class="senior">
+    Narrate the <em>why</em> of each step when asked: <code>cancelQueries</code> prevents an in-flight refetch
+    (started before the mutation) from resolving after your patch and overwriting it; the snapshot-in-context pattern
+    exists because <code>onError</code> runs in a different closure than <code>onMutate</code>; the final
+    <code>invalidateQueries</code> in <code>onSettled</code> means even a "successful" optimistic path converges to
+    server truth (the server may have computed fields you didn't predict). Also mention the cheap alternative: v5
+    exposes <code>mutation.variables</code> while pending, so for simple UIs you can just render the pending item
+    inline without touching the cache at all.
+  </div>
+
+  <h3>5.6 Dependent queries, prefetching, infinite queries</h3>
+  <pre><code>// Dependent: don't fire until the input exists
+const { data: user } = useQuery({ queryKey: ['user', email], queryFn: getUser });
+const { data: projects } = useQuery({
+  queryKey: ['projects', user?.id],
+  queryFn: () =&gt; getProjects(user!.id),
+  enabled: !!user?.id,                       // waits; status is 'pending' + fetchStatus 'idle'
+});
+
+// Prefetch on intent (hover/route-load) — instant navigation:
+onMouseEnter={() =&gt; queryClient.prefetchQuery({
+  queryKey: todoKeys.detail(id), queryFn: () =&gt; fetchTodo(id), staleTime: 10_000,
+})}
+
+// Infinite scroll:
+const q = useInfiniteQuery({
+  queryKey: todoKeys.lists(),
+  queryFn: ({ pageParam }) =&gt; fetchPage(pageParam),
+  initialPageParam: 0,
+  getNextPageParam: (lastPage) =&gt; lastPage.nextCursor ?? undefined, // undefined = no more
+});
+// q.data.pages: Page[]; call q.fetchNextPage() from a sentinel IntersectionObserver.</code></pre>
+
+  <p>
+    <strong>SSR/hydration awareness</strong> (detail in <a href="#rsc">§11</a>): fetch on the server via
+    <code>queryClient.prefetchQuery</code>, serialize with <code>dehydrate(queryClient)</code>, wrap the client tree
+    in <code>&lt;HydrationBoundary state={dehydratedState}&gt;</code> — client components then call the same
+    <code>useQuery</code> and find the data already cached, no client fetch, no loading flash.
+  </p>
+
+  <h3>5.7 TanStack Query vs RTK Query</h3>
+  <table>
+    <thead>
+      <tr><th></th><th>TanStack Query</th><th>RTK Query</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Coupling</td><td>Standalone; no Redux; framework-agnostic core (React/Vue/Solid/Svelte adapters)</td><td>Part of RTK; cache lives in the Redux store</td></tr>
+      <tr><td>API definition</td><td>Per-hook, colocated with usage; key factories are convention</td><td>Centralized <code>createApi</code> endpoint map; can be generated from OpenAPI</td></tr>
+      <tr><td>Invalidation</td><td>Imperative-ish: <code>invalidateQueries</code> by key prefix</td><td>Declarative tags: <code>providesTags</code>/<code>invalidatesTags</code></td></tr>
+      <tr><td>Refetch defaults</td><td>Stale-on-mount/focus/reconnect refetching ON by default</td><td>Opt-in (<code>refetchOnFocus</code> etc.); entries expire via <code>keepUnusedDataFor</code></td></tr>
+      <tr><td>Extras</td><td><code>useInfiniteQuery</code> built-in, richer pagination/offline/persist plugins, Suspense hooks</td><td><code>infiniteQuery</code> support added in RTK 2.x; streaming via <code>onCacheEntryAdded</code></td></tr>
+      <tr><td>Devtools</td><td>Dedicated Query devtools (cache explorer, staleness timeline)</td><td>Redux DevTools — cache actions visible alongside app actions</td></tr>
+      <tr><td>Pick when</td><td>No Redux in the app, or you want the deeper query feature set</td><td>Redux already there — one store, one devtools, one mental model, tags integrate with slices</td></tr>
+    </tbody>
+  </table>
+
+  <div class="note">
+    Fair-framing line: "They're the same architecture — normalized-by-key async cache with
+    stale-while-revalidate — differing in ecosystem posture. I wouldn't add Redux just to get RTK Query, and I
+    wouldn't add TanStack Query to an app already invested in RTK without a concrete missing feature."
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="zustand">6. Zustand — the minimal-store pattern <span class="tier tier-1">T1</span></h2>
+
+  <p>
+    Zustand is a ~1kB external store: a vanilla store (closure over state + a listener set, same shape as the Redux
+    core you saw above) plus a React hook bound via <code>useSyncExternalStore</code>. No provider, no actions/reducers
+    ceremony, no context — components subscribe with selectors.
+  </p>
+
+  <pre><code>import { create } from 'zustand';
+
+interface CartState {
+  items: CartItem[];
+  couponCode: string | null;
+  addItem: (item: CartItem) =&gt; void;
+  removeItem: (id: string) =&gt; void;
+  total: () =&gt; number;
+}
+
+export const useCartStore = create&lt;CartState&gt;()((set, get) =&gt; ({
+  items: [],
+  couponCode: null,
+  addItem: (item) =&gt;
+    set((state) =&gt; ({ items: [...state.items, item] })),   // set MERGES top-level keys
+  removeItem: (id) =&gt;
+    set((state) =&gt; ({ items: state.items.filter(i =&gt; i.id !== id) })),
+  total: () =&gt; get().items.reduce((s, i) =&gt; s + i.price * i.qty, 0),
+}));
+
+// Usage — the selector is the subscription:
+const items   = useCartStore((s) =&gt; s.items);      // re-renders only when items ref changes
+const addItem = useCartStore((s) =&gt; s.addItem);    // stable fn ref: never re-renders
+const whole   = useCartStore();                    // ⚠️ no selector = re-render on ANY change</code></pre>
+
+  <p>
+    Mechanics worth stating precisely: <code>set</code> performs a <strong>shallow merge</strong> at the top level
+    (you return only the keys that changed; nested objects must still be updated immutably — or add the
+    <code>immer</code> middleware). Updates are immutable snapshots, so change detection is reference equality —
+    same discipline as Redux, less ceremony. After each <code>set</code>, listeners run; each component hook
+    re-runs its selector and re-renders only if the selected value changed (<code>Object.is</code> by default).
+    For multi-field selections, use shallow comparison:
+  </p>
+
+  <pre><code>import { useShallow } from 'zustand/react/shallow';   // v5 idiom
+
+const { items, couponCode } = useCartStore(
+  useShallow((s) =&gt; ({ items: s.items, couponCode: s.couponCode }))
+);
+// Without useShallow this object literal is a new ref every notify → re-render
+// on every store change. (v4 legacy: useStore(selector, shallow) second arg.)</code></pre>
+
+  <h3>Slices pattern, persist, transient updates</h3>
+  <pre><code>// Slices: compose one store from focused creators (Redux-slice ergonomics, no combineReducers)
+const createCartSlice  = (set, get) =&gt; ({ items: [], addItem: ... });
+const createUserSlice  = (set, get) =&gt; ({ user: null, setUser: ... });
+export const useBoundStore = create()((...a) =&gt; ({
+  ...createCartSlice(...a),
+  ...createUserSlice(...a),
+}));
+
+// persist middleware — localStorage cart that survives refresh:
+import { persist, createJSONStorage } from 'zustand/middleware';
+export const useCartStore = create()(
+  persist(
+    (set) =&gt; ({ items: [], addItem: ... }),
+    { name: 'cart', partialize: (s) =&gt; ({ items: s.items }) }  // persist data, not fns
+  )
+);
+
+// Transient updates — read without rendering (cursors, canvas, 60fps data):
+useEffect(() =&gt;
+  useCartStore.subscribe((state) =&gt; {
+    badgeRef.current!.textContent = String(state.items.length);  // direct DOM write
+  }), []);
+
+// Works OUTSIDE React too — interceptors, analytics, game loops:
+const token = useAuthStore.getState().token;
+useAuthStore.setState({ token: null });</code></pre>
+
+  <h3>Why teams pick it — and what you give up</h3>
+  <p>
+    <strong>Pick it for:</strong> no provider wrapper (usable outside React — axios interceptors, event handlers,
+    non-React widgets); a full API you can hold in your head (<code>create</code>, <code>set</code>, <code>get</code>,
+    <code>subscribe</code>); render precision by default via selectors; ~1kB. It's the pragmatic middle for shared
+    client state once server cache is extracted.
+    <strong>You give up:</strong> Redux's enforced conventions (with <code>set</code> callable from anywhere, a large
+    codebase needs self-discipline to keep updates in named store actions); devtools depth (a devtools middleware
+    exists and integrates with Redux DevTools, but there's no serializable-action architecture, weaker time-travel
+    semantics); and ecosystem weight — RTK's entity adapter, listener middleware, RTK Query, established patterns for
+    100-engineer codebases. Honest summary: <em>Zustand trades guardrails for freedom; whether that's a win depends
+    on team size and discipline.</em>
+  </p>
+
+  <div class="pitfall">
+    Module-level store singletons (both Zustand's <code>create</code> at module scope and a Redux
+    <code>export const store</code>) are fine in SPAs but a <strong>cross-request state leak on SSR servers</strong> —
+    one Node process serves many users; user A's cart can hydrate into user B's HTML. The fix is per-request store
+    creation (<a href="#rsc">§11</a>). Raising this unprompted when Zustand comes up is a strong senior signal.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="jotai">7. Jotai and the atomic model <span class="tier tier-2">T2</span></h2>
+
+  <p>
+    Zustand and Redux are <strong>top-down</strong>: one store object, components select slices. Jotai is
+    <strong>bottom-up</strong>: state is a graph of <em>atoms</em> — independently subscribable units — and derived
+    atoms that recompute from them. The mental model to say out loud: <strong>a spreadsheet</strong>. Primitive atoms
+    are input cells; derived atoms are formula cells; change one input and exactly the dependent formulas recompute,
+    and exactly the components reading affected cells re-render. Dependency tracking is automatic — whatever your
+    read function <code>get</code>s becomes a dependency.
+  </p>
+
+  <pre><code>import { atom, useAtom, useAtomValue, useSetAtom } from 'jotai';
+
+// Primitive atoms — config objects, not containers; state lives in the Provider/store
+const priceAtom    = atom(100);
+const quantityAtom = atom(2);
+const taxRateAtom  = atom(0.08);
+
+// Derived (read-only) atom — the "formula cell":
+const totalAtom = atom((get) =&gt; get(priceAtom) * get(quantityAtom) * (1 + get(taxRateAtom)));
+
+// Writable derived atom — read + custom write:
+const discountedAtom = atom(
+  (get) =&gt; get(priceAtom) * 0.9,
+  (get, set, newPrice: number) =&gt; set(priceAtom, newPrice / 0.9)
+);
+
+function Total() {
+  const total = useAtomValue(totalAtom);       // subscribes ONLY to totalAtom's graph
+  return &lt;span&gt;{total.toFixed(2)}&lt;/span&gt;;
+}
+function QtyInput() {
+  const [qty, setQty] = useAtom(quantityAtom); // re-renders only on quantity changes
+  ...
+}
+// Async derived atoms return promises and integrate with Suspense:
+const userAtom = atom(async (get) =&gt; fetchUser(get(userIdAtom)));</code></pre>
+
+  <p>
+    <strong>When atomic wins:</strong> many <em>independent</em> interactive values with fine-grained dependencies —
+    design tools (every shape's x/y/selected an atom), dashboards of independent widgets, complex filter panels where
+    each control should re-render alone. In a single-store model you'd either write ever-more-precise selectors or eat
+    wide re-renders; atoms give granularity <em>structurally</em>. When a single store wins: one cohesive domain
+    updated by well-defined events (checkout flow, document editor with undo), where you want the whole state visible
+    in one devtools tree and transitions centralized. Atoms are also naturally code-split — an atom ships with the
+    lazy chunk that uses it, no central store file accreting every feature's keys.
+  </p>
+
+  <p>
+    <strong>Recoil</strong> is the origin of this model (Meta, 2020): atoms/selectors with keys, same spreadsheet
+    idea. It never left "experimental," development stalled after Meta layoffs, and the repo was
+    <strong>archived in early 2025</strong> — the interview-relevant fact. Treat Recoil in a codebase as a migration
+    candidate; Jotai is the maintained successor with a near-identical model (minus string keys).
+    <strong>MobX literacy:</strong> the other classic paradigm — <em>transparent reactivity</em>. State is
+    observable objects (Proxy-based); components wrapped in <code>observer()</code> track exactly which properties
+    they dereference during render and re-render when precisely those mutate. You write straight-line mutable code
+    (<code>todo.done = true</code> inside an action) and granular updates fall out automatically. Trade-offs: superb
+    update precision and terse code, but implicit dependency graphs are harder to trace than an action log, and it
+    fights the immutable-snapshot grain of the React ecosystem (<code>uSES</code>, concurrent-rendering assumptions).
+    You'll meet it in older enterprise apps and OOP-leaning teams — respect it, don't trash it.
+  </p>
+
+  <!-- ============================================================ -->
+  <h2 id="url-state">8. URL as state <span class="tier tier-2">T2</span></h2>
+
+  <p>
+    The most under-used store in most apps is the address bar — and mentioning it unprompted is a reliable
+    brownie point. State that describes <em>what the user is looking at</em> — filters, sort, page, active tab,
+    selected item, search text — often belongs in the URL, because the URL gives you for free what no client store
+    can: <strong>shareable links</strong> ("send me what you're seeing"), <strong>back/forward navigation</strong> as
+    undo for view state, <strong>refresh-proofness</strong>, bookmarkability, and server-side renderability (the
+    server sees the full view state in the request).
+  </p>
+
+  <pre><code>// React Router (Next.js: useSearchParams + router.replace — same idea)
+import { useSearchParams } from 'react-router-dom';
+
+function ProductFilters() {
+  const [searchParams, setSearchParams] = useSearchParams();
+
+  const category = searchParams.get('category') ?? 'all';
+  const page     = Number(searchParams.get('page') ?? '1');
+  const inStock  = searchParams.get('inStock') === 'true';
+
+  function updateFilter(key: string, value: string) {
+    setSearchParams(prev =&gt; {
+      const next = new URLSearchParams(prev);
+      value ? next.set(key, value) : next.delete(key);
+      if (key !== 'page') next.set('page', '1');   // filter change resets pagination
+      return next;
+    }, { replace: true });   // replace: don't spam history for every keystroke
+  }
+
+  // URL state composes perfectly with server cache — params ARE the queryKey:
+  const products = useQuery({
+    queryKey: ['products', { category, page, inStock }],
+    queryFn: () =&gt; fetchProducts({ category, page, inStock }),
+    placeholderData: keepPreviousData,   // keep old page visible while next loads
+  });
+}</code></pre>
+
+  <p>
+    <strong>Practical rules:</strong> URLs hold strings, so you own (de)serialization and validation — parse with
+    defaults and clamp bad values (someone <em>will</em> type <code>?page=-1</code>); a Zod schema at the parse
+    boundary is the clean pattern, and libraries like <code>nuqs</code> package the typed-param pattern for
+    Next.js/React Router. Use <code>replace</code> for high-frequency updates (typing) and push for discrete
+    navigation-like changes (page, tab) so Back behaves sensibly. Keep URLs human-scale: filters and ids, yes; a
+    20-field wizard draft, no — that's session/local storage or a store. <strong>When URL beats a store:</strong> if
+    losing the state on refresh would annoy the user, or if "share this view" is plausible, URL wins. When it
+    doesn't: secrets/PII (URLs leak into logs, history, referrers), ephemeral UI (open dropdowns), and
+    high-churn transient values.
+  </p>
+
+  <!-- ============================================================ -->
+  <h2 id="decision">9. The decision framework — the rehearsable answer <span class="tier tier-1">T1</span></h2>
+
+  <p>
+    "How do you choose a state management solution?" is the money question. Answer as a decision tree, classified by
+    the taxonomy — deliver it in under a minute, then let them pull threads:
+  </p>
+
+  <pre><code>Is it SERVER DATA (owned by a backend, can go stale)?
+├── YES → server-cache library.
+│         Already on Redux? → RTK Query. Otherwise → TanStack Query.
+│         (RSC app? → fetch in server components; client cache only for
+│          interactive/mutating islands.)
+└── NO → client state. Who reads it?
+    ├── One component → useState / useReducer. Stop. Don't globalize "just in case".
+    ├── A few related components → lift to common parent; try composition
+    │   before any tool.
+    ├── A subtree, LOW write frequency (theme, auth, locale) → Context.
+    ├── App-wide or HIGH frequency client state →
+    │   external store: Zustand (small API, no provider) or Redux Toolkit
+    │   (team standards, devtools/audit needs, large team, existing codebase);
+    │   Jotai if it's many independent fine-grained values.
+    ├── Describes WHAT THE USER IS VIEWING (filters/page/tab/selection),
+    │   shareable or refresh-worthy → URL search params.
+    └── Form state → react-hook-form (uncontrolled perf, resolver validation);
+        native FormData for simple forms.</code></pre>
+
+  <h3>Comparison table</h3>
+  <table>
+    <thead>
+      <tr><th>Tool</th><th>Bundle (min+gzip, approx)</th><th>Boilerplate</th><th>Devtools</th><th>Learning curve</th><th>SSR / RSC posture</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Context + hooks</td><td>0 (built in)</td><td>Low–medium (provider plumbing)</td><td>React DevTools only</td><td>None new</td><td>Fine; value must be serializable to cross RSC boundary</td></tr>
+      <tr><td>Redux Toolkit (+react-redux)</td><td>~12–15 kB</td><td>Medium (slices — far below legacy)</td><td>Best in class: time travel, action log, trace</td><td>Highest (actions/reducers/selectors/middleware)</td><td>Mature but manual: per-request store + provider, preloadedState hydration</td></tr>
+      <tr><td>Zustand</td><td>~1 kB</td><td>Minimal</td><td>Good (devtools middleware → Redux DevTools)</td><td>Very low</td><td>Needs per-request store discipline (context-provided store factory)</td></tr>
+      <tr><td>Jotai</td><td>~3–4 kB</td><td>Minimal</td><td>OK (jotai-devtools)</td><td>Low, but graph thinking</td><td>Provider-scoped stores per request; hydration atom utils</td></tr>
+      <tr><td>MobX</td><td>~15 kB+</td><td>Low code, high concept</td><td>Decent (mobx devtools, traces)</td><td>Medium; different paradigm</td><td>Workable; observables don't serialize naturally</td></tr>
+      <tr><td>TanStack Query</td><td>~11–13 kB</td><td>Low per endpoint</td><td>Excellent dedicated devtools</td><td>Medium (the two clocks, invalidation)</td><td>First-class: prefetch + dehydrate/HydrationBoundary, RSC recipes</td></tr>
+      <tr><td>RTK Query</td><td>ships inside RTK (~+9 kB over core RTK)</td><td>Low after createApi setup</td><td>Redux DevTools integrated</td><td>Medium (tags model)</td><td>Manual but documented (per-request store, SSR helpers)</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Three worked scenarios — say these out loud</h3>
+
+  <p><strong>Scenario 1 — e-commerce cart.</strong>
+    Classify: is the cart client state or server state? <em>It depends on the business</em> — that's the senior
+    answer. Guest carts on a content-first store: client state — Zustand with <code>persist</code>
+    (survives refresh, works before login, zero backend cost), items keyed by product id, totals as derived
+    selectors. Logged-in carts that must sync across devices and survive to checkout: it's <em>server state</em> —
+    the cart is a resource; use TanStack Query with optimistic <code>addItem</code> mutations (onMutate patch,
+    rollback on error, invalidate on settle). Real systems often hybrid: local for guests, merge-to-server on login.
+    The product detail page and pricing are unambiguously server cache either way.
+  </p>
+
+  <p><strong>Scenario 2 — collaborative analytics dashboard filters.</strong>
+    Filters (date range, segments, breakdown, tab) describe <em>what the user is viewing</em> and "share this view
+    with a teammate" is a core feature → <strong>URL search params are the store</strong>, parsed through a schema
+    with defaults. The chart data is server cache keyed by those params —
+    <code>queryKey: ['metrics', parsedFilters]</code> — with <code>staleTime</code> tuned to the data's real refresh
+    cadence (analytics aggregated hourly ⇒ minutes of staleTime, not 0) and <code>placeholderData: keepPreviousData</code>
+    so charts don't unmount between filter changes. If truly "collaborative" (live cursors/presence), that's a
+    WebSocket feeding either the query cache (<code>setQueryData</code>) or a small Zustand store for ephemeral
+    presence. Note what's absent: no Redux — nothing here is shared client state.
+  </p>
+
+  <p><strong>Scenario 3 — multi-step wizard (KYC/onboarding, 5 steps).</strong>
+    Form state + flow state. Field values: react-hook-form, one form per step or one form with step-scoped
+    validation via a Zod resolver. Flow position: <em>current step in the URL</em> (<code>/onboarding/step-3</code> or
+    <code>?step=3</code>) so refresh and Back work — with a route guard redirecting to the first incomplete step
+    (deep-linking to step 4 without steps 1–3 is an invalid state). Accumulated cross-step draft: a small
+    wizard-scoped store (Context+useReducer or Zustand), <em>persisted to sessionStorage</em> so an accidental
+    refresh doesn't wipe ten minutes of typing; alternatively persist each completed step to the server as a draft
+    resource — then it's server state and resumable cross-device. If transitions have real rules (retry limits,
+    conditional branches, doc-verification pending states), model the flow as an explicit state machine (§10).
+    No global store: the wizard's state should die when the wizard does.
+  </p>
+
+  <div class="senior">
+    Close the framework with the meta-point interviewers actually score: <em>"The library choice is the least
+    important decision. What matters is classifying each piece of state correctly, keeping it as local as possible,
+    and being consistent per category. I'd rather inherit a well-classified Context app than a badly-classified
+    Redux one."</em> Also name the socio-technical factors — team familiarity, existing codebase conventions,
+    hiring pool, devtools/audit requirements — as first-class inputs, not afterthoughts.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="state-machines">10. State machines — XState literacy &amp; the reducer-lite pattern <span class="tier tier-2">T2</span></h2>
+
+  <p>
+    Boolean-flag soup is the disease: <code>isLoading</code>, <code>isError</code>, <code>isSuccess</code>,
+    <code>isRetrying</code> — four booleans is sixteen combinations, of which maybe five are meaningful, and nothing
+    stops <code>isLoading &amp;&amp; isError</code> from happening. A state machine says: the system is in
+    <strong>exactly one named state</strong>; only <strong>declared events</strong> cause transitions; undeclared
+    events in a given state are ignored. Impossible states become unrepresentable rather than merely untested.
+  </p>
+
+  <pre><code>// XState v5 — payment step of a wizard
+import { setup, assign } from 'xstate';
+
+const paymentMachine = setup({
+  guards: { hasRetriesLeft: ({ context }) =&gt; context.retries &lt; 3 },
+}).createMachine({
+  id: 'payment',
+  initial: 'idle',
+  context: { retries: 0, error: null },
+  states: {
+    idle:       { on: { SUBMIT: 'processing' } },
+    processing: { on: { SUCCESS: 'succeeded',
+                        FAILURE: [
+                          { target: 'retrying', guard: 'hasRetriesLeft',
+                            actions: assign({ retries: ({ context }) =&gt; context.retries + 1 }) },
+                          { target: 'failed' },     // guard false → fall through
+                        ] } },
+    retrying:   { after: { 2000: 'processing' } },  // delayed transition
+    succeeded:  { type: 'final' },
+    failed:     { on: { RESET: 'idle' } },
+  },
+});
+// Note what's structurally impossible now: double-submit (SUBMIT isn't handled
+// in 'processing'), a 4th retry, success-after-failure. The machine is also a
+// diagram — XState's visualizer renders it for PM/design review.</code></pre>
+
+  <p>
+    <strong>When to reach for it:</strong> multi-step flows with rules (checkout, onboarding, doc upload pipelines),
+    media players, drag-and-drop, connection lifecycles — anywhere you catch yourself writing
+    <code>if (isX &amp;&amp; !isY &amp;&amp; wasZ)</code>. <strong>The honest caveat:</strong> XState is a paradigm
+    buy-in with real learning cost; for most cases the "lite" version — a discriminated union +
+    <code>useReducer</code> — captures 80% of the value with zero dependencies:
+  </p>
+
+  <pre><code>type State =
+  | { status: 'idle' }
+  | { status: 'processing' }
+  | { status: 'succeeded'; receiptId: string }
+  | { status: 'failed'; error: string; retries: number };
+// TypeScript enforces it: state.receiptId only exists when status === 'succeeded'.
+
+function reducer(state: State, event: Event): State {
+  switch (state.status) {                    // key move: switch on STATE first,
+    case 'idle':                             // then event — illegal transitions
+      return event.type === 'SUBMIT'         // simply return `state` unchanged
+        ? { status: 'processing' } : state;
+    case 'processing':
+      switch (event.type) {
+        case 'SUCCESS': return { status: 'succeeded', receiptId: event.receiptId };
+        case 'FAILURE': return { status: 'failed', error: event.error, retries: 0 };
+        default: return state;               // SUBMIT while processing: ignored. Free!
+      }
+    ...
+  }
+}</code></pre>
+
+  <!-- ============================================================ -->
+  <h2 id="rsc">11. RSC-era state management <span class="tier tier-3">T3</span></h2>
+
+  <p>
+    React Server Components rearrange the taxonomy's biggest category. <strong>Server cache largely moves to the
+    server:</strong> server components <code>await</code> data directly during render and ship HTML/serialized trees —
+    for read-only views there is no client fetch, no loading spinner, no client cache entry at all. Client stores
+    shrink to the <strong>interactive islands</strong>: <code>'use client'</code> components that genuinely need
+    stateful interactivity (cart widget, live filters, editors). The practical outcome: less global client state than
+    ever, with mutations flowing through server actions + <code>revalidate</code>/router refresh, or through a client
+    query cache where you need optimistic UX and background sync.
+  </p>
+
+  <h3>The per-request store gotcha</h3>
+  <pre><code>// ❌ SPA habit that becomes a bug on the server:
+export const store = createStore();          // module scope = ONE store per Node
+// process, shared across ALL requests. User A's auth slice can render into
+// user B's HTML. Module state also persists across requests (leaks accumulate).
+
+// ✅ Factory + provider: one store per request tree, created once per client mount
+'use client';
+export function StoreProvider({ children, initialState }) {
+  const storeRef = useRef&lt;AppStore | null&gt;(null);
+  if (!storeRef.current) {
+    storeRef.current = makeStore(initialState);   // makeStore = () =&gt; configureStore(...)
+  }
+  return &lt;Provider store={storeRef.current}&gt;{children}&lt;/Provider&gt;;
+}
+// Same pattern for Zustand: createStore (vanilla) in a ref, expose via a
+// context, read with useStore(ctx, selector) — the documented Next.js recipe.
+// Rule of thumb: on the server, NOTHING user-scoped may live at module scope.</code></pre>
+
+  <h3>Hydrating server-fetched data into TanStack Query</h3>
+  <pre><code>// app/todos/page.tsx — Server Component
+import { QueryClient, dehydrate, HydrationBoundary } from '@tanstack/react-query';
+
+export default async function TodosPage() {
+  const queryClient = new QueryClient();               // per request, never shared
+  await queryClient.prefetchQuery({ queryKey: ['todos'], queryFn: fetchTodos });
+
+  return (
+    &lt;HydrationBoundary state={dehydrate(queryClient)}&gt;
+      &lt;TodoListClient /&gt;
+    &lt;/HydrationBoundary&gt;
+  );
+}
+
+// TodoListClient.tsx — 'use client'
+export function TodoListClient() {
+  const { data } = useQuery({ queryKey: ['todos'], queryFn: fetchTodos });
+  // Cache already populated by hydration: renders instantly, no fetch, no
+  // spinner — and from here staleTime/refetching/mutations work as normal.
+}</code></pre>
+
+  <div class="note">
+    Why bother with a client cache when RSC can fetch? Because RSC data is <em>read-time</em>: refreshing it means a
+    server round-trip re-render. If the view needs client-side interactivity on that data — optimistic mutations,
+    polling, focus refetch, infinite scroll — hydrate-into-Query gives server-rendered first paint <em>plus</em> full
+    client cache semantics after. Views without those needs should stay pure RSC. That per-view judgment call is the
+    T3 talking point.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="qa">Interview Q&amp;A</h2>
+
+  <details class="qa">
+    <summary>Q1. "How do you decide where a piece of state should live?"</summary>
+    <div class="answer">
+      <p>Classify first: server cache, shared client state, local UI state, URL state, or form state — each category
+      has a best-fit tool. Server data goes to a server-cache library (TanStack Query, or RTK Query if Redux is
+      already there); view-describing state that should survive refresh and be shareable goes to the URL; forms go to
+      a form library; and for client state I apply colocation — <code>useState</code> in the component, lift to a
+      common parent when a second consumer appears, Context for low-frequency subtree values, and an external store
+      (Zustand/RTK) only for genuinely app-wide, high-frequency client state. The most common architecture mistake
+      I've seen is misclassifying server cache as client state — that's what filled 2016-era Redux stores with
+      loading/error boilerplate.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q2. "Why is 'server cache' not just client state with extra steps?"</summary>
+    <div class="answer">
+      <p>Because the client doesn't own it. Remote data can be changed by others while displayed, so it has
+      properties client state never has: staleness, background revalidation, request deduplication, retry, and
+      mutation reconciliation (invalidate or optimistically patch, then converge to server truth). Those are cache
+      semantics, not state semantics. Modeling it as client state forces you to hand-write status flags, dedup, and
+      invalidation per endpoint — badly. A dedicated cache layer gives stale-while-revalidate, focus/reconnect
+      refetch, and in-flight dedup as defaults.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q3. "Is React Context a state management tool?"</summary>
+    <div class="answer">
+      <p>Context is <em>transport</em>, not state management — it delivers a value to a subtree without prop
+      drilling, but has no store semantics: no selectors, no subscription granularity. Every consumer re-renders when
+      the provider's value reference changes, regardless of which field it reads. So it's right for
+      low-write-frequency app-wide values — theme, auth, locale, injected services — and wrong for per-keystroke
+      data. State still lives in <code>useState</code>/<code>useReducer</code> above the provider; Context just
+      moves it. Notably, react-redux and Jotai use Context only to pass the <em>store/scope reference</em> down —
+      subscriptions happen outside Context, via <code>useSyncExternalStore</code>.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q4. "Walk me through what happens inside Redux when you dispatch an action."</summary>
+    <div class="answer">
+      <p>The store is a closure over <code>state</code> and a listener array. <code>dispatch(action)</code> passes
+      the action through the middleware chain (each middleware is <code>store =&gt; next =&gt; action</code>, so
+      thunk can intercept functions); the root reducer runs synchronously — <code>combineReducers</code> delegates
+      each slice, and unchanged slices return their existing references; the returned tree replaces
+      <code>state</code>; then all listeners are notified. On the React side, <code>useSelector</code> (built on
+      <code>useSyncExternalStore</code> since react-redux v8) re-runs its selector against the new state and
+      re-renders only if the result isn't reference-equal to the last one. <code>uSES</code> also protects against
+      tearing under concurrent rendering — if the store changes mid-render, React falls back to a synchronous
+      re-render rather than committing inconsistent reads.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q5. "Why does Redux insist on immutability and serializable actions?"</summary>
+    <div class="answer">
+      <p>Immutability makes change detection a reference comparison — react-redux and Reselect can decide "did my
+      slice change" with <code>===</code> instead of deep equality — and it preserves old state snapshots, which is
+      what makes time-travel debugging possible. Serializable actions make the action log recordable, replayable,
+      diffable, and shippable in a bug report. Both constraints buy the same thing: predictability and debuggability
+      as architectural guarantees. Drop either and you keep Redux's ceremony while losing its actual payoff — which
+      is why RTK ships dev-mode middleware that throws on accidental mutation and non-serializable payloads.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q6. "createSlice lets you 'mutate' state. How is that not breaking Redux's rules?"</summary>
+    <div class="answer">
+      <p>Immer. <code>createSlice</code> wraps each case reducer in <code>produce</code>: your "state" parameter is a
+      Proxy draft that traps reads and writes. Writes trigger copy-on-write — the touched node is cloned once, the
+      change is recorded — and on return Immer finalizes a new immutable tree where changed nodes and their ancestors
+      are new objects while <strong>every untouched branch keeps its original reference</strong> (structural
+      sharing). So downstream reference-equality checks — <code>useSelector</code>, <code>createSelector</code>,
+      <code>React.memo</code> — behave exactly as if I'd hand-written the nested spreads. The rules to remember:
+      mutate the draft <em>or</em> return a new value, never both in one path; and <code>console.log</code> of a
+      draft prints a Proxy — use <code>current(state)</code>.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q7. "When does useSelector cause a re-render, and how do you prevent wasted ones?"</summary>
+    <div class="answer">
+      <p>After every dispatch, each <code>useSelector</code> re-runs its selector and re-renders the component iff
+      the result isn't reference-equal (<code>===</code>) to the previous result. So selectors that construct fresh
+      values — <code>.map()</code>, <code>.filter()</code>, object literals — re-render on <em>every</em> action.
+      Fixes, in order: select primitives or stored references; pass <code>shallowEqual</code> for multi-field object
+      selections; memoize derivations with <code>createSelector</code>, which reuses the cached result (same
+      reference) while its input selectors return reference-equal values; and for parameterized selectors shared
+      across many component instances, a per-instance selector factory (or Reselect 5's
+      <code>weakMapMemoize</code>), because default createSelector has a cache size of one.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q8. "Why normalize Redux state, and what does createEntityAdapter give you?"</summary>
+    <div class="answer">
+      <p>Normalization stores entities like database tables: <code>{ ids: [], entities: { [id]: entity } }</code>.
+      Three wins: O(1) lookup by id instead of array scans; no deep nested updates — every entity is one flat record;
+      and a single source of truth per entity, so an author embedded in fifty posts is one record updated once.
+      <code>createEntityAdapter</code> generates the CRUD reducers (<code>addOne</code>, <code>updateOne</code>,
+      <code>upsertMany</code>…), optional <code>sortComparer</code>-maintained ordering, and memoized selectors
+      (<code>selectAll</code>, <code>selectById</code>, <code>selectIds</code>). The performance pattern it enables:
+      a list subscribes to <code>selectIds</code> (stable when only fields change) while each memoized row subscribes
+      to <code>selectById</code> — editing one entity re-renders exactly one row.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q9. "You inherit a large redux-saga codebase. What's your take?"</summary>
+    <div class="answer">
+      <p>First, read it fluently: sagas are generators yielding effect <em>descriptions</em>
+      (<code>call</code>/<code>put</code>/<code>take</code>/<code>fork</code>) that the middleware interprets, which
+      makes them testable by stepping the generator, and operators like <code>takeLatest</code> give elegant
+      cancellation. Then triage: in my experience most saga code is "fetch on action" — that migrates
+      endpoint-by-endpoint to RTK Query, which deletes the fetch sagas <em>and</em> their loading/error state.
+      Residual reactive logic ("when X is dispatched, do Y") moves to RTK listener middleware, which covers
+      debounce/cancel/condition without the generator runtime. Genuinely complex long-lived orchestrations stay as
+      sagas until there's a concrete reason to touch them — migration is incremental, per-feature, never big-bang.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q10. "Explain staleTime vs gcTime precisely."</summary>
+    <div class="answer">
+      <p>Two independent clocks. <strong>staleTime</strong> starts when a fetch resolves and answers "how long is
+      this data fresh?" While fresh, any component using the key is served from cache with <em>no network request</em>,
+      and refetch triggers (mount, window focus, reconnect, interval) do nothing. Once stale, cached data is still
+      shown instantly, but those triggers fire background refetches — stale-while-revalidate. Default 0.
+      <strong>gcTime</strong> starts when the query becomes <em>inactive</em> — last observer unmounts — and answers
+      "how long does the unused entry stay in memory?" Default 5 minutes. Crucially, gcTime never causes a refetch;
+      it only decides whether the next mount finds instant cached data or a cold loading state. staleTime controls
+      network chatter; gcTime controls memory and back-navigation UX.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q11. "How does TanStack Query avoid duplicate requests when five components need the same data?"</summary>
+    <div class="answer">
+      <p>All observers of a queryKey attach to a single shared Query object in the QueryClient's cache. When a fetch
+      for that key is in flight, any newly mounted observer joins the existing promise instead of firing another
+      request — so five components calling <code>useQuery(['user', id])</code> in one render pass produce one network
+      call, and all five receive the result. After that, staleTime governs: within it, further mounts read cache
+      silently; past it, a mount triggers one shared background refetch. This is the strongest practical argument for
+      "hooks that fetch" over prop drilling data down — dedup makes colocated data access free.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q12. "Implement an optimistic update. Why each step?"</summary>
+    <div class="answer">
+      <p>In <code>onMutate</code>: (1) <code>await queryClient.cancelQueries(key)</code> — kills in-flight refetches
+      that started before the mutation, which could otherwise resolve <em>after</em> my patch and overwrite it with
+      pre-mutation data; (2) snapshot <code>getQueryData(key)</code>; (3) <code>setQueryData</code> with the
+      predicted result; (4) return <code>{ previous }</code> — this becomes the <code>context</code> argument,
+      because <code>onError</code> runs in a different closure. In <code>onError</code>: restore the snapshot. In
+      <code>onSettled</code>: <code>invalidateQueries(key)</code> regardless of outcome, so even the success path
+      converges to server truth (server-computed fields, concurrent edits). I'd also mention when <em>not</em> to
+      bother: for a simple pending row, v5's <code>mutation.variables</code> renders the in-flight item without
+      touching the cache.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q13. "TanStack Query or RTK Query — how do you choose?"</summary>
+    <div class="answer">
+      <p>Same architecture — keyed async cache with stale-while-revalidate, invalidation, optimistic updates — so
+      it's an ecosystem decision. Already invested in Redux? RTK Query: cache in the same store, one devtools, one
+      mental model, declarative tag invalidation, endpoints optionally codegen'd from OpenAPI. No Redux? TanStack
+      Query standalone: no reason to adopt a Redux store just to host a cache, and it brings the deeper query feature
+      set — mature infinite queries, Suspense hooks, persistence plugins, dedicated devtools. One behavioral delta
+      worth knowing: TanStack refetches stale data on focus/reconnect/mount by default; RTK Query's equivalents are
+      opt-in. The anti-pattern is running both in one app without a boundary.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q14. "How does Zustand work under the hood, and why no Provider?"</summary>
+    <div class="answer">
+      <p><code>create</code> builds a vanilla store — a closure over a state object and a Set of listeners, with
+      <code>getState</code>/<code>setState</code>/<code>subscribe</code> (structurally the same core as Redux's
+      store) — and returns a hook bound to it via <code>useSyncExternalStore</code>. The hook takes a selector; on
+      each notify it re-runs the selector and re-renders only if the selected value changed
+      (<code>Object.is</code>, or shallow via <code>useShallow</code>). No Provider is needed because the store is a
+      plain module-scope object, not a React context value — which is also why it works outside React
+      (<code>useStore.getState()</code> in an axios interceptor). The trade-off of that convenience: module-scope
+      singletons are a cross-request leak on SSR, so server-rendered apps use a per-request store factory passed
+      through context instead.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q15. "Your team wants to replace Redux with Zustand. Steelman both sides."</summary>
+    <div class="answer">
+      <p>For Zustand: most of the Redux store is probably misclassified server cache — extract that to a query
+      library first, and the remaining client state rarely justifies Redux's ceremony; Zustand gives selector-precise
+      subscriptions, no provider, ~1kB, and an API a new hire learns in an hour. For Redux: RTK already fixed the
+      boilerplate; the enforced convention — every change is a named, logged, serializable action through a pure
+      reducer — is a governance feature that scales with team size, and devtools time-travel plus the RTK ecosystem
+      (entity adapter, listener middleware, RTK Query) are real assets. My actual position: the migration that
+      matters is server-cache extraction; after that, whether the residue lives in RTK slices or a Zustand store is a
+      minor decision — I'd optimize for team familiarity and not rewrite working code without a driver.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q16. "What problem does the atomic model (Jotai) solve that single-store libraries don't?"</summary>
+    <div class="answer">
+      <p>Update granularity as a structural property instead of a selector discipline. In a single store, every
+      dispatch notifies every subscriber, and precision depends on writing good selectors. With atoms, state is a
+      dependency graph — components subscribe to specific atoms, derived atoms track exactly what they
+      <code>get</code> — so changing one atom recomputes and re-renders only its dependents, like a spreadsheet
+      recalculating affected formula cells. It wins for many independent fine-grained values: design canvases,
+      per-widget dashboards, complex filter panels. A single store still wins for one cohesive domain with
+      centralized transitions, whole-tree devtools visibility, and undo. I'd also note Recoil, the model's origin, is
+      archived — Jotai is the maintained implementation.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q17. "When should application state live in the URL?"</summary>
+    <div class="answer">
+      <p>When the state describes <em>what the user is viewing</em> — filters, sort, page, tab, selected id — and
+      shareability or refresh-survival has value. The URL delivers three things no client store can: shareable links,
+      back/forward as undo for view state, and refresh-proofness; it also makes the view server-renderable since the
+      request carries full view state. Implementation notes: URLs are strings, so parse with validation and defaults
+      (a Zod schema at the boundary, or a lib like nuqs); use <code>replace</code> for high-frequency updates so
+      history isn't spammed; reset page on filter change; and the params flow straight into the queryKey, so URL
+      state and server cache compose naturally. Exclusions: secrets/PII (URLs leak into logs and referrers) and
+      ephemeral UI state.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q18. "What's a state machine buying you over booleans, and when is XState overkill?"</summary>
+    <div class="answer">
+      <p>Booleans multiply: four flags is sixteen combinations, most meaningless, all representable —
+      <code>isLoading &amp;&amp; isError</code> can happen and must be defensively coded around. A machine inverts
+      it: exactly one named state, transitions only via declared events, undeclared events ignored — impossible
+      states become unrepresentable, double-submit dies structurally because SUBMIT isn't handled in
+      <code>processing</code>, and the machine doubles as a reviewable diagram. XState adds guards, delayed
+      transitions, nested/parallel states, and actor orchestration — worth it for genuinely complex flows (payments,
+      media players, connection lifecycles). For everything else, the lite version suffices: a discriminated union
+      (<code>{ status: 'succeeded'; receiptId }</code>) with <code>useReducer</code>, switching on <em>state</em>
+      first then event, which gets exhaustiveness-checked by TypeScript at zero dependency cost.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q19. "How do React Server Components change your state architecture?"</summary>
+    <div class="answer">
+      <p>They relocate the biggest category. Server cache moves server-side: server components await data during
+      render, so read-only views need no client fetch, no spinner, no cache entry. Client stores shrink to
+      interactive islands — the <code>'use client'</code> components that genuinely need state. Mutations can flow
+      through server actions plus revalidation instead of client-side invalidation. Two disciplines follow: no
+      user-scoped module-level store singletons on the server — per-request store factories held in a ref inside a
+      client provider, or you leak one user's state into another's HTML — and for views that need client cache
+      semantics (optimistic updates, polling, infinite scroll), prefetch server-side and hydrate into TanStack Query
+      via <code>dehydrate</code>/<code>HydrationBoundary</code> so you get server-rendered first paint <em>and</em>
+      live cache behavior after.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q20. "A dashboard re-renders everything on every keystroke in a search box. Diagnose."</summary>
+    <div class="answer">
+      <p>The input's state is too global — likely in a context whose provider value is recreated per render
+      (invalidating all consumers), or a store selected without precision (<code>useSelector</code> returning fresh
+      objects, or a store hook with no selector). Fix by classification and colocation: the raw keystroke value is
+      local UI state — <code>useState</code> in the search box; only the <em>debounced</em> term should escape,
+      ideally into the URL (<code>?q=</code>, with <code>replace</code>) feeding a queryKey. If a store must hold it,
+      subscribers select narrowly (primitives, <code>useShallow</code>/<code>shallowEqual</code>, memoized
+      selectors), and non-visual consumers use transient subscriptions (<code>store.subscribe</code>) that skip
+      rendering entirely. The pattern-level answer: high-frequency state demands either locality or
+      selector-precise subscriptions — never broadcast context.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q21. "How would you test state logic across these tools?"</summary>
+    <div class="answer">
+      <p>Push logic into pure, React-free units and test those directly: Redux reducers and Reselect selectors are
+      plain functions (<code>expect(reducer(state, action)).toEqual(...)</code>); Zustand stores test vanilla —
+      <code>store.getState().addItem(x)</code> then assert, resetting initial state between tests; state machines
+      test as transition tables. For server-cache behavior, test through the component with a mocked network (MSW)
+      and a fresh <code>QueryClient</code> per test with <code>retry: false</code> — you're testing your
+      keys/invalidation wiring and UI states, not the library. Integration tests then cover the seams: "mutation
+      settles → list refetches → UI shows the new row." The design takeaway: the more state logic lives in pure
+      functions rather than effects and handlers, the cheaper the whole pyramid gets.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q22. "What's your take on putting form state in a global store?"</summary>
+    <div class="answer">
+      <p>Almost always wrong. Form state is high-frequency (per keystroke), lifecycle-bound (should die with the
+      form), and rich in metadata (dirty, touched, errors, submit status) that a generic store models poorly — and
+      global stores make every keystroke a global event, with devtools noise and re-render risk to match.
+      react-hook-form is the default: uncontrolled inputs via <code>register</code> keep keystrokes out of React
+      state entirely (refs + native events), with isolated re-renders for subscribed fields and schema validation via
+      resolvers. The exceptions where form data legitimately escapes: multi-step wizard drafts (session-persisted
+      wizard store, or server-persisted draft resource) and autosave (debounced mutation — at which point it's
+      becoming server state anyway).</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q23. "How do tags-based invalidation and key-based invalidation differ?"</summary>
+    <div class="answer">
+      <p>RTK Query is declarative: queries <em>provide</em> tags (<code>{ type: 'Todo', id }</code> plus a
+      <code>LIST</code> sentinel), mutations <em>invalidate</em> tags, and the middleware refetches any active query
+      whose provided tags intersect — the relationship between writes and reads is data, defined once at the endpoint.
+      TanStack Query is structural: you invalidate by key prefix (<code>invalidateQueries(['todos'])</code> hits
+      lists and details), so precision comes from hierarchical key design and the discipline lives at mutation
+      call-sites (or centralized via mutation defaults/callbacks). Tags shine when many mutations touch overlapping
+      data — the mapping is self-documenting; keys shine in flexibility and no upfront registry. Both converge on the
+      same principle: after a write, mark affected reads stale and let the cache refetch — never manually patch
+      everything and hope.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q24. "Design the state layer for a Trello-style board. Go."</summary>
+    <div class="answer">
+      <p>Classify each piece. Board/lists/cards: server cache — TanStack Query, keys like
+      <code>['board', id]</code> with normalized-ish structure; card moves are optimistic mutations (onMutate
+      reorders locally, rollback on error, invalidate on settle) because drag-drop cannot wait on a round trip.
+      In-flight drag state (what's dragged, hover position): high-frequency ephemeral client state — local state or a
+      tiny Zustand store with transient subscriptions, never the query cache. Current board/card-modal: URL
+      (<code>/board/123?card=456</code>) — shareable deep links are core to the product. Card-edit form:
+      react-hook-form in the modal. Live collaboration: WebSocket events patch the query cache via
+      <code>setQueryData</code> (or targeted invalidation on conflict). Filters: URL params. Note the absence of a
+      big global store — after classification there's almost no shared client state left, and I'd say exactly that
+      out loud.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Q25. "What is tearing, and how do external stores avoid it?"</summary>
+    <div class="answer">
+      <p>Tearing is two components rendering values from different versions of the same store within one committed
+      UI — impossible when rendering was synchronous, possible once concurrent React can pause mid-render: the store
+      mutates during the pause, and components rendered after the pause read newer state than those before.
+      <code>useSyncExternalStore</code> is the contract that fixes it: the store supplies
+      <code>subscribe</code> and <code>getSnapshot</code>; React checks snapshot consistency at the end of the render
+      pass, and if the store changed mid-render, it discards and re-renders synchronously rather than committing a
+      torn frame. This is why react-redux v8+, Zustand, and TanStack Query all sit on uSES, and why immutable
+      snapshots matter — <code>getSnapshot</code> must return a stable, cheaply-comparable value. Trade-off worth
+      naming: uSES updates are de-facto synchronous, so external-store updates don't get the time-slicing benefits of
+      <code>useState</code>-based transitions.</p>
+    </div>
+  </details>
+
+  <!-- ============================================================ -->
+  <h2 id="exercises">Hands-on exercises</h2>
+
+  <div class="exercise">
+    <h4>Exercise 1 — Classify a real app's state</h4>
+    <p>Take an app you know well (or a Trello/Spotify/Amazon clone spec). List 15 distinct pieces of state it holds.
+    For each: (a) classify it into the five categories, (b) name the best-fit tool, (c) flag any piece that's
+    ambiguous and state what business question resolves it. Then write the 60-second "how I'd architect the state
+    layer" narration you'd deliver in an interview.</p>
+    <details>
+      <summary>Solution sketch &amp; check</summary>
+      <p>Example rows: product list → server cache → TanStack Query. Search text (as typed) → local UI state →
+      useState. Debounced search term → URL (<code>?q=</code>) feeding the queryKey. Theme → shared client,
+      low-frequency → Context (+ localStorage). Cart → <em>ambiguous</em>: guest = client (Zustand persist);
+      logged-in multi-device = server state with optimistic mutations — the resolving question is "must it sync
+      across devices?" Auth token/user → Context or small store; the <em>user profile</em> object is server cache.
+      Checkout address form → react-hook-form. Playback position → high-frequency local + transient subscription for
+      the scrubber. Grade yourself: did anything land in "global store" that only one screen uses? Did any
+      loading/error flag appear as client state (it's server cache)? Ambiguity acknowledged is a feature — seniors
+      surface the business question instead of guessing.</p>
+    </details>
+  </div>
+
+  <div class="exercise">
+    <h4>Exercise 2 — Build Zustand's core, then bind it to React</h4>
+    <p>Implement <code>createStore(initialState)</code> returning <code>{ getState, setState, subscribe }</code>
+    where <code>setState</code> accepts a partial or an updater fn and shallow-merges. Then write
+    <code>useStore(store, selector)</code> using <code>useSyncExternalStore</code> so components re-render only when
+    their selected value changes. Prove it with two components selecting different keys and a log of renders.</p>
+    <details>
+      <summary>Solution</summary>
+      <pre><code>function createStore(initialState) {
+  let state = initialState;
+  const listeners = new Set();
+  return {
+    getState: () =&gt; state,
+    setState: (partial) =&gt; {
+      const next = typeof partial === 'function' ? partial(state) : partial;
+      if (next !== state) {
+        state = { ...state, ...next };          // shallow merge, new reference
+        listeners.forEach((l) =&gt; l());
+      }
+    },
+    subscribe: (l) =&gt; { listeners.add(l); return () =&gt; listeners.delete(l); },
+  };
+}
+
+function useStore(store, selector) {
+  return useSyncExternalStore(
+    store.subscribe,
+    () =&gt; selector(store.getState()),   // snapshot = selected value
+    () =&gt; selector(store.getState())    // server snapshot (SSR)
+  );
+}
+// Key insight to verify: uSES re-renders when the SNAPSHOT changes by Object.is.
+// Because selector runs inside getSnapshot, selecting s.count gives a primitive —
+// updating s.name notifies listeners, but count's snapshot is unchanged → no
+// re-render. Also see the caveat: a selector returning a fresh object each call
+// would loop/thrash — exactly why real Zustand offers useShallow.</code></pre>
+    </details>
+  </div>
+
+  <div class="exercise">
+    <h4>Exercise 3 — Reselect mechanics by hand</h4>
+    <p>Implement <code>createSelector(inputSelectors, resultFn)</code> with cache size 1: if every input selector
+    returns a reference-equal value vs last call, return the cached result. Then construct a Redux-like scenario
+    proving (a) an unrelated dispatch does NOT recompute, (b) a relevant change does, and (c) the memoized result
+    keeps reference identity so a <code>===</code> check (as useSelector performs) skips the re-render.</p>
+    <details>
+      <summary>Solution</summary>
+      <pre><code>function createSelector(inputs, resultFn) {
+  let lastArgs = null;
+  let lastResult;
+  return (state, ...params) =&gt; {
+    const args = inputs.map((sel) =&gt; sel(state, ...params));
+    const same = lastArgs &amp;&amp; args.length === lastArgs.length &amp;&amp;
+                 args.every((a, i) =&gt; Object.is(a, lastArgs[i]));
+    if (!same) {
+      lastResult = resultFn(...args);
+      lastArgs = args;
+    }
+    return lastResult;                 // cached ⇒ SAME reference ⇒ useSelector skips
+  };
+}
+
+// Proof harness:
+const selectTodos  = (s) =&gt; s.todos;
+const selectOpen   = createSelector([selectTodos],
+                       (todos) =&gt; todos.filter(t =&gt; !t.done));
+const s1 = { todos: [{ id: 1, done: false }], theme: 'dark' };
+const r1 = selectOpen(s1);
+const s2 = { ...s1, theme: 'light' };     // unrelated change, todos same ref
+console.assert(selectOpen(s2) === r1);    // (a)+(c): no recompute, same ref
+const s3 = { ...s2, todos: [...s2.todos, { id: 2, done: false }] };
+console.assert(selectOpen(s3) !== r1);    // (b): recomputed
+// Extension: share selectOpen across 2 "components" with different params to
+// watch cache-size-1 thrash — motivating the selector-factory pattern.</code></pre>
+    </details>
+  </div>
+
+  <div class="exercise">
+    <h4>Exercise 4 — Optimistic toggle with rollback (TanStack Query)</h4>
+    <p>Against a mock API (e.g. MSW or a delayed in-memory server) where <code>PATCH /todos/:id</code> fails 30% of
+    the time, build a todo list with optimistic toggle: instant checkbox flip, rollback + toast on failure,
+    convergence via invalidation on settle. Add the detail most people miss: verify a slow, pre-mutation refetch
+    can't overwrite your optimistic state (hint: what does <code>cancelQueries</code> exist for?).</p>
+    <details>
+      <summary>Solution sketch</summary>
+      <pre><code>useMutation({
+  mutationFn: (t) =&gt; api.patch(`/todos/${t.id}`, { done: !t.done }),
+  onMutate: async (t) =&gt; {
+    await qc.cancelQueries({ queryKey: ['todos'] });          // the missed detail
+    const previous = qc.getQueryData(['todos']);
+    qc.setQueryData(['todos'], (old) =&gt;
+      old.map(x =&gt; x.id === t.id ? { ...x, done: !x.done } : x));
+    return { previous };
+  },
+  onError: (_e, _t, ctx) =&gt; { qc.setQueryData(['todos'], ctx.previous); toast('Failed'); },
+  onSettled: () =&gt; qc.invalidateQueries({ queryKey: ['todos'] }),
+});
+// To demo the race cancelQueries prevents: give GET /todos a 3s delay, focus the
+// window (starts a background refetch of pre-toggle data), toggle within 3s.
+// Without cancelQueries the stale GET resolves last and un-toggles your checkbox.
+// Grading checklist: snapshot returned via context (not a closure variable),
+// rollback restores it, onSettled invalidates on BOTH outcomes, and rapid
+// double-toggles still converge (invalidation guarantees eventual server truth).</code></pre>
+    </details>
+  </div>
+
+  <div class="exercise">
+    <h4>Exercise 5 — Wizard as a lite state machine + URL</h4>
+    <p>Build a 3-step signup wizard (account → profile → confirm) where: the current step is a discriminated-union
+    state driven by <code>useReducer</code>; the step is mirrored in the URL (<code>?step=</code>) with deep-link
+    guarding (landing on step 3 without completing 1–2 redirects to the first incomplete step); accumulated answers
+    persist to sessionStorage so refresh resumes; and SUBMIT during submission is structurally ignored.</p>
+    <details>
+      <summary>Solution sketch</summary>
+      <pre><code>type WizardState =
+  | { step: 'account' }
+  | { step: 'profile';  account: AccountData }
+  | { step: 'confirm';  account: AccountData; profile: ProfileData }
+  | { step: 'submitting'; account: AccountData; profile: ProfileData }
+  | { step: 'done' };
+// The union IS the guard: you cannot construct 'confirm' without both payloads.
+
+function reducer(state: WizardState, e: Event): WizardState {
+  switch (state.step) {
+    case 'account':
+      return e.type === 'ACCOUNT_DONE' ? { step: 'profile', account: e.data } : state;
+    case 'profile':
+      if (e.type === 'PROFILE_DONE') return { ...state, step: 'confirm', profile: e.data };
+      if (e.type === 'BACK') return { step: 'account' };
+      return state;
+    case 'confirm':
+      return e.type === 'SUBMIT' ? { ...state, step: 'submitting' } : state;
+    case 'submitting':
+      return e.type === 'SUCCESS' ? { step: 'done' } : state;  // SUBMIT ignored: free
+    case 'done': return state;
+  }
+}
+// URL sync: an effect writes ?step=state.step (replace). On load, parse ?step;
+// validity is derivable — the deepest step whose data exists in the rehydrated
+// sessionStorage draft; clamp deeper requests back (the redirect guard).
+// Persist: JSON.stringify(state) to sessionStorage on change; lazy-init
+// useReducer from it. Field editing inside each step: react-hook-form; only
+// validated step data enters the wizard state — two layers, cleanly separated.
+// Senior notes to make: sessionStorage (not localStorage) matches wizard
+// lifetime; 'submitting' as a STATE (not an isSubmitting flag) is what kills
+// double-submit; and the URL holds only the step — never the form data.</code></pre>
+    </details>
+  </div>
+
+  <nav class="page-nav">
+    <a href="10-react-18-19-latest.html">← Prev: React 18/19</a>
+    <a href="12-component-patterns-forms.html">Next: Component Patterns &amp; Forms →</a>
+  </nav>
+
+</main>
+</body>
+</html>
