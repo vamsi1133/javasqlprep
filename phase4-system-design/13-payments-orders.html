@@ -1,0 +1,2651 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>13 — Design a Payment / Order System | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <div class="breadcrumb"><a href="index.html">← Course Home</a></div>
+    <h1>13 — Design a Payment / Order System</h1>
+    <p>The archetype where a lost update isn't a bug — it's a financial loss. Ledgers, idempotency, sagas, and the discipline of being right.</p>
+  </div>
+</header>
+
+<main class="container">
+
+  <section>
+    <h2>Why this matters in the interview</h2>
+    <p>
+      <strong>This is the most important page in the phase for the companies you are targeting.</strong> Optum, JPMC,
+      Goldman — these are not companies that will ask you to shard Twitter. They will ask you to move money, or to move
+      a claim, or to move an order, and what they are really testing is whether you can be trusted with a system where
+      being wrong <em>costs something</em>. Every other case study in this course has a forgiving failure mode. Drop a
+      tweet from a timeline and nobody files a regulatory report. Serve a stale view count and the world continues. Here,
+      the same class of mistake — a lost update, a double-applied write, a dropped event — is a customer charged twice,
+      a merchant paid twice, a ledger that no longer balances, and in the worst case a conversation with a regulator.
+      This is also the design that sits directly on top of your Phase 1 capstone: the Spring Boot + Postgres
+      order-management service you already built is <em>literally this system, simplified</em>. You are not learning a
+      new domain here. You are learning what that domain looks like when it has to be correct under failure.
+    </p>
+    <p>
+      So here is the thesis, and it is the whole page: <strong>in every other system design, correctness bows to
+      availability and scale. Here it is the other way around. You design for auditability and correctness first, and
+      only then, grudgingly, for scale.</strong> The candidate who opens with "first let's estimate QPS so we know how
+      to shard" has already lost this round — not because estimation is wrong, but because it signals that they've
+      pattern-matched a payments question onto a feed question. Payments are <em>low</em> volume. A thousand transactions
+      per second is a very large payments business. Scale is not the hard part and saying so is itself a scoring move.
+      The hard part is that money is conserved, history is immutable, retries are guaranteed, third parties are
+      unreliable, and you must be able to prove — months later, to someone who is not an engineer — exactly what
+      happened and why. Get that framing out in the first ninety seconds and the rest of the interview is you being
+      right in public.
+    </p>
+    <div class="senior">The opening line for this round, and you should have it memorised: <em>"Before I draw anything: this is a correctness-first system, not a scale-first system. The volumes here are modest — payments are orders of magnitude lower-volume than reads — so scale won't drive my design. What will drive it is that every state change must be idempotent, auditable, and reconstructible, because a bug here isn't a bad user experience, it's a financial loss. So I'd rather be briefly unavailable than briefly wrong."</em> That last sentence inverts the instinct that every other system design round trains into you, and it is the single best thing you can say in a fintech loop.</div>
+  </section>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ul>
+      <li><a href="#prompt">1. The prompt</a></li>
+      <li><a href="#requirements">2. Requirements</a> — and the one non-functional that inverts everything ★</li>
+      <li><a href="#estimation">3. Estimation</a> — why the numbers are small, and why that's the point</li>
+      <li><a href="#api">4. API design</a> — <code>Idempotency-Key</code>, exactly as Stripe does it</li>
+      <li><a href="#datamodel">5. Data model</a> — orders, payments, and the ledger</li>
+      <li><a href="#hld">6. High-level design</a> — the checkout walked end to end</li>
+      <li><a href="#ledger">7. Deep dive: the double-entry ledger</a> ★★ the heart of the page</li>
+      <li><a href="#saga">8. Deep dive: the distributed transaction</a> ★★ saga, compensations, outbox</li>
+      <li><a href="#idempotency">9. Deep dive: idempotency &amp; the authorize/capture lifecycle</a> ★★ webhooks</li>
+      <li><a href="#consistency">10. Consistency &amp; isolation</a> — why Postgres, and why not Cassandra</li>
+      <li><a href="#scaling">11. Scaling &amp; bottlenecks</a></li>
+      <li><a href="#tradeoffs">12. Trade-offs</a></li>
+      <li><a href="#followups">13. Follow-ups you should expect</a></li>
+      <li><a href="#qa">Interview Q&amp;A</a></li>
+      <li><a href="#takeaways">What to remember</a></li>
+    </ul>
+  </div>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="prompt">1. The prompt</h2>
+
+    <p>The interviewer says, and this is genuinely all they say:</p>
+
+    <p style="font-size:1.15rem; font-weight:700; color:#111827; border-left:4px solid #8b5cf6; padding-left:1rem;">
+      "Design the payment and order system for an e-commerce site. A customer should be able to place an order and pay
+      for it."
+    </p>
+
+    <p>
+      Two sentences, and almost every load-bearing decision is unstated. Are you <em>Stripe</em>, or are you a shop
+      <em>using</em> Stripe? Does "pay" mean you touch a card number (in which case you have just walked into a
+      PCI-DSS compliance conversation) or does it mean you hand off to a provider? Is an order one item or a basket from
+      three different merchants? Refunds? Partial refunds? Chargebacks? Multiple currencies?
+    </p>
+    <p>
+      The vagueness is deliberate and it is the first thing being graded. A mid-level candidate starts drawing boxes: a
+      load balancer, an order service, a database. A senior candidate spends the next four minutes making the problem
+      <em>smaller and sharper</em>, and — this is the part people miss — <strong>says out loud what they are cutting and
+      why</strong>, so the interviewer knows the omission is a choice rather than a gap.
+    </p>
+
+    <div class="note">Notice what this prompt is <em>not</em>. It doesn't mention scale, DAU, or latency. In a feed or a shortener prompt, the interviewer usually hands you a number ("100M users") because scale is the puzzle. Here they don't, because it isn't. If you find yourself inventing a scale figure so you can do the estimation ritual, stop — you're answering a different question than the one you were asked.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="requirements">2. Requirements</h2>
+
+    <h3>The clarifying questions to ask first</h3>
+    <p>
+      Ask these in this order. The first one restructures the entire design, so it goes first and you do not draw
+      anything until you have the answer.
+    </p>
+
+    <table>
+      <thead><tr><th>Question</th><th>Why it matters</th><th>The answer to assume</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>"Are we the merchant, or are we the payment processor?"</strong></td>
+          <td>Completely different systems. The <em>processor</em> (Stripe, Adyen) speaks to card networks, holds PCI Level 1 scope, does fraud scoring and settlement. The <em>merchant</em> orchestrates an order and delegates the money movement. If you design the processor by accident you will spend 45 minutes in the wrong system.</td>
+          <td><strong>The merchant</strong>, integrating with a third-party PSP (payment service provider). That's the realistic scope, it's what almost every company actually builds, and it's what you have shipped.</td>
+        </tr>
+        <tr>
+          <td>"Do we ever see a raw card number?"</td>
+          <td>Determines whether PCI-DSS scope lands on you. If a PAN (primary account number) touches your servers, your <em>entire</em> infrastructure is in audit scope.</td>
+          <td><strong>No.</strong> The card is collected by the PSP's iframe/SDK in the browser; we receive a <strong>token</strong>. Say the word "tokenization" here.</td>
+        </tr>
+        <tr>
+          <td>"Single currency, or multi?"</td>
+          <td>Multi-currency doubles the ledger's complexity — you need FX rates, and a rate is a point-in-time fact you must store, not re-derive.</td>
+          <td>Single currency (USD) for the core design; I'll say how I'd extend it in the follow-ups.</td>
+        </tr>
+        <tr>
+          <td>"Refunds — full only, or partial?"</td>
+          <td>Partial refunds mean a payment has <em>many</em> refunds, so <code>refunded_amount ≤ captured_amount</code> becomes an invariant you must enforce under concurrency.</td>
+          <td><strong>Partial refunds are in scope.</strong> Ask for them — it's a better design and it shows you know the domain.</td>
+        </tr>
+        <tr>
+          <td>"Chargebacks and disputes?"</td>
+          <td>A chargeback is money reversed <em>by the bank</em>, weeks later, without asking you. It's an inbound event you cannot refuse.</td>
+          <td>Out of scope for the core flow, but I'll model the <code>disputed</code> state and cover it in follow-ups.</td>
+        </tr>
+        <tr>
+          <td>"Digital goods or physical?"</td>
+          <td>Physical means authorize-now/capture-at-shipment (and legally, in many jurisdictions, you may not capture before you ship). Digital means capture immediately.</td>
+          <td><strong>Physical</strong> — it forces the authorize/capture split, which is the more interesting and more commonly probed design.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>Functional requirements</h3>
+    <ul>
+      <li><strong>Place an order.</strong> A customer submits a basket; we create an order, reserve inventory, and take payment.</li>
+      <li><strong>Authorize a payment</strong> at checkout (hold the funds on the card) and <strong>capture</strong> it later (actually take the money), at shipment.</li>
+      <li><strong>Refund</strong> a payment, in full or in part, possibly several times against one payment.</li>
+      <li><strong>Handle failure at every step</strong> — declined card, out-of-stock item, PSP timeout, our own crash mid-flow. "Handle failure" is a functional requirement here, not an operational afterthought.</li>
+      <li><strong>Query order and payment status</strong> — for the customer, for support, and for finance.</li>
+      <li><strong>Produce an auditable history</strong> of every state change, forever.</li>
+    </ul>
+    <p><strong>Explicitly out of scope</strong> (say this): the cart/basket service, the product catalogue, shipping-carrier integration, fraud modelling internals, and tax calculation. Each is a real system; none is what's being tested.</p>
+
+    <h3>Non-functional requirements — this is where the round is won</h3>
+
+    <table>
+      <thead><tr><th>Requirement</th><th>What it actually means</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Correctness &gt; availability</strong> ★</td>
+          <td><strong>It is better to be down than to be wrong.</strong> If the ledger cannot be written consistently, refuse the payment. A customer who sees "please try again in a minute" is annoyed; a customer charged twice is a support ticket, a refund, a chargeback fee, and possibly a compliance incident. This inverts the usual instinct — in a feed you'd serve something stale rather than nothing — and stating the inversion deliberately is the highest-value sentence in this round.</td>
+        </tr>
+        <tr>
+          <td><strong>Auditability</strong></td>
+          <td>Every state change is <em>reconstructible</em>. Not "we log it" — the log is not a source of truth. The database itself is append-only for financial facts: you can replay the entries and re-derive any balance at any past instant. If finance asks "what was this account's balance on March 3rd at noon", you must be able to answer with a query, not a guess.</td>
+        </tr>
+        <tr>
+          <td><strong>Idempotency everywhere</strong></td>
+          <td>Every mutating endpoint, every queue consumer, every call <em>out</em> to the PSP. Retries are not an edge case — they are the steady state (05: "duplicates are the weather"). A system where a retry can double-charge is not a payment system; it is a liability.</td>
+        </tr>
+        <tr>
+          <td><strong>Durability</strong></td>
+          <td>Once we tell the customer "paid", that fact survives anything. Synchronous replication for the payment DB, not async. Losing 30 seconds of writes on failover is acceptable for a chat app and unacceptable here.</td>
+        </tr>
+        <tr>
+          <td><strong>Regulatory / PCI-DSS</strong></td>
+          <td><strong>Never store raw card numbers.</strong> Collect via the PSP's hosted field, store the returned token (<code>pm_1Ab2…</code>), and your PCI scope collapses from "everything" to "almost nothing" (SAQ-A). Financial records are retained for years (7 is a common figure) and <strong>never deleted</strong>.</td>
+        </tr>
+        <tr>
+          <td>Latency</td>
+          <td>Checkout should feel fast, but a payment taking 2 seconds is <em>fine</em> — users expect a spinner at checkout. Do not trade correctness for 100ms here. Meanwhile order <em>reads</em> should be fast, and they can be, because they're not on the money path.</td>
+        </tr>
+        <tr>
+          <td>Availability</td>
+          <td>Target high (99.9%+) — being down costs revenue — but it is explicitly the <em>second</em> priority, and you should say so rather than reciting "five nines" out of habit.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="pitfall">The most common self-inflicted wound in this round: reaching for the standard playbook. "We'll denormalize for read speed, go eventually consistent, and use a NoSQL store so we can scale writes." Every one of those is a defensible instinct in a feed design and every one of them is <em>wrong here</em>, because each trades correctness for throughput you do not need. If you catch yourself saying "eventually consistent" about a balance, stop and restart the sentence.</div>
+
+    <div class="senior">Frame the CAP decision explicitly, because they're waiting for it: <em>"On the money path I'm choosing CP over AP. Under a partition, the payment service refuses writes rather than accepting them into a state it can't reconcile. On the read path — order history, receipts — I'm happy to be AP and serve slightly stale data from a replica, because a receipt that's five seconds behind harms nobody. So this isn't one system with one consistency model; it's two paths with two."</em> Splitting the CAP answer by <em>path</em> rather than by <em>system</em> is a 7-YOE move (03).</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="estimation">3. Estimation</h2>
+
+    <p>
+      Do the arithmetic — but do it to make a <em>point</em>, and announce the point before you do the sums, so the
+      interviewer knows you're not just performing the ritual.
+    </p>
+
+    <p>Assume a large e-commerce business: <strong>100M registered users, 10M daily active, 1M orders per day.</strong></p>
+
+<pre><code>ORDERS
+  1,000,000 orders/day ÷ 86,400 s  ≈  12 orders/sec average
+  Peak (Black Friday, ~10× a normal peak, and peaks are ~3× average):
+      12 × 3 × 10  ≈  360 orders/sec  →  round up hard: call it 1,000 TPS
+
+PAYMENT OPERATIONS per order
+  1 authorize + 1 capture + ~0.1 refunds + ~2 webhook callbacks  ≈  4 ops
+  → ~4,000 payment-related writes/sec at peak.  Still tiny.
+
+READS (order status, order history, receipts, the "where's my stuff" page)
+  Every customer checks their order 5–10× before it arrives, and support
+  looks too:
+      ~50M reads/day  ≈  600 reads/sec avg,  ~5,000/sec peak
+  → READ:WRITE ≈ 50:1 on orders … but ONLY on the read path.
+
+STORAGE  (this is the number that actually matters)
+  Ledger entries: ~6 entries per order (see section 7) × ~200 bytes
+      1M orders/day × 6 × 200B  ≈  1.2 GB/day  ≈  440 GB/year
+  Orders + payments + events + outbox + idempotency keys: call it 3× that.
+      ≈ 1.5 TB/year, growing MONOTONICALLY — we never delete.
+</code></pre>
+
+    <p>
+      Now say the thing the numbers are there to license you to say:
+    </p>
+
+    <p style="font-size:1.1rem; font-weight:700; color:#111827; border-left:4px solid #8b5cf6; padding-left:1rem;">
+      A thousand transactions per second is a workload a single well-tuned Postgres instance handles comfortably.
+      <strong>Scale is not the hard part of this system. Correctness is.</strong> So I'm not going to shard for
+      throughput — I'm going to spend my design budget on making every write idempotent, every state change auditable,
+      and every failure recoverable.
+    </p>
+
+    <p>
+      That is a genuinely disarming thing to say, because it is <em>true</em> and because most candidates cannot bring
+      themselves to say it. Visa's global peak is on the order of tens of thousands of transactions per second. The
+      entire card-payments volume of planet Earth would fit, throughput-wise, into a handful of database servers. What
+      makes payments hard has never been the QPS.
+    </p>
+
+    <h3>The number that <em>does</em> drive the design: storage that only grows</h3>
+    <p>
+      Every other case study has a retention story — expire the cache, roll up the metrics, delete after 90 days. Here
+      you have the opposite: <strong>the ledger is append-only and retained essentially forever</strong>, because a
+      regulator or an auditor can ask about a transaction from six years ago and "we deleted it" is not an available
+      answer. So:
+    </p>
+    <ul>
+      <li><strong>You never <code>UPDATE</code> and you never <code>DELETE</code> a ledger entry.</strong> A correction is
+        a <em>new, compensating entry</em>, exactly like a saga compensation (05). The mistake stays visible forever, and
+        that is the feature, not the bug.</li>
+      <li><strong>Growth is linear and predictable</strong> (~1.5 TB/year), which is easy — but it means you need a
+        partitioning/archival story from day one. Partition the ledger by month; keep hot months on fast storage; move
+        cold partitions to cheap storage but keep them <em>queryable</em>. Postgres declarative partitioning does this
+        without an extra system.</li>
+      <li><strong>Cost is real but boring.</strong> Terabytes are cheap. Wrong numbers are expensive.</li>
+    </ul>
+
+    <div class="senior">Close the estimation section with this: <em>"The read:write ratio here is about 50:1, which normally would push me toward read replicas and aggressive caching — and I will do exactly that, but only on the order-history path. I'm deliberately <strong>not</strong> letting the read volume influence the write path, because the write path's constraint isn't throughput, it's correctness. Those are two different systems wearing one name, and I'll design them separately."</em></div>
+
+    <div class="pitfall">Don't cache balances. It will feel natural — you'll have just finished saying "50:1 read ratio, so cache" — and it is the exact trap. A cached balance is a stale balance, and a stale balance used in a "do they have enough funds?" check is a lost update with a dollar sign attached. Cache <em>order summaries</em> and <em>receipts</em> (immutable facts, safe to cache forever). Never cache a number you're about to make a decision with.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="api">4. API design</h2>
+
+    <p>
+      Small surface, and every mutating call carries an <strong><code>Idempotency-Key</code></strong> header. This is not
+      an invention — it is exactly how Stripe's API works, and naming that out loud is free credibility. Go look at
+      Stripe's real docs before this interview; being able to say "the same way Stripe does it, with a client-supplied
+      key held for 24 hours" is worth more than any diagram you'll draw.
+    </p>
+
+<pre><code>POST /v1/orders
+Idempotency-Key: 7c9e6679-7425-40de-944b-e07fc1f90ae7
+Content-Type: application/json
+
+{
+  "customerId": "cus_88213",
+  "items": [ { "sku": "SKU-991", "qty": 2, "unitPriceCents": 2499 } ],
+  "currency": "USD",
+  "paymentMethodToken": "pm_1Ab2C3d4E5"      ← a PSP TOKEN. Never a card number.
+}
+
+201 Created
+{
+  "orderId": "ord_01HX7…",
+  "status": "PENDING_PAYMENT",
+  "totalCents": 4998,
+  "currency": "USD"
+}
+</code></pre>
+
+    <p>
+      Three things to point at in that request, because each is a decision:
+    </p>
+    <ul>
+      <li><strong><code>Idempotency-Key</code></strong> is generated by the <em>client</em>, once per logical intent —
+        in your React app, when the checkout page mounts, <em>not</em> when the fetch fires. Retries reuse it. (05, §9.)</li>
+      <li><strong><code>unitPriceCents</code></strong> — an <strong>integer</strong>. Not <code>24.99</code>. Not a
+        <code>double</code>. We'll come back to this in §7 and it will have its own callout, because it is a real
+        interview gotcha.</li>
+      <li><strong><code>paymentMethodToken</code></strong> — the browser talked to Stripe directly and got back an opaque
+        token. Our servers never saw a PAN, so we are not in PCI scope for card data. Say <em>"tokenization keeps us at
+        SAQ-A"</em> and watch a fintech interviewer relax.</li>
+    </ul>
+
+<pre><code>POST /v1/payments                       ← authorize (hold the funds)
+Idempotency-Key: 3f1e…
+{ "orderId": "ord_01HX7…", "amountCents": 4998, "currency": "USD",
+  "paymentMethodToken": "pm_1Ab2C3d4E5", "capture": false }
+
+201 { "paymentId": "pay_9K2…", "status": "AUTHORIZED",
+      "amountCents": 4998, "authorizedAt": "2026-07-14T10:02:11Z" }
+
+
+POST /v1/payments/{paymentId}/capture   ← capture (take the money), at shipment
+Idempotency-Key: 9b0c…
+{ "amountCents": 4998 }                 ← may be LESS than authorized (partial ship)
+
+200 { "paymentId": "pay_9K2…", "status": "CAPTURED", "capturedCents": 4998 }
+
+
+POST /v1/refunds                        ← may be called several times per payment
+Idempotency-Key: c41d…
+{ "paymentId": "pay_9K2…", "amountCents": 1500, "reason": "item_returned" }
+
+201 { "refundId": "re_77…", "status": "PENDING", "amountCents": 1500 }
+
+
+GET  /v1/orders/{orderId}               ← status + timeline. Cacheable-ish, read replica.
+GET  /v1/payments/{paymentId}           ← the payment's current state + its refunds
+GET  /v1/orders?customerId=…&amp;cursor=…  ← history. Cursor pagination, never OFFSET.
+
+POST /v1/webhooks/psp                   ← the PROVIDER calls US. Section 9. Signed.
+</code></pre>
+
+    <h3>Design decisions in that surface, defended</h3>
+    <ul>
+      <li><strong><code>POST /refunds</code>, not <code>DELETE /payments/{id}</code>.</strong> This is the most important
+        line in the API and it encodes the entire philosophy of the page. <strong>A refund is not a deletion and not an
+        undo — it is a new, forward transaction that moves money in the opposite direction.</strong> The original charge
+        still happened, still appears on the customer's statement, and you probably still paid the processing fee on it.
+        Modelling a refund as <code>DELETE</code> is not just an aesthetic mistake; it's a statement that you think
+        history can be rewritten, and in this system it cannot.</li>
+      <li><strong>Capture is a separate call from authorize.</strong> It has to be, because they happen days apart.</li>
+      <li><strong>Refund returns <code>PENDING</code>, not <code>DONE</code>.</strong> The PSP takes days to actually move
+        the money back. Anything that lies about being synchronous when it isn't will eventually be caught by
+        reconciliation, and then you get to explain why your API said "refunded" and the bank disagrees.</li>
+      <li><strong>Cursor pagination on history</strong>, not <code>OFFSET</code> — offsets drift when rows are inserted,
+        and here that means a customer's order silently vanishing from page 2.</li>
+      <li><strong>Everything mutating is a <code>POST</code> with an idempotency key.</strong> <code>PUT</code> is
+        idempotent by HTTP spec, but "charge this card" isn't a resource replacement, so don't contort it. Use
+        <code>POST</code> and carry the key.</li>
+    </ul>
+
+    <div class="note">Worth 10 seconds of interview time: <strong>Stripe holds idempotency keys for 24 hours</strong> and returns the <em>original response</em>, including the original error, on a replay. Both halves matter — replaying a stored <code>402 card_declined</code> is just as important as replaying a success, because otherwise a retry of a declined charge could get lucky, charge the customer, and confuse everyone. Say "I'd replay the original response, success <em>or</em> failure."</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="datamodel">5. Data model</h2>
+
+    <h3>The SQL vs NoSQL decision, made explicitly</h3>
+    <p>
+      Make this call early, loudly, and with a reason — because the interviewer is watching to see whether you'll
+      reflexively reach for a NoSQL store because that's what "scalable" designs use.
+    </p>
+    <p style="font-size:1.1rem; font-weight:700; color:#111827; border-left:4px solid #8b5cf6; padding-left:1rem;">
+      Relational. Postgres. Because I need multi-row ACID transactions, real foreign keys, unique constraints as a
+      concurrency primitive, <code>CHECK</code> constraints to enforce financial invariants, and <code>SERIALIZABLE</code>
+      when I need it. Those are not conveniences here — they are the mechanism by which the system is correct.
+    </p>
+    <p>
+      The full argument is in §10, but plant the flag now. Every one of those features is doing load-bearing work in the
+      schema below.
+    </p>
+
+    <h3>Orders</h3>
+
+<pre><code><span class="kw">CREATE TABLE</span> orders (
+    id              <span class="typ">UUID</span>        <span class="kw">PRIMARY KEY</span>,
+    customer_id     <span class="typ">UUID</span>        <span class="kw">NOT NULL</span>,
+    status          <span class="typ">TEXT</span>        <span class="kw">NOT NULL</span>,        <span class="com">-- see the state machine, §9</span>
+    total_cents     <span class="typ">BIGINT</span>      <span class="kw">NOT NULL CHECK</span> (total_cents &gt; <span class="num">0</span>),
+    currency        <span class="typ">CHAR</span>(<span class="num">3</span>)    <span class="kw">NOT NULL</span>,        <span class="com">-- ISO 4217. Always store it.</span>
+    version         <span class="typ">INT</span>         <span class="kw">NOT NULL DEFAULT</span> <span class="num">0</span>,  <span class="com">-- optimistic locking (@Version)</span>
+    created_at      <span class="typ">TIMESTAMPTZ</span> <span class="kw">NOT NULL DEFAULT</span> now(),
+    updated_at      <span class="typ">TIMESTAMPTZ</span> <span class="kw">NOT NULL DEFAULT</span> now()
+);
+<span class="kw">CREATE INDEX</span> idx_orders_customer <span class="kw">ON</span> orders (customer_id, created_at <span class="kw">DESC</span>);
+
+<span class="kw">CREATE TABLE</span> order_items (
+    order_id        <span class="typ">UUID</span>   <span class="kw">NOT NULL REFERENCES</span> orders(id),
+    sku             <span class="typ">TEXT</span>   <span class="kw">NOT NULL</span>,
+    qty             <span class="typ">INT</span>    <span class="kw">NOT NULL CHECK</span> (qty &gt; <span class="num">0</span>),
+    unit_price_cents <span class="typ">BIGINT</span> <span class="kw">NOT NULL</span>,   <span class="com">-- the price AT THE TIME OF ORDER.</span>
+    <span class="kw">PRIMARY KEY</span> (order_id, sku)              <span class="com">-- NEVER join to the live catalogue price.</span>
+);
+
+<span class="com">-- Every status change, forever. The order row tells you WHERE it is;</span>
+<span class="com">-- this table tells you HOW IT GOT THERE. Auditability is a table, not a log file.</span>
+<span class="kw">CREATE TABLE</span> order_status_history (
+    id          <span class="typ">BIGSERIAL</span>   <span class="kw">PRIMARY KEY</span>,
+    order_id    <span class="typ">UUID</span>        <span class="kw">NOT NULL REFERENCES</span> orders(id),
+    from_status <span class="typ">TEXT</span>,
+    to_status   <span class="typ">TEXT</span>        <span class="kw">NOT NULL</span>,
+    reason      <span class="typ">TEXT</span>,
+    actor       <span class="typ">TEXT</span>        <span class="kw">NOT NULL</span>,   <span class="com">-- 'saga', 'webhook:psp', 'support:u_44'</span>
+    occurred_at <span class="typ">TIMESTAMPTZ</span> <span class="kw">NOT NULL DEFAULT</span> now()
+);
+</code></pre>
+
+    <p>
+      <code>unit_price_cents</code> on the order line is the kind of detail that reads as experience. <strong>The price is
+      copied into the order, not referenced.</strong> If you join to the catalogue at read time, then a price change next
+      Tuesday retroactively rewrites what the customer paid last week — and now your receipt disagrees with your ledger.
+      Same instinct as the FX-rate rule in the follow-ups: <strong>a financial fact is captured at the moment it becomes
+      true, and never re-derived.</strong>
+    </p>
+
+    <h3>Payments and refunds</h3>
+
+<pre><code><span class="kw">CREATE TABLE</span> payments (
+    id                  <span class="typ">UUID</span>        <span class="kw">PRIMARY KEY</span>,
+    order_id            <span class="typ">UUID</span>        <span class="kw">NOT NULL REFERENCES</span> orders(id),
+    status              <span class="typ">TEXT</span>        <span class="kw">NOT NULL</span>,   <span class="com">-- pending|authorized|captured|…</span>
+    amount_cents        <span class="typ">BIGINT</span>      <span class="kw">NOT NULL CHECK</span> (amount_cents &gt; <span class="num">0</span>),
+    captured_cents      <span class="typ">BIGINT</span>      <span class="kw">NOT NULL DEFAULT</span> <span class="num">0</span>,
+    refunded_cents      <span class="typ">BIGINT</span>      <span class="kw">NOT NULL DEFAULT</span> <span class="num">0</span>,
+    currency            <span class="typ">CHAR</span>(<span class="num">3</span>)    <span class="kw">NOT NULL</span>,
+    psp_payment_intent  <span class="typ">TEXT</span>        <span class="kw">UNIQUE</span>,     <span class="com">-- Stripe's id for this charge</span>
+    payment_method_token <span class="typ">TEXT</span>       <span class="kw">NOT NULL</span>,   <span class="com">-- 'pm_1Ab2…'. NOT a card number.</span>
+    version             <span class="typ">INT</span>         <span class="kw">NOT NULL DEFAULT</span> <span class="num">0</span>,
+    created_at          <span class="typ">TIMESTAMPTZ</span> <span class="kw">NOT NULL DEFAULT</span> now(),
+
+    <span class="com">-- The invariants, enforced BY THE DATABASE. You cannot refund more than you</span>
+    <span class="com">-- captured, no matter what bug your service layer has this week.</span>
+    <span class="kw">CHECK</span> (captured_cents &lt;= amount_cents),
+    <span class="kw">CHECK</span> (refunded_cents &lt;= captured_cents),
+    <span class="kw">CHECK</span> (refunded_cents &gt;= <span class="num">0</span>)
+);
+
+<span class="kw">CREATE TABLE</span> refunds (
+    id            <span class="typ">UUID</span>        <span class="kw">PRIMARY KEY</span>,
+    payment_id    <span class="typ">UUID</span>        <span class="kw">NOT NULL REFERENCES</span> payments(id),
+    amount_cents  <span class="typ">BIGINT</span>      <span class="kw">NOT NULL CHECK</span> (amount_cents &gt; <span class="num">0</span>),
+    status        <span class="typ">TEXT</span>        <span class="kw">NOT NULL</span>,      <span class="com">-- pending | succeeded | failed</span>
+    psp_refund_id <span class="typ">TEXT</span>        <span class="kw">UNIQUE</span>,
+    reason        <span class="typ">TEXT</span>,
+    created_at    <span class="typ">TIMESTAMPTZ</span> <span class="kw">NOT NULL DEFAULT</span> now()
+);
+</code></pre>
+
+    <div class="senior">Point at those <code>CHECK</code> constraints deliberately: <em>"I want the refund invariant enforced in the database, not in the service layer. Service-layer checks are check-then-act — two concurrent partial refunds can both read <code>refunded_cents = 0</code>, both pass validation, and together over-refund. A <code>CHECK</code> constraint plus a row lock makes over-refunding structurally impossible, and it stays true even when someone runs a manual UPDATE from a support tool at 2am."</em> That parenthetical about the support tool is what makes it land — it's the failure everyone has actually seen.</div>
+
+    <h3>The ledger — the tables that make this a payment system</h3>
+    <p>
+      This is §7's subject, but the schema belongs here so the shape of the whole model is visible at once.
+    </p>
+
+<pre><code><span class="com">-- An ACCOUNT is any place money can sit. Customers, merchants, and — crucially —</span>
+<span class="com">-- our own internal accounts (revenue, fees, cash-in-transit). Every movement of</span>
+<span class="com">-- money is BETWEEN accounts. Money never appears; it only ever moves.</span>
+<span class="kw">CREATE TABLE</span> accounts (
+    id          <span class="typ">UUID</span>        <span class="kw">PRIMARY KEY</span>,
+    type        <span class="typ">TEXT</span>        <span class="kw">NOT NULL</span>,   <span class="com">-- CUSTOMER | MERCHANT | REVENUE | FEES |</span>
+                                          <span class="com">-- PSP_CLEARING | CASH</span>
+    owner_id    <span class="typ">UUID</span>,                    <span class="com">-- null for internal accounts</span>
+    currency    <span class="typ">CHAR</span>(<span class="num">3</span>)    <span class="kw">NOT NULL</span>,
+    created_at  <span class="typ">TIMESTAMPTZ</span> <span class="kw">NOT NULL DEFAULT</span> now()
+    <span class="com">-- ⚠ NOTE WHAT IS NOT HERE: there is NO `balance` COLUMN. On purpose. §7.</span>
+);
+
+<span class="com">-- A TRANSACTION is a group of entries that must balance to zero together.</span>
+<span class="kw">CREATE TABLE</span> ledger_transactions (
+    id           <span class="typ">UUID</span>        <span class="kw">PRIMARY KEY</span>,
+    type         <span class="typ">TEXT</span>        <span class="kw">NOT NULL</span>,  <span class="com">-- CAPTURE | REFUND | FEE | CHARGEBACK</span>
+    reference_id <span class="typ">UUID</span>        <span class="kw">NOT NULL</span>,  <span class="com">-- the payment/refund that caused it</span>
+    idem_key     <span class="typ">TEXT</span>        <span class="kw">UNIQUE</span>,    <span class="com">-- ← the same transaction can never be</span>
+    occurred_at  <span class="typ">TIMESTAMPTZ</span> <span class="kw">NOT NULL DEFAULT</span> now()   <span class="com">--   posted twice</span>
+);
+
+<span class="com">-- An ENTRY is one leg of a transaction: this much money, into or out of this</span>
+<span class="com">-- account. Append-only. Never updated. Never deleted. Ever.</span>
+<span class="kw">CREATE TABLE</span> ledger_entries (
+    id             <span class="typ">BIGSERIAL</span>   <span class="kw">PRIMARY KEY</span>,
+    transaction_id <span class="typ">UUID</span>        <span class="kw">NOT NULL REFERENCES</span> ledger_transactions(id),
+    account_id     <span class="typ">UUID</span>        <span class="kw">NOT NULL REFERENCES</span> accounts(id),
+    direction      <span class="typ">TEXT</span>        <span class="kw">NOT NULL CHECK</span> (direction <span class="kw">IN</span> (<span class="str">'DEBIT'</span>,<span class="str">'CREDIT'</span>)),
+    amount_cents   <span class="typ">BIGINT</span>      <span class="kw">NOT NULL CHECK</span> (amount_cents &gt; <span class="num">0</span>),
+    currency       <span class="typ">CHAR</span>(<span class="num">3</span>)    <span class="kw">NOT NULL</span>,
+    created_at     <span class="typ">TIMESTAMPTZ</span> <span class="kw">NOT NULL DEFAULT</span> now()
+) <span class="kw">PARTITION BY RANGE</span> (created_at);   <span class="com">-- monthly partitions; cold ones archive</span>
+
+<span class="kw">CREATE INDEX</span> idx_entries_account <span class="kw">ON</span> ledger_entries (account_id, created_at);
+<span class="kw">CREATE INDEX</span> idx_entries_txn     <span class="kw">ON</span> ledger_entries (transaction_id);
+
+<span class="com">-- Make the append-only rule real, not a convention people forget:</span>
+<span class="kw">REVOKE UPDATE</span>, <span class="kw">DELETE</span> <span class="kw">ON</span> ledger_entries <span class="kw">FROM</span> app_user;
+</code></pre>
+
+    <h3>The supporting cast (both from 05, both non-negotiable)</h3>
+
+<pre><code><span class="kw">CREATE TABLE</span> idempotency_keys (
+    key           <span class="typ">TEXT</span>        <span class="kw">PRIMARY KEY</span>,     <span class="com">-- ← THE concurrency primitive.</span>
+    endpoint      <span class="typ">TEXT</span>        <span class="kw">NOT NULL</span>,        <span class="com">--   Not Redis. This.</span>
+    request_hash  <span class="typ">TEXT</span>        <span class="kw">NOT NULL</span>,
+    status        <span class="typ">TEXT</span>        <span class="kw">NOT NULL</span>,        <span class="com">-- IN_PROGRESS | COMPLETED</span>
+    response_code <span class="typ">INT</span>,
+    response_body <span class="typ">JSONB</span>,
+    created_at    <span class="typ">TIMESTAMPTZ</span> <span class="kw">NOT NULL DEFAULT</span> now()   <span class="com">-- reap after 24h</span>
+);
+
+<span class="kw">CREATE TABLE</span> outbox (                       <span class="com">-- 05 §8. Same table, same reasons.</span>
+    id             <span class="typ">BIGSERIAL</span>   <span class="kw">PRIMARY KEY</span>,
+    aggregate_type <span class="typ">TEXT</span>        <span class="kw">NOT NULL</span>,
+    aggregate_id   <span class="typ">TEXT</span>        <span class="kw">NOT NULL</span>,
+    event_type     <span class="typ">TEXT</span>        <span class="kw">NOT NULL</span>,
+    event_id       <span class="typ">UUID</span>        <span class="kw">NOT NULL UNIQUE</span>,
+    payload        <span class="typ">JSONB</span>       <span class="kw">NOT NULL</span>,
+    published_at   <span class="typ">TIMESTAMPTZ</span>
+);
+<span class="kw">CREATE INDEX</span> idx_outbox_unpub <span class="kw">ON</span> outbox (id) <span class="kw">WHERE</span> published_at <span class="kw">IS NULL</span>;
+
+<span class="kw">CREATE TABLE</span> processed_webhooks (          <span class="com">-- §9. The PSP will call you twice.</span>
+    psp_event_id  <span class="typ">TEXT</span>        <span class="kw">PRIMARY KEY</span>,
+    received_at   <span class="typ">TIMESTAMPTZ</span> <span class="kw">NOT NULL DEFAULT</span> now()
+);
+</code></pre>
+
+    <div class="note">Count the unique constraints in this schema: <code>idempotency_keys.key</code>, <code>ledger_transactions.idem_key</code>, <code>outbox.event_id</code>, <code>processed_webhooks.psp_event_id</code>, <code>payments.psp_payment_intent</code>. <strong>Five separate places where a duplicate is stopped by the database rather than by application logic.</strong> That's not paranoia — it's the design. 05's rule ("most 'we need a distributed lock' requirements turn out to be 'we need a unique constraint'") is not a slogan here; it is load-bearing in five places.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="hld">6. High-level design</h2>
+
+<pre><code>                         ┌──────────────────────────────┐
+   Browser ──────────────│  card details go DIRECTLY to  │
+      │  (Stripe.js)     │  the PSP — never to our API   │
+      │                  └───────────────┬──────────────┘
+      │  pm_token                        │
+      ▼                                  │
+ ┌──────────┐    ┌────────────────────────────────────────┐
+ │   API    │───▶│  ORDER SERVICE (the saga orchestrator) │
+ │ Gateway  │    │  owns: orders, order_items, saga_state │
+ └──────────┘    └───┬────────────┬─────────────┬─────────┘
+                     │            │             │
+        commands ────┘            │             └──── commands
+              ▼                   ▼                    ▼
+      ┌──────────────┐    ┌──────────────┐     ┌──────────────┐
+      │  INVENTORY   │    │   PAYMENT    │     │   SHIPPING   │
+      │   SERVICE    │    │   SERVICE    │     │   SERVICE    │
+      └──────────────┘    └──────┬───────┘     └──────────────┘
+                                 │
+                    ┌────────────┴──────────────┐
+                    ▼                           ▼
+            ┌───────────────┐          ┌─────────────────┐
+            │  POSTGRES     │          │  PSP (Stripe)   │
+            │  payments     │          │  authorize      │
+            │  refunds      │◀─webhook─│  capture        │
+            │  LEDGER       │  (async, │  refund         │
+            │  idempotency  │   signed,│                 │
+            │  outbox       │   dupes) └─────────────────┘
+            └───────┬───────┘                   ▲
+                    │ outbox relay              │ nightly settlement file
+                    ▼                           │
+            ┌───────────────┐          ┌────────┴────────┐
+            │    Kafka      │─────────▶│ RECONCILIATION  │  ← re-derives balances,
+            └───────────────┘          │      JOB        │    compares to the PSP,
+                    │                  └─────────────────┘    ALARMS on mismatch
+                    ▼
+          notification / analytics / fraud consumers
+</code></pre>
+
+    <p>
+      Three things about that diagram are worth narrating rather than leaving implicit:
+    </p>
+    <ul>
+      <li><strong>The card never touches us.</strong> That single arrow from the browser straight to the PSP is what keeps
+        our PCI scope near zero. It is also the arrow candidates forget to draw, and drawing it unprompted is a signal.</li>
+      <li><strong>The Order Service is the orchestrator</strong>, not a passive CRUD service. It owns the saga's state
+        machine. Ask "why is order 12345 stuck?" and the answer is one row in one table (05 §7b).</li>
+      <li><strong>The reconciliation job has an arrow of its own.</strong> It is not an afterthought or a cron someone
+        added later — it is a first-class component, and in a real payments org it is the thing that catches the bugs the
+        tests didn't. Draw it in the first pass of the diagram, not when the interviewer asks.</li>
+    </ul>
+
+    <h3>The write path: one checkout, end to end</h3>
+
+<pre><code> 1. Browser → Stripe.js collects card, returns  pm_1Ab2C3d4E5   (we never see the PAN)
+
+ 2. Browser → POST /v1/orders   [Idempotency-Key: 7c9e…]
+       Order Service, ONE Postgres transaction:
+         INSERT idempotency_keys (key) ON CONFLICT DO NOTHING   ← claim the key
+         INSERT orders (status = 'PENDING_PAYMENT')
+         INSERT order_items
+         INSERT saga_state (step = 'RESERVE_INVENTORY')
+         INSERT outbox ('OrderCreated')                         ← no dual write
+       COMMIT                                    → 201 to the browser IMMEDIATELY.
+                                                   The customer waits for nothing.
+
+ 3. Outbox relay → Kafka → Inventory Service consumes 'OrderCreated'
+       UPDATE stock SET reserved = reserved + qty
+        WHERE sku = ? AND (on_hand - reserved) &gt;= qty            ← conditional update.
+       0 rows ⇒ OUT OF STOCK ⇒ emit InventoryReservationFailed.   No lock needed. (14)
+       Emits InventoryReserved.
+
+ 4. Orchestrator consumes InventoryReserved → commands Payment Service:
+       POST /payments {orderId, amountCents, pm_token, capture:false}
+                      [Idempotency-Key: derived from (orderId, 'AUTH')]  ← DETERMINISTIC
+       Payment Service → Stripe authorize → 'AUTHORIZED'
+       ⚠ NO LEDGER ENTRY YET. An authorization is a HOLD, not a movement of money.
+
+ 5. Orchestrator → order status 'CONFIRMED' → outbox 'OrderConfirmed'
+       → notification service emails the customer. Order is done from their view.
+
+ 6. Days later: Shipping Service ships → 'OrderShipped'
+       Orchestrator commands Payment Service: CAPTURE
+       Payment Service → Stripe capture → and NOW, in ONE Postgres transaction:
+         UPDATE payments SET status='CAPTURED', captured_cents = 4998
+         INSERT ledger_transactions + ledger_entries  (the entries that SUM TO ZERO)
+         INSERT outbox ('PaymentCaptured')
+       COMMIT.   Money has now moved, and the ledger says so.
+
+ 7. Hours later: Stripe's webhook arrives:  payment_intent.succeeded
+       Verify signature → INSERT processed_webhooks ON CONFLICT DO NOTHING
+       → already there? we already captured. Do nothing. Idempotent. (§9)
+</code></pre>
+
+    <p>
+      Two subtleties in that walkthrough that are worth calling out, because the interviewer will notice if you do and
+      notice if you don't:
+    </p>
+    <ul>
+      <li><strong>Step 2 returns 201 immediately.</strong> The customer is not held on an HTTP connection while three
+        services talk to each other. The order exists in <code>PENDING_PAYMENT</code>, and the saga proceeds
+        asynchronously. This is what "the intermediate states are visible to users" means in practice (05 §7b) — and it's
+        why the UI shows "processing your order" rather than pretending the world is transactional.</li>
+      <li><strong>Step 4 writes no ledger entry.</strong> An authorization moves no money — it is a promise from the
+        issuing bank that the funds are reserved. Writing a ledger entry at authorize time is a real and frequently-made
+        mistake, and it silently inflates your revenue by the value of every authorization that is never captured.
+        <strong>The ledger records movements of money, not intentions to move money.</strong></li>
+    </ul>
+
+    <h3>The read path (deliberately boring)</h3>
+<pre><code>  GET /v1/orders/{id}
+      → read replica (Postgres streaming replication)
+      → order + items + payment summary + status timeline
+      → Redis cache for terminal-state orders ONLY (DELIVERED / CANCELLED / REFUNDED):
+        those are immutable, so cache them for a day with no invalidation problem.
+      → In-flight orders are read from the replica, uncached. They change too often
+        for a cache to help, and a stale "not yet paid" is a support call.
+</code></pre>
+    <p>
+      That's it. The read path is a solved problem and you should spend 60 seconds on it, say "replicas and a cache on
+      immutable terminal states," and get back to the money. <strong>Spending your deep-dive minutes on read caching in a
+      payments interview is a misallocation the interviewer will read as a lack of judgment.</strong>
+    </p>
+
+    <div class="senior">Say this as you finish the diagram, because it sets up the whole rest of the interview: <em>"I've deliberately kept the happy path simple, because in this system the happy path isn't where the design lives. Everything interesting happens in three places: how the ledger stays balanced, what happens when a step in the middle of the saga fails, and what happens when the same request arrives twice. I'd like to go deep on those."</em> You have just told the interviewer what to ask you, and you've picked the three questions you're best at.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="ledger">7. Deep dive: the double-entry ledger</h2>
+
+    <p>
+      <strong>This is where the interview really happens</strong>, and it is the single highest-leverage thing on this
+      page for the companies you're targeting. A candidate who can design a correct double-entry ledger on a whiteboard
+      is, to a fintech interviewer, immediately in a different category from one who cannot — because it is not a
+      distributed-systems trick, it is a demonstration that you understand what money <em>is</em> in a computer.
+    </p>
+
+    <h3>7a. The mistake: a mutable balance column</h3>
+
+    <p>Here is what almost everyone draws first, and it is wrong in three independent ways:</p>
+
+<pre><code><span class="kw">CREATE TABLE</span> accounts (
+    id       <span class="typ">UUID</span>   <span class="kw">PRIMARY KEY</span>,
+    balance  <span class="typ">BIGINT</span> <span class="kw">NOT NULL</span>     <span class="com">-- ← every problem in this section starts here</span>
+);
+
+<span class="com">-- and then, somewhere in a service:</span>
+<span class="kw">UPDATE</span> accounts <span class="kw">SET</span> balance = balance - <span class="num">4998</span> <span class="kw">WHERE</span> id = ?;
+<span class="kw">UPDATE</span> accounts <span class="kw">SET</span> balance = balance + <span class="num">4998</span> <span class="kw">WHERE</span> id = ?;
+</code></pre>
+
+    <p>Why it fails, in ascending order of how much it will hurt you:</p>
+    <ol>
+      <li><strong>You have destroyed the audit trail.</strong> The balance says <code>$412.00</code>. <em>Why?</em> There
+        is no answer in the database. You cannot reconstruct how it got there, you cannot answer "what was this balance
+        last Tuesday," and when finance says "this number is wrong" you have nothing to investigate with. An auditor
+        asking "show me the history of this account" is asking a question your schema cannot answer.</li>
+      <li><strong>You have created a lost-update race.</strong> Two concurrent refunds read the balance, both compute
+        <code>balance + 1500</code>, both write. One refund vanishes. Yes, <code>balance = balance - 4998</code> is atomic
+        <em>within one statement</em> — but the moment there's a <em>check</em> ("does this account have enough?") in
+        front of it, you're back to check-then-act, and now you need <code>SELECT … FOR UPDATE</code> and you've
+        serialised every operation on a hot account.</li>
+      <li><strong>Money can be created and destroyed.</strong> Nothing in that schema says the debit and the credit have
+        to agree. Deploy a bug where one of those two <code>UPDATE</code>s throws after the other commits, and you have
+        <em>invented money</em>. There is no constraint that will stop you, and no query that will tell you it happened.</li>
+    </ol>
+
+    <p style="font-size:1.15rem; font-weight:700; color:#111827; border-left:4px solid #8b5cf6; padding-left:1rem;">
+      A balance is not a fact you store. A balance is a <em>question you ask</em> — it is the sum of an immutable,
+      append-only sequence of entries. Store the entries. Derive the balance.
+    </p>
+
+    <h3>7b. Double-entry: the 500-year-old idea that fixes it</h3>
+
+    <p>
+      Double-entry bookkeeping predates computers by about five centuries (Luca Pacioli codified it in 1494, and the
+      Venetian merchants were using it before that), and it is still, unimprovedly, how every bank on earth records
+      money. The rule is one sentence:
+    </p>
+
+    <p style="font-size:1.15rem; font-weight:700; color:#111827; border-left:4px solid #8b5cf6; padding-left:1rem;">
+      Every transaction writes <strong>at least two entries</strong>, which <strong>sum to zero</strong>. Money is never
+      created and never destroyed — it is only ever <em>moved</em> from one account to another.
+    </p>
+
+    <p>
+      Treat a <strong>DEBIT</strong> as <code>+amount</code> and a <strong>CREDIT</strong> as <code>−amount</code> (the
+      accounting convention for which is which per account type is a distraction; what matters is that the two directions
+      are opposite signs and the total is zero). Then the invariant is a query, and a query is something you can
+      <em>assert</em>:
+    </p>
+
+<pre><code><span class="com">-- The invariant. If this ever returns a row, money has been created or destroyed,</span>
+<span class="com">-- and that is a page-someone-at-3am event, not a rounding error to paper over.</span>
+<span class="kw">SELECT</span> transaction_id,
+       <span class="kw">SUM</span>(<span class="kw">CASE</span> direction <span class="kw">WHEN</span> <span class="str">'DEBIT'</span> <span class="kw">THEN</span> amount_cents
+                            <span class="kw">ELSE</span> -amount_cents <span class="kw">END</span>) <span class="kw">AS</span> imbalance
+  <span class="kw">FROM</span> ledger_entries
+ <span class="kw">GROUP BY</span> transaction_id
+<span class="kw">HAVING</span> <span class="kw">SUM</span>(<span class="kw">CASE</span> direction <span class="kw">WHEN</span> <span class="str">'DEBIT'</span> <span class="kw">THEN</span> amount_cents
+                            <span class="kw">ELSE</span> -amount_cents <span class="kw">END</span>) &lt;&gt; <span class="num">0</span>;
+</code></pre>
+
+    <p>
+      And the balance you refused to store is now derived, from data that cannot lie:
+    </p>
+
+<pre><code><span class="com">-- The balance of an account, right now.</span>
+<span class="kw">SELECT</span> <span class="kw">SUM</span>(<span class="kw">CASE</span> direction <span class="kw">WHEN</span> <span class="str">'CREDIT'</span> <span class="kw">THEN</span> amount_cents
+                             <span class="kw">ELSE</span> -amount_cents <span class="kw">END</span>) <span class="kw">AS</span> balance_cents
+  <span class="kw">FROM</span> ledger_entries
+ <span class="kw">WHERE</span> account_id = ?;
+
+<span class="com">-- The balance of an account AS OF ANY PAST MOMENT — the query a mutable</span>
+<span class="com">-- balance column simply cannot answer:</span>
+<span class="kw">SELECT</span> <span class="kw">SUM</span>(...) <span class="kw">FROM</span> ledger_entries
+ <span class="kw">WHERE</span> account_id = ? <span class="kw">AND</span> created_at &lt;= <span class="str">'2026-03-03 12:00:00Z'</span>;
+</code></pre>
+
+    <div class="senior">The sentence that will make a fintech interviewer put their pen down and look at you: <em>"I would not have a balance column. A balance is a derived value — the sum of an immutable, append-only sequence of ledger entries — and the moment you store it and mutate it, you've destroyed your audit trail and introduced a lost-update race for nothing. I'd store entries, derive balances, and if reading them gets slow I'd add a periodic snapshot as a <strong>cache</strong> that can always be rebuilt from the entries, never as the source of truth."</em> That last clause is the whole game: the optimization is allowed, but it must be <em>re-derivable</em>.</div>
+
+    <h3>7c. A worked example: a $100 purchase with a $3 processing fee</h3>
+
+    <p>
+      Do this on the whiteboard. It takes ninety seconds and it proves more than ten minutes of talking. The customer
+      pays $100 for goods; the PSP keeps $3; the merchant nets $97.
+    </p>
+
+    <p><strong>The accounts involved:</strong></p>
+    <ul>
+      <li><code>customer_receivable</code> — what the customer owes / has paid us</li>
+      <li><code>psp_clearing</code> — money the PSP is holding on our behalf, not yet in our bank</li>
+      <li><code>revenue</code> — our income from the sale</li>
+      <li><code>processing_fees</code> — an expense account</li>
+    </ul>
+
+    <p><strong>Transaction 1 — the capture ($100 moves from the customer to us, via the PSP):</strong></p>
+
+<pre><code>txn_id = txn_A   type = CAPTURE   reference = pay_9K2
+
+  account              direction   amount     signed
+  ─────────────────────────────────────────────────────
+  psp_clearing         DEBIT       10000      +10000     money arrives with the PSP
+  revenue              CREDIT      10000      -10000     we recognise the sale
+                                            ──────────
+                                    SUM  =        0   ✓
+</code></pre>
+
+    <p><strong>Transaction 2 — the PSP's fee ($3 of what they hold is theirs, not ours):</strong></p>
+
+<pre><code>txn_id = txn_B   type = FEE   reference = pay_9K2
+
+  account              direction   amount     signed
+  ─────────────────────────────────────────────────────
+  processing_fees      DEBIT         300       +300     an expense we incurred
+  psp_clearing         CREDIT        300       -300     the PSP keeps it
+                                            ──────────
+                                    SUM  =       0    ✓
+</code></pre>
+
+    <p><strong>Transaction 3 — payout, two days later (the PSP wires us what's left):</strong></p>
+
+<pre><code>txn_id = txn_C   type = PAYOUT   reference = po_31
+
+  account              direction   amount     signed
+  ─────────────────────────────────────────────────────
+  bank_cash            DEBIT        9700      +9700     money lands in our bank
+  psp_clearing         CREDIT       9700      -9700     the PSP no longer holds it
+                                            ──────────
+                                    SUM  =       0    ✓
+</code></pre>
+
+    <p><strong>Now derive every balance from nothing but those six entries:</strong></p>
+
+<pre><code>  psp_clearing     = +10000 - 300 - 9700  =      0   ← settled to zero. Correct:
+                                                       the PSP holds nothing of ours.
+  revenue          = -10000               = -10000   ← we earned $100 (credit balance)
+  processing_fees  =   +300               =   +300   ← we spent $3
+  bank_cash        =  +9700               =  +9700   ← we have $97 in the bank
+
+  Sanity:  9700 (cash) + 300 (fees) - 10000 (revenue)  =  0   ✓
+           The books balance. They always balance, or something is broken.
+</code></pre>
+
+    <p>
+      Look at what you get for free from this. <strong>The $3 fee is not a mystery.</strong> It is not "revenue minus a
+      bit." There is a row that says exactly where it went, when, and which payment caused it. When finance asks "why did
+      we net $97 on a $100 sale," the answer is a <code>SELECT</code>. And when <code>psp_clearing</code> does
+      <em>not</em> settle to zero, you have found a bug — before the auditor did.
+    </p>
+
+    <div class="note">Notice that the fee is a <strong>separate transaction</strong>, not two extra legs bolted onto the capture. That's a modelling choice and you should be able to defend it: the fee is a distinct economic event that the PSP tells you about at a different time (often in the settlement file, days later, and sometimes at a different amount than you predicted). Modelling it separately means the capture transaction is written when the capture happens, and the fee transaction is written when you learn the fee — neither has to wait for the other, and neither is ever revised.</div>
+
+    <h3>7d. Money is never a float</h3>
+
+    <div class="pitfall"><strong>Never, ever, represent money as a <code>float</code> or a <code>double</code>.</strong> IEEE-754 binary floating point cannot exactly represent <code>0.1</code>, any more than decimal can exactly represent <code>1/3</code>. In Java, <code>0.1 + 0.2 == 0.30000000000000004</code>, and <code>System.out.println(1.03 - 0.42)</code> prints <code>0.6100000000000001</code>. Run that in a loop over a million ledger entries and your books do not balance — by an amount too small to notice and too large to ignore, in a system whose entire purpose is that the books balance. <strong>Use integer minor units (cents) as a <code>long</code>/<code>BIGINT</code>, or an exact decimal type (<code>java.math.BigDecimal</code>, Postgres <code>NUMERIC</code>).</strong> Never <code>double</code>. Never <code>float</code>. Never <code>REAL</code>. A rounding error in a ledger is a career-defining bug, and this is a real, commonly-asked interview gotcha — some interviewers will slip a <code>double amount</code> into a schema they show you purely to see whether you catch it.</div>
+
+    <table>
+      <thead><tr><th>Representation</th><th>Verdict</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>long amountCents</code> (integer minor units)</td>
+          <td><strong>Preferred.</strong></td>
+          <td>Exact, fast, trivially serialisable, no library needed. A <code>long</code> holds ±92 quadrillion cents — enough for any conceivable amount. This is what Stripe's API does: <code>"amount": 4998</code>.</td>
+        </tr>
+        <tr>
+          <td><code>BigDecimal</code> / <code>NUMERIC(19,4)</code></td>
+          <td><strong>Also correct.</strong></td>
+          <td>Exact decimal arithmetic with explicit scale and rounding mode. Necessary when you need sub-cent precision — FX conversion, interest accrual, per-unit pricing. Slower, and you must set the <code>RoundingMode</code> explicitly or it throws.</td>
+        </tr>
+        <tr>
+          <td><code>double</code> / <code>float</code> / <code>REAL</code></td>
+          <td><strong>Disqualifying.</strong></td>
+          <td>Binary floating point. Cannot represent decimal fractions exactly. Errors accumulate. There is no scenario in which this is the right choice for money, and using it in an interview is a red flag the interviewer will remember.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>
+      And a corollary that trips people: <strong>minor units are not always 100.</strong> The Japanese yen has zero
+      decimal places (¥100 is <code>100</code>, not <code>10000</code>); the Kuwaiti dinar has three. If you go
+      multi-currency you cannot hardcode "divide by 100" — you look up the currency's exponent (ISO 4217 defines it).
+      Mentioning that unprompted is a nice, cheap signal that you've worked with real money.
+    </p>
+
+    <h3>7e. Writing a transaction: the Java</h3>
+
+    <p>
+      The whole ledger write is one method and one Postgres transaction. Note that it does not read a balance, does not
+      take a lock, and cannot half-succeed.
+    </p>
+
+<pre><code><span class="ann">@Service</span>
+<span class="kw">public</span> <span class="kw">class</span> <span class="typ">LedgerService</span> {
+
+    <span class="com">/**
+     * Post a balanced transaction. The ONLY way entries enter the ledger.
+     * Idempotent on idemKey: posting the same transaction twice is a no-op.
+     */</span>
+    <span class="ann">@Transactional</span>
+    <span class="kw">public</span> <span class="typ">UUID</span> post(<span class="typ">String</span> idemKey, <span class="typ">LedgerTxnType</span> type,
+                     <span class="typ">UUID</span> referenceId, <span class="typ">List</span>&lt;<span class="typ">Entry</span>&gt; entries) {
+
+        <span class="com">// 1. The entries MUST balance. Assert it in code as well as in the DB —</span>
+        <span class="com">//    fail fast, before anything is written, with a message a human can act on.</span>
+        <span class="kw">long</span> sum = entries.stream()
+            .mapToLong(e -&gt; e.direction() == <span class="typ">Direction</span>.DEBIT
+                           ? e.amountCents() : -e.amountCents())
+            .sum();
+        <span class="kw">if</span> (sum != <span class="num">0</span>) {
+            <span class="kw">throw</span> <span class="kw">new</span> <span class="typ">UnbalancedTransactionException</span>(
+                <span class="str">"entries sum to "</span> + sum + <span class="str">", must be 0 — refusing to post"</span>);
+        }
+        <span class="kw">if</span> (entries.size() &lt; <span class="num">2</span>) {
+            <span class="kw">throw</span> <span class="kw">new</span> <span class="typ">UnbalancedTransactionException</span>(<span class="str">"need at least two legs"</span>);
+        }
+
+        <span class="com">// 2. Claim the transaction's idempotency key. The UNIQUE constraint on</span>
+        <span class="com">//    ledger_transactions.idem_key is what makes double-posting impossible —</span>
+        <span class="com">//    not a lock, not a check-then-act. (05 §9.)</span>
+        <span class="typ">UUID</span> txnId = <span class="typ">UUID</span>.randomUUID();
+        <span class="kw">int</span> claimed = jdbc.update(<span class="str">"""
+            INSERT INTO ledger_transactions (id, type, reference_id, idem_key)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT (idem_key) DO NOTHING
+            """</span>, txnId, type.name(), referenceId, idemKey);
+
+        <span class="kw">if</span> (claimed == <span class="num">0</span>) {
+            <span class="com">// Already posted. Return the EXISTING transaction id. This is not an</span>
+            <span class="com">// error — it is a retry doing exactly what a retry should do: nothing.</span>
+            <span class="kw">return</span> jdbc.queryForObject(
+                <span class="str">"SELECT id FROM ledger_transactions WHERE idem_key = ?"</span>,
+                <span class="typ">UUID</span>.class, idemKey);
+        }
+
+        <span class="com">// 3. Append the entries. INSERT only. There is no code path in this</span>
+        <span class="com">//    service that UPDATEs or DELETEs a ledger entry, and the DB grant</span>
+        <span class="com">//    (REVOKE UPDATE, DELETE) means there never can be.</span>
+        <span class="kw">for</span> (<span class="typ">Entry</span> e : entries) {
+            jdbc.update(<span class="str">"""
+                INSERT INTO ledger_entries
+                    (transaction_id, account_id, direction, amount_cents, currency)
+                VALUES (?, ?, ?, ?, ?)
+                """</span>, txnId, e.accountId(), e.direction().name(),
+                     e.amountCents(), e.currency());
+        }
+        <span class="kw">return</span> txnId;
+    }
+}
+</code></pre>
+
+    <p>And the caller, for the $100-with-$3-fee capture above:</p>
+
+<pre><code><span class="ann">@Transactional</span>   <span class="com">// SAME transaction as the payments-table update. Both or neither.</span>
+<span class="kw">public</span> <span class="kw">void</span> recordCapture(<span class="typ">Payment</span> p, <span class="kw">long</span> feeCents) {
+
+    payments.markCaptured(p.id(), p.amountCents());          <span class="com">// UPDATE payments</span>
+
+    ledger.post(<span class="str">"capture:"</span> + p.id(), <span class="typ">LedgerTxnType</span>.CAPTURE, p.id(), <span class="typ">List</span>.of(
+        <span class="typ">Entry</span>.debit (accounts.pspClearing(), p.amountCents(), p.currency()),
+        <span class="typ">Entry</span>.credit(accounts.revenue(),     p.amountCents(), p.currency())
+    ));
+
+    ledger.post(<span class="str">"fee:"</span> + p.id(), <span class="typ">LedgerTxnType</span>.FEE, p.id(), <span class="typ">List</span>.of(
+        <span class="typ">Entry</span>.debit (accounts.processingFees(), feeCents, p.currency()),
+        <span class="typ">Entry</span>.credit(accounts.pspClearing(),   feeCents, p.currency())
+    ));
+
+    outbox.emit(<span class="str">"Payment"</span>, p.id(), <span class="str">"PaymentCaptured"</span>, <span class="typ">PaymentCaptured</span>.from(p));
+}
+<span class="com">// Note the idempotency keys: "capture:{paymentId}" and "fee:{paymentId}" are</span>
+<span class="com">// DERIVED, not random. Call this method five times and you get exactly one</span>
+<span class="com">// capture transaction and one fee transaction, every time. That is the point.</span>
+</code></pre>
+
+    <div class="senior">The deterministic-key trick deserves a sentence of its own, because it's subtle and it's the kind of thing interviewers reward: <em>"Where I can, I derive the idempotency key from the business entity rather than generating a random one — <code>capture:{paymentId}</code>. A random UUID makes a retry idempotent only if the caller remembered to reuse it. A derived key makes the operation idempotent <strong>by construction</strong>, even if the caller is a buggy retry loop or a duplicate Kafka message that has no memory of the first attempt."</em></div>
+
+    <h3>7f. Refunds prove the model</h3>
+
+    <p>
+      Now refund $15 of that $100 order. Watch what does <em>not</em> happen: nothing is updated, nothing is deleted,
+      and the original capture transaction is untouched forever.
+    </p>
+
+<pre><code>txn_id = txn_D   type = REFUND   reference = re_77
+
+  account              direction   amount     signed
+  ─────────────────────────────────────────────────────
+  revenue              DEBIT        1500      +1500     we give back the revenue
+  psp_clearing         CREDIT       1500      -1500     the PSP sends it to the customer
+                                            ──────────
+                                    SUM  =       0    ✓
+
+  revenue balance now:   -10000 + 1500  =  -8500   ← we earned $85 net. Derived.
+  The $100 sale is STILL THERE. The $15 refund is STILL THERE. Both are true.
+</code></pre>
+
+    <p>
+      This is the same idea as a saga compensation (05 §7b) and it is not a coincidence — it is the <em>same idea</em>.
+      <strong>You do not undo a financial event. You post an opposing one.</strong> The history is the truth, and the
+      balance is just what the history adds up to.
+    </p>
+
+    <h3>7g. Reconciliation — the job that catches what your tests didn't</h3>
+
+    <p>
+      Your ledger says the PSP owes you $9,700. Does the PSP agree? <strong>You must check, and you must check
+      continuously, and you must alarm — loudly — when the answer is no.</strong>
+    </p>
+
+<pre><code>  NIGHTLY (and, for high-value accounts, hourly):
+
+  1. Pull the PSP's settlement report for the period
+        (Stripe: the Balance Transaction API / the settlement file)
+
+  2. Re-derive OUR view from the ledger — from the ENTRIES, never from a
+     cached balance, because the whole point is to catch a wrong cached balance:
+        SELECT SUM(...) FROM ledger_entries
+         WHERE account_id = psp_clearing AND created_at &lt; :cutoff
+
+  3. Compare, line by line, on the PSP's transaction id:
+        ┌────────────────────┬──────────────┬──────────────┬─────────────┐
+        │ psp txn            │ ours (cents) │ theirs       │ status      │
+        ├────────────────────┼──────────────┼──────────────┼─────────────┤
+        │ pi_3Ab…            │        10000 │        10000 │ ✓ match     │
+        │ pi_3Cd…            │         4998 │            — │ ✗ MISSING   │  ← we think
+        │                    │              │              │             │    we captured;
+        │                    │              │              │             │    they don't
+        │ pi_3Ef…            │            — │         2500 │ ✗ ORPHAN    │  ← they charged;
+        │                    │              │              │             │    we have no
+        │                    │              │              │             │    record. WORST
+        │                    │              │              │             │    case.
+        │ pi_3Gh…            │         1999 │         1996 │ ✗ AMOUNT    │  ← a 3¢ gap.
+        └────────────────────┴──────────────┴──────────────┴─────────────┘
+
+  4. EVERY non-match writes a break record and pages someone. Nothing is
+     auto-corrected. Nothing is rounded away.
+</code></pre>
+
+    <p>
+      The three break types map to three different bugs, and being able to name them is exactly the kind of practical
+      detail that says "I have done this":
+    </p>
+    <ul>
+      <li><strong>MISSING</strong> (we have it, they don't) — usually a capture we <em>think</em> succeeded but whose PSP
+        call actually failed, or a webhook we processed for an event that was later reversed. Investigate; often the fix
+        is to re-query the PSP for the authoritative state.</li>
+      <li><strong>ORPHAN</strong> (they have it, we don't) — <strong>the worst one.</strong> The customer's card was
+        charged and we have no record of it. This is money we took and cannot account for, and it is the shape of the
+        failure that ends up in a newspaper. Usually caused by a PSP call that timed out, succeeded on their side, and
+        was never reconciled because someone trusted the timeout.</li>
+      <li><strong>AMOUNT</strong> — a fee that differed from what we predicted, an FX rate applied differently, or a
+        genuine float bug (§7d). <strong>A 3-cent gap is not "close enough."</strong> Either you know why it's 3 cents,
+        or your ledger is wrong and the size of the error is a coincidence.</li>
+    </ul>
+
+    <div class="senior">The line, and deliver it flatly, because its flatness is the point: <em>"Reconciliation isn't a nice-to-have — it's the control that tells me my system is correct. Every night I re-derive our balances from the ledger entries and compare them, line by line, against the provider's settlement report. A mismatch raises a break that a human investigates. <strong>I never auto-correct a break and I never write off a discrepancy as a rounding error</strong>, because a system that quietly absorbs small differences is a system that will quietly absorb a large one."</em> Every person who has worked in payments has watched someone add a tolerance threshold to make an alarm stop firing, and every one of them has watched what happened next.</div>
+
+    <div class="pitfall">The optimization you will be tempted into, and the safe version of it: summing millions of entries to get a balance <em>does</em> get slow. The fix is <strong>snapshots</strong> — a materialised <code>account_balance_snapshot (account_id, as_of, balance_cents, last_entry_id)</code> row written periodically, so a current balance is <code>snapshot + SUM(entries after last_entry_id)</code>. That is <em>fine</em>, and it is what real ledgers do. What makes it fine is the property you must state out loud: <strong>the snapshot is a cache, not a source of truth, and it is fully rebuildable from the entries at any time.</strong> The moment someone treats the snapshot as authoritative and stops being able to rebuild it, you are back to a mutable balance column with extra steps.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="saga">8. Deep dive: the distributed transaction</h2>
+
+    <p>
+      Placing an order touches inventory, payment, shipping and notification. Even if you have not drawn microservice
+      boundaries, those are four separate concerns with four separate failure modes, and <strong>one of them is a third
+      party you do not control.</strong> That last fact settles the design before you start arguing about it.
+    </p>
+
+    <h3>8a. Why 2PC is off the table — say this in one sentence and move on</h3>
+
+    <p>
+      2PC (05 §7a) gives you real atomicity by having a coordinator drive every participant through prepare-then-commit.
+      It is not a bad protocol. It is simply <strong>unavailable to you</strong>, for a reason that has nothing to do with
+      its blocking failure mode:
+    </p>
+
+    <p style="font-size:1.1rem; font-weight:700; color:#111827; border-left:4px solid #8b5cf6; padding-left:1rem;">
+      <strong>Stripe will not join your XA transaction.</strong> There is no <code>prepare()</code> on a third-party
+      payment API. You cannot ask a card network to hold a lock while your inventory service makes up its mind.
+    </p>
+
+    <p>
+      That is the whole argument and it takes ten seconds. You can add the blocking critique — a coordinator crash after
+      prepare leaves every participant holding locks indefinitely, which under load is a cascading outage rather than a
+      stalled order — but lead with the structural reason, because it is unanswerable. And then acknowledge where 2PC
+      <em>does</em> survive, because you're interviewing at banks and they run it: <em>"Inside one datacenter, with XA
+      datasources under Spring's <code>JtaTransactionManager</code> and modest volume, 2PC is real and I'd expect to meet
+      it in a core-banking context. It's the cross-vendor, over-the-internet version that's impossible."</em> That
+      sentence tells a JPMC interviewer you're not going to sneer at their stack.
+    </p>
+
+    <h3>8b. The order saga, with its compensations</h3>
+
+<pre><code>  STEP                  LOCAL TXN                        COMPENSATION
+  ────────────────────────────────────────────────────────────────────────────────
+  1. Create order       INSERT orders                    UPDATE orders
+                        status = PENDING_PAYMENT           SET status='CANCELLED'
+                        + INSERT outbox                    + reason
+
+  2. Reserve            UPDATE stock SET reserved += q   UPDATE stock
+     inventory           WHERE (on_hand-reserved) &gt;= q     SET reserved -= q
+                        (0 rows ⇒ OUT_OF_STOCK)           ("release the hold")
+
+  3. Authorize          POST psp/authorize               POST psp/void
+     payment            [idem: auth:{orderId}]           (an auth VOID is free and
+                        → payments.status=AUTHORIZED      leaves no trace on the
+                        → NO LEDGER ENTRY (§6)            statement — cheap to undo)
+
+  4. Confirm order      UPDATE orders                    UPDATE orders
+                        SET status='CONFIRMED'             SET status='CANCELLED'
+                        + INSERT outbox                    + issue refund if captured
+
+  5. Ship               shipping label created           ⚠ CANNOT UNDO. Return label.
+
+  6. Capture            POST psp/capture                 ⚠ CANNOT UNDO.
+     payment            [idem: capture:{paymentId}]       ⇒ REFUND — a NEW forward
+                        → LEDGER ENTRIES POSTED             transaction, not a rollback
+                        → status = CAPTURED
+
+  7. Notify             send email                       ⚠ CANNOT UNDO. Send an
+                                                           apology email.
+
+  Failure at step 3 (card declined):
+      compensate 2, then 1, IN REVERSE ORDER  →  release the inventory hold,
+      then cancel the order.  Step 3 never committed, so nothing to compensate there.
+</code></pre>
+
+    <p>
+      Two ordering rules fall straight out of that table, and both are worth saying because they are <em>design
+      decisions</em>, not implementation details:
+    </p>
+    <ul>
+      <li><strong>Compensate in reverse order</strong>, unwinding like a stack. Release inventory before you cancel the
+        order, not after — the cancellation may cascade into logic that assumes the hold is already gone.</li>
+      <li><strong>Put the irreversible steps last.</strong> Look at where capture, ship and notify sit: at the end. That
+        is deliberate. Every step after an irreversible one is a step whose failure leaves a mess a human must clean up.
+        Sequencing the saga so the cheap-to-compensate steps come first and the impossible-to-compensate steps come last
+        is one of the highest-value things you can say in this section, and almost nobody says it.</li>
+    </ul>
+
+    <h3>8c. The honesty that defines this archetype: you cannot roll back a captured payment</h3>
+
+    <p style="font-size:1.15rem; font-weight:700; color:#111827; border-left:4px solid #8b5cf6; padding-left:1rem;">
+      A rollback erases history as if nothing happened. <strong>A refund does not.</strong> The charge appears on the
+      customer's statement. The refund appears on the customer's statement. Both are true, forever. You paid the
+      processing fee on the charge and, in many schemes, <em>you do not get it back.</em> A refund is a new forward
+      transaction that moves money in the opposite direction — it is not an undo, and calling it one is the tell that
+      someone has only read about payments.
+    </p>
+
+    <p>
+      This is not pedantry; it changes what you build. Because a refund is a real transaction:
+    </p>
+    <ul>
+      <li>It has its own <strong>idempotency key</strong>, its own row, its own PSP call, and its own <strong>ledger
+        transaction</strong> (§7f). You cannot model it as "set the payment back to <code>pending</code>."</li>
+      <li>It can <strong>fail</strong>. The PSP can decline a refund (the card is closed, the account is frozen). So your
+        compensation has a failure mode, which leads directly to the next subsection.</li>
+      <li>It is <strong>asynchronous</strong>. It returns <code>PENDING</code> and settles days later. Your saga must
+        tolerate a compensation that has been <em>initiated</em> but not <em>completed</em>.</li>
+      <li>It is <strong>partial-able</strong>. One capture, many refunds — which is why the <code>CHECK
+        (refunded_cents &lt;= captured_cents)</code> constraint in §5 exists.</li>
+    </ul>
+
+    <p>
+      And note the design consequence you should point at in the table above: <strong>an authorization can be voided
+      cleanly, but a capture can only be refunded.</strong> That is exactly why the saga captures <em>at shipment</em>
+      rather than at checkout. Capturing late means that for the entire window in which things are most likely to go
+      wrong — out of stock, address invalid, fraud check fails — the money hasn't actually moved, and the compensation is
+      a free void instead of a costly, visible, fee-incurring refund. <strong>The authorize/capture split is not a card-
+      network quirk you're working around; it is a saga design that the card networks handed you.</strong>
+    </p>
+
+    <div class="senior">Say this and you have separated yourself from the field: <em>"The crucial honesty about a saga is that you cannot roll back a captured payment — you can only refund it, and a refund is a new forward transaction, not an undo. The customer sees both entries on their statement and we've paid the processing fee on both. That's the whole reason compensation-based transactions exist as a concept rather than just being 'rollback over the network' — and it's why I'd order the saga so the irreversible steps happen last and capture at shipment rather than at checkout, so that most failures compensate with a free authorization void instead of a real refund."</em></div>
+
+    <h3>8d. What happens when the compensation itself fails?</h3>
+
+    <p>
+      This is the question that separates people who have run a saga in production from people who have drawn one. The
+      whiteboard version of a saga always assumes compensations succeed. <strong>They do not.</strong> The refund API call
+      times out. The inventory service is down. The compensation's own compensation is undefined, because there isn't one.
+    </p>
+    <p>
+      So what actually happens? Say it plainly, because pretending otherwise is a junior tell:
+    </p>
+
+<pre><code>  Compensation fails
+        │
+        ├─▶ RETRY, with exponential backoff and jitter (06). Forever, or nearly.
+        │   Compensations are IDEMPOTENT — a derived key, refund:{paymentId} —
+        │   so retrying is always safe. This resolves the overwhelming majority
+        │   of failures, because most of them are transient.
+        │
+        ├─▶ Still failing after N attempts / T hours?
+        │   The saga row moves to  status = COMPENSATION_FAILED
+        │   → DEAD-LETTER QUEUE (12)
+        │   → a break record, exactly like a reconciliation break (§7g)
+        │   → an ALERT, with the order id, the failing step, and the amount at risk
+        │
+        └─▶ A HUMAN LOOKS AT IT.
+            An ops/finance operator, in a support console, with an audit trail of
+            everything the system already tried, decides what to do — issue the
+            refund manually, credit the customer, write it off, escalate.
+</code></pre>
+
+    <p>
+      That last box is not a failure of the design. <strong>It is part of the design.</strong> In a money system there is
+      always a manual remediation path, because there is always a case the automation cannot resolve — and building the
+      console, the break queue and the audit trail that make manual remediation <em>safe</em> is real engineering work
+      that a real payments team spends real time on. A candidate who says "and eventually a human resolves it, and here's
+      the queue and the tooling they'd use" is describing a system that can actually be operated. A candidate whose saga
+      diagram has no such box is describing one that cannot.
+    </p>
+
+    <div class="pitfall">Do not say "and then we roll back." There is no rollback. Do not say "the compensation retries until it succeeds," full stop — <em>until it succeeds</em> is doing enormous unearned work in that sentence, and an interviewer at a bank will immediately ask "and if it never succeeds?" Have the answer ready: bounded retries with jitter, then a dead-letter queue, then a break record, then a human with a console and an audit trail. Say the word "human" out loud. It is not a weakness in your design; it is evidence that you know what these systems look like at 3am.</div>
+
+    <h3>8e. Orchestration, not choreography — and why</h3>
+
+    <p>
+      05 §7b lays out the general trade-off. Here is the decision <em>for this system</em>, and it is not close:
+    </p>
+
+    <p style="font-size:1.1rem; font-weight:700; color:#111827; border-left:4px solid #8b5cf6; padding-left:1rem;">
+      <strong>Orchestration.</strong> Because for money, you want exactly one place that knows the state of the world and
+      can be <em>queried</em>.
+    </p>
+
+    <table>
+      <thead><tr><th>The question you will be asked at 3am</th><th>Choreography</th><th>Orchestration</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>"Why is order 12345 stuck?"</td>
+          <td>Read five codebases, correlate traces across four services, and hope your distributed tracing was sampled in.</td>
+          <td><code>SELECT * FROM saga_state WHERE order_id = 12345</code> → <code>step=AWAITING_CAPTURE, since 4h, last_error='psp timeout'</code>. One row.</td>
+        </tr>
+        <tr>
+          <td>"How many orders are stuck right now?"</td>
+          <td>Unanswerable without building a whole analytics pipeline over the event bus.</td>
+          <td><code>GROUP BY step</code>. It's a dashboard.</td>
+        </tr>
+        <tr>
+          <td>"Retry the failed step for these 40 orders."</td>
+          <td>Republish events by hand and pray they're idempotent.</td>
+          <td>An admin endpoint that re-drives the saga from its recorded step. Safe, because every step is idempotent.</td>
+        </tr>
+        <tr>
+          <td>"Show the auditor the full lifecycle of this order."</td>
+          <td>Reconstruct from logs. Good luck.</td>
+          <td><code>order_status_history</code> + <code>saga_state</code> + <code>ledger_entries</code>. It's already a table.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>
+      The cost is real and you should name it: the orchestrator is a central component that every flow depends on, and it
+      couples to every participant. In a large org that's an organisational bottleneck — the team that owns the
+      orchestrator becomes a dependency for everyone. <strong>Accept it.</strong> In a payment system the auditability is
+      worth the coupling, and it is a trade you should make explicitly rather than by default.
+    </p>
+
+    <div class="senior">The framing that wins this exchange: <em>"For a two-step flow I'd choreograph — an orchestrator would be ceremony. For anything with money, I orchestrate, because the business process becomes an explicit state machine I can query, retry, and hand to an auditor. Choreography makes 'why is this order stuck' a research project; orchestration makes it a <code>SELECT</code>. I'll pay the coupling cost for that."</em></div>
+
+    <h3>8f. The orchestrator, in Spring</h3>
+
+    <p>
+      The saga's state lives in a database row, not in memory. That is the entire trick — it means the orchestrator can
+      crash, be redeployed, or be scaled to ten instances, and the saga resumes exactly where it was.
+    </p>
+
+<pre><code><span class="kw">CREATE TABLE</span> saga_state (
+    order_id     <span class="typ">UUID</span>        <span class="kw">PRIMARY KEY</span>,
+    step         <span class="typ">TEXT</span>        <span class="kw">NOT NULL</span>,   <span class="com">-- RESERVING_INVENTORY | AUTHORIZING | …</span>
+    status       <span class="typ">TEXT</span>        <span class="kw">NOT NULL</span>,   <span class="com">-- RUNNING | COMPENSATING | DONE |</span>
+                                          <span class="com">-- COMPENSATION_FAILED  ← the human queue</span>
+    completed    <span class="typ">JSONB</span>       <span class="kw">NOT NULL</span>,   <span class="com">-- steps done so far → what to compensate</span>
+    attempts     <span class="typ">INT</span>         <span class="kw">NOT NULL DEFAULT</span> <span class="num">0</span>,
+    last_error   <span class="typ">TEXT</span>,
+    next_retry_at <span class="typ">TIMESTAMPTZ</span>,             <span class="com">-- backoff + jitter lives here</span>
+    updated_at   <span class="typ">TIMESTAMPTZ</span> <span class="kw">NOT NULL DEFAULT</span> now()
+);
+</code></pre>
+
+<pre><code><span class="ann">@Service</span>
+<span class="kw">public</span> <span class="kw">class</span> <span class="typ">OrderSagaOrchestrator</span> {
+
+    <span class="com">// Driven by events off Kafka. Every handler is idempotent (05 §9): the</span>
+    <span class="com">// processed_event dedup row and the state change commit in ONE transaction.</span>
+    <span class="ann">@KafkaListener</span>(topics = <span class="str">"order-events"</span>)
+    <span class="ann">@Transactional</span>
+    <span class="kw">public</span> <span class="kw">void</span> on(<span class="typ">SagaEvent</span> evt) {
+        <span class="kw">if</span> (!dedup.claim(evt.eventId())) <span class="kw">return</span>;   <span class="com">// INSERT … ON CONFLICT DO NOTHING</span>
+
+        <span class="typ">SagaState</span> s = sagas.lockForUpdate(evt.orderId());  <span class="com">// SELECT … FOR UPDATE:</span>
+        <span class="com">// one saga row, one writer. Cheap, uncontended (nobody else wants THIS order),</span>
+        <span class="com">// and it makes the state machine's transitions serialisable for free.</span>
+
+        <span class="kw">switch</span> (evt.type()) {
+            <span class="kw">case</span> INVENTORY_RESERVED -&gt; {
+                s.complete(<span class="typ">Step</span>.RESERVE_INVENTORY);
+                advance(s, <span class="typ">Step</span>.AUTHORIZE_PAYMENT);
+            }
+            <span class="kw">case</span> PAYMENT_AUTHORIZED -&gt; {
+                s.complete(<span class="typ">Step</span>.AUTHORIZE_PAYMENT);
+                advance(s, <span class="typ">Step</span>.CONFIRM_ORDER);
+            }
+            <span class="kw">case</span> INVENTORY_FAILED, PAYMENT_DECLINED -&gt; compensate(s, evt.reason());
+            <span class="kw">case</span> SHIPMENT_DISPATCHED -&gt; advance(s, <span class="typ">Step</span>.CAPTURE_PAYMENT);
+            <span class="kw">case</span> PAYMENT_CAPTURED -&gt; s.finish();
+        }
+    }
+
+    <span class="kw">private</span> <span class="kw">void</span> advance(<span class="typ">SagaState</span> s, <span class="typ">Step</span> next) {
+        s.setStep(next);
+        sagas.save(s);
+        <span class="com">// The command goes out via the OUTBOX — same transaction as the state</span>
+        <span class="com">// change, so we can never advance the saga without emitting the command,</span>
+        <span class="com">// and never emit a command without advancing the saga. (05 §8.)</span>
+        outbox.emit(<span class="str">"Saga"</span>, s.orderId().toString(), next.commandName(),
+                    <span class="typ">Command</span>.forStep(next, s));
+    }
+
+    <span class="kw">private</span> <span class="kw">void</span> compensate(<span class="typ">SagaState</span> s, <span class="typ">String</span> reason) {
+        s.setStatus(<span class="typ">Status</span>.COMPENSATING);
+        <span class="com">// Reverse order — unwind the stack of completed steps.</span>
+        <span class="kw">for</span> (<span class="typ">Step</span> done : s.completedStepsReversed()) {
+            <span class="com">// Derived idempotency key: safe to emit this N times.</span>
+            outbox.emit(<span class="str">"Saga"</span>, s.orderId().toString(),
+                        done.compensationCommand(),
+                        <span class="typ">Compensation</span>.forStep(done, s, reason));
+        }
+        sagas.save(s);
+    }
+
+    <span class="com">// The sweeper. This is what makes the saga actually reliable, and it is the</span>
+    <span class="com">// component candidates forget: a saga with no sweeper stalls silently forever</span>
+    <span class="com">// the first time a reply is lost.</span>
+    <span class="ann">@Scheduled</span>(fixedDelay = <span class="num">30_000</span>)
+    <span class="kw">public</span> <span class="kw">void</span> sweepStuckSagas() {
+        <span class="kw">for</span> (<span class="typ">SagaState</span> s : sagas.findRunningPastRetry(<span class="typ">Instant</span>.now())) {
+            <span class="kw">if</span> (s.attempts() &gt;= MAX_ATTEMPTS) {
+                s.setStatus(<span class="typ">Status</span>.COMPENSATION_FAILED);   <span class="com">// → the human queue</span>
+                alerts.raise(<span class="str">"saga stuck"</span>, s.orderId(), s.step(), s.lastError());
+            } <span class="kw">else</span> {
+                s.incrementAttempts();
+                s.setNextRetryAt(backoffWithJitter(s.attempts()));  <span class="com">// 06</span>
+                outbox.emit(<span class="str">"Saga"</span>, s.orderId().toString(),
+                            s.step().commandName(), <span class="typ">Command</span>.forStep(s.step(), s));
+            }
+            sagas.save(s);
+        }
+    }
+}
+</code></pre>
+
+    <p>
+      The sweeper is the part to point at. <strong>A saga is not driven by events; it is driven by its own state, and
+      events merely nudge it.</strong> If a reply is lost — the inventory service replied and the message vanished — an
+      event-driven-only orchestrator waits forever and the order silently never completes. The sweeper re-drives from the
+      recorded step, which is safe precisely <em>because</em> every command is idempotent. That's the payoff for all the
+      idempotency work: <strong>it makes blind retries free</strong>, which is what lets you build a system that
+      self-heals instead of one that quietly loses orders.
+    </p>
+
+    <h3>8g. The outbox, and why it is not optional here</h3>
+
+    <p>
+      Every <code>outbox.emit()</code> above is doing specific work, and it is worth twenty seconds of explanation
+      because it is the difference between a design that works and one that silently drops orders.
+    </p>
+    <p>
+      The naive version — <code>sagas.save(s)</code> then <code>kafkaTemplate.send(...)</code> — is a <strong>dual
+      write</strong> (05 §8). Two systems, no shared transaction. Commit the state change, crash before the publish, and
+      the saga has advanced to <code>AUTHORIZING</code> with <strong>no command ever sent</strong>. The order sits in that
+      state forever. The customer's card is never charged, no email is sent, and nobody finds out until they complain —
+      and in a payment system the mirror-image failure (publish, then the transaction rolls back) is worse: you have just
+      commanded a card to be charged for an order that does not exist.
+    </p>
+
+<pre><code>   ┌────────── ONE POSTGRES TRANSACTION ──────────┐
+   │  UPDATE saga_state SET step = 'AUTHORIZING'   │   ← both, or neither.
+   │  INSERT INTO outbox (AuthorizePaymentCommand) │     Structurally.
+   └───────────────────────┬──────────────────────┘
+                           │ COMMIT
+                           ▼
+                  relay (poll, FOR UPDATE SKIP LOCKED)
+                           │
+                           ▼
+                         Kafka  ──▶  Payment Service (idempotent consumer)
+
+  Relay crashes after publishing, before marking published?
+      → the command is published TWICE
+      → the consumer dedupes on event_id
+      → nothing happens twice.
+  We converted an UNFIXABLE problem (a lost command) into a TRIVIAL one
+  (a duplicate command). That trade is the entire pattern.
+</code></pre>
+
+    <div class="senior">Offer this unprompted, the moment you draw an arrow from a database to a queue: <em>"That's a dual write, so I'd use the outbox pattern — the command goes into an outbox table in the same transaction as the saga state change, and a relay publishes it at-least-once. In a feed system a dropped event is a missing notification. Here a dropped command is an order that is never paid for, or a card that's charged for an order that doesn't exist. Same pattern, completely different blast radius — which is why in this system I'd treat it as mandatory rather than as an optimization."</em></div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="idempotency">9. Deep dive: idempotency &amp; the authorize/capture lifecycle</h2>
+
+    <h3>9a. The problem, stated so that it cannot be dodged</h3>
+
+    <p>
+      Your client sends <code>POST /payments</code>. The network times out. <strong>Did the payment go through?</strong>
+    </p>
+
+    <p style="font-size:1.15rem; font-weight:700; color:#111827; border-left:4px solid #8b5cf6; padding-left:1rem;">
+      <strong>You cannot know from the client side.</strong> A lost request and a lost response are byte-for-byte
+      identical from where you're standing: silence. (05 §1 — this is the root cause of the entire field.) So you have
+      exactly two choices: retry and risk charging the customer twice, or don't retry and risk never charging them at
+      all. Neither is acceptable. <strong>The idempotency key is the third option, and it is the only one there is.</strong>
+    </p>
+
+    <p>
+      The key doesn't prevent the duplicate — nothing can prevent the duplicate, because you can't prevent a network
+      failure. <strong>It makes the duplicate harmless.</strong> And once retries are harmless, you can retry
+      aggressively, which is what makes the entire saga in §8 work.
+    </p>
+
+<pre><code>  POST /v1/payments
+  Idempotency-Key: 7c9e6679-7425-40de-944b-e07fc1f90ae7   ← generated by the CLIENT,
+  { "orderId": "ord_01HX7…", "amountCents": 4998 }          ONCE per intent, stable
+                                                            across every retry
+
+  1st call  → key unseen  → charge → store (key → 201 + body)   → 201 Created
+  2nd call  → key SEEN    → do NOT charge → replay stored body  → 201 Created
+             identical paymentId, identical body. The client cannot tell.
+             The customer is charged exactly once.
+
+  ⚠ And if the 1st call FAILED with 402 card_declined?
+     The replay returns the SAME 402. You do not get a second bite at the card.
+</code></pre>
+
+    <h3>9b. The implementation — and the race everyone misses</h3>
+
+    <p>
+      The naive implementation checks "have I seen this key?" and then acts. That is <strong>check-then-act</strong>, and
+      two copies of the same request arriving 5ms apart will both check, both see nothing, and both charge the card. The
+      race you were trying to eliminate is back, now with a table in front of it.
+    </p>
+    <p>
+      The fix is 05's fix and it is not a lock: <strong>make the <em>insert</em> the check.</strong> A primary key
+      constraint is an atomic, durable, linearizable compare-and-swap that you already have, already operate, and already
+      trust.
+    </p>
+
+<pre><code><span class="ann">@RestController</span>
+<span class="kw">public</span> <span class="kw">class</span> <span class="typ">PaymentController</span> {
+
+    <span class="ann">@PostMapping</span>(<span class="str">"/v1/payments"</span>)
+    <span class="kw">public</span> <span class="typ">ResponseEntity</span>&lt;<span class="typ">PaymentResponse</span>&gt; authorize(
+            <span class="ann">@RequestHeader</span>(<span class="str">"Idempotency-Key"</span>) <span class="typ">String</span> idemKey,
+            <span class="ann">@Valid</span> <span class="ann">@RequestBody</span> <span class="typ">AuthorizeRequest</span> req) {
+
+        <span class="kw">if</span> (idemKey == <span class="kw">null</span> || idemKey.isBlank()) {
+            <span class="com">// Reject it. A mutating money endpoint without an idempotency key is</span>
+            <span class="com">// a bug in the caller, and accepting it is a bug in you.</span>
+            <span class="kw">throw</span> <span class="kw">new</span> <span class="typ">MissingIdempotencyKeyException</span>();   <span class="com">// 400</span>
+        }
+        <span class="typ">Result</span> r = paymentService.authorize(idemKey, req);
+        <span class="kw">return</span> <span class="typ">ResponseEntity</span>.status(r.code()).body(r.body());
+    }
+}
+
+<span class="ann">@Service</span>
+<span class="kw">public</span> <span class="kw">class</span> <span class="typ">PaymentService</span> {
+
+    <span class="ann">@Transactional</span>
+    <span class="kw">public</span> <span class="typ">Result</span> authorize(<span class="typ">String</span> idemKey, <span class="typ">AuthorizeRequest</span> req) {
+
+        <span class="typ">String</span> hash = sha256(canonicalJson(req));
+
+        <span class="com">// ── 1. CLAIM THE KEY. This INSERT *is* the check-and-act, atomically.</span>
+        <span class="com">//    Exactly one concurrent caller can win this row. No Redis. No Redlock.</span>
+        <span class="com">//    No distributed-lock argument. The PRIMARY KEY already solved it.</span>
+        <span class="kw">int</span> claimed = jdbc.update(<span class="str">"""
+            INSERT INTO idempotency_keys (key, endpoint, request_hash, status)
+            VALUES (?, '/v1/payments', ?, 'IN_PROGRESS')
+            ON CONFLICT (key) DO NOTHING
+            """</span>, idemKey, hash);
+
+        <span class="kw">if</span> (claimed == <span class="num">0</span>) {
+            <span class="typ">IdemRecord</span> prior = idemRepo.get(idemKey);
+
+            <span class="com">// Same key, DIFFERENT body → the client has a bug and is about to</span>
+            <span class="com">// charge someone the wrong amount. Fail loudly. Never guess.</span>
+            <span class="kw">if</span> (!prior.requestHash().equals(hash)) {
+                <span class="kw">throw</span> <span class="kw">new</span> <span class="typ">IdempotencyKeyReuseException</span>();     <span class="com">// 422</span>
+            }
+            <span class="com">// The original is still running. Do NOT run it again — that is the</span>
+            <span class="com">// double charge. Tell the client to come back.</span>
+            <span class="kw">if</span> (prior.status().equals(<span class="str">"IN_PROGRESS"</span>)) {
+                <span class="kw">throw</span> <span class="kw">new</span> <span class="typ">RequestInFlightException</span>();        <span class="com">// 409 + Retry-After</span>
+            }
+            <span class="com">// COMPLETED → replay the ORIGINAL response, success or failure.</span>
+            <span class="kw">return</span> <span class="kw">new</span> <span class="typ">Result</span>(prior.responseCode(), prior.responseBody());
+        }
+
+        <span class="com">// ── 2. We won the key. Do the work — and pass an idempotency key DOWNSTREAM</span>
+        <span class="com">//    too. Stripe has its own Idempotency-Key header; use it, keyed off OUR</span>
+        <span class="com">//    key, so a retry of our PSP call is also safe. Idempotency is a CHAIN;</span>
+        <span class="com">//    it is only as strong as its weakest hop.</span>
+        <span class="typ">PspResult</span> psp = pspClient.authorize(
+            req.pspIntent(), <span class="str">"idem-"</span> + idemKey);       <span class="com">// ← the downstream key</span>
+
+        <span class="typ">Payment</span> p = payments.save(<span class="typ">Payment</span>.authorized(req, psp));
+
+        <span class="com">// ── 3. Record the outcome IN THE SAME TRANSACTION as the business write.</span>
+        <span class="com">//    The key and the payment can therefore never disagree about whether</span>
+        <span class="com">//    this happened. That is the property the whole design rests on.</span>
+        <span class="typ">Result</span> res = <span class="typ">Result</span>.created(<span class="typ">PaymentResponse</span>.from(p));
+        jdbc.update(<span class="str">"""
+            UPDATE idempotency_keys
+               SET status = 'COMPLETED', response_code = ?, response_body = ?
+             WHERE key = ?
+            """</span>, res.code(), json.write(res.body()), idemKey);
+
+        outbox.emit(<span class="str">"Payment"</span>, p.id().toString(), <span class="str">"PaymentAuthorized"</span>,
+                    <span class="typ">PaymentAuthorized</span>.from(p));
+        <span class="kw">return</span> res;
+    }
+}
+</code></pre>
+
+    <div class="pitfall">The subtle failure in that code, and be ready for it as a follow-up: <strong>what if we crash after calling the PSP but before the transaction commits?</strong> The card is authorized at Stripe; our transaction rolled back; the <code>IN_PROGRESS</code> key row is gone too (it rolled back with everything else). A retry gets a fresh key claim and calls Stripe again — but <strong>the downstream idempotency key <code>idem-{idemKey}</code> is derived from the same client key</strong>, so Stripe recognises the retry and returns the <em>original</em> authorization instead of creating a second one. That's why passing the key downstream isn't a nicety; it's what closes the last hole. And the belt-and-braces answer if the PSP had no such header: you'd write an <code>IN_PROGRESS</code> "intent" row in its <em>own</em> committed transaction <em>before</em> calling out, so a crash leaves a breadcrumb the reconciler can find. Volunteering that shows you've actually thought about the crash window rather than reciting the pattern.</div>
+
+    <h3>9c. The payment state machine</h3>
+
+    <p>
+      Draw this. It takes forty seconds and it structures every subsequent question the interviewer asks.
+    </p>
+
+<pre><code>                            ┌─────────┐
+                            │ PENDING │  created; not yet sent to the PSP
+                            └────┬────┘
+                        authorize│
+                    ┌────────────┴────────────┐
+                    ▼                         ▼
+             ┌────────────┐            ┌──────────┐
+             │ AUTHORIZED │            │  FAILED  │  declined / insufficient
+             └──┬──────┬──┘            └──────────┘  funds / 3DS abandoned
+                │      │                    (terminal)
+        capture │      │ void / expire
+                │      └──────────────▶ ┌─────────┐
+                │       (auths expire   │ VOIDED  │  free to undo. No trace on
+                │        after ~7 days) └─────────┘  the customer's statement.
+                ▼
+          ┌──────────┐        ┌─────────────────────┐
+          │ CAPTURED │───────▶│ PARTIALLY_REFUNDED  │◀──┐ more refunds
+          └──┬────┬──┘ refund └──────────┬──────────┘   │ (0 &lt; refunded &lt; captured)
+             │    │                      │              │
+             │    │  full refund         └──────────────┘
+             │    └────────────────────▶ ┌──────────┐
+             │                           │ REFUNDED │  refunded == captured
+             │                           └──────────┘
+             │ bank reverses it, weeks later, WITHOUT ASKING US
+             ▼
+       ┌──────────┐
+       │ DISPUTED │ → chargeback. Money is taken back + a fee. We may
+       └──────────┘   contest it. This state is INBOUND — we don't cause it.
+
+  SETTLED is not a state of the payment — it's a property of the MONEY, and
+  it lives in the ledger (§7): the payout transaction that moves funds from
+  psp_clearing to bank_cash. Don't conflate "captured" with "we have the money."
+</code></pre>
+
+    <p><strong>Authorize vs capture, explained the way you should explain it out loud:</strong></p>
+    <ul>
+      <li><strong>Authorize</strong> asks the issuing bank to <em>reserve</em> the funds and reduce the customer's
+        available credit. No money moves. It's a promise, and it expires (typically ~7 days, sometimes 30 for travel).
+        <strong>This is why a charge shows as "pending" on your statement for a few days and then changes.</strong> Use
+        that example — everyone has seen it, and connecting the abstraction to a thing the interviewer has personally
+        observed on their own bank app makes it stick.</li>
+      <li><strong>Capture</strong> is when the money actually moves. You capture at shipment, not at checkout — in many
+        jurisdictions you're not permitted to take payment for physical goods before you dispatch them, and even where
+        you are, capturing late is <em>better engineering</em> (§8c): a failed order compensates with a free void instead
+        of a costly, visible refund.</li>
+      <li><strong>You may capture less than you authorized</strong> (you shipped 2 of 3 items) but generally not more. So
+        <code>captured_cents &lt;= amount_cents</code> — which is exactly the <code>CHECK</code> constraint from §5. The
+        state machine and the schema are the same object viewed from two angles, and saying that is a nice moment of
+        coherence.</li>
+    </ul>
+
+    <div class="senior">The transition rule to state explicitly, because it's the thing that makes the state machine <em>enforceable</em> rather than decorative: <em>"Every transition is a conditional update, not a read-modify-write. <code>UPDATE payments SET status='CAPTURED' WHERE id=? AND status='AUTHORIZED'</code> — if it returns zero rows, someone else already moved it and I stop. That single line gives me optimistic concurrency, idempotency and state-machine validation in one statement, enforced by the database, with no lock and no race."</em> That is 05's "let the database enforce it" theme paying off for the third time on this page, and pointing out the repetition is itself a signal that you see the pattern rather than memorising instances.</div>
+
+    <h3>9d. The webhook problem</h3>
+
+    <p>
+      Here is where people who have shipped payments and people who have read about payments visibly diverge. The PSP
+      does not just answer your calls — <strong>it calls you back</strong>, asynchronously, to tell you that a payment
+      succeeded, a refund settled, a dispute was opened, an authorization expired. And webhooks are, without exaggeration,
+      the least reliable part of the whole system.
+    </p>
+
+    <table>
+      <thead><tr><th>What webhooks do</th><th>What you must do about it</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Arrive twice</strong> (or five times — the PSP retries when your 200 is slow or lost)</td>
+          <td><strong>Dedupe by the provider's event ID.</strong> <code>INSERT INTO processed_webhooks (psp_event_id) ON CONFLICT DO NOTHING</code> in the same transaction as the side effect. Zero rows inserted ⇒ already handled ⇒ return 200 and do nothing.</td>
+        </tr>
+        <tr>
+          <td><strong>Arrive out of order.</strong> <code>payment.captured</code> can genuinely land <em>before</em> <code>payment.authorized</code>.</td>
+          <td><strong>Never write state blindly from a webhook.</strong> Use conditional transitions (<code>WHERE status = 'AUTHORIZED'</code>) so an out-of-order event is simply a no-op, and/or carry a version/sequence and ignore anything older than what you have. Do not let a stale event drag a payment backwards through the state machine.</td>
+        </tr>
+        <tr>
+          <td><strong>Never arrive.</strong> Your endpoint was down for 20 minutes; the PSP exhausted its retries; the event is gone.</td>
+          <td><strong>Poll. Always also poll.</strong> A reconciliation job (§7g) that re-queries the PSP for the state of anything in a non-terminal state older than N minutes. This is the one that matters most, and it is the one candidates omit.</td>
+        </tr>
+        <tr>
+          <td><strong>Are forgeable.</strong> Your webhook endpoint is a public URL that accepts POSTs saying "this payment succeeded."</td>
+          <td><strong>Verify the signature</strong> (Stripe signs with an HMAC over the raw body + a timestamp) and <strong>reject stale timestamps</strong> to stop replay attacks. Verify against the <em>raw</em> bytes, before any JSON parsing — re-serialising the body changes it and the signature will never match.</td>
+        </tr>
+        <tr>
+          <td><strong>Time out if you're slow.</strong> The PSP wants a 200 in a couple of seconds and will retry if it doesn't get one.</td>
+          <td><strong>Verify, dedupe, persist, 200 — then process asynchronously.</strong> Never do the business work inside the webhook handler. Write it to a queue (or your own outbox) and return immediately.</td>
+        </tr>
+      </tbody>
+    </table>
+
+<pre><code><span class="ann">@PostMapping</span>(<span class="str">"/v1/webhooks/psp"</span>)
+<span class="ann">@Transactional</span>
+<span class="kw">public</span> <span class="typ">ResponseEntity</span>&lt;<span class="typ">Void</span>&gt; onWebhook(
+        <span class="ann">@RequestHeader</span>(<span class="str">"Stripe-Signature"</span>) <span class="typ">String</span> signature,
+        <span class="ann">@RequestBody</span> <span class="kw">byte</span>[] rawBody) {        <span class="com">// ← RAW bytes. Not a parsed DTO.</span>
+
+    <span class="com">// 1. Verify. HMAC over the raw payload + timestamp. Reject replays older</span>
+    <span class="com">//    than ~5 minutes. An unsigned webhook endpoint is an unauthenticated</span>
+    <span class="com">//    "mark this order paid" API exposed to the internet.</span>
+    <span class="typ">PspEvent</span> evt = pspVerifier.constructEvent(rawBody, signature);   <span class="com">// throws → 400</span>
+
+    <span class="com">// 2. Dedupe on the PROVIDER's event id. They WILL send it again.</span>
+    <span class="kw">int</span> fresh = jdbc.update(
+        <span class="str">"INSERT INTO processed_webhooks (psp_event_id) VALUES (?) "</span> +
+        <span class="str">"ON CONFLICT DO NOTHING"</span>, evt.id());
+    <span class="kw">if</span> (fresh == <span class="num">0</span>) <span class="kw">return</span> <span class="typ">ResponseEntity</span>.ok().build();   <span class="com">// seen it. 200. Done.</span>
+
+    <span class="com">// 3. Persist the intent to process, and RETURN. Do not call the ledger, do</span>
+    <span class="com">//    not call Kafka, do not do anything slow. The dedup row and the queued</span>
+    <span class="com">//    work commit together, so we can never ack an event we then drop.</span>
+    outbox.emit(<span class="str">"PspEvent"</span>, evt.id(), evt.type(), evt.payload());
+    <span class="kw">return</span> <span class="typ">ResponseEntity</span>.ok().build();               <span class="com">// fast 200. Stripe is happy.</span>
+}
+
+<span class="com">// …and the actual handler, downstream, applies it with a CONDITIONAL update, so</span>
+<span class="com">// an out-of-order or duplicate event cannot drag the state machine backwards:</span>
+<span class="ann">@Transactional</span>
+<span class="kw">public</span> <span class="kw">void</span> apply(<span class="typ">PspEvent</span> evt) {
+    <span class="kw">int</span> rows = jdbc.update(<span class="str">"""
+        UPDATE payments SET status = 'CAPTURED', captured_cents = ?
+         WHERE psp_payment_intent = ?
+           AND status = 'AUTHORIZED'        -- ← the guard. Out of order? 0 rows.
+        """</span>, evt.amountCents(), evt.intentId());
+
+    <span class="kw">if</span> (rows == <span class="num">0</span>) <span class="kw">return</span>;   <span class="com">// already captured, or not authorized yet. Fine.</span>
+                             <span class="com">// The reconciler will sort out anything genuinely wrong.</span>
+    ledger.post(<span class="str">"capture:"</span> + evt.intentId(), CAPTURE, ...);   <span class="com">// §7e</span>
+}
+</code></pre>
+
+    <div class="senior">This is the paragraph that says "I have shipped this," and it is worth memorising almost word for word: <em>"I'd treat webhooks as a <strong>hint, never as a source of truth</strong>. They arrive twice, they arrive out of order, and sometimes they never arrive at all. So: verify the HMAC signature against the raw body, dedupe on the provider's event ID, make the handler idempotent with conditional state transitions, return a fast 200 and do the work asynchronously — <strong>and always also poll.</strong> A reconciliation job re-queries the provider for anything stuck in a non-terminal state. If my system's correctness depends on a webhook arriving, then my system's correctness depends on someone else's retry logic, and that's not a bet I'm willing to make with money."</em></div>
+
+    <div class="pitfall">The specific webhook bug that has cost real companies real money: handling <code>charge.succeeded</code> by <em>inserting</em> a ledger entry, with no dedupe. Stripe retries the webhook because your 200 was slow. You post the entry twice. Your books now show twice the revenue and your <code>psp_clearing</code> account doesn't reconcile — and because a ledger is append-only, <strong>you cannot simply delete the bad entry.</strong> You must post a correcting entry, and explain the whole thing to finance. The dedupe row is one <code>INSERT … ON CONFLICT DO NOTHING</code> and it is not optional.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="consistency">10. Consistency &amp; isolation</h2>
+
+    <h3>10a. Why relational, and why "we'll use Cassandra for scale" fails here</h3>
+
+    <p>
+      Somebody in this interview is going to suggest a NoSQL store — sometimes the interviewer, as a deliberate test.
+      Have the answer ready, and make it about <em>requirements</em>, not about taste.
+    </p>
+
+    <table>
+      <thead><tr><th>What this system needs</th><th>Postgres</th><th>Cassandra / Dynamo-style</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Multi-row ACID transaction</strong> — the payment row, the ledger entries and the outbox row must commit together or not at all</td>
+          <td>Native. <code>BEGIN … COMMIT</code>.</td>
+          <td><strong>No.</strong> Lightweight transactions are single-partition and use Paxos per operation; there is no multi-partition transaction. Your ledger entries and your payment row would commit independently — which is the dual-write problem, inside your own database.</td>
+        </tr>
+        <tr>
+          <td><strong>Unique constraints</strong> — five of them (§5), each one preventing a duplicate charge</td>
+          <td>Native, and enforced across concurrent writers.</td>
+          <td>Only via <code>IF NOT EXISTS</code> LWT, single-partition, slow, and with well-documented edge cases. This is the constraint doing the most work in your design and it becomes your weakest link.</td>
+        </tr>
+        <tr>
+          <td><strong>CHECK constraints</strong> — <code>refunded_cents &lt;= captured_cents</code></td>
+          <td>Native.</td>
+          <td>Does not exist. Every invariant moves into application code, where it is check-then-act and therefore racy.</td>
+        </tr>
+        <tr>
+          <td><strong>Ad-hoc analytical queries</strong> — reconciliation, "sum every entry for this account", finance's questions</td>
+          <td>SQL. Aggregations, joins, window functions.</td>
+          <td>Query patterns must be designed into the partition key up front. "Sum all entries for an account across time" is a query you can't easily ask if you didn't model for it — and reconciliation asks new questions constantly.</td>
+        </tr>
+        <tr>
+          <td><strong>Write throughput of 4,000/sec</strong></td>
+          <td>Trivial for one instance.</td>
+          <td>Also trivial — <em>and irrelevant</em>, because we never needed the throughput.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>
+      Look at the last row. <strong>Cassandra's advantage is the one thing this system does not need.</strong> You would
+      be trading away every mechanism that makes the design correct in exchange for headroom on an axis you're nowhere
+      near saturating. That is the trade, stated plainly, and once you state it plainly nobody argues.
+    </p>
+
+    <div class="senior">The full answer, and it works whether the suggestion came from the interviewer or from your own nerves: <em>"I'd use Postgres, and I want to be specific about why, because 'scale' isn't the reason to pick a database — <strong>the invariants are</strong>. My correctness rests on multi-row transactions, five unique constraints and two check constraints. Cassandra buys me write throughput I don't need — 4,000 writes a second is nothing — and takes away the exact primitives my design is built on. Picking an eventually-consistent store for a ledger means reimplementing ACID in application code, badly, and then finding the bugs in production with real customers' money. If I ever outgrow one Postgres, I'd shard it by account and keep the transactions — not switch to a database that can't do them."</em></div>
+
+    <h3>10b. Isolation levels — where <code>READ COMMITTED</code> quietly betrays you</h3>
+
+    <p>
+      Postgres defaults to <code>READ COMMITTED</code>, and for most applications it is fine. For balance checks it is
+      not, and the reason is worth knowing precisely (03 covers the general theory; here is where it bites).
+    </p>
+
+    <p>
+      The dangerous pattern is a <strong>read-then-decide</strong> across rows: read a total, compare it to a limit,
+      insert a row. Under <code>READ COMMITTED</code>, two transactions can both read the same total, both conclude they
+      are within the limit, and both insert — and neither ever sees the other. Nothing is locked, because the row you
+      would need to lock <em>doesn't exist yet</em>. This is a <strong>write skew</strong>, and it is the classic
+      over-refund bug:
+    </p>
+
+<pre><code>  Payment pay_9K2:  captured = 10000, already refunded = 8000.
+                    So at most 2000 more may be refunded.
+
+  Txn A (refund 1500)                    Txn B (refund 1500)
+  ────────────────────────────────────────────────────────────────────────
+  SELECT SUM(amount) FROM refunds
+    WHERE payment_id = 'pay_9K2'
+    → 8000                               SELECT SUM(amount) FROM refunds
+                                           WHERE payment_id = 'pay_9K2'
+                                           → 8000        ← SAME. Neither sees
+                                                            the other's INSERT.
+  8000 + 1500 = 9500 &lt;= 10000  ✓ OK      8000 + 1500 = 9500 &lt;= 10000  ✓ OK
+
+  INSERT refund 1500                     INSERT refund 1500
+  COMMIT                                 COMMIT
+
+  Total refunded = 11000 on a 10000 capture.  We refunded MORE THAN WE TOOK.
+  Both transactions individually obeyed the rule. Together they broke it.
+</code></pre>
+
+    <p>Three fixes, and you should be able to name all three and pick one:</p>
+
+    <table>
+      <thead><tr><th>Fix</th><th>How</th><th>Verdict</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Explicit row lock</strong></td>
+          <td><code>SELECT … FROM payments WHERE id = ? FOR UPDATE</code> before validating. Both transactions must now queue on the payment row, so B reads A's committed total.</td>
+          <td><strong>My default.</strong> Simple, predictable, and the contention is per-payment — which is to say, essentially zero, because nobody else is refunding <em>this</em> payment. It costs nothing precisely because it locks something nobody else wants.</td>
+        </tr>
+        <tr>
+          <td><strong>A denormalized counter + a CHECK</strong></td>
+          <td>Keep <code>payments.refunded_cents</code>, update it in the same transaction (<code>UPDATE payments SET refunded_cents = refunded_cents + ? WHERE id = ?</code>), and let <code>CHECK (refunded_cents &lt;= captured_cents)</code> reject the over-refund.</td>
+          <td><strong>Also excellent</strong>, and it's what §5's schema does. The atomic increment takes the row lock implicitly and the constraint enforces the invariant — the database refuses the second refund outright. Note this is <em>not</em> a mutable balance in the §7a sense: it's a derived cache with a hard constraint, and the refunds table remains the source of truth.</td>
+        </tr>
+        <tr>
+          <td><strong><code>SERIALIZABLE</code></strong></td>
+          <td>Postgres's SSI detects the read-write dependency cycle and aborts one transaction with a serialization failure.</td>
+          <td><strong>Correct, and the strongest guarantee available</strong> — but you must handle <code>40001</code> serialization failures by retrying the whole transaction, which every caller must now do. Use it for the ledger-posting path where the invariants are subtle and you want the database to be paranoid on your behalf. Don't reach for it globally without saying you'd measure the abort rate.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="senior">Say the general principle, not just the fix, because the principle is what transfers: <em>"Anywhere I read a value, make a decision, and then write based on that decision, <code>READ COMMITTED</code> is not enough — that's a write skew and both transactions can pass their own check while jointly violating the invariant. So on the money path I either take an explicit <code>FOR UPDATE</code> lock on the aggregate root, or I push the invariant into a database constraint, or I run <code>SERIALIZABLE</code> and retry on 40001. What I never do is validate in application code under the default isolation level and assume it holds."</em> Every over-refund, every double-spend and every oversold seat in the history of computing is that sentence being ignored.</div>
+
+    <div class="note">Notice the shape of the answer: it is the same as 05's, and the same as 14's (ticket booking). <strong>Push the invariant down to something that can enforce it atomically</strong> — a unique constraint, a check constraint, a conditional update, a row lock. Different domain, identical move. When you see the same answer arrive from three different directions, that's the archetype, and archetypes are what you're actually building in this phase.</div>
+
+    <h3>10c. Replication and durability</h3>
+    <ul>
+      <li><strong>Synchronous replication on the payment/ledger database.</strong> <code>synchronous_commit = on</code>
+        with at least one sync standby. Yes, it costs write latency (a round trip to the standby). Pay it. The alternative
+        is that a failover loses the last few seconds of writes — and "we lost the record of the money we took" is not a
+        sentence you want to be part of.</li>
+      <li><strong>Async read replicas for the order-history path.</strong> Replication lag is fine there — a receipt that's
+        200ms stale harms nobody.</li>
+      <li><strong>Read your own writes.</strong> After a customer pays, route their next few reads to the primary (or use
+        the PSP's returned state), because the one place lag <em>does</em> hurt is the customer refreshing the page right
+        after checkout and seeing "unpaid." That is a support call and a duplicate payment attempt waiting to happen.</li>
+      <li><strong>Point-in-time recovery, and test the restore.</strong> An untested backup is a rumour. In a regulated
+        environment you will be asked to demonstrate the restore, so build it before someone makes you.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="scaling">11. Scaling &amp; bottlenecks</h2>
+
+    <p>
+      Now — and only now, and having earned it — talk about scale. The framing matters as much as the content:
+    </p>
+
+    <p style="font-size:1.1rem; font-weight:700; color:#111827; border-left:4px solid #8b5cf6; padding-left:1rem;">
+      You scale the read path freely and aggressively. You scale the write path <strong>conservatively and
+      reluctantly</strong>, and every scaling move on the write path must preserve the transactional guarantees, or it is
+      not a scaling move — it is a downgrade wearing a scaling move's clothes.
+    </p>
+
+    <h3>What breaks first, in order</h3>
+
+    <table>
+      <thead><tr><th>#</th><th>Breaks</th><th>Symptom</th><th>Fix</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>1</td>
+          <td><strong>Order-history reads</strong> saturate the primary</td>
+          <td>Checkout latency rises because "where's my order" traffic is stealing the primary's IO</td>
+          <td>Read replicas + cache terminal-state orders. Easy, and it should already be done — this is the <em>first</em> thing to break and the <em>least</em> interesting.</td>
+        </tr>
+        <tr>
+          <td>2</td>
+          <td><strong>The ledger table</strong> gets huge (billions of rows)</td>
+          <td>Balance queries slow down; vacuum and index maintenance get painful</td>
+          <td><strong>Partition by month</strong> (declarative partitioning — already in §5's DDL). Balance snapshots (§7g) so you sum a bounded suffix, not the whole history. Archive cold partitions to cheap storage, keeping them queryable.</td>
+        </tr>
+        <tr>
+          <td>3</td>
+          <td><strong>The outbox table</strong> grows unboundedly</td>
+          <td>The relay's query slows; autovacuum falls behind; eventually the table takes down the database it was protecting</td>
+          <td>Reap published rows aggressively (delete after publish, or partition by day and drop partitions). 05 flags this as a real production incident, and it is.</td>
+        </tr>
+        <tr>
+          <td>4</td>
+          <td><strong>The PSP</strong> is your throughput ceiling and your availability ceiling</td>
+          <td>Stripe has an incident; your checkout is down; nothing you own is broken</td>
+          <td>Circuit breaker (06) — fail fast rather than piling up threads. Queue authorizations for retry rather than showing the customer an error where you can. And the real answer: <strong>a second PSP</strong>, with routing/failover. Which is a business decision as much as a technical one, and saying so is a maturity signal.</td>
+        </tr>
+        <tr>
+          <td>5</td>
+          <td><strong>Write throughput on one Postgres</strong></td>
+          <td>You are, genuinely, at tens of thousands of TPS. Congratulations, you are Stripe.</td>
+          <td>Shard. See below. But be honest that most companies never get here, and designing for it prematurely costs you correctness today for throughput you'll need in five years.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>If you truly must shard the write path</h3>
+
+    <p>
+      <strong>Shard by <code>account_id</code> (or <code>customer_id</code>)</strong>, not by <code>order_id</code> and
+      absolutely not by time. The reason is the only reason that matters: <strong>a ledger transaction must be atomic
+      across all its entries, so all the accounts it touches should live in one shard.</strong> Shard by account and the
+      overwhelming majority of transactions are single-shard, so they keep real ACID.
+    </p>
+
+<pre><code>  shard = hash(account_id) % N       ← or consistent hashing (04) to make
+                                       rebalancing survivable
+
+  Customer pays merchant, and both accounts are on shard 3:
+      → ONE local Postgres transaction. Real ACID. Nothing changes. ✓
+
+  Customer on shard 3 pays merchant on shard 7:
+      → a CROSS-SHARD ledger transaction.  Now what?
+      → You are back to §8: a saga, with the entries posted in each shard's
+        local transaction, an in-flight "clearing" account absorbing the
+        imbalance, and a reconciliation job that catches any that get stuck.
+      → The books balance GLOBALLY and are momentarily unbalanced LOCALLY,
+        which is exactly what a clearing account is FOR. This is not a hack —
+        it is how the actual banking system works, and it is why "money in
+        transit" is a real accounting concept with a real account behind it.
+</code></pre>
+
+    <h3>The hot-account problem</h3>
+
+    <p>
+      This is the interesting one and it is 04's celebrity-partition problem in a suit. Sharding by account works
+      beautifully for customers — a customer makes a handful of payments a month, so the load spreads perfectly. It works
+      terribly for the accounts on the <em>other side</em> of those transactions. <strong>Your <code>revenue</code>
+      account, your <code>psp_clearing</code> account, and a large merchant's account are touched by <em>every single
+      transaction in the system.</em></strong> Every write in the entire business contends on one row's worth of locality.
+    </p>
+
+    <table>
+      <thead><tr><th>Fix</th><th>How it works</th><th>The cost</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Because you have no balance column, there is no row to contend on</strong> ★</td>
+          <td>This is the sleeper benefit of §7 and you should point at it triumphantly. An append-only ledger has no hot <em>row</em> — every entry is an <code>INSERT</code>, and inserts don't block each other. Ten thousand concurrent payments to one merchant are ten thousand independent appends. <strong>A mutable balance column would have serialised every one of them behind a single row lock.</strong></td>
+          <td>Reading that merchant's balance means summing many entries — which is what snapshots (§7g) are for.</td>
+        </tr>
+        <tr>
+          <td><strong>Sub-accounts / sharded counters</strong></td>
+          <td>Split the hot account into <code>revenue_00 … revenue_99</code>, write to a random one, and define the real balance as the sum. Same trick as a sharded counter (04, 18).</td>
+          <td>Every balance read now fans out across 100 sub-accounts. Worth it only when appends genuinely contend, which with an append-only ledger is rare.</td>
+        </tr>
+        <tr>
+          <td><strong>Give the hot account its own shard</strong></td>
+          <td>Directory-based sharding (04): internal accounts are pinned to dedicated, well-provisioned shards.</td>
+          <td>More cross-shard transactions, because now customer and revenue are always on different shards. Trades one problem for another; only do it if you've measured.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="senior">The moment to reach for: <em>"The hot-account problem is the one that would actually bite me at scale — every transaction in the business touches the same few internal accounts. But notice that the append-only ledger already solves the worst of it: because there's no mutable balance column, there's no hot <strong>row</strong> to serialise on. Inserts don't contend. If I'd stored balances, I'd have every payment in the company queuing behind one row lock. The design I chose for <em>auditability</em> turns out to be the one that scales — and that's not a coincidence, it's what immutability buys you."</em> Landing that callback — the correctness decision paying a scalability dividend — is a genuinely memorable way to close a design.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="tradeoffs">12. Trade-offs</h2>
+
+    <p>
+      Every row is a decision you made on purpose. Being able to say "and here's when I'd flip it" is the difference
+      between having a design and having <em>judgment</em>.
+    </p>
+
+    <table>
+      <thead><tr><th>Decision</th><th>Alternative</th><th>Why I chose it</th><th>When I'd flip</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Correctness over availability</strong> on the money path (CP)</td>
+          <td>AP — accept writes under partition, reconcile later</td>
+          <td>Being briefly down costs revenue; being briefly wrong costs money, trust and possibly a regulatory event. Down is recoverable. Wrong is not.</td>
+          <td>Never, on the money path. On the read path I'm already AP.</td>
+        </tr>
+        <tr>
+          <td><strong>Append-only double-entry ledger</strong>, no balance column</td>
+          <td>A mutable <code>balance</code> column</td>
+          <td>Auditability, no lost-update race, no hot row, and money that provably cannot be created or destroyed.</td>
+          <td>Never for the source of truth. I <em>would</em> add balance snapshots as a rebuildable cache the moment sums get slow.</td>
+        </tr>
+        <tr>
+          <td><strong>Integer cents</strong> (<code>BIGINT</code>)</td>
+          <td><code>NUMERIC</code>/<code>BigDecimal</code></td>
+          <td>Exact, fast, no library, matches Stripe's API. Enough for any amount.</td>
+          <td><code>NUMERIC(19,4)</code> the moment I need sub-cent precision — FX, interest, per-unit pricing. Never <code>double</code>, under any circumstances.</td>
+        </tr>
+        <tr>
+          <td><strong>Saga</strong> (compensations)</td>
+          <td>2PC / XA</td>
+          <td>A third-party PSP cannot join an XA transaction. Full stop. And 2PC blocks on coordinator failure.</td>
+          <td>2PC is defensible for two in-house XA datasources in one datacenter at modest volume — a real pattern at banks, and I'd use it there.</td>
+        </tr>
+        <tr>
+          <td><strong>Orchestration</strong></td>
+          <td>Choreography</td>
+          <td>One queryable place that knows the state of every order. "Why is 12345 stuck" is a <code>SELECT</code>, and an auditor gets a table.</td>
+          <td>Choreography for 2–3 step flows with no money in them (e.g. a notification fan-out).</td>
+        </tr>
+        <tr>
+          <td><strong>Authorize at checkout, capture at shipment</strong></td>
+          <td>Capture immediately</td>
+          <td>An authorization voids for free and leaves no trace; a capture can only be refunded, visibly and with fees. Late capture makes most failures cheap. Often also a legal requirement for physical goods.</td>
+          <td>Capture immediately for digital goods delivered instantly — there's no window in which to fail.</td>
+        </tr>
+        <tr>
+          <td><strong>Postgres</strong> (relational, single primary)</td>
+          <td>Cassandra / DynamoDB</td>
+          <td>Multi-row transactions, unique constraints, check constraints, ad-hoc reconciliation queries. The invariants <em>are</em> the design.</td>
+          <td>If I outgrow one primary, I <strong>shard Postgres by account</strong> and keep the transactions. I don't switch to a store that can't do them.</td>
+        </tr>
+        <tr>
+          <td><strong>Client-supplied <code>Idempotency-Key</code></strong></td>
+          <td>Server-side dedup on a request hash</td>
+          <td>Only the client knows which HTTP attempts are the same <em>intent</em>. A request hash can't distinguish "retry" from "the customer genuinely bought the same thing twice."</td>
+          <td>Never. But I <em>also</em> derive keys server-side (<code>capture:{paymentId}</code>) for internal steps, where the entity itself defines the intent.</td>
+        </tr>
+        <tr>
+          <td><strong>Outbox</strong> for every event</td>
+          <td>Publish directly to Kafka after commit</td>
+          <td>A dual write silently drops events. Here a dropped event is an unpaid order or an uncommanded charge.</td>
+          <td>Never in this system. In a metrics pipeline, a direct publish is fine — a lost click event costs nothing.</td>
+        </tr>
+        <tr>
+          <td><strong>Webhooks + polling</strong></td>
+          <td>Webhooks alone</td>
+          <td>Webhooks are duplicated, reordered and sometimes never delivered. Trusting them alone means outsourcing your correctness to someone else's retry logic.</td>
+          <td>Never drop the polling. I'd tune its frequency (aggressive for in-flight payments, lazy for terminal ones), not remove it.</td>
+        </tr>
+        <tr>
+          <td><strong>Tokenization</strong> (never store PANs)</td>
+          <td>Store cards ourselves, encrypted</td>
+          <td>Collapses PCI scope from the whole estate to almost nothing. Nobody who has been through a PCI audit would choose otherwise.</td>
+          <td>Only if you <em>are</em> the payment processor — in which case PCI Level 1 is your business model, not an inconvenience.</td>
+        </tr>
+        <tr>
+          <td><strong>Synchronous replication</strong> on the payment DB</td>
+          <td>Async replication (lower write latency)</td>
+          <td>A failover must not lose the record of money we took.</td>
+          <td>Async is right for the order-history replicas, and I'd use it there.</td>
+        </tr>
+        <tr>
+          <td><strong>Explicit <code>FOR UPDATE</code> / CHECK constraints</strong></td>
+          <td><code>SERIALIZABLE</code> everywhere</td>
+          <td>Predictable, no retry storms, contention is per-payment (i.e. zero).</td>
+          <td><code>SERIALIZABLE</code> on the ledger-posting path if the invariants get subtle — accepting that every caller must retry on 40001.</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="followups">13. Follow-ups you should expect</h2>
+
+    <h3>"How do you handle chargebacks and disputes?"</h3>
+    <p>
+      A chargeback is a customer telling <em>their bank</em> (not you) that a charge was wrong. The bank pulls the money
+      back, weeks or months later, <strong>without asking your permission</strong>, and charges you a dispute fee on top.
+      It is the one flow in the system where money leaves without you initiating it — and that single fact dictates the
+      design.
+    </p>
+    <ul>
+      <li>It arrives as an <strong>inbound webhook</strong> (<code>charge.dispute.created</code>). Everything from §9d
+        applies: verify, dedupe, apply conditionally.</li>
+      <li>It is a <strong>ledger transaction like any other</strong>: debit <code>revenue</code>, credit
+        <code>psp_clearing</code> for the amount, plus a second transaction for the dispute fee (debit
+        <code>dispute_fees</code>, credit <code>psp_clearing</code>). <strong>Nothing is deleted; the original sale
+        remains.</strong> This is the ledger model earning its keep for the fourth time.</li>
+      <li>The payment moves to <code>DISPUTED</code>. There's a <strong>representment</strong> window in which you can
+        contest it by submitting evidence (delivery confirmation, the customer's IP, the signed terms) — so you need a
+        case-management workflow and a place to store evidence. Model it, don't build it in the interview.</li>
+      <li>If you win, the money comes back — <strong>as another new transaction</strong>, never as a rewrite of the old
+        ones.</li>
+      <li>The senior note: <strong>a high chargeback rate gets you thrown off the card networks.</strong> Above roughly
+        1% you enter a monitoring programme; sustained, you lose the ability to accept cards at all. That makes fraud
+        prevention a business-survival concern rather than a cost-optimisation one, and knowing that is a business-domain
+        signal fintech interviewers notice.</li>
+    </ul>
+
+    <h3>"What about multiple currencies?"</h3>
+    <p>
+      Two rules, and the second is the one that gets you hired.
+    </p>
+    <ul>
+      <li><strong>An account has exactly one currency.</strong> You never mix currencies within an account, and a ledger
+        transaction's entries must all be in the same currency — otherwise "sums to zero" is meaningless. A conversion is
+        <em>two</em> transactions plus an FX position account: debit the USD account, credit the EUR account, and book the
+        spread as revenue or loss.</li>
+      <li><strong>Store the FX rate you actually used, at the time you used it — and never re-derive it.</strong> Put
+        <code>fx_rate</code> and <code>fx_rate_at</code> (and the source) on the transaction. If you re-fetch today's rate
+        to explain a conversion from March, you will get a different number, your books won't balance, and you will have
+        no way to prove what happened. <strong>This is the same rule as copying <code>unit_price_cents</code> onto the
+        order line (§5): a financial fact is captured when it becomes true and is never recomputed.</strong> Say it that
+        way — spotting that two different-looking requirements are the same principle is exactly what "judgment" means.</li>
+      <li>And the minor-unit trap from §7d: JPY has zero decimal places, KWD has three. No hardcoded <code>/100</code>.</li>
+    </ul>
+
+    <h3>"Where does fraud detection go?"</h3>
+    <ul>
+      <li><strong>An async scoring step in the saga that can hold the order</strong> — not a synchronous gate on checkout.
+        The order goes to <code>UNDER_REVIEW</code>; the saga pauses; a scoring service (rules + a model) returns a score;
+        the saga resumes to <code>CONFIRMED</code> or compensates to <code>CANCELLED</code>.</li>
+      <li>This is exactly why <strong>authorize-then-capture</strong> is such a gift: fraud review happens in the window
+        when the money is only <em>held</em>. A fraud rejection voids the authorization for free. If you'd captured at
+        checkout, every fraud rejection would be a refund — visible to the customer, fee-incurring, and slow.</li>
+      <li>Keep a small set of <strong>synchronous</strong> hard blocks (velocity checks: this card has been tried 40 times
+        in 5 minutes; this device has 12 accounts) — they must be fast, so Redis counters, same shape as the rate limiter
+        in 09. The expensive model scoring goes async.</li>
+      <li>The trade-off, stated: <strong>false positives cost you a real customer; false negatives cost you a chargeback
+        plus a fee plus network standing.</strong> The threshold is a business decision, and you should say that rather
+        than pretending it's an engineering one.</li>
+    </ul>
+
+    <h3>"How do you reduce PCI scope?"</h3>
+    <ul>
+      <li><strong>Tokenization.</strong> The card is collected by the PSP's iframe or SDK <em>in the customer's browser</em>
+        and posted directly to the PSP. Your server receives <code>pm_1Ab2C3d4E5</code>. A PAN never touches your network,
+        your logs, your database, or your backups.</li>
+      <li>This takes you from PCI-DSS SAQ-D (hundreds of controls, an annual QSA audit, network segmentation, key rotation
+        — an entire compliance function) to <strong>SAQ-A</strong> (a short self-assessment). It is the single largest
+        engineering-effort reduction available in payments and it is one architectural decision.</li>
+      <li>Watch the leaks: don't log request bodies indiscriminately on payment endpoints; scrub PANs at the log pipeline
+        as a belt-and-braces measure; and remember that a card number pasted into a support ticket puts your ticketing
+        system in scope. <strong>PCI scope is contagious</strong> — it spreads to every system a PAN touches, which is why
+        the winning move is to make sure it touches none.</li>
+    </ul>
+
+    <h3>"GDPR says delete the user's data. Your ledger is immutable. Which wins?"</h3>
+    <p>
+      This is a genuinely good question, it is a real tension, and interviewers ask it to see whether you'll pretend it
+      isn't. Do not hand-wave it.
+    </p>
+    <ul>
+      <li><strong>You delete the PII. You keep the financial record.</strong> That's the answer, and it is not a
+        compromise — it's what the law actually says. GDPR's right to erasure has an explicit exemption for data that must
+        be retained to comply with a <em>legal obligation</em>, and financial and tax records carry statutory retention
+        periods (commonly 7 years). You cannot delete a transaction record because a customer asked you to; a tax
+        authority also has a claim on it.</li>
+      <li><strong>Architecturally: separate PII from financial facts.</strong> The ledger references an
+        <code>account_id</code>, not a name, an email, or an address. Those live in a customer service that <em>can</em> be
+        redacted. Erasure means the customer record is anonymised and the ledger keeps referring to an account whose owner
+        is now unnamed. The money still balances; the person is gone.</li>
+      <li><strong>Crypto-shredding</strong> is the elegant version, and worth naming: encrypt each customer's PII with a
+        per-customer key, and "delete" by destroying the key. The ciphertext remains in immutable storage and backups —
+        which you couldn't have rewritten anyway — and is now permanently unreadable.</li>
+      <li>Say this: <em>"These two requirements are genuinely in tension, and the honest answer is that neither wins
+        entirely — I delete the PII and keep the financial record, because the financial record is legally required to be
+        retained. Which means the architecture has to separate them from day one: the ledger must never contain a name.
+        Retrofitting that separation into a ledger that embedded customer data is extremely painful, so this is a
+        day-one decision."</em></li>
+    </ul>
+
+    <h3>"Can you guarantee exactly-once?"</h3>
+    <p>
+      This is a bait question and 05 §9 gives you the answer. Do not answer the question as asked.
+    </p>
+    <p>
+      <em>"Exactly-once <strong>delivery</strong> doesn't exist — the sender can never distinguish a lost message from a
+      lost acknowledgement, so it either retries and risks a duplicate or doesn't and risks a loss. What I build is
+      exactly-once <strong>processing</strong>: at-least-once delivery plus idempotent handlers that dedupe on an event ID
+      or an idempotency key <em>in the same transaction as the side effect</em>. In this system that's the
+      <code>idempotency_keys</code> table on the API, the <code>processed_webhooks</code> table on the PSP callbacks, the
+      <code>event_id</code> dedup on Kafka consumers, and the unique <code>idem_key</code> on ledger transactions. The
+      customer's card is charged exactly once — not because the network is reliable, but because the fourth duplicate
+      hits a primary key constraint and does nothing."</em>
+    </p>
+
+    <h3>"What if the payment provider is down?"</h3>
+    <ul>
+      <li><strong>Circuit breaker</strong> (06) — fail fast rather than exhausting your thread pool waiting on a dead
+        dependency. A slow dependency takes down more systems than a dead one.</li>
+      <li><strong>Never retry a timed-out capture blindly</strong> without the idempotency key — that's the double-charge.
+        With the key, retry freely; it costs nothing.</li>
+      <li>For <strong>authorizations</strong>, you have a real choice: fail the checkout ("please try again"), or accept
+        the order into <code>PENDING_PAYMENT</code> and retry the authorization asynchronously. The second is better UX
+        and it is exactly what the saga already supports — the order exists, the saga is at
+        <code>AUTHORIZE_PAYMENT</code>, the sweeper retries with backoff. <strong>You get provider-outage tolerance for
+        free from a design you built for correctness.</strong></li>
+      <li><strong>A second PSP</strong> with failover routing is the real answer at scale — and it is expensive, because
+        you now maintain two integrations, two reconciliation pipelines and two sets of webhook quirks. Name that cost;
+        it's the reason most companies don't do it until they've been burned.</li>
+      <li><strong>And do not, under any circumstances, "queue the charge and process it later" while telling the customer
+        they've paid.</strong> You don't know that the card will authorize. You've just promised a customer something the
+        bank hasn't agreed to. Tell them the order is <em>pending</em>, and mean it.</li>
+    </ul>
+
+    <h3>"How does this relate to the order-management service you built?"</h3>
+    <p>
+      Have this ready, because at 7 YOE the interviewer <em>wants</em> to connect the design to something you've actually
+      shipped, and the honest version of the answer is more impressive than a fabricated one:
+    </p>
+    <p>
+      <em>"The Spring Boot and Postgres order service I built has the same spine — orders, order items, a status state
+      machine, and payment integration. What a system at this scale adds is everything that happens when things go wrong:
+      an idempotency-key table so retries can't double-charge, an outbox so a crash between the commit and the publish
+      can't lose an order, a saga orchestrator with real compensations and a sweeper, and a double-entry ledger so that
+      what we <strong>believe</strong> about the money is reconstructible and checkable against what the provider
+      <strong>says</strong> about the money. The happy path is the part I already had. The design is all in the
+      failures."</em>
+    </p>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="qa">Interview Q&amp;A</h2>
+
+    <details class="qa">
+      <summary>"Why not just store a balance column and update it? It's simpler."</summary>
+      <div class="answer">
+        <p>
+          It's simpler right up to the point where it's wrong, and it's wrong in three independent ways.
+        </p>
+        <p>
+          <strong>It destroys the audit trail.</strong> The column says <code>$412.00</code> and there is nothing in the
+          database that explains why. You cannot answer "what was this balance last Tuesday," you cannot investigate when
+          finance says the number is wrong, and you cannot show an auditor how it got there. In a system whose entire
+          purpose is being provably correct about money, that is disqualifying on its own.
+        </p>
+        <p>
+          <strong>It creates a lost-update race.</strong> Any balance check in front of the update is check-then-act: two
+          concurrent operations both read the old value, both validate, both write. To fix it you need
+          <code>SELECT … FOR UPDATE</code>, which serialises every operation on that account behind one row lock — and the
+          accounts you most care about (revenue, PSP clearing, a big merchant) are touched by <em>every transaction in the
+          system</em>.
+        </p>
+        <p>
+          <strong>It lets money be created and destroyed.</strong> Nothing in the schema says the debit and the credit
+          must agree. One <code>UPDATE</code> commits, the other throws, and you have invented currency — with no
+          constraint to stop you and no query to detect it.
+        </p>
+        <p>
+          <strong>The alternative:</strong> an append-only double-entry ledger. Every transaction writes at least two
+          entries that sum to zero, so money is conserved by construction; the balance is derived as
+          <code>SUM(entries)</code>; and if summing gets slow, you add a snapshot as a <em>rebuildable cache</em>, never
+          as a source of truth. As a bonus, an append-only table has no hot row — inserts don't contend — so the design I
+          chose for auditability is also the one that scales.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"A customer clicks Pay twice, or the network times out and the client retries. How do you avoid double-charging?"</summary>
+      <div class="answer">
+        <p>
+          Start by conceding the thing everyone tries to design around: <strong>you cannot know, from the client side,
+          whether the first request went through.</strong> A lost request and a lost response are indistinguishable —
+          both are silence. So you can't <em>prevent</em> the duplicate; you can only make it <em>harmless</em>.
+        </p>
+        <p>
+          <strong>An idempotency key</strong>, exactly as Stripe does it. The client generates a UUID once per logical
+          intent — in a React checkout, when the form mounts, not when the fetch fires — and sends it as an
+          <code>Idempotency-Key</code> header. Every retry reuses it.
+        </p>
+        <p>
+          Server side, the critical detail is that <strong>you do not check-then-act</strong>, because two concurrent
+          duplicates would both check, both see nothing, and both charge. Instead the insert <em>is</em> the check:
+          <code>INSERT INTO idempotency_keys (key) VALUES (?) ON CONFLICT (key) DO NOTHING</code>. Exactly one caller can
+          win that row — the primary key constraint is an atomic, durable compare-and-swap I already have. The winner does
+          the work and stores the response <em>in the same transaction</em> as the business write. The loser reads the
+          stored response and replays it — including replaying an original <code>402 card_declined</code>, because a retry
+          must not get a second bite at the card.
+        </p>
+        <p>
+          And <strong>pass an idempotency key downstream to the PSP too</strong>. Idempotency is a chain; it's only as
+          strong as its weakest hop. If I crash after calling Stripe but before my transaction commits, the downstream key
+          — derived from the client's key — is what stops the retry from creating a second authorization.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"Walk me through what happens when the payment succeeds but the inventory reservation fails."</summary>
+      <div class="answer">
+        <p>
+          First, note that in my saga this <em>shouldn't</em> happen, because I deliberately ordered the steps to reserve
+          inventory <em>before</em> touching payment — the cheapest-to-compensate steps go first. Being able to say "my
+          step ordering was chosen to make this failure rare" is a better answer than handling it gracefully.
+        </p>
+        <p>
+          But suppose it does: the warehouse discovers the last unit is damaged after we authorized. The saga enters
+          <code>COMPENSATING</code> and unwinds in reverse order — void the authorization (free, invisible on the
+          customer's statement, no fee), release any inventory hold, cancel the order, and notify the customer.
+        </p>
+        <p>
+          <strong>This is precisely why I authorize at checkout and capture at shipment.</strong> In that window the money
+          is only <em>held</em>, so the compensation is a free void. If I'd captured at checkout, this compensation would
+          be a <strong>refund</strong> — and a refund is not a rollback. It's a new forward transaction: the charge stays
+          on the customer's statement, the refund appears beside it, we've paid the processing fee on both, and the
+          customer is annoyed. <strong>You cannot un-charge a card. You can only refund it.</strong>
+        </p>
+        <p>
+          And the part people skip: <strong>the compensation itself can fail.</strong> The void times out; the PSP is
+          down. So compensations are idempotent (derived keys — <code>void:{paymentId}</code>) and retried with
+          exponential backoff and jitter. If they still fail after N attempts, the saga row moves to
+          <code>COMPENSATION_FAILED</code>, it goes to a dead-letter queue and a break queue, an alert fires with the
+          amount at risk, and <strong>a human resolves it in an ops console with a full audit trail of what the system
+          already tried.</strong> Every real payment system has that path. A design without one is a design that hasn't
+          met production.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"Why a saga and not 2PC?"</summary>
+      <div class="answer">
+        <p>
+          The decisive reason is structural, not performance: <strong>Stripe will not join my XA transaction.</strong>
+          There is no <code>prepare()</code> on a third-party payment API. The moment a participant in my transaction is a
+          company I don't control, 2PC is not a choice I'm making — it's an option that doesn't exist.
+        </p>
+        <p>
+          The secondary reason is 2PC's failure mode. It's a <em>blocking</em> protocol: if the coordinator dies between
+          "everyone voted yes" and "everyone commit," every participant sits there holding locks indefinitely — it can't
+          commit (it doesn't know the decision) and it can't abort (it already promised). Under load, every other
+          transaction touching those rows queues behind them, so a coordinator failure becomes a cascading outage rather
+          than a stalled order.
+        </p>
+        <p>
+          But I'd be careful not to sneer at 2PC, because it is alive and well: two in-house XA datasources in one
+          datacenter, driven by Spring's <code>JtaTransactionManager</code>, at modest volume, is a real and correct
+          pattern — you'll find it in core banking. It's the cross-vendor, over-the-internet version that's impossible.
+          What a saga costs me in exchange is real: no isolation, so intermediate states are visible to users (hence the
+          explicit <code>PENDING_PAYMENT</code> status), and every compensation is code <em>I</em> have to write and test.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"The payment provider's webhook says the payment succeeded. Do you trust it?"</summary>
+      <div class="answer">
+        <p>
+          <strong>I treat a webhook as a hint, never as a source of truth.</strong> Four things are true about webhooks
+          and each one demands a defence:
+        </p>
+        <p>
+          <strong>They arrive twice.</strong> The provider retries whenever your 200 is slow or lost. So I dedupe on
+          <em>their</em> event ID — <code>INSERT INTO processed_webhooks (psp_event_id) ON CONFLICT DO NOTHING</code>, in
+          the same transaction as the side effect. Zero rows inserted means I've handled it; return 200 and do nothing.
+        </p>
+        <p>
+          <strong>They arrive out of order.</strong> <code>payment.captured</code> can genuinely land before
+          <code>payment.authorized</code>. So I never write state blindly from a webhook — every transition is conditional
+          (<code>UPDATE … WHERE status = 'AUTHORIZED'</code>), and an out-of-order event is simply a no-op that affects
+          zero rows.
+        </p>
+        <p>
+          <strong>They are forgeable.</strong> That endpoint is a public URL that accepts POSTs saying "this payment
+          succeeded." I verify the HMAC signature against the <em>raw request bytes</em> before parsing anything, and
+          reject stale timestamps to prevent replay.
+        </p>
+        <p>
+          <strong>And sometimes they never arrive at all.</strong> This is the one that matters most and the one
+          candidates omit. <strong>I always also poll.</strong> A reconciliation job re-queries the provider for anything
+          stuck in a non-terminal state past a threshold. If my correctness depends on a webhook arriving, then my
+          correctness depends on someone else's retry logic — and that is not a bet I'll make with money.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"What's the difference between authorize and capture, and why do you care?"</summary>
+      <div class="answer">
+        <p>
+          <strong>Authorize</strong> asks the issuing bank to reserve the funds and reduce the customer's available
+          credit. No money moves. It's a promise, and it expires — typically after about 7 days. <strong>This is why a
+          charge shows as "pending" on your statement for a few days and then changes.</strong>
+        </p>
+        <p>
+          <strong>Capture</strong> is when the money actually moves. You capture at shipment. In many jurisdictions you're
+          not permitted to take payment for physical goods before you dispatch them.
+        </p>
+        <p>
+          Why I care, in design terms: <strong>an authorization can be voided for free and leaves no trace; a capture can
+          only be refunded — visibly, with fees, and irreversibly.</strong> So the authorize/capture split is really a
+          saga design that the card networks handed me. By capturing late, I arrange for the entire window in which things
+          are most likely to go wrong — out of stock, bad address, fraud review — to be a window in which the money hasn't
+          moved yet and my compensation is a free void. It's also what makes async fraud scoring viable: the score can
+          take thirty seconds because nobody has been charged yet.
+        </p>
+        <p>
+          One more consequence for the schema: you can capture <em>less</em> than you authorized (you shipped 2 of 3
+          items) but not more — which is exactly the <code>CHECK (captured_cents &lt;= amount_cents)</code> constraint in
+          my payments table. And critically, <strong>an authorization writes no ledger entry</strong>, because no money has
+          moved. Posting to the ledger at authorize time silently inflates revenue by the value of every authorization
+          that's never captured.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"Why not use Cassandra? It scales better."</summary>
+      <div class="answer">
+        <p>
+          It does scale better, and that's the one thing this system doesn't need. Peak here is around a thousand
+          transactions per second — a single well-tuned Postgres handles that comfortably. <strong>I'd be trading away
+          every mechanism that makes the design correct in exchange for headroom on an axis I'm nowhere near
+          saturating.</strong>
+        </p>
+        <p>
+          Concretely, what I'd lose: multi-row ACID transactions (the payment row, the ledger entries and the outbox row
+          <em>must</em> commit atomically — without that, I have the dual-write problem inside my own database); five
+          unique constraints that are individually preventing a duplicate charge; check constraints enforcing
+          <code>refunded_cents &lt;= captured_cents</code>; and ad-hoc SQL for reconciliation, which asks new questions
+          every time finance finds something odd.
+        </p>
+        <p>
+          <strong>The invariants are the design.</strong> Picking an eventually-consistent store for a ledger means
+          reimplementing ACID in application code, badly, and discovering the bugs in production with real customers'
+          money. And if I ever genuinely outgrow one Postgres, my answer is to <strong>shard Postgres by account</strong>
+          and keep the transactions — not to switch to a database that can't do them.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"Two partial refunds are issued at the same moment. What stops you over-refunding?"</summary>
+      <div class="answer">
+        <p>
+          This is a <strong>write skew</strong>, and it's the classic Postgres <code>READ COMMITTED</code> trap. Both
+          transactions run <code>SELECT SUM(amount) FROM refunds WHERE payment_id = ?</code>, both get 8000 out of a
+          10000 capture, both conclude that another 1500 is fine, and both insert. Neither ever sees the other, because
+          there is no row to lock — <em>the row that would conflict doesn't exist yet.</em> Total refunded: 11000 on a
+          10000 capture. Both transactions individually obeyed the rule; together they broke it.
+        </p>
+        <p>
+          Three fixes, and I'd name all three:
+        </p>
+        <p>
+          <strong>1. An explicit row lock</strong> — <code>SELECT … FROM payments WHERE id = ? FOR UPDATE</code> before
+          validating. Both refunds now queue on the payment row, so the second one sees the first one's total. This is my
+          default, and it's cheap precisely because the contention is per-payment: nobody else in the world is refunding
+          <em>this</em> payment.
+        </p>
+        <p>
+          <strong>2. A denormalized counter plus a constraint</strong> — <code>UPDATE payments SET refunded_cents =
+          refunded_cents + ?</code> takes the row lock implicitly, and <code>CHECK (refunded_cents &lt;=
+          captured_cents)</code> makes the database itself reject the over-refund. This is what my schema does. Note it's
+          not a mutable balance in the bad sense: the refunds table is still the source of truth, and the counter is a
+          derived cache with a hard constraint.
+        </p>
+        <p>
+          <strong>3. <code>SERIALIZABLE</code></strong> — Postgres's SSI detects the dependency cycle and aborts one
+          transaction with a 40001, which every caller must then retry.
+        </p>
+        <p>
+          The general principle, which is what actually transfers: <strong>anywhere I read a value, make a decision, and
+          write based on it, <code>READ COMMITTED</code> is not enough.</strong> Push the invariant into the database — a
+          lock, a constraint, or a conditional update — and never validate in application code and assume it holds.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"What is reconciliation and why does it need to exist if your code is correct?"</summary>
+      <div class="answer">
+        <p>
+          Because <em>"if your code is correct"</em> is doing all the work in that sentence, and no payments engineer has
+          ever believed it about their own system.
+        </p>
+        <p>
+          Reconciliation is a job that periodically re-derives our balances <strong>from the ledger entries</strong> —
+          never from a cached balance, since the whole point is to catch a wrong cached balance — and compares them, line
+          by line, against the provider's settlement report. Every mismatch produces a break record that a human
+          investigates.
+        </p>
+        <p>
+          Three break types, three different bugs. <strong>MISSING</strong> (we have it, they don't) is usually a capture
+          we <em>think</em> succeeded but whose call actually failed. <strong>ORPHAN</strong> (they have it, we don't) is
+          the worst: a customer's card was charged and we have no record — money we took and can't account for, typically
+          caused by someone trusting a timeout. <strong>AMOUNT</strong> mismatches are a differing fee, an FX rate applied
+          differently, or a genuine float bug.
+        </p>
+        <p>
+          And the discipline that makes it worth anything: <strong>I never auto-correct a break and I never write off a
+          discrepancy as a rounding error.</strong> A three-cent gap is not "close enough" — either I know why it's three
+          cents, or my ledger is wrong and the size of the error is a coincidence. A system that quietly absorbs small
+          differences is a system that will quietly absorb a large one, and everyone who has worked in payments has
+          watched somebody raise a tolerance threshold to make an alarm stop firing.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"How would you store the amount? Show me the type."</summary>
+      <div class="answer">
+        <p>
+          <code>BIGINT amount_cents</code> in Postgres; <code>long</code> in Java. Integer minor units. Exactly what
+          Stripe's API does — <code>"amount": 4998</code>.
+        </p>
+        <p>
+          <strong>Never a <code>float</code> or a <code>double</code>.</strong> IEEE-754 binary floating point cannot
+          exactly represent <code>0.1</code>, any more than decimal can exactly represent one third. In Java,
+          <code>0.1 + 0.2</code> is <code>0.30000000000000004</code>, and <code>1.03 - 0.42</code> prints
+          <code>0.6100000000000001</code>. Accumulate that across millions of ledger entries and the books stop balancing
+          — by an amount too small to notice and too large to ignore, in a system whose entire purpose is that the books
+          balance. A float rounding error in a ledger is a career-defining bug.
+        </p>
+        <p>
+          The acceptable alternative is an exact decimal type — <code>BigDecimal</code> / <code>NUMERIC(19,4)</code> —
+          which I'd reach for the moment I need sub-cent precision: FX conversion, interest accrual, per-unit pricing.
+          It's slower and you must set the <code>RoundingMode</code> explicitly, but it's exact.
+        </p>
+        <p>
+          And a detail that shows you've handled real money: <strong>minor units aren't always 100.</strong> The Japanese
+          yen has zero decimal places, the Kuwaiti dinar has three. If I go multi-currency I look up the ISO 4217 exponent
+          rather than hardcoding a divide-by-100.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"GDPR requires you to delete a customer's data. Your ledger is immutable. Which wins?"</summary>
+      <div class="answer">
+        <p>
+          They're genuinely in tension and I wouldn't pretend otherwise. The honest answer is that <strong>neither wins
+          entirely: I delete the PII and I keep the financial record.</strong>
+        </p>
+        <p>
+          That's not a compromise I invented — it's what the law says. GDPR's right to erasure has an explicit exemption
+          for data retained to comply with a legal obligation, and financial and tax records carry statutory retention
+          periods, commonly seven years. I cannot delete a transaction record because a customer asked me to; a tax
+          authority has a claim on it too.
+        </p>
+        <p>
+          <strong>Architecturally that has to be a day-one decision.</strong> The ledger references an
+          <code>account_id</code> — never a name, an email or an address. PII lives in a customer service that <em>can</em>
+          be redacted. Erasure anonymises the customer record; the ledger keeps referring to an account whose owner is now
+          unnamed. The money still balances; the person is gone. Retrofitting that separation into a ledger that embedded
+          customer data is extremely painful, which is exactly why it's a day-one decision and not a compliance
+          afterthought.
+        </p>
+        <p>
+          The elegant version is <strong>crypto-shredding</strong>: encrypt each customer's PII under a per-customer key
+          and "delete" by destroying the key. The ciphertext survives in immutable storage and in backups — which you
+          could never have rewritten anyway — and is now permanently unreadable.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"Can you guarantee exactly-once processing of a payment?"</summary>
+      <div class="answer">
+        <p>
+          Not as asked — and refusing the question is the answer.
+        </p>
+        <p>
+          <strong>Exactly-once <em>delivery</em> doesn't exist.</strong> A sender that gets no acknowledgement cannot
+          distinguish a lost message from a lost ack. It has exactly two options: retry, and risk a duplicate
+          (at-least-once), or don't, and risk a loss (at-most-once). There is no third option and no amount of
+          acknowledgement fixes it — that's the Two Generals problem, and it's turtles all the way down.
+        </p>
+        <p>
+          <strong>Exactly-once <em>processing</em> is achievable</strong>, because I control the receiver. At-least-once
+          delivery plus idempotent handlers that dedupe <em>in the same transaction as the side effect</em>. In this
+          system that's four separate mechanisms: the <code>idempotency_keys</code> table on the API, the
+          <code>processed_webhooks</code> table on PSP callbacks, <code>event_id</code> dedup on Kafka consumers, and the
+          unique <code>idem_key</code> on ledger transactions.
+        </p>
+        <p>
+          So the customer's card is charged exactly once — <strong>not because the network is reliable, but because the
+          fourth duplicate hits a primary key constraint and does nothing.</strong> And I'd add the precise note about
+          Kafka: its exactly-once semantics are real, but they only hold <em>inside Kafka</em>. The moment my consumer
+          calls Stripe, I'm outside that transaction and back to needing my own idempotency.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"You have 10 minutes left and the interviewer says 'now make it handle 10× the traffic.' What do you do?"</summary>
+      <div class="answer">
+        <p>
+          I'd start by pushing back gently, because the honest answer is more impressive than the eager one:
+          <strong>10× of 1,000 TPS is 10,000 TPS, and that is still not a scale problem for a single Postgres on decent
+          hardware.</strong> The first things that break are the read path and the ledger's table size, not the write
+          throughput.
+        </p>
+        <p>
+          So in order: <strong>(1)</strong> read replicas plus a cache on terminal-state orders — those are immutable, so
+          they cache forever with no invalidation problem. <strong>(2)</strong> Partition the ledger by month and add
+          balance snapshots so a balance query sums a bounded suffix rather than the whole history. <strong>(3)</strong>
+          Reap the outbox, or it takes down the database it was protecting. <strong>(4)</strong> A circuit breaker on the
+          PSP, which at that volume is my real availability ceiling, not my database.
+        </p>
+        <p>
+          <strong>Only then</strong> would I shard the write path — <strong>by <code>account_id</code>, not by
+          <code>order_id</code></strong>, so that both sides of a ledger transaction usually live on the same shard and
+          keep real ACID. Cross-shard transactions fall back to a saga with a clearing account absorbing the temporary
+          imbalance, which is exactly how the real banking system works.
+        </p>
+        <p>
+          And the punchline I'd want to land: <strong>the hot-account problem is already half-solved by the ledger
+          design.</strong> Every transaction touches the same few internal accounts, but because there is no mutable
+          balance column, there is no hot <em>row</em> — every entry is an append, and appends don't contend. If I'd
+          stored balances, every payment in the company would be queuing behind one row lock. The choice I made for
+          auditability turned out to be the one that scales.
+        </p>
+      </div>
+    </details>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="takeaways">What to remember</h2>
+
+    <p>
+      If you revise one page in this phase the night before a fintech loop, revise this one. And if you remember one
+      sentence from it, remember the first.
+    </p>
+
+    <ul>
+      <li><strong>In every other system design, a lost update is a bug. Here it is a financial loss and possibly a
+        regulatory event.</strong> Everything follows from that. You design for auditability and correctness first, and
+        only then for scale. The candidate who leads with "let's shard for scale" has already failed this round.</li>
+
+      <li><strong>"It is better to be down than to be wrong."</strong> Correctness over availability, said out loud, in
+        the first two minutes. It inverts the instinct every other system design round trains into you, and it is the
+        single best thing you can say in this interview. CP on the money path, AP on the read path — split the CAP answer
+        by <em>path</em>, not by system.</li>
+
+      <li><strong>Scale is not the hard part. Correctness is — and say so.</strong> A thousand TPS is a large payments
+        business and a trivial database workload. The number that actually drives the design is <em>storage that only
+        grows</em>, because the ledger is retained forever and you never delete.</li>
+
+      <li><strong>Never store a mutable balance column.</strong> A balance is a derived value — the sum of an immutable,
+        append-only sequence of entries. Storing and mutating it destroys the audit trail and creates a lost-update race
+        for nothing. Snapshots are allowed <em>as a rebuildable cache</em>, never as a source of truth.</li>
+
+      <li><strong>Double-entry: every transaction writes at least two entries that sum to zero.</strong> Money is never
+        created or destroyed, only moved. <code>SUM(amount) = 0</code> is an invariant you can check with a query, so
+        assert it continuously and alarm when it breaks. Walk the $100-purchase-with-a-$3-fee example on the whiteboard;
+        it takes ninety seconds and proves more than ten minutes of talking.</li>
+
+      <li><strong>Money is never a float.</strong> Integer minor units (<code>BIGINT</code> cents) or an exact decimal
+        (<code>NUMERIC</code>/<code>BigDecimal</code>). Never <code>double</code>. A float rounding error in a ledger is a
+        career-defining bug, and some interviewers plant one in a schema to see if you catch it.</li>
+
+      <li><strong>You cannot roll back a captured payment. You can only refund it — and a refund is a new forward
+        transaction, not an undo.</strong> That distinction is the entire point of compensation-based transactions. It's
+        why you order the saga to put irreversible steps last, and why you authorize at checkout but capture at shipment:
+        most failures then compensate with a free void instead of a costly, visible refund.</li>
+
+      <li><strong>Compensations fail too — say what happens.</strong> Idempotent retry with backoff and jitter, then a
+        dead-letter queue, then a break record, then <em>a human with a console and an audit trail</em>. Pretending
+        compensation always succeeds is a junior tell. Say the word "human" out loud.</li>
+
+      <li><strong>Orchestration, not choreography, for money.</strong> You want one place that knows the state of the
+        world and can be queried. "Why is order 12345 stuck?" should be a <code>SELECT</code>, not a research project
+        across five codebases.</li>
+
+      <li><strong>The outbox is mandatory here, not an optimization.</strong> A dual write silently drops events; in this
+        system a dropped event is an unpaid order or a card charged for an order that doesn't exist. State change and
+        event go into one local transaction; a relay publishes at-least-once; consumers dedupe.</li>
+
+      <li><strong>The idempotency key is what makes a retry safe, because you cannot know from the client side whether
+        the payment went through.</strong> Client-generated, once per intent, stable across retries — exactly as Stripe
+        does it. The <code>INSERT … ON CONFLICT DO NOTHING</code> <em>is</em> the check; never check-then-act. Store and
+        replay the original response, success <em>or</em> failure. And pass a key downstream — idempotency is a chain.</li>
+
+      <li><strong>Webhooks are a hint, never a source of truth.</strong> They arrive twice, arrive out of order, and
+        sometimes never arrive. Verify the signature against the raw body, dedupe on the provider's event ID, use
+        conditional state transitions, return a fast 200 and process asynchronously — <strong>and always also poll.</strong>
+        This is the detail that separates people who have shipped payments from people who have read about them.</li>
+
+      <li><strong>Reconciliation is a first-class component, not a cron someone added later.</strong> Re-derive balances
+        from the entries, compare to the provider's settlement report, and raise a break on every mismatch. Never
+        auto-correct. Never write off a discrepancy as a rounding error — a system that quietly absorbs small differences
+        will quietly absorb a large one.</li>
+
+      <li><strong>Postgres, because the invariants are the design.</strong> Multi-row transactions, five unique
+        constraints, two check constraints, ad-hoc reconciliation queries. Cassandra buys throughput you don't need and
+        removes the primitives you're built on. If you outgrow one primary, shard Postgres by <em>account</em> and keep
+        the transactions.</li>
+
+      <li><strong><code>READ COMMITTED</code> is not enough for read-then-decide.</strong> Two partial refunds can each
+        pass their own check and jointly over-refund — that's write skew. Take a <code>FOR UPDATE</code> lock on the
+        aggregate root, or push the invariant into a <code>CHECK</code> constraint, or run <code>SERIALIZABLE</code> and
+        retry on 40001. Never validate in application code and assume it holds.</li>
+
+      <li><strong>PCI: never store raw card numbers. Tokenize.</strong> The card goes from the browser straight to the
+        PSP; you hold an opaque token. That single architectural decision collapses your compliance scope from SAQ-D to
+        SAQ-A. PCI scope is contagious — the winning move is that a PAN touches nothing you own.</li>
+
+      <li><strong>GDPR vs the immutable ledger is a real tension, and the honest answer wins.</strong> Delete the PII,
+        keep the financial record — which is what the law actually requires. Which means the ledger must reference an
+        <code>account_id</code> and never a name, from day one.</li>
+
+      <li><strong>Exactly-once delivery is a myth; exactly-once <em>processing</em> is achievable.</strong> The card is
+        charged once not because the network is reliable, but because the fourth duplicate hits a primary key constraint
+        and does nothing.</li>
+
+      <li><strong>The recurring move, arriving from four directions on this page: push the invariant down into something
+        that can enforce it atomically.</strong> A unique constraint, a check constraint, a conditional update, a row
+        lock. Not a distributed lock. Not application-layer validation. That is the archetype — and it is the same answer
+        you'll give in <a href="14-ticket-booking.html">14</a> when they ask you not to oversell a seat.</li>
+    </ul>
+
+    <div class="senior">One last calibration. Everything on this page is in service of a single impression you are trying
+    to leave in the room: <strong>that you are someone who can be trusted with a system where being wrong costs
+    money.</strong> Not someone who knows the most patterns. Someone who knows which failures are recoverable and which
+    are not, who says "a human looks at it" without embarrassment, who refuses to round away a three-cent discrepancy,
+    and who would rather be briefly down than briefly wrong. That's the hire. Everything else is decoration.</div>
+  </section>
+
+  <nav class="page-nav">
+    <a href="12-notifications-scheduler.html">← 12 — Notifications &amp; Scheduler</a>
+    <a href="14-ticket-booking.html">14 — Design Ticket Booking →</a>
+  </nav>
+
+</main>
+</body>
+</html>

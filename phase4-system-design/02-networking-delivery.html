@@ -1,0 +1,1093 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 — Networking &amp; Delivery | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <div class="breadcrumb"><a href="index.html">← Course Home</a></div>
+    <h1>02 — Networking &amp; Delivery</h1>
+    <p>Everything between the user's finger and your first line of application code — and how to explain it under pressure.</p>
+  </div>
+</header>
+
+<main class="container">
+
+  <section>
+    <h2>Why this matters in the interview</h2>
+    <p>
+      You already know most of this page. Seven years of frontend work means you have <em>operated</em> every box in it:
+      you've watched a cold DNS lookup add 100ms to your Lighthouse trace, you've fought a CORS preflight at 11pm, you've
+      deleted your domain-sharding hack after moving to HTTP/2, you've purged a CDN because a stale <code>index.html</code>
+      was pinning users to a deleted JS chunk, you've opened a WebSocket and then discovered it doesn't reconnect. What you
+      have <em>not</em> had to do is stand at a whiteboard and say <em>why</em> any of it exists, in the right order, in
+      ninety seconds. That translation — working intuition into stated mechanism and trade-off — is the entire content of
+      this tutorial. The gap between you and a strong system design answer here is smaller than you think, and it closes
+      faster than any other topic in Phase 4.
+    </p>
+    <p>
+      It matters because networking is the <strong>connective tissue of every case study that follows</strong>. You cannot
+      design a chat system without defending WebSockets over SSE and then owning the connection-state problem that choice
+      creates. You cannot design video streaming without a CDN strategy. You cannot design any multi-region system without
+      knowing that a Mumbai→Virginia round trip costs ~150ms, which is the number that decides whether your protocol can be
+      chatty. Interviewers rarely ask "what is TCP" as a question — they ask it as an <em>ambush</em>, three levels into a
+      design, when you say "the client connects to the server" and they say "walk me through what actually happens there."
+      A 3-YOE candidate names the boxes. A 7-YOE candidate names the boxes, the round trips each one costs, and what he'd
+      remove if latency were the top-line requirement. Everything below is aimed at that second answer.
+    </p>
+  </section>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ul>
+      <li><a href="#path">1. The full request path</a> — the diagram everything else hangs off</li>
+      <li><a href="#dns">2. DNS</a> — resolution, TTL, and geo-routing (the part interviews actually want)</li>
+      <li><a href="#tcp">3. TCP vs UDP</a> — the handshake and what it costs you</li>
+      <li><a href="#tls">4. TLS</a> — handshake cost, termination, session resumption</li>
+      <li><a href="#http">5. HTTP/1.1 → HTTP/2 → HTTP/3</a> — head-of-line blocking, three times over</li>
+      <li><a href="#cdn">6. CDNs &amp; edge caching</a> — including for <em>dynamic</em> APIs</li>
+      <li><a href="#lb">7. Load balancers: L4 vs L7</a> — algorithms, health checks, failover</li>
+      <li><a href="#gateway">8. API gateway vs reverse proxy vs load balancer</a></li>
+      <li><a href="#realtime">9. Real-time: WebSockets vs SSE vs long polling</a></li>
+      <li><a href="#apistyle">10. REST vs gRPC vs GraphQL</a></li>
+      <li><a href="#latency">11. Latency numbers you must know cold</a></li>
+      <li><a href="#qa">Interview Q&amp;A</a></li>
+      <li><a href="#takeaways">What to remember</a></li>
+    </ul>
+  </div>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="path">1. The full request path</h2>
+    <p>
+      Before any individual box, hold the whole path in your head. Every question in this tutorial is "what does this hop
+      cost, what can it see, and what happens when it dies." Draw this from memory once and the rest of the page is
+      annotation.
+    </p>
+
+<pre><code>  Browser in Mumbai                                   your infra
+  ─────────────────                                   ──────────
+   1. DNS lookup ────▶ resolver ──▶ authoritative NS
+      (~20-120ms cold, ~0ms cached)   │
+                                      └─ returns nearest edge IP (GeoDNS)
+   2. TCP + TLS ─────▶ CDN edge PoP (Mumbai, ~10ms away)
+      (2-3 RTT, or 0-1 RTT resumed)   │
+                                      ├─ HIT  ──▶ respond from edge  ◀── done
+                                      │
+   3. MISS / dynamic ────────────────┘
+      edge ──▶ origin over a warm, pooled connection (~150ms to us-east-1)
+                 │
+                 ▼
+        ┌────────────────┐   L4/L7, TLS terminated here
+        │ Load balancer  │   health checks, sticky sessions
+        └───────┬────────┘
+                ▼
+        ┌────────────────┐   authN/authZ, rate limit, routing,
+        │  API gateway   │   request/response shaping
+        └───────┬────────┘
+                ▼
+        ┌────────────────┐  gRPC   ┌────────────────┐
+        │  Service A     │ ──────▶ │  Service B     │  (~0.5-1ms same-DC)
+        └───────┬────────┘         └────────────────┘
+                ▼
+         Cache (Redis) ──miss──▶ Database
+         (~1ms)                  (~5-20ms)
+</code></pre>
+
+    <p>
+      Two things to notice, because they're the ones interviewers reward. First, <strong>the expensive hops are at the
+      top</strong>: DNS, TCP, TLS and the cross-continent leg dominate, and none of them are your application code. Second,
+      <strong>every box after the CDN exists to be crossed as rarely as possible</strong> — the whole delivery stack is a
+      series of increasingly desperate attempts to answer the request before it reaches your database.
+    </p>
+
+    <div class="senior">The framing sentence for this entire topic: <em>"Before I talk about services, let me account for the request path — because at international scale the network is the latency budget, not the application. A cold connection from Mumbai to us-east-1 costs a DNS lookup plus a TCP handshake plus a TLS handshake before a single byte of my payload moves. That's why we terminate TLS at an edge PoP 10ms away and keep a warm pooled connection back to origin."</em> Say that in the first two minutes of a design and the interviewer recalibrates who they're talking to.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="dns">2. DNS</h2>
+
+    <p>
+      <strong>What it is.</strong> A distributed, cached, hierarchical lookup from a name to an IP address. You type
+      <code>api.example.com</code>; something must return <code>52.14.x.x</code> before a packet can move.
+    </p>
+    <p>
+      <strong>Why it exists.</strong> Obviously "humans can't remember IPs" — but that's the 3-YOE answer and it's not the
+      useful one. The system-design answer is: <strong>DNS is the last layer of indirection you control before the client's
+      packet leaves its ISP.</strong> It is the only place you can influence routing <em>before</em> the user has connected
+      to anything of yours. That makes it a load-balancing and failover mechanism, not just a phone book. That reframing is
+      the whole point of this section.
+    </p>
+
+    <h3>The resolution path</h3>
+<pre><code>  browser cache ──▶ OS cache ──▶ stub resolver
+        │                              │
+        │ (all misses fall through)    ▼
+        │                       recursive resolver (ISP / 8.8.8.8 / 1.1.1.1)
+        │                              │  ← THIS is where nearly all caching happens
+        │                              ├─▶ root NS      "who handles .com?"
+        │                              ├─▶ TLD NS       "who handles example.com?"
+        │                              └─▶ authoritative NS  "A record for api = 52.14.x.x"
+        ▼
+   IP address (cached for TTL seconds at every layer above)
+</code></pre>
+
+    <p>
+      Cold, that's up to four round trips and can cost 20–120ms. Warm, it's ~0ms — and it's warm the overwhelming majority
+      of the time, which is why DNS almost never shows up in your p50 but disproportionately shows up in your p99 and in
+      first-visit metrics. This is why <code>&lt;link rel="dns-prefetch"&gt;</code> and <code>preconnect</code> exist, and
+      you've shipped both.
+    </p>
+
+    <h3>TTL: the knob, and the trade-off</h3>
+    <p>
+      Every DNS record carries a TTL. Resolvers may cache the answer for that long. This is a pure, clean trade-off and
+      interviewers love it:
+    </p>
+    <table>
+      <thead><tr><th></th><th>Low TTL (30–60s)</th><th>High TTL (1–24h)</th></tr></thead>
+      <tbody>
+        <tr><td>Failover speed</td><td>Fast — you can move traffic off a dead region in ~a minute</td><td>Slow — stale clients keep hammering a dead IP for hours</td></tr>
+        <tr><td>Query volume</td><td>High — resolvers re-ask constantly; you pay for it and it's a DDoS surface</td><td>Low</td></tr>
+        <tr><td>Latency for users</td><td>More cold lookups → worse tail latency</td><td>Better</td></tr>
+        <tr><td>Use it for</td><td>Records you intend to <em>steer</em>: failover targets, blue/green cutovers, GeoDNS</td><td>Stable records: MX, static apex, anything you won't move</td></tr>
+      </tbody>
+    </table>
+
+    <div class="pitfall">TTL is a <em>hint</em>, not a contract. Plenty of resolvers, corporate middleboxes and JVMs (the JVM historically cached DNS <strong>forever</strong> by default — <code>networkaddress.cache.ttl</code>) ignore it. So <strong>never make DNS your only failover mechanism.</strong> The correct answer is layered: DNS steers users to a region; an anycast IP or a load balancer with health checks handles failures <em>inside</em> the region within seconds, without waiting for any client to re-resolve. Candidates who say "we'll just lower the TTL and repoint DNS" and stop there get pushed on it every time.</div>
+
+    <h3>The part interviews actually want: geo-routing</h3>
+    <p>
+      "A user in Mumbai should reach your Mumbai region, a user in Ohio should reach us-east-1." How? Three real mechanisms,
+      and you should be able to name all three and pick one.
+    </p>
+    <table>
+      <thead><tr><th>Mechanism</th><th>How it decides</th><th>Strengths</th><th>Weaknesses</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>GeoDNS</strong> (geolocation routing)</td>
+          <td>Authoritative NS returns a different A record depending on the <em>resolver's</em> IP (roughly, the user's geography)</td>
+          <td>Simple; works for any protocol; no client support needed</td>
+          <td>It sees the <em>resolver</em>, not the user — a user on a corporate VPN or 8.8.8.8 can be geolocated to the wrong continent. Geography ≠ latency.</td>
+        </tr>
+        <tr>
+          <td><strong>Latency-based routing</strong></td>
+          <td>Provider (Route 53, etc.) keeps measured latency tables from resolver networks to each of your regions; returns the lowest-latency region</td>
+          <td>Optimizes the thing you actually care about, not a proxy for it. Handles the case where the "nearest" region is nearest by map but not by fiber.</td>
+          <td>Still resolver-based; needs a provider that measures this; adds a control plane you don't own</td>
+        </tr>
+        <tr>
+          <td><strong>Anycast</strong> (BGP)</td>
+          <td>One IP announced from many PoPs; the <em>internet's own routing</em> takes the packet to the topologically nearest one</td>
+          <td>Failover in seconds without any DNS change or TTL wait. This is how CDNs and 1.1.1.1 work. Excellent DDoS absorption.</td>
+          <td>You need to run (or rent) network infrastructure. Long-lived TCP connections can theoretically break on a route flap — fine in practice, but know the caveat.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>
+      Two more DNS routing policies worth naming because they cost you one sentence each and sound fluent:
+      <strong>weighted routing</strong> (send 5% of traffic to the new stack — a canary deploy at the DNS layer) and
+      <strong>failover routing</strong> (health-check the primary; return the secondary's IP when it's down).
+    </p>
+
+    <div class="senior">The soundbite: <em>"For 'nearest region' I'd use latency-based DNS rather than pure GeoDNS, because geographic proximity is a bad proxy for network latency — and I'd back it with anycast at the edge so failover doesn't depend on TTL expiry. DNS steers, but health checks at the load balancer are what actually make failover fast."</em> That one answer covers geo-routing, TTL, and failover in three clauses.</div>
+
+    <div class="note">Real anchor you already know: your CDN's CNAME. When you point <code>www</code> at <code>d1234.cloudfront.net</code>, you're handing geo-routing to someone who does it better — their authoritative NS answers with the PoP nearest the resolver, and the PoP's IP is anycast on top of that. You have already deployed a two-layer geo-routing system. You just never had to say so.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="tcp">3. TCP vs UDP</h2>
+
+    <p>
+      <strong>What they are.</strong> Both are transport protocols on top of IP. TCP gives you a reliable, ordered byte
+      stream with congestion control. UDP gives you "here is a datagram, good luck." Everything else follows from that
+      sentence.
+    </p>
+    <p>
+      <strong>Why TCP exists.</strong> IP is allowed to drop, duplicate, and reorder packets. Almost every application
+      wants none of that, so rather than each app re-implementing reliability, TCP does it once: sequence numbers to
+      reorder, ACKs and retransmission to recover loss, a sliding window plus congestion control so you don't melt the
+      network. The price is <strong>state and round trips</strong>.
+    </p>
+
+    <h3>The handshake, and why it costs you a round trip</h3>
+<pre><code>  Client                                Server
+    │ ── SYN  (seq=x) ──────────────────▶ │   ┐
+    │ ◀───────────── SYN-ACK (seq=y,ack) │   │ 1 full RTT before you can send data
+    │ ── ACK  ──────────────────────────▶ │   ┘
+    │ ── GET /api/thing ────────────────▶ │   (data can ride with the final ACK in theory)
+</code></pre>
+    <p>
+      Three messages, but only <strong>one full round trip of waiting</strong> before the client may send application data.
+      Add TLS on top and you're at 2–3 RTTs. From Mumbai to Virginia at ~150ms per RTT that's <strong>300–450ms of pure
+      setup</strong> before your server sees the first byte. This single fact is why connection reuse, keep-alive,
+      connection pooling and edge termination all exist — and why you should say it out loud.
+    </p>
+    <p>
+      Two more TCP behaviours that show up as follow-ups:
+    </p>
+    <ul>
+      <li><strong>Slow start.</strong> A new TCP connection doesn't start at full speed — it ramps its congestion window. So a fresh connection is slow even after the handshake completes. Reused, warm connections are faster than new ones for two separate reasons.</li>
+      <li><strong>Head-of-line blocking at the transport layer.</strong> Because TCP guarantees <em>ordered</em> delivery, one lost segment stalls delivery of every byte behind it — even bytes for a totally unrelated stream sharing that connection. Remember this; it is the entire reason HTTP/3 exists, and we'll come back to it in §5.</li>
+    </ul>
+
+    <h3>When UDP is right</h3>
+    <p>
+      UDP is the right choice when <strong>a late packet is worth less than no packet</strong>. If your data is only
+      valuable if it's timely, TCP's "I will stall everything to redeliver that dropped frame from 400ms ago" is actively
+      harmful.
+    </p>
+    <table>
+      <thead><tr><th></th><th>TCP</th><th>UDP</th></tr></thead>
+      <tbody>
+        <tr><td>Connection</td><td>Handshake, connection state on both ends</td><td>Connectionless — fire and forget</td></tr>
+        <tr><td>Setup cost</td><td>1 RTT (+1–2 for TLS)</td><td>0 RTT</td></tr>
+        <tr><td>Reliability</td><td>Guaranteed delivery, retransmission</td><td>None. Packets may vanish silently.</td></tr>
+        <tr><td>Ordering</td><td>Guaranteed (and therefore head-of-line blocks)</td><td>None</td></tr>
+        <tr><td>Congestion control</td><td>Built in</td><td>You build it, or you don't (and you're a bad neighbour)</td></tr>
+        <tr><td>Header</td><td>20 bytes</td><td>8 bytes</td></tr>
+        <tr><td>Use it for</td><td>HTTP, DB connections, anything where correctness &gt; timeliness — i.e. almost everything you build</td><td>Live video/voice (WebRTC), gaming state updates, DNS queries, metrics/telemetry firehoses (StatsD), QUIC</td></tr>
+      </tbody>
+    </table>
+
+    <p>
+      Why <strong>DNS</strong> on UDP is the cleanest example: a query and its answer each fit in one small packet, so
+      you'd be paying a full TCP handshake — a round trip — to reliably deliver a message whose <em>total cost to retry is
+      one round trip anyway</em>. Reliability is cheaper at the application layer here: just ask again. (DNS falls back to
+      TCP for responses too large for a datagram, e.g. zone transfers and some DNSSEC responses. Knowing the fallback exists
+      is a nice detail.)
+    </p>
+    <p>
+      Why <strong>live video and gaming</strong>: if a frame from 300ms ago arrives now, it's garbage — the game has moved
+      on. You want the <em>current</em> position, not a faithful replay of a stale one. TCP would deliver the stale one and
+      hold up the current one behind it. That's the exact wrong behaviour, and it's the sentence to say.
+    </p>
+
+    <div class="note">Nuance worth having ready, because a good interviewer will spring it: <strong>video <em>streaming</em> (Netflix, YouTube VOD) runs over TCP/HTTP, not UDP.</strong> It's buffered, so a retransmit that lands within the buffer window is free — reliability is cheap and quality matters. It's <strong>real-time</strong> video (calls, live low-latency) that goes UDP, because there's no buffer to hide a retransmit in. Candidates confidently say "video → UDP" and get taken apart on it. The real distinction is buffered vs interactive.</div>
+
+    <div class="senior">Soundbite: <em>"TCP trades latency for correctness — it will stall the whole stream to redeliver a lost byte. That's the right trade for an API and the wrong one for a live call, where a 300ms-old audio frame is worthless. So the question isn't 'which is faster', it's 'is stale data worth more than no data?'"</em></div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="tls">4. TLS</h2>
+
+    <p>
+      <strong>What it is.</strong> A handshake that (a) authenticates the server via a certificate chain, (b) negotiates a
+      cipher, and (c) agrees on a symmetric session key — after which everything is encrypted with cheap symmetric crypto.
+      The expensive, asymmetric part happens once per connection.
+    </p>
+    <p>
+      <strong>Why it exists in a system design conversation</strong> — not "because security", but because
+      <strong>it costs round trips and CPU, and both are things you architect around.</strong>
+    </p>
+
+    <h3>The cost</h3>
+<pre><code>  TLS 1.2:  TCP handshake (1 RTT)  +  TLS handshake (2 RTT)  = 3 RTT before data
+  TLS 1.3:  TCP handshake (1 RTT)  +  TLS handshake (1 RTT)  = 2 RTT before data
+  TLS 1.3 + session resumption:                                1 RTT  (0-RTT possible)
+  QUIC (HTTP/3), new connection:   transport + crypto merged = 1 RTT
+  QUIC, resumed:                                               0 RTT
+</code></pre>
+    <p>
+      Multiply by 150ms for a cross-continent connection: TLS 1.2 to a far origin is ~450ms of setup. TLS 1.3 to a nearby
+      edge PoP (10ms) is ~20ms. <strong>That difference — 450ms vs 20ms, for the identical request — is the argument for
+      edge termination, in one line.</strong>
+    </p>
+
+    <h3>TLS termination at the load balancer / edge</h3>
+    <p>
+      "Terminating TLS" means the LB (or CDN edge) is the endpoint of the encrypted connection: it holds the certificate and
+      private key, decrypts, and forwards plaintext (or re-encrypts) to your backends. Four reasons this is the default:
+    </p>
+    <ul>
+      <li><strong>Latency.</strong> The expensive handshake happens against a PoP that's 10ms away, not an origin that's 150ms away. Combined with a <em>warm, pre-established, pooled</em> connection from edge to origin, the user pays handshake cost against the near box only.</li>
+      <li><strong>CPU.</strong> Asymmetric crypto is expensive. Offloading it (often to dedicated hardware) keeps it off your application servers, which you'd rather spend on business logic.</li>
+      <li><strong>Certificate management.</strong> One place to rotate certs and renew Let's Encrypt, rather than N services each with a keystore. Anyone who has done cert rotation across a fleet will feel this one.</li>
+      <li><strong>Visibility — and this is the L7 story in §7.</strong> A load balancer cannot route on a URL path, read a header, or inject a request ID if it can't decrypt the traffic. <strong>TLS termination is the precondition for L7 routing.</strong> That's the link between these two sections and it's the thing candidates miss.</li>
+    </ul>
+
+    <div class="pitfall">"Terminate TLS at the LB, then plaintext to the backends" is fine <em>if</em> the internal network is trusted. In fintech, healthcare and anything under PCI/HIPAA — i.e. Optum, JPMC, Goldman — it very often isn't, and the expected answer is <strong>re-encryption</strong> (TLS termination at the edge, a fresh TLS connection to the backend) or full <strong>mTLS</strong> between services, usually via a service mesh. Saying <em>"I'd terminate at the LB for L7 routing, then re-encrypt to the backend — in a regulated environment I'd assume the internal network is hostile and use mTLS"</em> is a direct scoring line at those companies. Volunteer it there; skip it at a consumer-scale FAANG loop unless asked.</div>
+
+    <h3>Session resumption</h3>
+    <p>
+      A returning client shouldn't redo the expensive handshake. Two mechanisms:
+    </p>
+    <ul>
+      <li><strong>Session IDs</strong> — the server stores session state and hands the client an ID. Problem: it's <em>server-side state</em>, so with N load-balanced terminators the client must land on the same one (or you need a shared session cache). Sound familiar? It's the sticky-session problem again, one layer down.</li>
+      <li><strong>Session tickets</strong> — the server encrypts the session state with a key only it knows and gives the blob to the <em>client</em> to store. Stateless, so it works across a fleet — provided every terminator shares the ticket-encryption key and you rotate it properly. This is the modern default and it's the same "move state to the client, signed" trick as a JWT.</li>
+    </ul>
+    <p>
+      TLS 1.3 additionally allows <strong>0-RTT resumption</strong>: the client sends application data <em>with</em> the
+      first packet. Free speed, with one catch that interviewers like: 0-RTT data is <strong>replayable</strong> by an
+      attacker, so you must only allow it for <em>idempotent</em> requests. A replayed <code>GET</code> is harmless; a
+      replayed <code>POST /transfer</code> is a fraud incident. (Idempotency is a theme that will return with force in
+      tutorial 13.)
+    </p>
+
+    <div class="senior">Soundbite: <em>"TLS is a latency problem before it's a security problem. Terminating at the edge turns a 3-RTT handshake against a distant origin into a 1–2 RTT handshake against a PoP 10ms away, and it's also what lets the load balancer do L7 routing at all — you can't route on a path you can't decrypt."</em></div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="http">5. HTTP/1.1 → HTTP/2 → HTTP/3</h2>
+
+    <p>
+      This is the section you already know from web-perf work — you just know it as tactics ("we sharded domains", "we
+      inlined critical CSS", "we stopped concatenating after H2"). Here is the causal chain those tactics came from. The
+      entire evolution of HTTP is <strong>one problem, solved at three different layers: head-of-line blocking.</strong>
+      If you can tell that story straight, this whole topic is done.
+    </p>
+
+    <h3>HTTP/1.1 — head-of-line blocking at the request layer</h3>
+    <p>
+      One connection carries one request at a time. Response #2 cannot start until response #1 finishes. Browsers worked
+      around this by opening ~6 parallel TCP connections per origin — hence the great hack of your early career,
+      <strong>domain sharding</strong>: serve assets from <code>static1.</code>, <code>static2.</code>, <code>static3.</code>
+      to multiply the browser's 6-connection cap. (HTTP pipelining was supposed to fix this and was a disaster in practice —
+      broken proxies, and responses still had to come back in order, so it just moved the blocking. Nobody enabled it.)
+    </p>
+    <p>
+      Every HTTP/1.1 performance tactic you ever shipped was a workaround for this one limit: concatenate your JS bundles
+      (fewer requests), sprite your images (fewer requests), inline critical CSS (fewer requests), shard domains (more
+      connections). Say that out loud in an interview and it lands, because it's true and it's yours.
+    </p>
+
+    <h3>HTTP/2 — multiplexing kills it at the HTTP layer</h3>
+    <p>
+      H2 splits the connection into <strong>frames</strong> tagged with a <strong>stream ID</strong>. Many logical requests
+      interleave over a single TCP connection, and responses can come back in any order. Plus:
+    </p>
+    <ul>
+      <li><strong>Header compression (HPACK)</strong> — HTTP/1.1 re-sent your 800-byte cookie header on every one of 60 asset requests. HPACK keeps a shared dynamic table so repeated headers cost a few bytes.</li>
+      <li><strong>Stream prioritization</strong> — the client can hint that CSS matters more than a footer image.</li>
+      <li><strong>Server push</strong> — send resources the client hasn't asked for yet. It was clever, it was hard to use without wasting bandwidth (you push what's already in the client's cache), and it is now <strong>deprecated / removed from Chrome</strong>. Early Hints (<code>103</code>) replaced it. Saying that is a fresh, current detail most candidates don't have.</li>
+    </ul>
+    <p>
+      And this is why <strong>domain sharding became actively harmful</strong>: it fragments what should be one multiplexed
+      connection into six, defeating HPACK's shared table, splitting congestion-control state, and multiplying handshakes.
+      You already deleted your sharding config for exactly this reason. That's the anecdote — use it.
+    </p>
+
+    <h3>…but H2 still head-of-line blocks — at the TCP layer</h3>
+    <p>
+      Here is the punchline the whole topic builds to, and it's the question that separates people who read a blog post from
+      people who understand the stack.
+    </p>
+    <p>
+      HTTP/2 removed blocking <em>between HTTP requests</em>. But all those streams ride on <strong>one TCP
+      connection</strong>, and TCP guarantees ordered delivery of the byte stream. So if a single TCP segment is lost, the
+      kernel <em>will not hand any subsequent bytes to the application</em> until it's retransmitted — including bytes
+      belonging to completely unrelated streams. One dropped packet stalls all 100 in-flight requests.
+    </p>
+
+<pre><code>  HTTP/1.1 — blocking between requests, at the HTTP layer
+    conn: [ req1 ........ resp1 ][ req2 ........ resp2 ]   ← strictly serial
+
+  HTTP/2 — multiplexed over ONE TCP connection
+    TCP:  [ s1 ][ s3 ][ s1 ][ s2 ][ s3 ][ s2 ]   ← interleaved frames, great
+                       ✗ packet lost
+    TCP:  [ s1 ][ s3 ][ XX ][ ?? ][ ?? ][ ?? ]   ← ALL streams stall waiting
+                                                    for one retransmit (TCP HOL)
+
+  HTTP/3 — multiplexed over QUIC (on UDP), independent streams
+    QUIC: [ s1 ][ s3 ][ XX ][ s2 ][ s3 ][ s2 ]   ← only stream 1 stalls;
+                                                    s2 and s3 are delivered
+</code></pre>
+
+    <p>
+      On a clean fibre connection you never feel this. On a lossy mobile network — which is most of your users — it is the
+      dominant cost, and H2's advantage over H1 narrows or even inverts, because H1's six connections at least fail
+      independently.
+    </p>
+
+    <h3>HTTP/3 / QUIC — why it had to move to UDP</h3>
+    <p>
+      You cannot fix TCP head-of-line blocking <em>inside</em> TCP. Ordered delivery is TCP's defining guarantee, and TCP is
+      implemented in every OS kernel and every middlebox on earth — you cannot ship a change to it. So QUIC does the only
+      available thing: <strong>it rebuilds a transport in userspace on top of UDP</strong>, because UDP is the one thing
+      middleboxes will pass without opinions.
+    </p>
+    <p>
+      QUIC then re-adds everything worth keeping — reliability, congestion control, ordering — but <em>per stream</em>
+      instead of per connection. Loss on stream 1 stalls only stream 1. It also:
+    </p>
+    <ul>
+      <li><strong>Merges the transport and TLS handshakes</strong> → 1 RTT to first byte on a new connection, <strong>0 RTT</strong> on resumption. TLS 1.3 isn't optional in QUIC; it's baked in.</li>
+      <li><strong>Uses connection IDs instead of the 4-tuple</strong>, so the connection survives a network change — walk out of your house, phone flips Wi-Fi → LTE, IP changes, and your QUIC connection <em>keeps going</em> instead of tearing down and re-handshaking. This is called connection migration and it is a huge deal on mobile.</li>
+      <li>Costs more <strong>CPU</strong> (userspace, per-packet crypto, less kernel/NIC offload) and gets blocked or throttled by some corporate firewalls that distrust UDP — hence every H3 client keeps a TCP fallback.</li>
+    </ul>
+
+    <table>
+      <thead><tr><th></th><th>HTTP/1.1</th><th>HTTP/2</th><th>HTTP/3 (QUIC)</th></tr></thead>
+      <tbody>
+        <tr><td>Transport</td><td>TCP</td><td>TCP</td><td><strong>UDP</strong> (QUIC)</td></tr>
+        <tr><td>Multiplexing</td><td>No — 1 request per connection at a time</td><td>Yes — streams over 1 connection</td><td>Yes — <em>independent</em> streams</td></tr>
+        <tr><td>HOL blocking</td><td>At the HTTP layer (request level)</td><td>Fixed at HTTP layer, <strong>remains at TCP layer</strong></td><td>Eliminated (per-stream loss recovery)</td></tr>
+        <tr><td>Headers</td><td>Plaintext, resent every request</td><td>HPACK compression</td><td>QPACK compression</td></tr>
+        <tr><td>Handshake to first byte</td><td>TCP + TLS = 2–3 RTT</td><td>TCP + TLS = 2–3 RTT</td><td><strong>1 RTT new, 0 RTT resumed</strong></td></tr>
+        <tr><td>Encryption</td><td>Optional (TLS bolted on)</td><td>Optional in spec, mandatory in practice</td><td>Mandatory, integrated</td></tr>
+        <tr><td>Survives IP change</td><td>No</td><td>No</td><td><strong>Yes</strong> — connection migration</td></tr>
+        <tr><td>Right optimization</td><td>Fewer requests: concat, sprite, inline, shard domains</td><td>Stop sharding; many small cacheable files are now fine</td><td>Same as H2, plus big wins on lossy mobile</td></tr>
+        <tr><td>Cost</td><td>Connection overhead</td><td>Single point of TCP-level stall</td><td>More CPU; some networks block UDP → need TCP fallback</td></tr>
+      </tbody>
+    </table>
+
+    <div class="note">In practice you don't "implement HTTP/3" — you check a box on your CDN and it negotiates H3 with clients that support it (via the <code>Alt-Svc</code> header) and falls back to H2 for the rest. Origin-side you can happily still be H1.1 behind the LB. Say this: it shows you know where the protocol actually terminates, and it's a nice reminder that <strong>the client-facing protocol and the internal protocol are different decisions.</strong></div>
+
+    <div class="senior">The full soundbite, and it's one of the highest-value 30 seconds on this page: <em>"HTTP's whole evolution is one bug fixed at three layers. H1.1 blocked between requests, so we opened six connections and concatenated everything. H2 multiplexed streams over one connection and killed request-level blocking — which is why domain sharding became an anti-pattern. But those streams still rode one TCP connection, and TCP's ordering guarantee means a single lost packet stalls every stream behind it. You can't fix that inside TCP, so HTTP/3 rebuilt the transport on UDP: independent streams, merged TLS handshake at 0–1 RTT, and connection IDs so it survives a Wi-Fi-to-LTE switch."</em></div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="cdn">6. CDNs &amp; edge caching</h2>
+
+    <p>
+      <strong>What it is.</strong> A globally distributed fleet of caching reverse proxies (PoPs — points of presence),
+      sitting in front of your origin, close to users.
+    </p>
+    <p>
+      <strong>Why it exists.</strong> Two reasons, and candidates only ever give the first. (1) <strong>Latency</strong> —
+      you cannot beat the speed of light, so move the bytes closer to the user. (2) <strong>Origin offload</strong> — a
+      95% cache hit ratio means your origin sees 1/20th of the traffic, which is a capacity and cost story, not a latency
+      one. And a third, quieter one: (3) <strong>a CDN is your DDoS absorber</strong> — it has more capacity than your
+      origin ever will, and it's the only thing standing between an attacker and your app servers.
+    </p>
+
+    <h3>Push vs pull</h3>
+    <table>
+      <thead><tr><th></th><th>Pull (origin pull) — the default</th><th>Push</th></tr></thead>
+      <tbody>
+        <tr><td>How</td><td>First request for an object misses; the edge fetches it from origin, caches it, serves it. Everyone after that hits.</td><td>You proactively upload content to the CDN before anyone asks for it.</td></tr>
+        <tr><td>Cost</td><td>The <em>first</em> user in each region eats a cache-miss round trip to origin.</td><td>You pay storage for content nobody may ever request.</td></tr>
+        <tr><td>Ops</td><td>Zero — it's self-managing. Set headers, done.</td><td>You own an upload/invalidate pipeline.</td></tr>
+        <tr><td>Right when</td><td>Long-tail content, anything unpredictable — i.e. ~95% of the time. Every website you've shipped.</td><td>Large files with known, spiky, predictable demand: a game patch, a Netflix release, a live-event stream. Pre-positioning a 4GB video before the launch beats 10,000 simultaneous origin misses.</td></tr>
+      </tbody>
+    </table>
+    <p>
+      The pull-mode failure mode has a name and you should use it: a <strong>cache stampede / thundering herd</strong>. A
+      hot object expires, and a thousand concurrent edge misses all hammer origin at once. Mitigations —
+      <em>request coalescing</em> (the edge collapses N concurrent misses for the same key into one origin fetch — Nginx
+      calls it <code>proxy_cache_lock</code>, most CDNs do it automatically), <em>stale-while-revalidate</em> (serve the
+      stale copy instantly, refresh in the background), and TTL jitter. This whole family of problems gets a proper
+      treatment in tutorial 06.
+    </p>
+
+    <h3>Cache keys</h3>
+    <p>
+      The cache key is what the edge hashes to decide "is this the same object?" By default it's roughly the URL. You can
+      add headers to it — and this is where the whole thing lives or dies, so make it explicit:
+    </p>
+    <ul>
+      <li><strong>Every dimension you add to the key multiplies your object count and divides your hit ratio.</strong> Key on <code>Accept-Language</code> and you now cache 20 copies. Key on the raw <code>Cookie</code> header and your hit ratio is effectively zero, because every user's session cookie is unique — congratulations, you built an expensive proxy.</li>
+      <li>The disciplined move is to <strong>normalize before keying</strong>: strip marketing query params (<code>utm_*</code>) so they don't fragment the cache, sort remaining params, and vary on a <em>derived</em> low-cardinality value (a <code>country</code> or <code>device-class</code> header the edge computes) rather than the raw high-cardinality one.</li>
+      <li><code>Vary: Accept-Encoding</code> is fine (2–3 values). <code>Vary: User-Agent</code> is a classic self-inflicted wound (thousands of values).</li>
+    </ul>
+
+    <h3>TTL &amp; invalidation — and why "cache invalidation is hard" is a real answer</h3>
+    <p>
+      Three mechanisms, in increasing order of how much you should like them:
+    </p>
+    <ol>
+      <li><strong>TTL expiry</strong> (<code>Cache-Control: max-age=…</code>). Passive, cheap, eventually consistent. You accept staleness for up to the TTL. Everything else is a workaround for a TTL you set too long.</li>
+      <li><strong>Explicit purge / invalidation.</strong> Tell the CDN to drop a key. It works, but it's <em>slow</em> (seconds to minutes to propagate across hundreds of PoPs), often rate-limited, and it is a <em>distributed</em> operation — so it can partially fail, and now some PoPs serve new content and some serve old. Purge-by-<strong>surrogate-key/tag</strong> ("purge everything tagged <code>product:123</code>") is much better than purge-by-URL, because one write usually invalidates many URLs and you don't want to enumerate them.</li>
+      <li><strong>Versioned/immutable URLs — the one that actually works.</strong> Never invalidate; change the name.
+        <code>app.a1b2c3.js</code> with <code>Cache-Control: max-age=31536000, immutable</code>. A new deploy produces a new filename, so there is nothing to invalidate — the old object simply stops being requested and ages out. <strong>You have shipped this a hundred times: it's content-hashed bundle filenames from Webpack/Vite.</strong> You've been solving cache invalidation by sidestepping it since 2018.</li>
+    </ol>
+    <p>
+      The corollary you also already know: the <strong>one file you cannot version is <code>index.html</code></strong>,
+      because its name is the URL. So it gets a short TTL or <code>no-cache</code>, and it's the pointer to all the immutable
+      assets. That two-tier pattern — a short-TTL mutable pointer to long-TTL immutable content — is a genuinely general
+      caching design and it generalizes far beyond the browser.
+    </p>
+
+    <div class="senior">Say this and it reads as scar tissue, not theory: <em>"I'd avoid invalidation as a design goal rather than solve it. Content-hashed, immutable URLs with a one-year TTL and a short-TTL HTML pointer means there's nothing to purge — a deploy changes the names. Purge APIs are a distributed operation across hundreds of PoPs; they're slow and they can partially fail, so I don't want correctness depending on them. Where I must invalidate — a product price changed — I'd use surrogate-key purging, not URL purging, and I'd design the read path to tolerate a few seconds of staleness."</em></div>
+
+    <h3>The interesting part: a CDN for a <em>dynamic</em> API</h3>
+    <p>
+      Everyone can say "the CDN caches my static assets." The senior answer is what the CDN does for an API that returns
+      per-user JSON and can't be cached at all. Four things, and none of them are "cache the response":
+    </p>
+    <ul>
+      <li>
+        <strong>Connection termination alone is worth it.</strong> Even at a 0% hit ratio, the CDN edge terminates TCP+TLS
+        10ms from the user instead of 150ms from origin, and forwards over a <em>warm, pre-established, pooled</em>
+        connection on optimized backbone routes. You can cut hundreds of milliseconds off an <em>uncacheable</em> request.
+        This is the single most under-said fact about CDNs in interviews. <strong>The CDN is not just a cache; it is a
+        latency-optimized on-ramp to your origin.</strong>
+      </li>
+      <li>
+        <strong>Micro-caching.</strong> A 1–5 second TTL on a hot, non-personalized endpoint (<code>/trending</code>,
+        <code>/prices</code>, a leaderboard) sounds useless and is transformative: at 10,000 RPS, a 1-second TTL means your
+        origin serves <strong>1</strong> request per second instead of 10,000. Nobody notices one second of staleness on a
+        trending list. Have this number ready — it's a great "10× traffic" answer.
+      </li>
+      <li>
+        <strong>Split the response.</strong> Most "personalized" pages are 90% shared content and 10% user-specific. Cache
+        the shared part at the edge with a long TTL, fetch the personal slice separately (or stitch it in at the edge). Cache
+        hit ratio is a function of how well you've decomposed your responses — not a property handed to you.
+      </li>
+      <li>
+        <strong>Edge compute</strong> (Cloudflare Workers, Lambda@Edge, Fastly Compute). Run code <em>at the PoP</em>:
+        validate a JWT and reject unauthorized traffic 10ms from the user instead of 150ms away; A/B bucket a user and rewrite
+        the cache key; do geo-based redirects; serve a personalized shell from cached fragments; rate-limit abusive IPs before
+        they ever reach your infrastructure. The mental model: <strong>edge compute is where you put logic that must be fast
+        and must not require your database.</strong> That constraint — no strongly-consistent state at the edge, because the
+        edge is 300 PoPs and your DB is in one region — is exactly the trade-off to name, and naming the constraint is what
+        makes it a senior answer.
+      </li>
+    </ul>
+
+    <div class="pitfall">The classic CDN horror story, and it's worth telling as a "what breaks" answer: caching a response that had a <code>Set-Cookie</code> header or a personalized body, because someone forgot <code>Cache-Control: private</code>. User A's session lands in the shared edge cache and gets served to User B. This is a real, recurring, career-defining outage class — <strong>anything user-specific must be <code>private</code>/<code>no-store</code>, and your cache key must never accidentally be shared across identities.</strong> Volunteering this unprompted in a design where you've put a CDN in front of an API is a strong signal.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="lb">7. Load balancers: L4 vs L7</h2>
+
+    <p>
+      <strong>What it is.</strong> A box that takes incoming connections and distributes them across a pool of backends.
+      <strong>Why it exists.</strong> Two things, and they're different: <em>scale</em> (one machine can't take the load) and
+      <em>availability</em> (one machine will eventually die and you need traffic to route around it without anyone
+      noticing). The health check is what delivers the second one, and it's the part candidates forget.
+    </p>
+    <p>
+      The L4/L7 distinction is just <strong>what the balancer is allowed to look at</strong>, which follows directly from the
+      OSI layer it operates on.
+    </p>
+
+    <table>
+      <thead><tr><th></th><th>L4 (transport)</th><th>L7 (application)</th></tr></thead>
+      <tbody>
+        <tr><td>Operates on</td><td>TCP/UDP packets</td><td>HTTP requests</td></tr>
+        <tr><td>Can see</td><td>Source/dest IP + port. That's it. The payload is opaque bytes (and encrypted).</td><td>Method, URL path, headers, cookies, body — because it terminates TLS and parses HTTP</td></tr>
+        <tr><td>Can route on</td><td>Nothing but the connection tuple — so it picks a backend and pins the whole connection there</td><td><code>/api/*</code> → service A, <code>/img/*</code> → service B; header/cookie-based routing; canary by user ID; A/B splits</td></tr>
+        <tr><td>Load-balancing unit</td><td>The <strong>connection</strong> — once assigned, every byte of it goes to one backend</td><td>The <strong>request</strong> — two requests on one connection can hit two different backends</td></tr>
+        <tr><td>TLS termination</td><td>No (it just forwards encrypted bytes — TLS passthrough)</td><td>Yes — it must, to read the request</td></tr>
+        <tr><td>Sticky sessions</td><td>By source IP hash only (crude — a whole corporate NAT is one "user")</td><td>By cookie — precise, per-user</td></tr>
+        <tr><td>Health checks</td><td>Shallow — "does the port accept a TCP connection?"</td><td>Deep — "does <code>GET /health</code> return 200?" Catches a process that's alive but broken.</td></tr>
+        <tr><td>Cost / throughput</td><td>Very cheap, very fast — near-line-rate, minimal CPU, low latency (µs)</td><td>More CPU (crypto + HTTP parsing), adds ~ms of latency, more expensive</td></tr>
+        <tr><td>Extras</td><td>None — it's a dumb, fast pipe</td><td>Retries, timeouts, header rewriting, compression, caching, WAF, request-ID injection, rate limiting</td></tr>
+        <tr><td>Use it for</td><td>Non-HTTP protocols; extreme throughput; when you must not decrypt (regulatory/E2E); the front door in a two-tier setup</td><td>Basically all HTTP traffic. This is your default.</td></tr>
+      </tbody>
+    </table>
+
+    <p>
+      In the real world you usually run <strong>both</strong>, and saying so is the mature answer: an L4 balancer (AWS NLB, or
+      anycast + ECMP) as the ultra-fast, cheap, DDoS-absorbing front door, fanning out to a fleet of L7 balancers (ALB, Envoy,
+      Nginx) that do the intelligent per-request work. It's the same reason you don't do expensive work at the outermost layer
+      of anything.
+    </p>
+
+    <h3>Algorithms</h3>
+    <table>
+      <thead><tr><th>Algorithm</th><th>How</th><th>When it's right / wrong</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Round robin</strong></td>
+          <td>Next backend in the list, in order.</td>
+          <td>Fine when requests are uniform and backends are identical. <em>Breaks</em> when request cost varies wildly — a server unlucky enough to get three 10-second reports in a row is buried while its peers idle.</td>
+        </tr>
+        <tr>
+          <td><strong>Weighted round robin</strong></td>
+          <td>Round robin, but bigger machines get more turns.</td>
+          <td>Heterogeneous fleets; gradual canary rollout (send 1% to the new version).</td>
+        </tr>
+        <tr>
+          <td><strong>Least connections</strong></td>
+          <td>Send to whichever backend has the fewest open connections right now.</td>
+          <td>The best general default for variable-cost requests: it's <em>feedback-driven</em>, so a slow backend naturally receives less. Watch out for a freshly-restarted server with zero connections getting instantly flooded — hence "slow start" ramping.</td>
+        </tr>
+        <tr>
+          <td><strong>Least response time</strong></td>
+          <td>Least connections, weighted by observed latency.</td>
+          <td>Better still, more state to maintain.</td>
+        </tr>
+        <tr>
+          <td><strong>IP / consistent hashing</strong></td>
+          <td>Hash a key (source IP, user ID, cache key) onto the ring of backends, so the same key always lands on the same backend.</td>
+          <td>When the backend holds <em>state</em> for that key: a cache node (you want cache locality — the same key hitting the same node's local cache), a sharded service, a WebSocket session. <strong>Consistent</strong> hashing (not <code>hash % N</code>) is what makes adding/removing a node remap only ~1/N of keys instead of nearly all of them. That's tutorial 04, and it's one of the most reliably-asked topics in this phase.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="pitfall">Do not say "round robin" reflexively. It's the answer everybody gives and it's usually the wrong one. <strong>Least connections</strong> is the better default for real APIs because request cost is never uniform, and the interviewer is specifically listening for whether you noticed. And if the backend holds any per-key state — a cache, a shard, a live connection — the answer is consistent hashing, full stop.</div>
+
+    <h3>Health checks</h3>
+    <p>
+      The LB pings each backend on an interval; N consecutive failures eject it from the pool, M consecutive successes bring
+      it back. Two things that make this a senior answer instead of a bullet point:
+    </p>
+    <ul>
+      <li>
+        <strong>Shallow vs deep.</strong> A shallow check ("is the port open? does <code>/health</code> return 200?") catches a
+        <em>dead</em> process. A deep check ("can I reach the DB and Redis?") catches a <em>useless</em> process. But a deep
+        check is dangerous: if the shared database has a hiccup, every backend fails its health check simultaneously, the LB
+        ejects <strong>the entire fleet</strong>, and a degraded system becomes a total outage. The mature position:
+        <em>"shallow checks for liveness so I never eject the whole fleet on a shared dependency, plus separate deep checks
+        that page a human and shed load — but don't remove capacity."</em> If you know Kubernetes, this is exactly the
+        liveness-vs-readiness probe distinction, and naming it lands.
+      </li>
+      <li>
+        <strong>Connection draining / graceful shutdown.</strong> When you deploy, the LB must stop sending <em>new</em>
+        requests to an instance but let in-flight ones finish before the process exits. Without it, every deploy is a burst of
+        500s. Interviewers love this because it shows you have actually operated something.
+      </li>
+    </ul>
+
+    <h3>Active-active vs active-passive</h3>
+    <table>
+      <thead><tr><th></th><th>Active-active</th><th>Active-passive</th></tr></thead>
+      <tbody>
+        <tr><td>How</td><td>All nodes/regions serve traffic simultaneously</td><td>One serves; the standby idles, ready to take over</td></tr>
+        <tr><td>Failover</td><td>Instant — you just have less capacity. Traffic is already flowing everywhere.</td><td>Takes seconds to minutes: detect, promote, repoint DNS/VIP, warm caches</td></tr>
+        <tr><td>Utilization</td><td>100% of what you pay for</td><td>You pay for ~2× capacity and use ~1×</td></tr>
+        <tr><td>Hard part</td><td><strong>Writes.</strong> Multi-region active-active means concurrent writes in two places → conflict resolution, or a single-writer-per-shard scheme. This is where the real difficulty lives, and it's a CAP conversation (tutorial 03).</td><td>Simple and correct — there is exactly one writer. That's precisely why banks run it.</td></tr>
+        <tr><td>Use it for</td><td>Stateless services (trivially active-active — do it). Reads, globally. High-scale consumer systems.</td><td>Databases and anything requiring a single source of truth. Regulated environments where correctness beats availability.</td></tr>
+      </tbody>
+    </table>
+    <p>
+      The clean way to hold this: <strong>the stateless tier is always active-active; the interesting question is only ever
+      about the stateful tier.</strong> A very common and very defensible enterprise answer is <em>active-active for reads
+      across regions, active-passive for writes</em> — you get global read latency without ever having to resolve a write
+      conflict.
+    </p>
+
+    <div class="senior">Soundbite: <em>"I'd run an L7 balancer because I want path-based routing, per-request distribution and deep health checks — L4 can't see a URL because it never decrypts. I'd use least-connections rather than round robin, since request cost isn't uniform. And I'd keep health checks shallow, because a deep check against a shared database will eject the entire fleet the moment that database blinks — a degraded system shouldn't become an outage."</em></div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="gateway">8. API gateway vs reverse proxy vs load balancer</h2>
+
+    <p>
+      Candidates blur these three constantly, draw all three boxes, and can't say what any of them is <em>for</em>. They
+      overlap in implementation — Nginx and Envoy can be all three at once — but they are <strong>three distinct jobs</strong>,
+      and separating them cleanly is a cheap, reliable point.
+    </p>
+
+    <table>
+      <thead><tr><th></th><th>Reverse proxy</th><th>Load balancer</th><th>API gateway</th></tr></thead>
+      <tbody>
+        <tr><td>Its one job</td><td>Be the single public front door — hide the backend topology from clients</td><td>Spread load across N identical instances and route around dead ones</td><td>Own the <em>cross-cutting concerns</em> of an API so services don't each reimplement them</td></tr>
+        <tr><td>Fronts</td><td>One or more backends</td><td>A pool of interchangeable instances of the <em>same</em> service</td><td>Many <em>different</em> services (a microservice fleet)</td></tr>
+        <tr><td>Typically does</td><td>TLS termination, static caching, compression, header rewriting, hiding internal ports</td><td>Health checks, an LB algorithm, connection draining, failover</td><td>AuthN/authZ, rate limiting &amp; quotas, request routing per API, request/response transformation, response aggregation, API versioning, per-consumer metrics, billing/analytics, schema validation</td></tr>
+        <tr><td>Layer</td><td>L7</td><td>L4 or L7</td><td>L7, always — it must read the request to do any of its job</td></tr>
+        <tr><td>Analogy</td><td>The building's front desk</td><td>The queue manager sending you to whichever teller is free</td><td>Security, ID check, and the rulebook that applies to every visitor</td></tr>
+      </tbody>
+    </table>
+
+    <p>
+      The relationships, precisely: <strong>a load balancer is a specialized reverse proxy</strong> (every LB is a reverse
+      proxy; not every reverse proxy balances). <strong>An API gateway is a reverse proxy with an opinion about your API</strong>
+      — it's the box where you put the logic that <em>every</em> service would otherwise duplicate.
+    </p>
+    <p>
+      The gateway's real reason to exist is worth a sentence of its own, because it's the "why" that scores:
+      <strong>without a gateway, thirty microservices each implement JWT validation, each implement rate limiting, each
+      implement request logging — and they implement them thirty slightly different ways, one of which is wrong.</strong>
+      The gateway is a DRY argument about cross-cutting concerns, exactly the same argument as middleware in Express or a
+      Spring filter chain. That's the framing: <em>the API gateway is your middleware stack, extracted into infrastructure.</em>
+    </p>
+
+    <p>Two more gateway responsibilities that come up constantly and are worth naming:</p>
+    <ul>
+      <li><strong>Aggregation / BFF.</strong> The mobile app needs one screen's worth of data that lives in four services. Either the client makes four round trips over a 150ms link (fatal — see §11), or the gateway fans out <em>inside the datacenter</em> where each hop is 1ms, and returns one composed response. That's a <strong>Backend-For-Frontend</strong>, and as a frontend engineer you should own this argument — you have felt the pain of a chatty API from the client side and you can say precisely why it hurts on mobile.</li>
+      <li><strong>Protocol translation.</strong> The outside world speaks REST/JSON over HTTP/1.1; your internal fleet speaks gRPC. The gateway is the seam. (This is the natural bridge into §10.)</li>
+    </ul>
+
+    <div class="pitfall">Two failure modes to volunteer, because they're the follow-ups. <strong>(1) The gateway is a single point of failure</strong> — everything goes through it, so it must be replicated and horizontally scaled, and it must have a very fast, boring, non-blocking path. <strong>(2) The gateway becomes a monolith.</strong> Business logic creeps in ("just this one little transform"), and five years later the gateway is a distributed ball of mud that every team is scared to deploy — the ESB problem, reborn. The rule you state: <em>the gateway does cross-cutting concerns only; if it needs to know what a "purchase order" is, it's in the wrong place.</em> Saying that is a strong, opinionated, enterprise-flavoured answer.</div>
+
+    <div class="senior">Soundbite: <em>"A reverse proxy is a front door, a load balancer is a reverse proxy that distributes and health-checks, and an API gateway is a reverse proxy that owns cross-cutting concerns — auth, rate limiting, routing, aggregation — so thirty services don't reimplement them thirty ways. In a design I'd draw the LB and the gateway as one edge tier and say so, rather than drawing boxes I can't justify."</em></div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="realtime">9. Real-time transports: WebSockets vs SSE vs long polling</h2>
+
+    <p>
+      <strong>The problem all of these solve:</strong> HTTP is request/response and client-initiated. The server cannot say
+      anything unless asked. But a chat message, a price tick, a "your order shipped" notification, another user's cursor —
+      all of these originate at the <em>server</em>. Every technique below is a workaround for that one asymmetry.
+    </p>
+
+<pre><code>SHORT POLLING — "any news?" every 3s
+  C ──req──▶ S   (empty)      Simple. Wasteful. Latency = poll interval.
+  C ──req──▶ S   (empty)      99% of requests return nothing but still
+  C ──req──▶ S   [msg!]       pay HTTP + auth + a DB read. Terrible at scale.
+
+LONG POLLING — "any news? I'll wait."
+  C ──req──▶ S ............   Server HOLDS the request open until it has
+  C ◀─resp── S   [msg!]       something (or times out at ~30s).
+  C ──req──▶ S ............   Near-real-time, works everywhere. But: a new
+                              HTTP request per message, and a held connection
+                              per client anyway — so you pay WebSocket-like
+                              connection cost with HTTP-like overhead.
+
+SSE — one long-lived HTTP response, server streams events
+  C ──GET /events──▶ S
+  C ◀════ event ════ S        One connection. Server → client only.
+  C ◀════ event ════ S        Auto-reconnect + Last-Event-ID are built in.
+  C ◀════ event ════ S        Plain HTTP: proxies, CDNs, auth headers all work.
+
+WEBSOCKET — upgrade to a full-duplex TCP connection
+  C ──GET /ws (Upgrade)──▶ S
+  C ◀═══════ 101 Switching Protocols ═══════ S
+  C ◀════════ frames both ways ════════════▶ S   Lowest latency, lowest
+                                                 per-message overhead (~2-6
+                                                 byte frame header), bidirectional.
+                                                 But: not HTTP any more — you
+                                                 own reconnect, auth, backpressure.
+</code></pre>
+
+    <table>
+      <thead><tr><th></th><th>Long polling</th><th>SSE</th><th>WebSockets</th></tr></thead>
+      <tbody>
+        <tr><td>Direction</td><td>Server → client (each response)</td><td>Server → client only</td><td><strong>Full duplex</strong></td></tr>
+        <tr><td>Protocol</td><td>Plain HTTP</td><td>Plain HTTP (<code>text/event-stream</code>)</td><td>Upgraded TCP — no longer HTTP after the handshake</td></tr>
+        <tr><td>Per-message overhead</td><td>Full HTTP request + response headers</td><td>A few bytes</td><td>2–6 byte frame header</td></tr>
+        <tr><td>Reconnect</td><td>Inherent (you re-request anyway)</td><td><strong>Built into the browser</strong>, with <code>Last-Event-ID</code> replay</td><td>You write it yourself — with backoff and jitter</td></tr>
+        <tr><td>Infra friendliness</td><td>Perfect — it's just HTTP</td><td>Very good — proxies, CDNs, gateways, gzip all just work</td><td>Awkward — many proxies/LBs need explicit config; long-lived connections break naive gateways; some corporate firewalls kill them</td></tr>
+        <tr><td>Client-to-server</td><td>The next request</td><td>A normal separate <code>POST</code></td><td>Same socket</td></tr>
+        <tr><td>Server cost</td><td>Highest — held connection <em>plus</em> HTTP churn</td><td>One held connection</td><td>One held connection, cheapest per message</td></tr>
+        <tr><td>Right when</td><td>You need a fallback for hostile networks, or updates are rare and you don't want new infra</td><td><strong>Updates flow one way:</strong> notifications, live feeds, price tickers, progress bars, streaming LLM tokens, dashboards</td><td><strong>Genuinely bidirectional, high-frequency, low-latency:</strong> chat, multiplayer, collaborative editing, live cursors, trading</td></tr>
+      </tbody>
+    </table>
+
+    <div class="senior">This is one of the highest-value trade-offs on the page because almost every candidate reaches for WebSockets reflexively. Say: <em>"Before I pick WebSockets I'd ask whether the traffic is actually bidirectional. Notifications, feeds and live dashboards are server-to-client only — SSE handles those over plain HTTP, gets browser-native reconnect with Last-Event-ID replay for free, and passes through every proxy and gateway I already run. I'd only take on WebSockets when the client genuinely pushes at high frequency — chat, presence, collaborative cursors — because that's when I'm buying real duplex, and I'm paying for it with a reconnect layer, a connection-state tier and an LB that understands long-lived connections."</em> That answer alone reads as someone who has actually operated a real-time system.</div>
+
+    <div class="note">SSE's known limits, so you're not caught out: it's <strong>text-only</strong> (base64 your binary — usually fine), and over <strong>HTTP/1.1</strong> the browser's ~6-connections-per-origin cap counts your event stream, so a few open tabs can starve your normal requests. Over HTTP/2 it's multiplexed and that limit evaporates. "SSE is bad because of the 6-connection limit" is a stale objection that assumes HTTP/1.1 — knowing <em>why</em> it's stale is exactly the kind of detail that lands.</div>
+
+    <h3>The hard part isn't the protocol — it's connection state</h3>
+    <p>
+      Anyone can open a WebSocket. What makes this an interview topic is what a persistent connection <em>does to your
+      architecture</em>, and it is a genuinely deep problem:
+    </p>
+    <ul>
+      <li><strong>Your servers become stateful.</strong> A stateless HTTP fleet lets any box serve any request; that's why you can autoscale it freely. A WebSocket pins a specific user to a <em>specific process</em> for hours. That single fact breaks load balancing, breaks deploys (every restart drops every connection — you need drain windows and client reconnect with jitter, or a deploy becomes a self-inflicted thundering herd), and breaks autoscaling (scaling <em>in</em> means severing live users).</li>
+      <li><strong>Routing a message becomes a lookup problem.</strong> User A on server 7 sends to user B — who is connected to server 23. Server 7 must <em>find out</em> where B is (a registry: <code>userId → serverId</code>, typically Redis) and hand the message to server 23 (via a pub/sub bus or a direct RPC). Your fan-out now depends on a distributed connection registry that must be kept correct through crashes, which is much harder than it sounds.</li>
+      <li><strong>Connections are expensive in aggregate.</strong> Each open socket costs a file descriptor and kernel + userspace buffers — call it tens of KB. A million concurrent connections is a real memory and FD-limit engineering problem, and it's why chat systems have a dedicated, thin, horizontally-scaled <em>connection tier</em> that owns nothing but sockets, sitting in front of stateless business services.</li>
+    </ul>
+    <p>
+      All three of these get built out properly in <strong>tutorial 11 (Design a Chat System)</strong> — the connection
+      registry, presence, and the fan-out path. What you need <em>here</em> is to be able to say "and choosing WebSockets
+      means I've made my edge tier stateful, which is the real cost" — because naming the cost of your own choice is the
+      single most reliable senior signal in this entire phase.
+    </p>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="apistyle">10. REST vs gRPC vs GraphQL</h2>
+
+    <p>
+      These are not competitors on one axis. They answer different questions, and the fastest way to sound senior here is to
+      say <strong>which boundary you're talking about</strong> before you pick one — because the right answer for a public
+      client-facing API and the right answer for service-to-service traffic inside your datacenter are almost never the same.
+    </p>
+
+    <table>
+      <thead><tr><th></th><th>REST</th><th>gRPC</th><th>GraphQL</th></tr></thead>
+      <tbody>
+        <tr><td>Wire format</td><td>JSON over HTTP — human-readable, verbose</td><td><strong>Protobuf</strong> — binary, compact, ~3–10× smaller and much faster to (de)serialize</td><td>JSON over HTTP (usually a single <code>POST /graphql</code>)</td></tr>
+        <tr><td>Transport</td><td>Any HTTP</td><td><strong>HTTP/2 required</strong> — gets multiplexing and streaming for free</td><td>Any HTTP</td></tr>
+        <tr><td>Contract</td><td>OpenAPI, if someone remembered to write it</td><td><code>.proto</code> file — <strong>enforced, versioned, codegen'd</strong> for every language</td><td>The schema — strongly typed, introspectable</td></tr>
+        <tr><td>Streaming</td><td>No (SSE/WS bolted on)</td><td><strong>Native</strong>: server-, client-, and bi-directional streaming</td><td>Subscriptions (usually over WebSockets)</td></tr>
+        <tr><td>Browser support</td><td>Native</td><td><strong>Not directly</strong> — needs grpc-web + a proxy. This is the whole reason it's an internal protocol.</td><td>Native</td></tr>
+        <tr><td>Caching</td><td><strong>Free</strong> — HTTP verbs + URLs mean CDNs, proxies and browsers all cache it out of the box</td><td>Not via HTTP; you do it yourself</td><td><strong>Hard</strong> — one POST URL, dynamic body. HTTP caching is useless; you need client-side normalized caches (Apollo/Relay) or persisted queries</td></tr>
+        <tr><td>Solves</td><td>Nothing special. It's the boring default, and boring is a feature.</td><td>Fast, type-safe, schema-enforced internal RPC</td><td><strong>Over- and under-fetching</strong>: the client asks for exactly the fields it needs, from many resources, in one round trip</td></tr>
+        <tr><td>Use it for</td><td><strong>Public APIs, third-party integrations, CRUD, anything you want cacheable and debuggable with curl.</strong> The default — deviate only with a reason.</td><td><strong>Internal service-to-service</strong> in a microservice fleet, especially on hot paths and polyglot teams</td><td><strong>Client-driven aggregation</strong> when many diverse clients (web, iOS, Android, watch) need different shapes of the same data</td></tr>
+      </tbody>
+    </table>
+
+    <h3>gRPC: why it's the internal answer</h3>
+    <p>
+      Three properties, and they all point the same way. <strong>Binary Protobuf</strong> means less bytes and dramatically
+      cheaper serialization — which matters enormously when one user request fans out to fifteen internal calls and every
+      one of them is paying JSON parse cost. <strong>HTTP/2</strong> gives you multiplexing over one long-lived connection
+      between services, so you're not paying handshakes per call. And <strong>the <code>.proto</code> contract is
+      enforced</strong>: it generates the client and server stubs, so an incompatible change fails at build time instead of
+      at 3am. The trade-offs, honestly: it's not human-readable (you can't curl it, and debugging is worse), it's awkward
+      through browsers and some middleboxes, and it adds a codegen step to your build. That's exactly why it lives
+      <em>behind</em> the API gateway (§8) and the gateway translates REST/JSON at the edge.
+    </p>
+
+    <div class="senior">The soundbite that gets used in half the case studies in this phase: <em>"REST at the edge, gRPC internally. The public API is REST/JSON because it's cacheable, debuggable and every client speaks it — but service-to-service I'd use gRPC: binary Protobuf over a multiplexed HTTP/2 connection, with an enforced schema so a breaking change fails at compile time rather than in production. The gateway is the translation seam."</em></div>
+
+    <h3>GraphQL: argue about it like a systems engineer, not a frontend dev</h3>
+    <p>
+      You know why you liked GraphQL: no more begging a backend team for a new endpoint, no more fetching a 40-field user
+      object to render a name and an avatar, no more three round trips to paint one screen. That's real, and on a
+      150ms-RTT mobile link (§11) collapsing three sequential round trips into one is worth ~300ms of perceived load time.
+      Say that — it's the strongest argument for GraphQL and it's <em>a latency argument</em>.
+    </p>
+    <p>
+      But in a <em>system design</em> interview, the interviewer is testing whether you know what it costs on the server.
+      Own all four:
+    </p>
+    <ul>
+      <li>
+        <strong>N+1 queries.</strong> <code>{ posts { author { name } } }</code> — resolvers are per-field, so a naive
+        implementation fetches 100 posts, then issues <strong>100 separate queries</strong> for the authors. This is the
+        single most-asked GraphQL follow-up. The fix is <strong>DataLoader</strong>: batch all the author lookups within one
+        tick into a single <code>WHERE id IN (…)</code>, and cache per request. You have hit this exact problem from the
+        Postgres side in Phase 1 — it's the same N+1 as a lazily-loaded JPA relation, and saying so connects two phases in one
+        sentence.
+      </li>
+      <li>
+        <strong>Caching is genuinely hard.</strong> Everything is a <code>POST</code> to one URL with a different body, so
+        HTTP caching — CDN, proxy, browser — is dead. You're pushed to <strong>persisted queries</strong> (register the query
+        server-side, send a hash, make it a cacheable GET — this is the real answer) and to normalized client caches. You gave
+        up the single greatest free win in web architecture. Name it as a cost.
+      </li>
+      <li>
+        <strong>You handed clients an unbounded query budget.</strong> A deeply nested or recursive query can be a
+        self-inflicted DoS. So you need <em>query depth limiting</em>, <em>complexity/cost analysis</em>, and rate limiting by
+        computed cost rather than by request count — which is a much harder rate limiter than "100 requests/minute" (tutorial 09).
+      </li>
+      <li>
+        <strong>Observability degrades.</strong> Every request is <code>POST /graphql 200</code>. Your per-endpoint latency
+        dashboards, your per-route rate limits, your "which endpoint is slow" instincts — all gone. You have to rebuild
+        observability at the resolver level.
+      </li>
+    </ul>
+
+    <div class="pitfall">The trap: proposing GraphQL for internal service-to-service communication. It's a <em>client-facing aggregation</em> layer — the whole value proposition is "an unknown client wants an unpredictable shape of data." Between two of your own services, the shape is known at compile time, so all you've bought is parsing overhead, N+1 risk and lost caching, and you've given up the schema enforcement you'd have got free from Protobuf. Use gRPC there. Equally: don't propose GraphQL for a system with one client and stable screens — you've taken on all of the cost and none of the benefit. <strong>GraphQL earns its keep when you have many heterogeneous clients whose data needs you can't predict.</strong> That's the sentence.</div>
+
+    <div class="note">The pragmatic middle you should have in your pocket: <strong>a BFF (Backend-For-Frontend) REST endpoint</strong> that aggregates services inside the datacenter and returns exactly the shape one screen needs. You get GraphQL's round-trip savings, keep HTTP caching, and skip the entire GraphQL server. In a design interview, proposing the BFF <em>instead</em> of GraphQL — and explaining that you're choosing it because your client set is small and stable — is often the stronger answer, because it shows you can turn a technology <em>down</em>.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="latency">11. Latency numbers you must know cold</h2>
+
+    <p>
+      These aren't trivia. They are the <strong>inputs to every design argument you'll make</strong> — you cannot claim a
+      design meets a 200ms p99 without knowing what its hops cost. Learn the order of magnitude, not the digits; nobody
+      will fault you for saying "call it a millisecond" but they will absolutely notice if you think a cross-continent round
+      trip is 10ms.
+    </p>
+
+    <table>
+      <thead><tr><th>Operation</th><th>Time</th><th>Relative</th><th>What it implies</th></tr></thead>
+      <tbody>
+        <tr><td>L1 / L2 cache reference</td><td>~1 ns</td><td>1×</td><td>Free. Ignore it in system design.</td></tr>
+        <tr><td>Main memory reference</td><td>~100 ns</td><td>100×</td><td>An in-process cache lookup is essentially free.</td></tr>
+        <tr><td>Compress 1 KB</td><td>~10 µs</td><td></td><td>Compression is nearly always worth it over a network.</td></tr>
+        <tr><td>SSD random read</td><td>~100 µs (0.1 ms)</td><td>~1,000× memory</td><td>Disk is ~1000× slower than RAM. <strong>This one number is the entire justification for caching.</strong></td></tr>
+        <tr><td>Read 1 MB sequentially from memory</td><td>~250 µs</td><td></td><td></td></tr>
+        <tr><td>Round trip within the same datacenter</td><td><strong>~0.5 ms</strong></td><td></td><td>Internal service calls are cheap. You can afford a fan-out of 10 here. This is <em>why</em> aggregation belongs at the gateway (§8) and not in the client.</td></tr>
+        <tr><td>Read 1 MB sequentially from SSD</td><td>~1 ms</td><td></td><td></td></tr>
+        <tr><td>Redis GET (same DC, incl. network)</td><td><strong>~1 ms</strong></td><td></td><td>The number to quote when you add a cache.</td></tr>
+        <tr><td>Postgres query, indexed, warm</td><td><strong>~1–10 ms</strong></td><td></td><td>A cache hit is ~5–10× faster than a good DB query — and it's the <em>tail</em> and the <em>load relief</em> you're really buying.</td></tr>
+        <tr><td>Disk seek (spinning rust)</td><td>~10 ms</td><td>~100,000× memory</td><td>Mostly historical, but it's why LSM-trees and sequential writes exist (tutorial 03).</td></tr>
+        <tr><td>Read 1 MB over a 1 Gbps network</td><td>~10 ms</td><td></td><td>Payload size is latency. A 1 MB JSON response is not free.</td></tr>
+        <tr><td>RTT: same city / same region</td><td><strong>~1–5 ms</strong></td><td></td><td>Cross-AZ is cheap. Synchronous cross-AZ replication is viable.</td></tr>
+        <tr><td>RTT: US East ↔ US West</td><td><strong>~60–70 ms</strong></td><td></td><td>Synchronous cross-country writes cost you 70ms <em>per write</em>. That's a design decision, not an implementation detail.</td></tr>
+        <tr><td>RTT: intercontinental (Mumbai ↔ US East, or CA ↔ Netherlands)</td><td><strong>~150 ms</strong></td><td></td><td><strong>The number that decides architectures.</strong> See below.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>What they IMPLY — this is the part that scores</h3>
+    <p>Anyone can recite the table. The interview is about the inferences:</p>
+    <ul>
+      <li>
+        <strong>A chatty protocol is fatal internationally.</strong> At 150ms per round trip, five sequential dependent
+        requests — the shape of a naive REST client painting a screen — is <strong>750ms of pure network</strong>, before your
+        servers do a single thing. You cannot optimize your way out of that with a faster database; the only fixes are
+        <em>fewer round trips</em> (aggregate at a BFF/gateway, batch, use GraphQL or a composed endpoint) or <em>a shorter
+        trip</em> (put a PoP near the user and terminate there). <strong>This one implication is the through-line of the whole
+        page</strong> — CDNs, edge termination, HTTP/2 multiplexing, gateway aggregation and GraphQL are all, at bottom, attacks
+        on round-trip count and round-trip length.
+      </li>
+      <li>
+        <strong>Speed of light is a hard floor.</strong> ~300,000 km/s in vacuum, ~200,000 km/s in fibre — and real routes are
+        not straight lines. Mumbai to Virginia is ~13,000 km, so ~65ms one way <em>at the theoretical limit</em>, ~150ms round
+        trip in reality. <strong>No amount of money buys you a 20ms round trip to another continent.</strong> If a requirement
+        says "sub-100ms globally," you have just been told, in the requirements, that you need multi-region — before you draw
+        anything. Deriving that out loud from the latency budget is a top-percentile move (and it's the method from tutorial 01
+        in action).
+      </li>
+      <li>
+        <strong>Memory is ~1000× faster than SSD, and a same-DC round trip costs about as much as a disk read.</strong> That's
+        why a Redis lookup over the network still beats hitting the database — you're trading a cheap network hop for an
+        expensive disk hop, plus you're offloading the DB.
+      </li>
+      <li>
+        <strong>Sequential beats random, everywhere.</strong> Reading 1 MB sequentially from SSD (~1ms) is far cheaper than
+        10,000 random 100-byte reads. It's why batching wins, why Kafka is fast, and why LSM-trees turn random writes into
+        sequential ones.
+      </li>
+    </ul>
+
+    <div class="senior">Use the numbers as an argument, never as a recital. <em>"Requirement is a 200ms p99 for users in Europe and our origin is us-east-1 — that's a 90ms round trip before we do any work, so nearly half the budget is gone on physics. Either we serve reads from an EU region, or we accept that 200ms is only achievable in North America. Which is it?"</em> That is what estimation is <em>for</em>, and tutorial 26 drills it until it's automatic.</div>
+
+    <div class="note">Nobody expects exact figures. Round hard and say you're rounding: "call it a millisecond for a same-DC round trip, call it 150ms across the world, memory is roughly a thousand times faster than disk." Confident approximations beat hesitant precision every single time, and hesitation is what actually costs you points.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="qa">Interview Q&amp;A</h2>
+    <p>Answer each out loud before opening it. If your spoken answer is shorter than the written one, you have found a gap.</p>
+
+    <details class="qa">
+      <summary>Walk me through everything that happens when a user in Mumbai types your URL and hits enter.</summary>
+      <div class="answer">
+        <p>The one they open with. Structure it as <em>hops with costs</em>, not as a list of nouns:</p>
+        <ol>
+          <li><strong>DNS resolution.</strong> Browser cache → OS cache → recursive resolver → root → TLD → authoritative NS. Cold that's up to four round trips (20–120ms); warm it's ~0ms. Our authoritative NS does latency-based routing, so it hands back an IP for the nearest edge PoP rather than the origin.</li>
+          <li><strong>TCP handshake</strong> to that PoP — one RTT, but the PoP is ~10ms away, not 150ms.</li>
+          <li><strong>TLS handshake</strong> — 1 RTT on TLS 1.3, or 0 on resumption. TLS terminates at the edge.</li>
+          <li><strong>The CDN checks its cache.</strong> Hit → we're done, the request never touched our infrastructure. Miss → the edge forwards to origin over an already-warm, pooled connection on an optimized backbone route.</li>
+          <li><strong>Load balancer</strong> at origin: health-checked pool, least-connections, deep L7 routing on the path.</li>
+          <li><strong>API gateway</strong>: authenticate the JWT, apply rate limits, route to the right service, possibly aggregate.</li>
+          <li><strong>Service</strong> → cache (~1ms) → database on miss (~5–20ms).</li>
+          <li>Response back up the chain; the edge caches it if the headers allow.</li>
+        </ol>
+        <p>Then the closing line that makes it a senior answer: <em>"Note that most of the elapsed time is in steps 1–3 and the origin leg — the network, not my code. That's why the edge exists."</em></p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Why does HTTP/3 use UDP? Isn't UDP unreliable?</summary>
+      <div class="answer">
+        <p>UDP isn't the goal — it's the <em>escape hatch</em>. The real goal is eliminating TCP head-of-line blocking: HTTP/2 multiplexes many streams over one TCP connection, but TCP guarantees ordered delivery of the byte stream, so one lost packet stalls delivery of <em>every</em> stream behind it. You can't fix that inside TCP — ordered delivery is TCP's defining guarantee, and TCP lives in every kernel and middlebox on earth, so you can't ship a change to it.</p>
+        <p>So QUIC rebuilds a transport in userspace on top of UDP, because UDP is the only thing middleboxes will pass without opinions. It then re-adds reliability, ordering and congestion control <strong>per stream</strong> instead of per connection — so loss on stream 1 stalls only stream 1. It also merges the transport and TLS handshakes (1 RTT new, 0 RTT resumed) and uses connection IDs instead of the IP 4-tuple, so a connection survives a Wi-Fi→LTE switch. HTTP/3 is not less reliable than HTTP/2; the reliability just moved up a layer, where it could be made per-stream.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>L4 or L7 load balancer — how do you choose?</summary>
+      <div class="answer">
+        <p>It's a question of what the balancer needs to <em>see</em>. L4 works on TCP packets: it knows source and destination IP and port and nothing else, so it can only pin an entire connection to a backend. L7 terminates TLS and parses HTTP, so it can route on path, header or cookie, distribute <em>per request</em> rather than per connection, do deep health checks (<code>GET /health</code>, not just "is the port open"), retry, rewrite headers, inject request IDs, and rate limit.</p>
+        <p>L7 is the default for HTTP because you almost always want path-based routing and per-request distribution. L4 wins where you need raw throughput, non-HTTP protocols, or where you must <em>not</em> decrypt (regulatory or end-to-end encryption). In practice, run both: a cheap, fast, DDoS-absorbing L4 front door fanning out to a fleet of L7 balancers doing the intelligent work.</p>
+        <p>The connective insight to state: <strong>TLS termination is the precondition for L7 — you cannot route on a URL you can't decrypt.</strong></p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>WebSockets or SSE for a live notification feed?</summary>
+      <div class="answer">
+        <p><strong>SSE</strong>, and the reasoning is the answer. Notifications are strictly server-to-client, so full duplex buys nothing. SSE is plain HTTP: it passes through every proxy, load balancer, CDN and API gateway I already operate, it works with normal auth headers and compression, and the browser gives me automatic reconnect with <code>Last-Event-ID</code> replay for free — which is precisely the layer I'd otherwise have to write, badly, myself for a WebSocket.</p>
+        <p>I'd take WebSockets when the client genuinely pushes at high frequency — chat, typing indicators, presence, collaborative cursors, live trading — because then I'm actually buying duplex. And I'd say what it costs: my edge tier becomes stateful, deploys sever live connections, and I need a connection registry to find which server a given user is attached to.</p>
+        <p>Long polling stays in my pocket as a fallback for hostile corporate networks that kill long-lived connections.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>You've put a CDN in front of a personalized, dynamic API. The cache hit ratio is 0%. Is the CDN useless?</summary>
+      <div class="answer">
+        <p>No — and this is the question that separates people who've only read about CDNs. Even at 0% hit ratio the CDN terminates TCP and TLS ~10ms from the user instead of ~150ms from origin, then forwards over a pre-established, warm, pooled connection on an optimized backbone path. You've removed 2–3 expensive round trips against a distant origin and replaced them with cheap ones against a nearby PoP. On an uncacheable request that can still be hundreds of milliseconds. <strong>A CDN is a latency-optimized on-ramp before it is a cache.</strong> It's also your DDoS absorber and your TLS/cert layer.</p>
+        <p>Then I'd attack the 0%: <strong>micro-caching</strong> hot non-personalized endpoints with a 1–5 second TTL (at 10k RPS, a 1s TTL means the origin serves 1 request/second instead of 10,000, and nobody notices one second of staleness on a trending list); <strong>splitting responses</strong> so the 90% shared content caches long and only the 10% personal slice is dynamic; and <strong>edge compute</strong> to validate JWTs and reject bad traffic at the PoP. Hit ratio is a design output, not a fixed property.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Why is cache invalidation hard, and what do you actually do about it?</summary>
+      <div class="answer">
+        <p>It's hard because a purge is a <em>distributed</em> operation across hundreds of PoPs: it takes seconds to minutes, it's usually rate-limited, and it can partially fail — leaving some PoPs serving new content and others serving old, with no easy way to tell which. So any design where correctness depends on a purge landing promptly and everywhere is fragile.</p>
+        <p>What I actually do: <strong>avoid invalidation rather than solve it.</strong> Content-hashed immutable URLs (<code>app.a1b2c3.js</code>, <code>max-age=31536000, immutable</code>) mean a deploy changes the <em>name</em>, so there is nothing to purge — the old object simply stops being requested. The one file that can't be versioned is the HTML entry point, because its name is the URL, so it gets a short TTL and acts as a pointer to immutable assets. That two-tier pattern — a short-TTL mutable pointer to long-TTL immutable content — generalizes far beyond the browser.</p>
+        <p>Where I genuinely must invalidate (a price changed), I'd use <strong>surrogate-key/tag purging</strong> ("purge everything tagged <code>product:123</code>") rather than URL purging, since one write invalidates many URLs, and I'd use <code>stale-while-revalidate</code> so users get an instant response while the refresh happens in the background.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Round robin or least connections?</summary>
+      <div class="answer">
+        <p><strong>Least connections</strong>, for anything where request cost varies — which is every real API. Round robin is blind: a server that gets unlucky and receives three ten-second report requests in a row is buried while its neighbours idle, and round robin will happily send it a fourth. Least connections is feedback-driven — a struggling backend accumulates open connections and therefore naturally receives less traffic.</p>
+        <p>The caveat worth adding: a freshly restarted server has zero connections and will get instantly flooded, so you want a slow-start ramp. And if the backend holds any state <em>keyed by something</em> — a cache node, a shard, a live WebSocket session — neither applies: you want <strong>consistent hashing</strong>, so the same key always lands on the same node and adding or removing a node remaps only ~1/N of keys instead of nearly all of them.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>What's the difference between an API gateway, a reverse proxy, and a load balancer?</summary>
+      <div class="answer">
+        <p>They overlap in implementation — Nginx or Envoy can be all three — but they are three jobs. A <strong>reverse proxy</strong> is the single public front door that hides your backend topology (TLS, compression, static caching, header rewriting). A <strong>load balancer</strong> is a specialized reverse proxy whose job is spreading traffic across N identical instances of the same service and routing around dead ones via health checks. An <strong>API gateway</strong> is a reverse proxy that owns the <em>cross-cutting concerns</em> of an API across <em>many different</em> services: authN/authZ, rate limiting and quotas, per-API routing, request/response transformation, aggregation, versioning, per-consumer metrics.</p>
+        <p>The gateway's reason to exist, said plainly: without it, thirty microservices each implement JWT validation and rate limiting thirty slightly different ways, one of which is wrong. <strong>It's your Express middleware stack or Spring filter chain, extracted into infrastructure.</strong> The danger is that business logic creeps into it and it becomes a monolith everyone is afraid to deploy — the old ESB problem. My rule: if the gateway needs to know what a "purchase order" is, it's in the wrong place.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Would you use GraphQL here? Sell me on it, then argue against it.</summary>
+      <div class="answer">
+        <p><strong>For it:</strong> when you have many heterogeneous clients — web, iOS, Android — whose data needs you can't predict, GraphQL kills over- and under-fetching and collapses several sequential round trips into one. On a 150ms mobile link, turning three dependent requests into one is ~300ms of real perceived load time. That's a latency argument and it's the strongest one.</p>
+        <p><strong>Against it:</strong> (1) <strong>N+1 queries</strong> — per-field resolvers turn <code>{ posts { author } }</code> into 1 + 100 queries; you need DataLoader-style per-request batching and it's a footgun forever. It's the same N+1 as a lazily-loaded JPA relation. (2) <strong>You lose HTTP caching</strong> — everything is a POST to one URL, so CDNs, proxies and browsers can't cache it; you're pushed to persisted queries and normalized client caches. That's giving up the single greatest free win in web architecture. (3) <strong>You've handed clients an unbounded query budget</strong> — a deeply nested query is a self-inflicted DoS, so you need depth limiting and cost-based rate limiting, which is a much harder rate limiter than "100 req/min". (4) <strong>Observability collapses</strong> — every request is <code>POST /graphql 200</code>, so per-endpoint dashboards and route-level limits are gone.</p>
+        <p><strong>My call:</strong> if the client set is small and the screens are stable, I'd use a <strong>BFF REST endpoint</strong> that aggregates inside the datacenter instead — same round-trip savings, keep HTTP caching, skip the GraphQL server entirely. And I'd never use GraphQL service-to-service; that's gRPC's job.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Your service is in us-east-1. A requirement says p99 under 200ms for users in Singapore. What do you say?</summary>
+      <div class="answer">
+        <p>I do the arithmetic <em>before</em> I draw anything. Singapore to us-east-1 is roughly a 200ms+ round trip — over the stated budget on <strong>physics alone</strong>, with zero server time. Even a single request can't make it. So the requirement is telling me, in the requirements phase, that this is a multi-region design; there is no caching or query optimization that fixes it.</p>
+        <p>Then I'd separate reads from writes, because they have different answers. <strong>Reads:</strong> serve from a Singapore region — a read replica, or edge caching if the data tolerates staleness. That's usually achievable and it's most of the traffic. <strong>Writes:</strong> if they must be strongly consistent against a single primary in us-east-1, that 200ms round trip is unavoidable and I'd go back to the interviewer and say so — either the write-latency SLO is relaxed, or we accept a multi-primary design and its conflict resolution, or writes are made async from the user's perspective. <strong>Naming which requirement has to give is the answer</strong>, not silently pretending I can meet all of them.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Why is TLS termination at the load balancer important?</summary>
+      <div class="answer">
+        <p>Four reasons, and the fourth is the one candidates miss. <strong>Latency:</strong> the expensive handshake happens against a PoP 10ms away instead of an origin 150ms away — turning ~450ms of setup into ~20ms — and the edge-to-origin leg rides a warm pooled connection. <strong>CPU:</strong> asymmetric crypto is expensive and offloading it keeps it off your app servers. <strong>Certificate management:</strong> one place to rotate certs, not N services with N keystores. <strong>Visibility:</strong> an LB cannot route on a path, read a header, or inject a request ID if it can't decrypt — <em>TLS termination is the precondition for L7 routing at all.</em></p>
+        <p>And the caveat that matters in fintech and healthcare: terminating and then sending plaintext to backends assumes a trusted internal network. Under PCI or HIPAA it isn't, and the expected answer is re-encryption to the backend, or full mTLS between services via a service mesh.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Why is DNS not a sufficient failover mechanism on its own?</summary>
+      <div class="answer">
+        <p>Because TTL is a hint, not a contract. Resolvers, corporate middleboxes and some runtimes (the JVM historically cached DNS <em>forever</em> by default) ignore it, so "lower the TTL and repoint the record" leaves a long tail of clients hammering a dead IP for minutes or hours after you've moved. Lowering TTLs also costs you: more cold lookups, worse tail latency, higher query volume, and a bigger DDoS surface.</p>
+        <p>So failover has to be layered. DNS (ideally latency-based) <em>steers</em> users to a region — it's coarse-grained, minutes-scale, and that's fine for what it's for. Inside a region, <strong>health checks at the load balancer</strong> eject a dead instance in seconds without any client re-resolving. Across regions, <strong>anycast</strong> lets the internet's own routing move traffic to a healthy PoP in seconds, again with no DNS change. DNS is a steering wheel, not an airbag.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>What's the hardest part of running WebSockets at scale?</summary>
+      <div class="answer">
+        <p>Not the protocol — the <strong>state</strong>. A WebSocket pins a specific user to a specific process for hours, which undoes the thing that makes an HTTP tier easy: statelessness.</p>
+        <ul>
+          <li><strong>Routing becomes a lookup.</strong> User A on server 7 messages user B, who is connected to server 23. Server 7 has to <em>discover</em> that (a <code>userId → serverId</code> registry, typically Redis) and hand the message over via pub/sub or direct RPC. That registry has to stay correct through crashes, which is the genuinely hard part.</li>
+          <li><strong>Deploys sever every connection.</strong> Restarting the fleet drops a million sockets, all of which reconnect at once — a self-inflicted thundering herd. You need connection draining and client reconnect with exponential backoff <em>plus jitter</em>.</li>
+          <li><strong>Autoscaling fights you.</strong> Scaling in kills live users; scaling out doesn't help existing connections, since they're already pinned.</li>
+          <li><strong>Raw capacity.</strong> Each socket costs a file descriptor and kernel buffers — tens of KB. A million concurrent connections is a real memory and FD engineering problem.</li>
+        </ul>
+        <p>Which is why chat systems run a thin, dedicated, horizontally-scaled <strong>connection tier</strong> that owns nothing but sockets, in front of stateless business services. Tutorial 11 builds exactly that.</p>
+      </div>
+    </details>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="takeaways">What to remember</h2>
+
+    <ul>
+      <li><strong>The request path, in order:</strong> DNS → TCP → TLS → CDN edge → LB → API gateway → service → cache → DB. The expensive hops are at the top and none of them are your code. Every box after the CDN exists to be crossed as rarely as possible.</li>
+      <li><strong>DNS is a routing layer, not a phone book.</strong> It's the last indirection you control before the packet leaves the user's ISP. Latency-based routing beats GeoDNS (geography is a bad proxy for latency). Low TTL = fast failover but more lookups; TTL is a hint, so never make DNS your only failover — anycast plus LB health checks are what make failover <em>fast</em>.</li>
+      <li><strong>TCP costs a round trip before your first byte</strong> (plus 1–2 more for TLS). Pick UDP when stale data is worthless: live voice/video, gaming, DNS. Buffered video streaming is TCP — the distinction is interactive vs buffered, not "video".</li>
+      <li><strong>TLS is a latency problem before it's a security problem.</strong> Terminate at the edge: 450ms of setup becomes 20ms. Termination is also the precondition for L7 routing. Session tickets (stateless) beat session IDs (sticky). 0-RTT is replayable — idempotent requests only.</li>
+      <li><strong>HTTP's whole history is head-of-line blocking, fixed at three layers.</strong> H1.1 blocks between requests (→ sharding, concat). H2 multiplexes streams and kills that (→ sharding becomes an anti-pattern), but TCP's ordering still stalls all streams on one lost packet. H3/QUIC rebuilds the transport on UDP for independent streams, 0–1 RTT handshakes, and connection migration across network changes.</li>
+      <li><strong>A CDN is a latency-optimized on-ramp before it's a cache.</strong> Even at a 0% hit ratio it terminates TLS near the user and forwards over a warm connection. Pull by default; push for predictable spikes. Every dimension you add to the cache key divides your hit ratio.</li>
+      <li><strong>Don't solve cache invalidation — sidestep it.</strong> Content-hashed immutable URLs with a short-TTL HTML pointer. Purges are distributed, slow, and can partially fail. Where you must purge, purge by surrogate key, not URL.</li>
+      <li><strong>L4 sees IP+port and pins whole connections; L7 decrypts, sees the request, and distributes per request.</strong> L7 is the HTTP default. Use <em>least connections</em>, not round robin. Use consistent hashing when the backend holds per-key state. Keep health checks shallow so a shared DB blip doesn't eject the entire fleet.</li>
+      <li><strong>Reverse proxy = front door. Load balancer = distribute + health-check. API gateway = cross-cutting concerns</strong> (auth, rate limiting, routing, aggregation) so N services don't reimplement them N ways. It's middleware, extracted into infrastructure — and it must not grow business logic.</li>
+      <li><strong>SSE for server→client, WebSockets for genuinely bidirectional, long polling as a fallback.</strong> Most "real-time" needs are one-way and SSE gives you reconnect and proxy-friendliness for free. WebSockets make your edge tier stateful — that's the real cost, and naming it is the senior move.</li>
+      <li><strong>REST at the edge, gRPC internally, GraphQL only for many heterogeneous clients</strong> — and if you say GraphQL, you must immediately own N+1, lost HTTP caching, unbounded query cost, and collapsed observability. Never GraphQL service-to-service.</li>
+      <li><strong>The numbers:</strong> memory ~100ns · SSD read ~0.1ms · Redis ~1ms · same-DC RTT ~0.5ms · same-region ~1–5ms · US coast-to-coast ~70ms · <strong>intercontinental ~150ms</strong>. Memory is ~1000× faster than disk (that's why you cache). Five sequential round trips from Mumbai is 750ms of pure physics — <strong>a chatty protocol is fatal internationally, and no database optimization saves it.</strong></li>
+      <li><strong>The habit:</strong> every time you place a box, say what it costs. "I'll terminate TLS at the edge — that buys me 400ms of handshake but it means the edge holds my private key, so in a regulated environment I'd re-encrypt to the backend." Design, then price it. That's the whole grading rubric.</li>
+    </ul>
+  </section>
+
+  <nav class="page-nav">
+    <a href="01-the-method.html">← 01 — The Method</a>
+    <a href="03-data-storage.html">03 — Data &amp; Storage Engines →</a>
+  </nav>
+
+</main>
+</body>
+</html>

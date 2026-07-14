@@ -1,0 +1,1438 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>16 — Design Video Streaming (YouTube / Netflix) | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <div class="breadcrumb"><a href="index.html">← Course Home</a></div>
+    <h1>16 — Design Video Streaming (YouTube / Netflix)</h1>
+    <p>The one that isn't a database problem. Archetype: <strong>media at scale</strong> — big dumb blobs, an async processing pipeline, and delivery economics.</p>
+  </div>
+</header>
+
+<main class="container">
+
+  <section>
+    <h2>Why this matters in the interview</h2>
+    <p>
+      Every case study so far has been, underneath, a <em>data</em> problem. Where do the rows live, how do you shard them, how do you
+      keep two replicas from disagreeing. Video is not that. The metadata for every video YouTube has ever hosted would fit in a
+      Postgres cluster you could run yourself; it is <em>boring</em>. The hard part is that each of those tiny rows points at a
+      multi-gigabyte object, and millions of people want that object streamed to their living room at 5 Mbps <em>right now</em>, and
+      the bytes have to physically travel over networks that somebody bills you for. This is the archetype: <strong>media at
+      scale</strong>. It transfers directly to image hosting, podcast distribution, large-file distribution, software updates, and game
+      patches — Steam shipping a 90 GB update to ten million players on launch day is this exact problem with the video parts filed
+      off. Say that out loud; the interviewer will recognize it.
+    </p>
+    <p>
+      And here is the reframe that decides your grade, so make it in the first three minutes rather than the last three:
+      <strong>this is not a database problem, it is a bandwidth and storage problem — and therefore it is a cost problem.</strong>
+      Netflix's engineering, stripped to its core, is a decades-long campaign to <em>avoid paying for the same byte twice</em>. That is
+      why they built a CDN out of their own hardware and gave it away to ISPs. Most candidates never make this move. They draw an
+      upload service, a transcoding box, a database, an S3 bucket, an arrow labelled "CDN", and they think they're done — they have
+      described the shape of the system and understood nothing about it. You want to be the candidate who says <em>"before I draw
+      anything, let me work out the egress bandwidth, because I think that number is the entire design."</em> It is. Everything else on
+      this page — the transcoding ladder, the segment format, the pre-positioning strategy, the cold storage tier — is downstream of
+      one arithmetic result.
+    </p>
+  </section>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ul>
+      <li><a href="#prompt">1. The prompt</a> — and the YouTube-vs-Netflix fork hiding in it ★</li>
+      <li><a href="#requirements">2. Requirements</a> — rebuffering is THE metric</li>
+      <li><a href="#estimation">3. Estimation</a> — the bandwidth number that reframes everything ★★</li>
+      <li><a href="#api">4. API design</a> — presigned upload, manifest, segments</li>
+      <li><a href="#data-model">5. Data model</a> — metadata/blob split, and the renditions table</li>
+      <li><a href="#hld">6. High-level design</a> — one upload and one playback, end to end</li>
+      <li><a href="#deep-dive-1">7a. Deep dive: the transcoding pipeline</a> ★★ — async, chunked, idempotent</li>
+      <li><a href="#deep-dive-2">7b. Deep dive: ABR &amp; delivery economics</a> ★★ — this is the interview</li>
+      <li><a href="#scaling">8. Scaling &amp; bottlenecks</a> — protect the origin</li>
+      <li><a href="#tradeoffs">9. Trade-offs</a></li>
+      <li><a href="#followups">10. Follow-ups you should expect</a> — live, DRM, analytics, resume, search</li>
+      <li><a href="#qa">Interview Q&amp;A</a></li>
+      <li><a href="#takeaways">What to remember</a></li>
+    </ul>
+  </div>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="prompt">1. The prompt</h2>
+
+    <p>The interviewer says:</p>
+
+<pre><code>  "Design YouTube."
+</code></pre>
+
+    <p>
+      Or "design Netflix," which sounds like the same question and is not. Two words, and they hide a fork that changes the answer
+      completely. You need to find that fork before you draw a box, so ask:
+      <em>"Is this user-generated video — anyone can upload, unbounded catalog — or a curated catalog like Netflix, where a few
+      thousand titles are licensed and everybody watches the same handful?"</em>
+    </p>
+
+    <table>
+      <thead><tr><th></th><th>YouTube</th><th>Netflix</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Catalog</strong></td>
+          <td>Unbounded. Billions of videos, growing by hundreds of hours <em>every minute</em>.</td>
+          <td>Curated. Tens of thousands of titles. You know every one of them in advance.</td>
+        </tr>
+        <tr>
+          <td><strong>Popularity curve</strong></td>
+          <td>Brutal long tail. <strong>The overwhelming majority of videos have close to zero views</strong> — and yet you must store them forever.</td>
+          <td>Extremely concentrated. A new season drops and tens of millions of people watch <em>the same bytes</em> in the same week.</td>
+        </tr>
+        <tr>
+          <td><strong>Write path</strong></td>
+          <td>The hard part. Ingest and transcode a firehose of uploads from strangers, in every broken format ever produced.</td>
+          <td>Easy and offline. A studio hands you a master file weeks before launch. You can transcode it at your leisure, by hand if you want.</td>
+        </tr>
+        <tr>
+          <td><strong>Caching strategy</strong></td>
+          <td><strong>Reactive.</strong> You cannot pre-position a catalog you haven't seen yet. Cache on first request and accept that the tail always misses.</td>
+          <td><strong>Predictive.</strong> You can push the entire relevant catalog to the edge <em>before anyone asks for it</em>. This is a luxury and it is enormous.</td>
+        </tr>
+        <tr>
+          <td><strong>What the interview is about</strong></td>
+          <td>The upload → transcode pipeline, plus delivery.</td>
+          <td>Delivery, delivery, delivery. And cost.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>
+      <strong>Default to YouTube</strong> unless they say otherwise — it is the strictly harder problem, it contains Netflix as a special
+      case, and it gives you both deep dives. But keep the Netflix contrast in your pocket, because you will use it in §7b to explain
+      why "just put a CDN in front of it" is an answer and not <em>the</em> answer. The catalog shape determines the caching strategy,
+      and the caching strategy determines the bill.
+    </p>
+
+    <div class="senior">Open with the reframe. <em>"Before requirements — I want to flag where I think this problem actually lives. The metadata here is trivial; a single Postgres instance could hold the row for every video YouTube has. What's hard is that each row points at gigabytes of bytes, and those bytes have to reach millions of concurrent viewers over networks somebody charges for. So I'd like to spend my estimation time on storage and egress bandwidth rather than QPS, because I believe the bandwidth number is going to dictate the entire architecture. Is that the direction you want?"</em> You have, in twenty seconds, told them you know that video is a cost-engineering problem wearing a distributed-systems costume. Very few candidates open here.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="requirements">2. Requirements</h2>
+
+    <p>
+      Ask, but always <strong>propose an answer with the question</strong> — make their job to correct you, not to teach you.
+    </p>
+
+    <table>
+      <thead><tr><th>You ask</th><th>They answer</th><th>What it just forced</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><em>"User-generated or curated catalog? I'll assume YouTube — anyone uploads, unbounded catalog."</em></td>
+          <td>Yes, YouTube.</td>
+          <td>You now own the transcoding pipeline <em>and</em> a long tail you can't pre-cache. Both deep dives just got selected.</td>
+        </tr>
+        <tr>
+          <td><em>"Global audience? I'll assume yes, and that a viewer in São Paulo must get the same startup latency as one in San Jose."</em></td>
+          <td>Global.</td>
+          <td><strong>This is the sentence that buys you the CDN.</strong> Physics — not architecture — says you cannot serve 4K video from one region to the planet.</td>
+        </tr>
+        <tr>
+          <td><em>"How fast must playback start, and how much rebuffering is tolerable? I'd target under 2 seconds to first frame and effectively zero rebuffer."</em></td>
+          <td>Yes. Rebuffering is the metric we're judged on.</td>
+          <td><strong>The two numbers that define the product.</strong> Everything in §7b exists to hit these. Write them on the board.</td>
+        </tr>
+        <tr>
+          <td><em>"Is it OK if an upload takes minutes to become watchable? I'd like to make processing asynchronous."</em></td>
+          <td>Totally fine.</td>
+          <td><strong>Enormous.</strong> This is the permission slip for the entire async pipeline. Without it you'd have to transcode inside the request, which is impossible.</td>
+        </tr>
+        <tr>
+          <td><em>"Adaptive quality — the player switches resolution as the network changes?"</em></td>
+          <td>Yes, essential.</td>
+          <td>You now must transcode into a <em>ladder</em> of renditions, which multiplies storage, and you must segment them. §7a and §7b.</td>
+        </tr>
+        <tr>
+          <td><em>"Am I in scope for recommendations, the home feed, comments, monetization?"</em></td>
+          <td>No, out of scope.</td>
+          <td>Cut them explicitly and loudly. Recommendations is an ML system that will eat 45 minutes and is not what's being tested.</td>
+        </tr>
+        <tr>
+          <td><em>"DRM and piracy protection — awareness level, or do you want it designed?"</em></td>
+          <td>Mention it, don't design it.</td>
+          <td>Good. It's a real constraint (see §10) but designing a key-exchange system is a different interview.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>Functional requirements</h3>
+    <ul>
+      <li><strong>Upload</strong> a video file (potentially many GB, from a flaky consumer connection — must be resumable).</li>
+      <li><strong>Transcode</strong> it into a ladder of renditions — 240p / 480p / 720p / 1080p / 4K, in a couple of codecs.</li>
+      <li><strong>Stream</strong> it to a player, globally, with <strong>adaptive bitrate</strong>: quality tracks the viewer's actual bandwidth.</li>
+      <li><strong>Seek</strong> to an arbitrary timestamp without downloading the whole file, and <strong>resume</strong> where you left off.</li>
+      <li><strong>Thumbnails</strong> — a poster frame, plus the scrub-preview strip you see when you drag the seek bar.</li>
+      <li><strong>(Cut, explicitly)</strong> recommendations, search ranking, comments, monetization, live streaming, social graph.</li>
+    </ul>
+
+    <h3>Non-functional requirements</h3>
+    <ul>
+      <li>
+        <strong>Low startup latency and zero rebuffering. These are THE metrics.</strong> Not p99 API latency, not throughput —
+        <em>time-to-first-frame</em> and <em>rebuffer ratio</em>. A user who hits play and stares at a spinner for four seconds leaves,
+        and a user whose video stalls mid-scene leaves and doesn't come back. Every serious video company instruments these two
+        numbers above all others and ties engineering headcount to moving them. Say this in the requirements phase — it tells the
+        interviewer you know what the product actually is.
+      </li>
+      <li><strong>Upload can be slow; playback cannot.</strong> This asymmetry is the load-bearing wall of the whole design. It is what makes the pipeline async and it is what lets you throw the expensive work into a background fleet.</li>
+      <li><strong>Global.</strong> Bytes must be served from near the viewer. Non-negotiable, and it's physics, not preference.</li>
+      <li><strong>Storage is enormous and grows forever.</strong> You delete nothing. Videos with zero views still cost you rent every month.</li>
+      <li><strong>Availability over consistency, trivially.</strong> There is no consistency problem here worth the name. Nobody is harmed if a freshly uploaded video takes thirty seconds to appear, or if the view count is off by a few hundred. Do not spend interview minutes on CAP.</li>
+      <li><strong>Cost is a first-class requirement.</strong> At this scale the infrastructure bill is a line item the CFO reads. Design decisions that halve egress are worth more than decisions that halve latency.</li>
+    </ul>
+
+    <div class="pitfall">The classic wrong turn is treating this like the other case studies — reaching for sharding, replication, quorums, consistency models. There <em>is</em> a database here and it is genuinely uninteresting: a few hundred bytes of metadata per video, read-heavy, cacheable, would run happily on Postgres with read replicas for years. If you spend fifteen minutes shard-keying the video table you have spent fifteen minutes on the easiest part of the problem and you will run out of clock before you reach ABR. Name the database boring, say why, and move on.</div>
+
+    <div class="senior">Make the scoping cut explicitly: <em>"I'm cutting recommendations, comments and monetization. They're real, but they hang off the metadata service and don't change the architecture of ingest or delivery — and recommendations especially is an ML problem that would eat the whole session. I want the time to go on the transcoding pipeline and on how bytes actually reach the viewer, because that's where I think this problem is hard. Does that scope work for you?"</em></div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="estimation">3. Estimation</h2>
+
+    <p>
+      This is the section that <em>reframes the problem</em>, and on this page it is worth more than anywhere else in the course.
+      Round aggressively and say you're rounding. Announce the convention once — <em>"I'll use 100k seconds per day, close enough"</em> —
+      and go.
+    </p>
+
+    <h3>Ingest</h3>
+    <p>YouTube's real, publicly stated number is roughly <strong>500 hours of video uploaded every minute</strong>. Use it; it's a great anchor and interviewers recognize it.</p>
+
+<pre><code>  <span class="com">// Ingest volume</span>
+  500 hours/min × 60 min/hr × 24 hr = <span class="num">720,000</span> hours of video uploaded per day
+
+  <span class="com">// Raw source bytes. Say ~1 GB per hour for a decent 1080p source</span>
+  <span class="com">// (real uploads vary wildly — phone 4K is far more; call it an average)</span>
+  720,000 hr × 1 GB/hr        ≈ <span class="num">720 TB/day</span> of RAW uploaded footage
+</code></pre>
+
+    <p>~720 TB/day of source material, before you've done anything to it. Now do the thing candidates forget.</p>
+
+    <h3>The transcoding multiplier — storage is not the source file</h3>
+    <p>
+      You do not store the upload. You store the upload <em>and</em> every rendition you produce from it. A ladder of 240p/480p/720p/
+      1080p/4K in two codecs is not one copy of the video, it's a stack of them:
+    </p>
+
+<pre><code>  <span class="com">// Rough per-hour sizes for one hour of video, per rendition</span>
+  240p   ~0.15 GB      1080p  ~1.5 GB
+  480p   ~0.35 GB      4K     ~6.0 GB   <span class="com">// the 4K rendition dwarfs everything else</span>
+  720p   ~0.7  GB
+                       ─────────────────────
+  One codec, full ladder  ≈ <span class="num">~8.7 GB per source hour</span>
+  Two codecs (H.264 + AV1) ≈ <span class="num">~15 GB per source hour</span>  <span class="com">// call it a 10-15× multiplier</span>
+
+  720,000 hr/day × ~10 GB  ≈ <span class="num">7.2 PB/day</span> of stored output
+                            ≈ <span class="num">~2.6 exabytes/year</span>, growing, forever
+</code></pre>
+
+    <div class="senior">Say the multiplier out loud, because it's the first genuinely non-obvious thing on the board: <em>"Note that transcoding doesn't just cost me CPU — it </em>multiplies my storage<em>. Every rendition in the ladder is a full second copy of the video. A five-rung ladder in two codecs is roughly a 10-to-15× storage amplification on top of the source. So the ladder isn't a free feature; it's the single biggest driver of my storage bill, and that's going to make me want to transcode the exotic rungs lazily."</em> You have just set up your own cost-control deep dive in §7a, and you got there from arithmetic rather than from having read a blog post.</div>
+
+    <h3>Bandwidth — the number that is the whole problem</h3>
+    <p>Now the read side. This is the one. Do it slowly and let it land.</p>
+
+<pre><code>  <span class="com">// A single viewer at decent quality</span>
+  1080p streaming bitrate ≈ <span class="num">5 Mbps</span>   <span class="com">// 4K is ~25 Mbps</span>
+
+  <span class="com">// One million people watching at the same moment — a modest number.</span>
+  <span class="com">// YouTube and Netflix are each well into the tens of millions.</span>
+  1,000,000 viewers × 5 Mbps = 5,000,000 Mbps
+                             = <span class="num">5 Tbps</span> of sustained egress
+
+  <span class="com">// Now scale to something realistic for peak evening traffic:</span>
+  10M concurrent viewers     = <span class="num">50 Tbps</span>
+</code></pre>
+
+    <p>
+      Sit with that. <strong>Five terabits per second, sustained, for one million viewers.</strong> That is not a number you serve out of
+      an application tier. It is not a number you serve out of a datacenter. It is a number in the same league as the total capacity
+      of large national internet exchanges. And now convert it into money, because that's the move:
+    </p>
+
+<pre><code>  <span class="com">// Bytes shipped, per month, at 5 Tbps sustained</span>
+  5 Tbps = 625 GB/sec  →  × 2.6M sec/month ≈ <span class="num">~1.6 exabytes/month</span>
+
+  <span class="com">// At commodity cloud egress list price (order $0.05-0.09 per GB):</span>
+  1.6 EB = 1.6 billion GB  ×  ~$0.05/GB  ≈  <span class="num">~$80,000,000 / month</span>
+</code></pre>
+
+    <div class="note">Do not defend that figure to four significant figures — nobody at this scale pays list price, and the real number depends on contracts you'll never see. The <em>order of magnitude</em> is the point, and the order of magnitude is: <strong>serving video from a cloud provider's egress meter is a business-ending expense.</strong> That's the insight, and it is completely robust to your rounding being sloppy.</div>
+
+    <p>
+      <strong>This single number is why every large video company builds or buys CDN capacity instead of serving from origin.</strong> It is
+      not an optimization. It is not a nice-to-have you bolt on in the scaling section. It is the reason the company can exist. And
+      it explains the most striking fact in this entire domain:
+    </p>
+
+    <div class="note">
+      <strong>Netflix ships its own hardware.</strong> Open Connect Appliances are physical servers — stuffed with disks, running a tuned
+      FreeBSD — that Netflix <em>manufactures, pays for, and gives away free</em> to internet service providers, who rack them inside their
+      own datacenters. When you press play, the bytes very often come from a box sitting in your ISP's building, a few milliseconds
+      away, having never crossed the public internet at all. Netflix eats the hardware cost because the alternative — paying transit
+      to push those same bytes across the internet, every single time — is dramatically more expensive. That is the entire thesis of
+      this page rendered in sheet metal: <em>do not pay for the same byte twice.</em>
+    </div>
+
+    <h3>Which number drives the design?</h3>
+    <p>Line them up and be explicit — this is the senior move and it takes one sentence:</p>
+
+    <table>
+      <thead><tr><th>Number</th><th>Value</th><th>Does it drive the design?</th></tr></thead>
+      <tbody>
+        <tr><td>Metadata QPS</td><td>Maybe ~100k reads/sec for video pages</td><td><strong>No.</strong> Cache + read replicas. This is a solved, boring problem.</td></tr>
+        <tr><td>Upload rate</td><td>~500 hours/min → a few thousand uploads/sec</td><td><strong>Barely.</strong> It sizes the worker fleet, and it means uploads must not touch your app tier.</td></tr>
+        <tr><td>Storage</td><td>~7 PB/day, forever, with a 10× transcode multiplier</td><td><strong>Yes — it drives cost.</strong> Forces the lazy-transcode and tiered-storage answers.</td></tr>
+        <tr><td><strong>Egress bandwidth</strong></td><td><strong>5 Tbps per million concurrent viewers</strong></td><td><strong>YES. This is the design.</strong> It forces the CDN, and the CDN's cache hit ratio becomes the number the business lives or dies by.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="senior">The sentence that wins this section: <em>"So the number that drives everything is egress. A million concurrent viewers is five terabits a second, which at cloud list prices is tens of millions of dollars a month — that's not an infrastructure line item, that's the company. Which means my job isn't really 'how do I store video', it's 'how do I make sure each byte leaves my origin exactly once and gets served from the edge forever after.' Cache hit ratio at the CDN is the single most important metric in this system, and I'll design backwards from it."</em> That is the whole page in five seconds, and most candidates never say anything like it.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="api">4. API design</h2>
+
+    <p>
+      Three flows: upload, then fetch a manifest, then fetch segments. The interesting one is the first, and it's interesting for a
+      reason that catches people out.
+    </p>
+
+    <h3>Upload — the client uploads to blob storage, NOT through your API</h3>
+
+    <p>
+      The client asks your API for permission to upload, and your API hands back a <strong>presigned URL</strong>: a time-limited,
+      cryptographically signed URL that grants write access to one specific key in your blob store (S3, GCS, Azure Blob — see
+      <a href="03-data-storage.html">03</a>). The client then <code>PUT</code>s the file <em>directly to the blob store</em>. Your servers never
+      see a single byte of video.
+    </p>
+
+<pre><code>  <span class="com">// 1. Ask for an upload slot. Tiny JSON in, tiny JSON out.</span>
+  POST /api/v1/videos
+  { <span class="str">"title"</span>: <span class="str">"Cat vs Roomba"</span>, <span class="str">"sizeBytes"</span>: <span class="num">4200000000</span>,
+    <span class="str">"contentType"</span>: <span class="str">"video/mp4"</span> }
+
+  → <span class="num">201</span> Created
+  { <span class="str">"videoId"</span>:    <span class="str">"vid_9fk2p"</span>,
+    <span class="str">"uploadUrl"</span>:  <span class="str">"https://raw-uploads.s3.../vid_9fk2p/src?X-Amz-Signature=..."</span>,
+    <span class="str">"expiresIn"</span>:  <span class="num">3600</span>,
+    <span class="str">"status"</span>:     <span class="str">"awaiting_upload"</span> }
+
+  <span class="com">// 2. Client PUTs 4 GB straight at S3. Your API tier is not involved.</span>
+  PUT https://raw-uploads.s3.../vid_9fk2p/src   [4 GB of bytes]
+
+  <span class="com">// 3. Client tells you it's done (or S3 fires an event — see §6).</span>
+  POST /api/v1/videos/vid_9fk2p/complete
+  → <span class="num">202</span> Accepted   { <span class="str">"status"</span>: <span class="str">"processing"</span> }
+</code></pre>
+
+    <div class="pitfall">Proxying the upload through your application servers is a <strong>catastrophic</strong> design and interviewers watch for it specifically. Think about what you've just signed up for: a 10 GB file streaming through a Spring Boot app for twenty minutes, holding a thread or an event-loop slot, consuming heap or disk on a machine that was sized to serve 50 ms JSON requests. A few hundred concurrent uploads and your entire API tier — the one also serving every video page on the site — falls over. You would be spending expensive, stateful, latency-critical compute to do the one job that dumb, cheap, infinitely scalable object storage does better than anything on earth. Say it plainly: <em>"The bytes never touch my app servers. My app servers deal in kilobytes of metadata; S3 deals in gigabytes of blob. Presigned URL, direct upload."</em></div>
+
+    <p>
+      Use <strong>multipart / resumable upload</strong>, which every blob store supports natively. The client splits the file into parts,
+      uploads them independently (in parallel, even), and retries only the parts that fail. This is not a nicety — it is the
+      difference between a usable product and one where a 4 GB upload from a phone on hotel wifi fails at 97% and starts over. The
+      blob store gives you this for free; you'd be insane to build it.
+    </p>
+
+    <h3>Playback — manifest, then segments</h3>
+
+<pre><code>  <span class="com">// 1. The page load: metadata + where the manifest lives.</span>
+  GET /api/v1/videos/vid_9fk2p
+  → { <span class="str">"videoId"</span>: <span class="str">"vid_9fk2p"</span>, <span class="str">"title"</span>: <span class="str">"Cat vs Roomba"</span>,
+      <span class="str">"durationSec"</span>: <span class="num">212</span>, <span class="str">"status"</span>: <span class="str">"ready"</span>,
+      <span class="str">"thumbnailUrl"</span>: <span class="str">"https://cdn.../vid_9fk2p/poster.jpg"</span>,
+      <span class="str">"manifestUrl"</span>:  <span class="str">"https://cdn.../vid_9fk2p/master.m3u8"</span> }
+
+  <span class="com">// 2. The player fetches the manifest — FROM THE CDN, not from you.</span>
+  GET https://cdn.../vid_9fk2p/master.m3u8
+
+  <span class="com">// 3. The player then fetches segments — also from the CDN. Hundreds of</span>
+  <span class="com">//    these, one every few seconds, for as long as the video plays.</span>
+  GET https://cdn.../vid_9fk2p/1080p/seg_00042.ts
+</code></pre>
+
+    <p>
+      Notice what your API is doing during playback: <strong>nothing</strong>. It handed over one small JSON object and then got out of
+      the way. Every byte after that is a static file served by a CDN edge node. That is not an accident — it is the property the
+      entire design is engineered to have, and §7b is about why.
+    </p>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="data-model">5. Data model</h2>
+
+    <p>
+      The <strong>metadata/blob split</strong> (<a href="03-data-storage.html">03</a>) is the organizing idea, and here it is at its most
+      extreme. The metadata is small, relational, queried in a dozen different ways, and needs transactions. The blobs are enormous,
+      opaque, and need nothing but "give me bytes 400000–500000 of this key." Those are two completely different storage products and
+      you should use two.
+    </p>
+
+<pre><code>  <span class="com">-- Small, relational, boring. Postgres. Read-heavy, so add replicas + Redis.</span>
+  <span class="kw">CREATE TABLE</span> videos (
+    video_id      <span class="typ">TEXT</span> <span class="kw">PRIMARY KEY</span>,      <span class="com">-- vid_9fk2p</span>
+    uploader_id   <span class="typ">BIGINT</span> <span class="kw">NOT NULL</span>,
+    title         <span class="typ">TEXT</span>,
+    description   <span class="typ">TEXT</span>,
+    duration_sec  <span class="typ">INT</span>,
+    status        <span class="typ">TEXT</span>,                <span class="com">-- awaiting_upload|processing|ready|failed</span>
+    visibility    <span class="typ">TEXT</span>,                <span class="com">-- public|unlisted|private</span>
+    source_key    <span class="typ">TEXT</span>,                <span class="com">-- s3://raw-uploads/vid_9fk2p/src</span>
+    manifest_key  <span class="typ">TEXT</span>,                <span class="com">-- s3://media/vid_9fk2p/master.m3u8</span>
+    thumbnail_key <span class="typ">TEXT</span>,
+    created_at    <span class="typ">TIMESTAMPTZ</span>
+  );
+  <span class="kw">CREATE INDEX</span> <span class="kw">ON</span> videos (uploader_id, created_at <span class="kw">DESC</span>);  <span class="com">-- "my channel"</span>
+
+  <span class="com">-- One video → MANY transcoded variants. This table is the ladder.</span>
+  <span class="kw">CREATE TABLE</span> renditions (
+    video_id    <span class="typ">TEXT</span> <span class="kw">REFERENCES</span> videos(video_id),
+    resolution  <span class="typ">TEXT</span>,        <span class="com">-- 240p | 480p | 720p | 1080p | 2160p</span>
+    codec       <span class="typ">TEXT</span>,        <span class="com">-- h264 | vp9 | av1</span>
+    bitrate_bps <span class="typ">INT</span>,
+    status      <span class="typ">TEXT</span>,        <span class="com">-- pending | processing | ready | skipped</span>
+    playlist_key <span class="typ">TEXT</span>,      <span class="com">-- s3://media/vid_9fk2p/1080p/index.m3u8</span>
+    size_bytes  <span class="typ">BIGINT</span>,
+    <span class="kw">PRIMARY KEY</span> (video_id, resolution, codec)
+  );
+</code></pre>
+
+    <p>
+      That <code>renditions</code> table is doing more work than it looks. It is what lets you say <em>"this video has 1080p ready but 4K is
+      still <code>pending</code>"</em> and serve a manifest containing only the ready rungs. It is what lets you mark a rung
+      <code>skipped</code> because the video only ever got three views and doesn't deserve a 4K encode (§7a). It is the ledger of your
+      storage bill, one row per copy of the video you're paying rent on. When the interviewer asks "how would you decide what to
+      delete or downgrade," you point at this table.
+    </p>
+
+    <h3>SQL or NoSQL?</h3>
+    <p>
+      Make the call and defend it in two sentences, then move on — this is not where the marks are.
+      <strong>Postgres is completely fine</strong>, and saying so confidently is a stronger signal than reflexively reaching for Cassandra.
+      A billion videos × ~1 KB of metadata is about a terabyte: one machine's worth, before you shard anything. The workload is
+      overwhelmingly read-heavy on a primary key, so it caches beautifully. And the relational shape genuinely helps —
+      <code>videos → renditions</code> is a real one-to-many you'll query constantly. If the interviewer pushes on write scale (upload rate,
+      view counters), the honest answer is that the counters are the only high-write thing here and they belong in a separate system
+      anyway (<a href="18-streaming-aggregation.html">18</a>), not in the <code>videos</code> row.
+    </p>
+
+    <div class="senior">Be the person who says: <em>"The metadata is small and relational and I'd put it in Postgres without apology — a billion rows of a kilobyte is a terabyte, that's one box. The blobs are enormous and dumb: they need no schema, no transactions, no queries, just durable bytes addressable by key. So this is the metadata/blob split at its purest — the database holds a pointer, and object storage holds the reality. The mistake would be letting the size of the video scare me into over-engineering the part of the system that stores its title."</em></div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="hld">6. High-level design</h2>
+
+    <p>
+      Draw <strong>two</strong> diagrams, not one. The write path and the read path in this system barely touch each other — they share a
+      metadata row and a bucket, and nothing else. Separating them on the board is itself a design statement, and it makes the whole
+      thing legible in a way that one tangled diagram never is.
+    </p>
+
+    <h3>The write path (upload → processing)</h3>
+
+<pre><code>                    (1) POST /videos          ┌──────────────┐
+   ┌────────┐  ───────────────────────────▶   │  Upload API  │
+   │ Client │  ◀─── presigned URL ──────────  └──────┬───────┘
+   └───┬────┘                                        │ row: status=awaiting_upload
+       │ (2) PUT 4 GB directly                       ▼
+       │     (multipart, resumable)            ┌───────────┐
+       ▼                                       │ Metadata  │
+   ┌──────────────────┐   (3) object-created   │ (Postgres)│
+   │  Raw blob store  │ ─────── event ──────▶  └───────────┘
+   │  (S3: /raw/...)  │                              ▲
+   └──────────────────┘                              │ status=ready
+       │                                             │
+       │ (4) enqueue job                             │
+       ▼                                             │
+   ┌───────────┐    ┌──────────────────────┐   ┌─────┴──────┐
+   │  Queue    │───▶│  Transcoding fleet   │──▶│ Publisher  │
+   │ (Kafka /  │    │  (worker pool, §7a)  │   └────────────┘
+   │  SQS)     │    └──────────┬───────────┘
+   └───────────┘               │ (5) write renditions + segments
+                               ▼
+                      ┌──────────────────┐
+                      │  Media blob store│  ◀── the CDN's origin
+                      │  (S3: /media/...)│
+                      └──────────────────┘
+</code></pre>
+
+    <p>Walk it, step by step, out loud:</p>
+    <ol>
+      <li><strong>Client asks for an upload slot.</strong> The API writes a <code>videos</code> row with <code>status = awaiting_upload</code> and returns a presigned URL. This request is a few hundred bytes and takes 20 ms.</li>
+      <li><strong>Client uploads the raw file straight to the blob store.</strong> Multipart, resumable, retryable, parallel. Your app tier is asleep. If the user's connection dies at 80%, they resume from 80%.</li>
+      <li><strong>The blob store emits an event</strong> on object creation (S3 event notification, or a GCS pub/sub trigger). This is better than trusting the client to call <code>/complete</code>, because clients lie, crash, and get closed. <em>Trust the storage layer, not the browser.</em> (Keep the explicit <code>/complete</code> call too — it's a latency optimization, and the event is the safety net.)</li>
+      <li><strong>A job goes on the queue</strong> (<a href="06-caching-queues-resilience.html">06</a>). The metadata row flips to <code>processing</code>. From the user's point of view the upload is <em>done</em> — the page says "your video is processing, we'll email you." Nothing is blocking.</li>
+      <li><strong>The transcoding fleet does the expensive work</strong> — §7a — and writes renditions, segments, manifests and thumbnails into the media bucket. The publisher step flips <code>status = ready</code> and the video goes live.</li>
+    </ol>
+
+    <h3>The read path (playback)</h3>
+
+<pre><code>   ┌────────┐  (1) GET /videos/vid_9fk2p    ┌──────────────┐   ┌──────────┐
+   │ Player │ ────────────────────────────▶ │ Metadata API │──▶│  Redis   │
+   │        │ ◀── title, manifestUrl ────── └──────────────┘   └────┬─────┘
+   └───┬────┘                                                       │ miss
+       │                                                       ┌────▼─────┐
+       │ (2) GET master.m3u8                                   │ Postgres │
+       │ (3) GET seg_00001.ts, seg_00002.ts, ...               └──────────┘
+       ▼
+   ┌────────────────┐   cache MISS (first    ┌───────────────────┐
+   │   CDN  edge    │ ───── viewer only) ──▶ │  Media blob store │
+   │ (near viewer)  │ ◀──── fill cache ───── │     (ORIGIN)      │
+   └────────────────┘                        └───────────────────┘
+        │
+        └──▶ every subsequent viewer in this region: cache HIT.
+             The origin serves this byte ONCE and never again.
+</code></pre>
+
+    <p>
+      That last line is the entire business model. The origin's job is not to serve video — it's to serve video <strong>once per edge
+      location</strong> and then never again. Every byte that leaves the origin twice is a byte you paid for twice.
+    </p>
+
+    <p>
+      And notice how little is happening. Playback is: one small cacheable JSON call, then a static text file, then a long series of
+      static binary files. There is no application logic in the hot path <em>at all</em>. Your 50 Tbps of traffic is being served by
+      what is essentially a very good, very distributed Apache. <strong>The design's cleverness is entirely in having arranged for the hot
+      path to be stupid.</strong>
+    </p>
+
+    <div class="senior">Land this: <em>"What I want you to notice about the read path is that there's no service on it. The player talks to my API once for metadata, and after that it's fetching static files off a CDN. That's deliberate — it's the property that makes the system affordable, because a static file can be cached by anyone, anywhere, and served without me. If I'd designed a 'streaming service' that proxied bytes through my own servers, I'd have made every one of those bytes non-cacheable and I'd have signed up for a 50-terabit-per-second bill. The dumbness of the read path IS the architecture."</em></div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="deep-dive-1">7a. Deep dive: the transcoding pipeline</h2>
+
+    <p>
+      <strong>This is where the interview really happens</strong> — one of two places, and this is the one the interviewer pushes into if
+      they came from an infrastructure background. The whole thing is a case study in <em>asynchronous, parallel, idempotent batch
+      processing</em>, and if you can build it here you can build it for image processing, document conversion, ETL, or any other
+      "user hands you a big thing, you must do expensive work on it" problem.
+    </p>
+
+    <h3>Why it must be asynchronous — and the UI that proves it</h3>
+    <p>
+      Transcoding one hour of video into a five-rung ladder is <em>minutes to hours</em> of CPU. An HTTP request times out in
+      30 seconds. The gap isn't a factor of two, it's a factor of hundreds. There is no version of this that lives inside the request.
+      So the upload returns <code>202 Accepted</code> with <code>status: processing</code>, immediately, and the work happens somewhere else.
+    </p>
+
+    <div class="note">You have seen this. Upload a video to YouTube and the page says <em>"Your video is being processed — we'll notify you when it's ready,"</em> and for a while only the low resolutions are selectable in the quality menu, and 4K shows up ten minutes later. <strong>That UI <em>is</em> the architecture leaking through.</strong> The status field, the async pipeline, the ladder being published rung by rung as each transcode job finishes — you've been staring at this system's internals for years without noticing. Point this out in the interview; it's a genuinely charming observation and it demonstrates you're reasoning from the real world rather than from a diagram you memorized.</div>
+
+    <h3>Parallelism via chunking — the MapReduce shape</h3>
+    <p>
+      Here's the part candidates miss, and it's the good part. If transcoding one hour of video is one hour of work, why doesn't a
+      one-hour upload take an hour to appear? Because <strong>you don't transcode the video — you transcode pieces of it, in
+      parallel.</strong>
+    </p>
+    <p>
+      Split the source into chunks at keyframe boundaries (say, 30 seconds each). Each chunk can be transcoded <em>completely
+      independently</em> of every other chunk, because video compression is (mostly) local — a group of pictures doesn't need to know
+      what happened ten minutes ago. So a 1-hour video becomes 120 independent chunks, and 120 chunks × 5 renditions is 600
+      independent jobs you can throw at 600 workers. This is <strong>embarrassingly parallel</strong>, and it means your processing latency
+      is bounded by <em>the slowest chunk</em>, not by the length of the video.
+    </p>
+
+<pre><code>  <span class="com">// This is map/reduce, and you should say the words "map" and "reduce".</span>
+
+   source.mp4 (1 hour)
+        │
+        │  SPLIT at keyframe boundaries
+        ▼
+   [c0][c1][c2] ... [c119]            120 chunks × 30 sec
+        │
+        │  MAP: each (chunk × rendition) is one independent job
+        ▼
+   ┌──────────────────────────────────────────┐
+   │  worker fleet (hundreds of machines)     │
+   │  c0@240p  c0@480p  c0@720p  c0@1080p ... │  ← 600 jobs
+   │  c1@240p  c1@480p  ...                   │     all at once
+   └──────────────────────────────────────────┘
+        │
+        │  REDUCE: stitch each rendition's chunks back in order,
+        ▼          package into segments, write the manifest
+   240p/  480p/  720p/  1080p/  master.m3u8
+</code></pre>
+
+    <div class="senior">Say it: <em>"Transcoding is embarrassingly parallel, so I chunk the source and fan the chunks out across a worker fleet. A one-hour video doesn't take an hour to process — my processing time is the time of the slowest chunk plus the stitch, so it's minutes. That's a map/reduce shape: split, transcode independently, reassemble in order. It also means I can trade money for latency directly — if I want a video live in half the time, I add workers. That's a knob I control, which is exactly what you want from a batch system."</em> The "trade money for latency with a knob" framing is a very senior thing to notice.</div>
+
+    <h3>The DAG</h3>
+    <p>
+      The pipeline is not a line, it's a <strong>directed acyclic graph</strong> of jobs, and drawing it as a DAG is worth points because it
+      shows you know which steps can run concurrently and which have to wait.
+    </p>
+
+<pre><code>                      ┌──▶ transcode 240p ──┐
+                      ├──▶ transcode 480p ──┤
+  validate ──▶ chunk ─┼──▶ transcode 720p ──┼──▶ package ──▶ publish
+      │               ├──▶ transcode 1080p ─┤     (segment       │
+      │               └──▶ transcode 4K ────┘      + manifest)   │
+      │                                                          │
+      └──────────────▶ thumbnails ───────────────────────────────┘
+                        (independent — runs in parallel,
+                         doesn't block publish of the video)
+</code></pre>
+
+    <ul>
+      <li><strong>validate</strong> — is this actually a video? Is it a codec we can read? Is it malware, or a zip bomb dressed as an MP4? Fail fast and cheap, before you've spent CPU on it. (Also: this is where the content-moderation hook goes, if asked.)</li>
+      <li><strong>chunk</strong> — split at keyframes. Must produce deterministic boundaries so retries reproduce the same chunks.</li>
+      <li><strong>transcode × N</strong> — the fan-out. Each rung of the ladder, each chunk, one job. This is 99% of the CPU bill.</li>
+      <li><strong>package</strong> — stitch chunks per rendition, cut into 2–10s streaming segments, generate the per-rendition playlist and the master manifest. §7b explains what these are.</li>
+      <li><strong>thumbnails</strong> — poster frame, plus the sprite sheet of little frames the player shows when you drag the scrub bar. Cheap, independent, and easy to forget. Mention it; it's on the requirements list and dropping it is a free lost point.</li>
+      <li><strong>publish</strong> — flip <code>status = ready</code>, invalidate the metadata cache, notify the uploader. The <em>only</em> step that makes the video visible, and therefore the only step that must be last.</li>
+    </ul>
+
+    <h3>Idempotency and retries — assume workers die</h3>
+    <p>
+      A transcode job can run for ten minutes on a machine that might be a spot instance that AWS is about to reclaim with two
+      minutes' notice. <strong>Workers dying mid-job is the normal case, not the exception</strong>, and the pipeline must be boringly safe
+      about it (<a href="05-coordination-consensus.html">05</a>, <a href="06-caching-queues-resilience.html">06</a>).
+    </p>
+    <ul>
+      <li><strong>Every step is idempotent.</strong> Re-running "transcode chunk 42 to 720p" produces the same output at the same key and overwrites it harmlessly. Nothing accumulates, nothing double-counts. This is what makes at-least-once delivery from the queue survivable — and at-least-once is all any queue will honestly give you.</li>
+      <li><strong>Write to a deterministic key</strong>: <code>/media/vid_9fk2p/720p/chunk_00042.ts</code>. Derived from the job inputs, never from a timestamp or a random ID. Two workers racing on the same job write identical bytes to the same key and the last one wins, harmlessly.</li>
+      <li><strong>Visibility timeout + retry.</strong> The worker leases the message; if it dies, the lease expires and another worker picks it up. Retry with backoff and jitter; after N attempts the job goes to a <strong>dead-letter queue</strong> and a human looks at it.</li>
+      <li><strong>Checkpoint at the chunk level, not the video level.</strong> If chunk 42 of 120 fails, you retry <em>chunk 42</em>, not the whole video. That's the second big win from chunking, after parallelism — the blast radius of a failure is 30 seconds of footage, not an hour.</li>
+      <li><strong>Poison pills are real.</strong> Somebody will upload a file that reliably segfaults your decoder, and the queue will hand it to worker after worker, killing each one. This is why you cap retries and why validation runs first. It's a great thing to volunteer, because it shows you've operated something.</li>
+    </ul>
+
+    <div class="pitfall">Do not put the transcoding fleet behind a synchronous RPC and do not let the upload request wait on it, no matter how tempted you are to draw a straight line from the client to the encoder. And equally: do not let the <em>publish</em> step run before all the required renditions are ready, or a user will hit play on a video whose 1080p rung doesn't exist yet and get a broken player. The manifest is a promise; only publish rungs you can actually keep.</div>
+
+    <h3>Cost control: transcode the long tail lazily</h3>
+    <p>
+      Here is the cost-aware instinct that separates a senior candidate, and it comes straight from the popularity curve you
+      established in §1.
+    </p>
+    <p>
+      <strong>Most YouTube videos have essentially no views.</strong> Someone's phone footage of a birthday party gets watched four times.
+      You just spent CPU generating a 4K AV1 rendition of it — the single most expensive encode in the ladder — and you're now paying
+      storage rent on 6 GB of it, forever, so that nobody can watch it in a resolution nobody requested. <strong>Multiply that by the
+      millions of such videos uploaded every day.</strong>
+    </p>
+    <p>So don't. Split the ladder:</p>
+
+    <table>
+      <thead><tr><th>Rung</th><th>When</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>360p / 480p / 720p (H.264)</strong></td>
+          <td><strong>Eagerly</strong>, always, on upload.</td>
+          <td>Cheap to encode, small to store, and they cover the overwhelming majority of actual playback. Universally decodable — H.264 plays on everything, including a decade-old smart TV. This is your floor: <em>every</em> video is watchable the moment processing finishes.</td>
+        </tr>
+        <tr>
+          <td><strong>1080p / 4K / exotic codecs (AV1, VP9)</strong></td>
+          <td><strong>Lazily</strong> — on demand, or triggered once the video crosses a view threshold.</td>
+          <td>Expensive to encode, enormous to store, and worth it <em>only</em> if enough people will watch. A video with 3 views does not need a 4K rendition. A video that crosses 10,000 views has proven it deserves the good encode — and at that point the better codec starts <em>saving</em> you money, because it cuts the bitrate of a stream millions of people are pulling.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>
+      The mechanism is trivial once the <code>renditions</code> table exists: rows start as <code>pending</code>, the view-count pipeline
+      (<a href="18-streaming-aggregation.html">18</a>) fires a threshold event, and a job enqueues the upgrade. The manifest simply grows a
+      rung when the encode lands. Nobody notices except your CFO.
+    </p>
+
+    <div class="senior">This is the highest-value thing you can volunteer in this deep dive, so volunteer it before you're asked: <em>"One thing I'd push on is that I don't think you should transcode the full ladder eagerly. The popularity distribution is brutally long-tailed — most uploads get almost no views — so eagerly generating a 4K AV1 encode for every one of them means paying the most expensive encode in the ladder, plus storage rent forever, for content nobody will ever request at that resolution. I'd transcode the cheap universal rungs eagerly so everything is immediately watchable, and generate the expensive ones lazily on a view-count trigger. It costs a little latency on the first person to want 4K on a video that just went viral, and it saves an enormous amount of money across the tail. And notice the incentive lines up: the videos that earn the expensive encode are exactly the ones where a better codec pays for itself in saved egress."</em> Cost-aware architecture, derived from the popularity curve, with the trade-off named. That's the answer of someone who has owned a budget.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="deep-dive-2">7b. Deep dive: adaptive bitrate streaming &amp; delivery</h2>
+
+    <p>
+      <strong>This is where the interview really happens.</strong> If §7a is the interview an infrastructure engineer gives you, this is the
+      one everybody gives you, because it's where the money is. And — happily for you — it is the half of this system a frontend
+      engineer can genuinely <em>own</em>. Most backend candidates can recite "HLS, adaptive bitrate, CDN" and cannot tell you what the
+      player is actually doing. You can. Use that.
+    </p>
+
+    <h3>What HLS/DASH actually is</h3>
+    <p>
+      A streamed video is not a file. It's <strong>a directory of small files plus a text file describing them.</strong> That's the whole
+      trick, and it's almost aggressively simple:
+    </p>
+    <ul>
+      <li>Each rendition is cut into <strong>segments</strong> of 2–10 seconds. A 10-minute video at 6-second segments is 100 segments — <em>per rung of the ladder</em>.</li>
+      <li>A <strong>manifest</strong> — <code>.m3u8</code> for HLS, <code>.mpd</code> for DASH — is a plain text file listing what's available: which renditions exist, at what bitrate and resolution, and where their segments live.</li>
+      <li>The player fetches the manifest, then fetches segments over ordinary HTTP <code>GET</code>s, one after another, staying a few segments ahead of playback.</li>
+    </ul>
+
+<pre><code>  <span class="com"># master.m3u8 — the "here's what I have" file. This is the whole API.</span>
+  #EXTM3U
+  #EXT-X-STREAM-INF:BANDWIDTH=400000,RESOLUTION=426x240
+  240p/index.m3u8
+  #EXT-X-STREAM-INF:BANDWIDTH=1400000,RESOLUTION=1280x720
+  720p/index.m3u8
+  #EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080
+  1080p/index.m3u8
+
+  <span class="com"># 720p/index.m3u8 — the segment list for one rung.</span>
+  #EXTM3U
+  #EXT-X-TARGETDURATION:6
+  #EXTINF:6.0,
+  seg_00001.ts
+  #EXTINF:6.0,
+  seg_00002.ts
+  ...
+</code></pre>
+
+    <p>
+      Seeking, for free: the player wants <code>t = 4:30</code>, divides by the segment duration, and fetches segment 45. It never
+      downloads the parts you skipped. Resolution switching, for free: the player just starts fetching the next segment from a
+      different rung's directory — the segments are keyframe-aligned across rungs, so they splice cleanly. <strong>The design of the
+      format is doing the work that would otherwise be a service.</strong>
+    </p>
+
+    <h3>The inversion of control — the client decides, and that is the point</h3>
+
+    <p>
+      Now the elegant core. <strong>The server does not decide what quality to send you. The client does.</strong> The player measures how
+      fast the last few segments downloaded, looks at how many seconds of video it has buffered, and picks which rung to request
+      next. The server is not consulted. The server does not know. The server is a file host.
+    </p>
+
+<pre><code>  <span class="com">// The player's loop, in essence. This is the ABR algorithm.</span>
+  <span class="kw">while</span> (playing) {
+    <span class="kw">const</span> throughput = measuredBpsOfLastSegments();   <span class="com">// how fat is the pipe?</span>
+    <span class="kw">const</span> buffer     = secondsOfVideoBuffered();      <span class="com">// how much runway?</span>
+
+    <span class="kw">let</span> next = highestRungWhere(r =&gt; r.bitrate &lt; throughput * <span class="num">0.8</span>);
+
+    <span class="com">// Buffer health overrides throughput. A draining buffer means</span>
+    <span class="com">// STALL IS COMING — drop quality NOW, don't be brave.</span>
+    <span class="kw">if</span> (buffer &lt; <span class="num">5</span>)  next = lowerRung(next);
+    <span class="kw">if</span> (buffer &gt; <span class="num">30</span>) next = maybeStepUp(next);  <span class="com">// step up slowly, one rung</span>
+
+    fetch(segmentUrl(next, nextIndex));            <span class="com">// a plain HTTP GET</span>
+  }
+</code></pre>
+
+    <p>
+      Two heuristics, and the second one dominates: <strong>buffer health beats throughput estimation.</strong> Throughput measurements are
+      noisy and backward-looking; the buffer level is the ground truth about whether you are about to stall. A player with 40 seconds
+      buffered can afford to gamble on a higher rung. A player with 3 seconds buffered must drop quality <em>immediately</em>, because
+      one bad segment fetch and the user is looking at a spinner. And rebuffering, remember, is <strong>the</strong> metric — a viewer will
+      forgive 480p, but they will not forgive a stall. <em>Fall fast, rise slow.</em>
+    </p>
+
+    <div class="senior">This is your moment. Say: <em>"The elegant thing about ABR is the inversion of control — the client picks the bitrate, not the server. And that isn't just a nice division of labor, it's what makes the economics work: because the server never adapts, it never has to hold session state, never has to run logic per viewer, and never has to look at the request. Every segment is just a static file at a stable URL. Which means </em>any dumb HTTP cache on earth can serve it<em>. If the server were choosing the bitrate per client, every response would be personalized and therefore uncacheable, and I'd be back to serving 50 terabits a second from my own origin. The stupidity of the server is what buys me the CDN. Adaptive bitrate and cacheability are the same design decision."</em> That connection — client-side ABR <em>is</em> what makes CDN caching possible — is the single sharpest thing you can say on this page. Most candidates present ABR and CDN as two unrelated bullet points.</div>
+
+    <h3>Your home turf: the player</h3>
+    <p>
+      You're a frontend engineer. This is the layer you can speak about with an authority the average backend candidate can't fake,
+      and interviewers notice depth wherever it appears. The connective tissue:
+    </p>
+    <ul>
+      <li>
+        <code>&lt;video&gt;</code> plays a plain MP4 natively, but it does <strong>not</strong> speak HLS or DASH on most browsers (Safari is the
+        exception — it plays HLS natively, which is why iOS was the platform HLS was invented for).
+      </li>
+      <li>
+        <strong>MSE — Media Source Extensions</strong> is the browser API that makes streaming possible on the web. Instead of giving
+        <code>&lt;video&gt;</code> a URL, you give it a <code>MediaSource</code> object and then <em>you</em>, in JavaScript, fetch segments and
+        append their bytes into a <code>SourceBuffer</code>. The browser decodes whatever you feed it. That's it — the entire
+        streaming stack above the codec is a JavaScript program appending <code>ArrayBuffer</code>s.
+      </li>
+      <li>
+        <strong>hls.js</strong> (and <code>dash.js</code>, and Shaka Player) are exactly that program: parse the manifest, run the ABR
+        heuristic, fetch segments, append to the <code>SourceBuffer</code>, handle seeks, handle errors, switch rungs. When you
+        <code>npm install hls.js</code> you are installing an ABR algorithm.
+      </li>
+      <li>
+        <strong>Buffer health is a number you can read.</strong> <code>video.buffered</code> gives you the buffered <code>TimeRanges</code>;
+        subtract <code>currentTime</code> and you have the runway in seconds. That's the input to the whole decision above — and it's
+        the number you'd put on a dashboard, because <em>buffer level trending toward zero across a population of players</em> is your
+        early-warning signal that a CDN edge is sick.
+      </li>
+    </ul>
+
+    <div class="note">Bring this up deliberately: <em>"I've worked on the player side of this, so — the reason ABR works in a browser at all is MSE. You're not handing the video element a URL, you're appending segment bytes into a SourceBuffer yourself, in JavaScript, which is what lets a library like hls.js implement the bitrate decision in userland. It also means the quality selector in the UI isn't asking the server for anything — it's just changing which directory the player fetches from."</em> It's true, it's specific, it's yours, and it turns a section where many candidates are hand-waving into one where you're the expert in the room.</div>
+
+    <h3>CDN strategy — and this is where YouTube and Netflix part ways</h3>
+
+    <p>
+      You established in §3 that origin egress would bankrupt you and in §7b that every segment is a cacheable static file. Now
+      collect the winnings (<a href="02-networking-delivery.html">02</a>). There are two ways to get bytes onto an edge node, and the right
+      one <em>depends entirely on the catalog shape you asked about in minute one</em>.
+    </p>
+
+    <table>
+      <thead><tr><th></th><th>Pull-through (reactive)</th><th>Pre-positioning (predictive)</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>How</strong></td>
+          <td>Edge has nothing. First viewer in a region requests a segment, edge misses, fetches from origin, caches it, serves it. Everyone after that is a hit.</td>
+          <td>You <em>push</em> content to edge nodes before anyone asks for it, on your own schedule.</td>
+        </tr>
+        <tr>
+          <td><strong>Cost of a miss</strong></td>
+          <td>One origin fetch per segment per edge — and it's paid by a <em>real user</em>, in latency, during their session.</td>
+          <td>Zero misses. The first viewer gets a hit like everyone else.</td>
+        </tr>
+        <tr>
+          <td><strong>Requires</strong></td>
+          <td>Nothing. It's the default, and it works for any catalog.</td>
+          <td><strong>Knowing what people will watch.</strong> Which requires a small, curated, predictable catalog.</td>
+        </tr>
+        <tr>
+          <td><strong>Who</strong></td>
+          <td><strong>YouTube.</strong> No choice — the catalog is unbounded and mostly unwatched.</td>
+          <td><strong>Netflix.</strong> Total luxury, and they exploit it ruthlessly.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>
+      <strong>Netflix pre-positions.</strong> The catalog is small and the popularity is concentrated, so they know with high confidence
+      what your region will watch this week — a new season drops Friday, and by Friday it is <em>already sitting on the Open Connect
+      box in your ISP's rack</em>. And here's the detail that makes it beautiful: they push that content <strong>at 3 a.m.</strong>, when the
+      network is idle and bandwidth is nearly free, using capacity that would otherwise be wasted. They are time-shifting their
+      bandwidth consumption from the most expensive hour of the day to the cheapest. Ten million people then watch the première and
+      essentially none of those bytes cross a paid transit link. <em>Do not pay for the same byte twice — and where you must pay, pay
+      at 3 a.m.</em>
+    </p>
+
+    <p>
+      <strong>YouTube cannot do this and never will.</strong> There is no world in which you pre-position billions of videos — most of which
+      will never be watched by anyone — onto every edge node on the planet. The catalog is orders of magnitude larger than the total
+      storage at the edge. So YouTube caches <em>reactively</em>: popular videos naturally end up hot at the edges because they're
+      requested constantly, and the long tail permanently misses and gets served from a regional origin, more slowly, at real cost.
+      <strong>YouTube accepts a worse cache hit ratio as the price of an unbounded catalog.</strong> That is not a failure of engineering; it
+      is the correct answer for their product, and saying so shows you understand that architecture serves the business.
+    </p>
+
+    <div class="senior">Tie the two halves of the page together: <em>"The catalog shape decides the caching strategy, which is why I asked about it first. Netflix has a small curated catalog with concentrated demand, so they can pre-position the entire relevant library at the edge overnight and hit near-100% cache rates — they even ship their own hardware into ISPs to do it. YouTube has an unbounded catalog with a brutal long tail, so pre-positioning is arithmetically impossible; they have to cache reactively and eat the misses on the tail. Same archetype, opposite strategy, and the difference comes entirely from one requirements question I asked in minute one."</em></div>
+
+    <h3>Cache hit ratio is the business metric</h3>
+    <p>
+      Everything above collapses into one number. <strong>Cache hit ratio at the edge is not an engineering metric, it's a financial
+      one</strong>, and you should say so in exactly those words.
+    </p>
+
+<pre><code>  <span class="com">// Every 1% of misses is 1% of your traffic served from origin.</span>
+  Suppose 100 PB/month of viewer traffic.
+
+  99% hit ratio →  1 PB/month from origin
+  98% hit ratio →  2 PB/month from origin   <span class="com">// you DOUBLED your origin bill</span>
+
+  <span class="com">// One percentage point of hit ratio = millions of dollars a year,</span>
+  <span class="com">// and it's the difference between one origin fleet and two.</span>
+</code></pre>
+
+    <p>
+      Note the nonlinearity, because it's the thing people miss: at high hit ratios, origin load is proportional to the
+      <em>miss</em> rate, so going from 99% to 98% doesn't cost you 1% more — it costs you <strong>100% more origin traffic</strong>. Hit ratio
+      improvements have wildly outsized returns exactly where they're hardest to get. This is why video companies employ people whose
+      entire job is cache hit ratio, and why they care about apparently trivial things like <em>segment duration</em> (fewer, larger
+      segments = fewer objects = better cache density) and <strong>URL stability</strong> (a cache-busting query param accidentally appended
+      to segment URLs is a self-inflicted outage that turns 100% of your traffic into misses — this has really happened, to real
+      companies, more than once).
+    </p>
+
+    <h3>The cold-start problem: a brand-new video goes viral</h3>
+    <p>
+      The interviewer's favorite jab in this section, and it's a good one. Someone uploads a video, it hits the front page, and
+      500,000 people in 50 countries hit play <em>in the same minute</em>. Nothing is cached anywhere — the video is minutes old.
+      Every one of those requests is a cache miss. What happens?
+    </p>
+    <p>
+      What happens, if you've been careless, is that <strong>500,000 identical requests for segment 1 stampede your origin
+      simultaneously</strong>. This is the thundering herd (<a href="06-caching-queues-resilience.html">06</a>) wearing a new hat, and the
+      cure is the same:
+    </p>
+    <ul>
+      <li>
+        <strong>Request coalescing at the edge</strong> (nginx calls it <code>proxy_cache_lock</code>; CDNs call it request collapsing). A
+        thousand simultaneous misses for the same object result in <strong>one</strong> origin fetch; the other 999 wait for it and are
+        served from the fill. This is the single most important protection and it's a config flag, not a system you build. Know its
+        name.
+      </li>
+      <li>
+        <strong>A tiered CDN / shield origin.</strong> Edges don't fetch from your origin — they fetch from a regional mid-tier cache,
+        which fetches from origin. Now a global miss costs you a handful of origin fetches (one per region), not one per edge node.
+        The mid-tier is a fan-in funnel, and it's the standard answer.
+      </li>
+      <li>
+        <strong>Ride the natural shape of playback.</strong> You have an advantage a normal API doesn't: viewers arrive at segment 1 and
+        move forward at exactly 1× speed. The herd is <em>ordered</em>. Once segment 1 is warm it stays warm, and the herd warms your
+        cache for you as it advances. The pain is measured in seconds, not minutes.
+      </li>
+      <li>
+        <strong>Prewarm the obvious cases.</strong> If a video is trending, or if you're a Netflix and you know a season drops at
+        midnight, push it to the edges beforehand. You've already built this machinery — it's pre-positioning, applied selectively.
+      </li>
+    </ul>
+
+    <div class="pitfall">The wrong answer to cold start is "scale up the origin." You are proposing to size an origin fleet for a load that occurs for ninety seconds, on an unpredictable schedule, and is by definition redundant — it's the same handful of objects requested half a million times. Coalesce the requests and add a shield tier. Then say the general form of the lesson, because it's what they're actually testing: <em>"any time N clients miss on the same key at the same moment, the fix is to collapse them into one origin request, not to build an origin that can take N."</em></div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="scaling">8. Scaling &amp; bottlenecks</h2>
+
+    <p>What breaks first at 10×, and what you do about it. Be specific; "add more servers" scores nothing.</p>
+
+    <h3>Origin egress — the one that matters</h3>
+    <p>
+      Everything else on this list is an inconvenience. This one is existential, and it is the bottleneck you should name
+      <em>first</em> and unprompted. The origin exists to serve each byte <strong>once</strong> per edge, and every mechanism that protects
+      that property is worth real money:
+    </p>
+    <ul>
+      <li><strong>Tiered CDN with a shield origin</strong> — fan-in so that N edges cost you one origin fetch per region, not N.</li>
+      <li><strong>Long TTLs and immutable URLs.</strong> A video segment, once published, never changes. Set <code>Cache-Control: public, max-age=31536000, immutable</code> and mean it. If you ever need to change the bytes, change the URL. There is no reason for a segment to expire from a cache except eviction under memory pressure.</li>
+      <li><strong>Request coalescing</strong> at every tier.</li>
+      <li><strong>Multi-CDN.</strong> At real scale you buy from two or three CDNs and steer traffic between them by measured performance and price — partly for resilience, largely for negotiating leverage. Awareness level, but worth one sentence.</li>
+      <li><strong>Monitor origin egress as a top-line metric.</strong> A sudden rise in origin traffic without a rise in viewers means your cache hit ratio just fell off a cliff, and that is a page-someone-at-3am event. It usually means somebody shipped a URL change.</li>
+    </ul>
+
+    <h3>The transcoding fleet at upload peaks</h3>
+    <p>
+      Uploads are spiky and time-zone-correlated. The fleet must absorb that without either melting or sitting idle at 4 a.m. costing
+      you money.
+    </p>
+    <ul>
+      <li><strong>The queue is the shock absorber.</strong> This is the whole reason it's there. A 10× upload spike doesn't overload anything — it lengthens the queue, and processing latency rises from 5 minutes to 30. <em>The system degrades in latency, not in errors.</em> That's exactly the trade you want on a path where the user is not waiting.</li>
+      <li><strong>Autoscale the workers on queue depth</strong>, not on CPU. Queue depth is the leading indicator; CPU is the lagging one. And the fleet is stateless and idempotent, so scaling it is trivial — which is a payoff from §7a's design discipline.</li>
+      <li><strong>Run on spot / preemptible instances.</strong> The workload is interruptible, retryable and not latency-critical — it is the <em>textbook</em> spot instance workload, and it's a large discount on your biggest CPU line item. Say this; it's another cost-aware point that costs you nothing to make.</li>
+      <li><strong>Priority queues.</strong> A verified creator with 10 million subscribers should not sit behind 4,000 birthday videos. Two queues, or a priority field. Cheap to add, obviously correct, and interviewers like it.</li>
+    </ul>
+
+    <h3>Storage cost and the long tail</h3>
+    <p>
+      You are storing petabytes per day, forever, and a large fraction of it will never be watched again. Storage is cheap
+      <em>per gigabyte</em> and ruinous <em>in aggregate</em>. The answer is <strong>tiered storage</strong>, and it's a real, sensible, deployed
+      answer, not an interview trick:
+    </p>
+
+    <table>
+      <thead><tr><th>Tier</th><th>Contents</th><th>Property</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Hot</strong> (standard object storage, CDN-fronted)</td><td>Anything watched recently; everything trending.</td><td>Instant. Most expensive per GB. Small fraction of the catalog, huge fraction of the traffic.</td></tr>
+        <tr><td><strong>Warm</strong> (infrequent-access tier)</td><td>Watched occasionally — a few views a month.</td><td>Same latency, cheaper storage, but you pay per retrieval. Correct when reads are rare.</td></tr>
+        <tr><td><strong>Cold</strong> (archival — Glacier and friends)</td><td>The dead tail. Zero views in a year. Also: the original source masters, which you keep in case you ever need to re-encode into a future codec.</td><td>Dirt cheap. <strong>Retrieval takes minutes to hours.</strong> Which is fine — if someone finally plays a video that nobody has watched in two years, "restoring, try again in a few minutes" is an acceptable experience for an audience of one.</td></tr>
+      </tbody>
+    </table>
+
+    <p>
+      The transition is lifecycle-policy plumbing (blob stores do this natively on an access-time rule), and the aggressive version is
+      to <strong>delete the expensive renditions of dead videos entirely</strong> — keep 480p and the source master, drop the 4K encode, and
+      regenerate it if anyone ever asks. You have the source; a rendition is derived data, and derived data is a cache. <em>Treat your
+      renditions as a cache of your masters.</em> That's a lovely sentence and it's true.
+    </p>
+
+    <h3>Thumbnails</h3>
+    <p>
+      Easy to forget, surprisingly large: every video needs a poster frame and a sprite sheet of scrub previews, and the home page of
+      a video site is <em>a wall of thumbnails</em>. In request volume, thumbnails are served far more often than videos are watched —
+      you see fifty thumbnails to play one video. They're small, static, and infinitely cacheable, so they belong on the CDN like
+      everything else, but generating them is a step in the DAG and serving them is real traffic. One sentence in the interview,
+      but say the sentence, because it's on the requirements list and it shows you actually thought about the product surface.
+    </p>
+
+    <h3>The metadata tier</h3>
+    <p>
+      Last, and least. Reads are ~all by primary key, so put Redis in front of Postgres, add read replicas, and you're done for a
+      very long time. If you eventually shard, shard by <code>video_id</code> — there are no cross-video queries in the hot path. The
+      one genuinely high-write thing in the neighborhood is the <strong>view counter</strong>, and it does not belong in this table at all
+      (see <a href="18-streaming-aggregation.html">18</a>). Give this paragraph thirty seconds in the interview and no more; every extra
+      minute you spend here is a minute stolen from the parts that are hard.
+    </p>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="tradeoffs">9. Trade-offs</h2>
+
+    <table>
+      <thead><tr><th>Decision</th><th>Alternative</th><th>Why this way — and when you'd flip</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Presigned URL, client uploads direct to blob storage</strong></td>
+          <td>Upload through the API tier</td>
+          <td>Proxying gigabytes through stateful app servers sized for 50 ms JSON requests is how you take down the whole site with 200 concurrent uploads. <strong>Never flip this.</strong> The only nuance is if you need to inspect/transform bytes in flight — and even then you do it in the pipeline, after the upload lands, not in the request.</td>
+        </tr>
+        <tr>
+          <td><strong>Async transcoding pipeline</strong></td>
+          <td>Transcode synchronously in the upload request</td>
+          <td>Transcoding takes minutes-to-hours; requests time out in seconds. There is no flip. The <em>real</em> trade you're making is that the user waits for their video to become watchable — and you bought permission for that in requirements.</td>
+        </tr>
+        <tr>
+          <td><strong>Chunk the source and transcode chunks in parallel</strong></td>
+          <td>Transcode each rendition as one long job</td>
+          <td>Chunking gives you parallelism (minutes instead of hours), chunk-level retries (small blast radius), and a money-for-latency knob. Cost: a stitch step and keyframe-alignment care. Flip only for very short videos, where the coordination overhead exceeds the encode.</td>
+        </tr>
+        <tr>
+          <td><strong>Eager cheap ladder, lazy expensive ladder</strong></td>
+          <td>Transcode the full ladder eagerly for everything</td>
+          <td>The long tail makes eager-4K-for-everything an enormous, mostly wasted expense in both CPU and forever-storage. Cost: the first person to want 4K on a suddenly-viral video waits, or gets 1080p. <strong>Flip for Netflix</strong> — a curated catalog with guaranteed demand should absolutely be encoded eagerly and beautifully, because you <em>know</em> millions will watch it.</td>
+        </tr>
+        <tr>
+          <td><strong>Client-side ABR (client picks the bitrate)</strong></td>
+          <td>Server picks quality per client and transmuxes on the fly</td>
+          <td>Server-side selection makes every response personalized and therefore <strong>uncacheable</strong>, which detonates the entire cost model. Client-side ABR keeps every segment a static, shared, edge-cacheable file. This is the load-bearing decision of the whole system. Never flip.</td>
+        </tr>
+        <tr>
+          <td><strong>HLS/DASH segments over plain HTTP</strong></td>
+          <td>A custom UDP/RTMP streaming protocol</td>
+          <td>Plain HTTP means every cache, proxy, CDN and firewall on earth already supports you, for free. Custom protocols get better theoretical latency and are blocked by corporate firewalls, unsupported by CDNs, and a nightmare to operate. <strong>Flip only for genuine low-latency live</strong> (§10), where seconds of glass-to-glass delay actually matter.</td>
+        </tr>
+        <tr>
+          <td><strong>Short segments (2–4s)</strong></td>
+          <td>Long segments (10s)</td>
+          <td>Short segments = faster startup, more responsive bitrate switching, better live latency. Long segments = fewer objects, better compression efficiency, better cache density, less request overhead. It's a real dial, and the honest answer is <em>"~4 seconds, and I'd tune it against startup latency and hit ratio."</em> Naming the dial and its two directions is what's being graded.</td>
+        </tr>
+        <tr>
+          <td><strong>Pre-position at the edge (Netflix)</strong></td>
+          <td>Pull-through caching (YouTube)</td>
+          <td><strong>Decided entirely by catalog shape.</strong> Small curated catalog with predictable demand → pre-position, get near-100% hit rates, push at 3am when bandwidth is cheap. Unbounded long-tail catalog → you literally cannot, so cache reactively and accept tail misses. This is the same archetype flipping on one requirements answer.</td>
+        </tr>
+        <tr>
+          <td><strong>Metadata in Postgres</strong></td>
+          <td>Cassandra / DynamoDB</td>
+          <td>A billion rows of a kilobyte is ~1 TB — one machine, before sharding — with a read-heavy PK workload and a real one-to-many. Postgres is the right, boring answer. Flip if metadata writes genuinely explode, but they won't: <em>the videos are big, the rows aren't</em>.</td>
+        </tr>
+        <tr>
+          <td><strong>Tiered storage, cold-archive the dead tail</strong></td>
+          <td>Keep everything hot forever</td>
+          <td>Most of the catalog is never watched, and hot storage for petabytes of it is pure loss. Cost: a video nobody has watched in two years takes minutes to restore. That is an entirely acceptable experience for an audience of one, and saying so calmly is a senior move.</td>
+        </tr>
+        <tr>
+          <td><strong>Spot instances for the worker fleet</strong></td>
+          <td>Reserved/on-demand instances</td>
+          <td>The workload is idempotent, retryable, and not latency-critical — the canonical spot workload, at a large discount on your biggest CPU bill. Cost: workers vanish mid-job, which you already handle. Flip for the priority queue (a premium creator's upload shouldn't be at the mercy of the spot market).</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="followups">10. Follow-ups you should expect</h2>
+
+    <h3>"Now make it live." (The big one)</h3>
+    <p>
+      This is the most common follow-up and it is a <strong>genuinely different problem</strong> — say so immediately, because candidates who
+      try to bolt live onto the VOD design get lost. The reason it's different is one sentence long and you should lead with it:
+      <strong>you cannot pre-transcode the future.</strong> Every comfort you had in the VOD design came from the video existing in its
+      entirety before anyone watched it. Now it doesn't.
+    </p>
+    <ul>
+      <li><strong>The pipeline runs at 1× speed, forever, with no do-overs.</strong> Encode falls behind by 5 seconds and it never catches up — the stream is degraded for its entire duration. Batch throughput stops mattering; <em>sustained real-time throughput</em> is everything.</li>
+      <li><strong>Ingest becomes a persistent connection</strong> (RTMP, SRT, WebRTC) rather than a file upload, and it must survive the broadcaster's home wifi hiccupping.</li>
+      <li><strong>The manifest becomes a living document.</strong> In VOD the manifest is complete and immutable — a gift, cacheable forever. In live it's a sliding window that changes every few seconds, so it has a tiny TTL, and now you have a hot, frequently-revalidated object being requested by every viewer simultaneously. <em>The manifest becomes the scaling problem.</em> (DASH's answer is templated segment URLs the player can compute without re-fetching; that's a nice detail to know.)</li>
+      <li>
+        <strong>The core trade: latency vs reliability.</strong> Standard HLS buffers several segments ahead, giving you 15–30 seconds of
+        glass-to-glass delay and a rock-solid stream. <strong>Low-Latency HLS / LL-DASH</strong> cut that to 2–5 seconds using partial
+        segments and chunked transfer encoding — the edge starts sending a segment's bytes <em>before the encoder has finished producing
+        it</em>. WebRTC gets you sub-second but abandons the CDN model entirely and is brutally expensive to scale. <strong>Every second of
+        latency you remove costs you buffer, and buffer is what protects you from rebuffering.</strong>
+      </li>
+      <li><strong>Pick your point on that curve from the product:</strong> a sports book or an auction needs sub-second and will pay for it; a concert stream is fine at 20 seconds. Say <em>"how much latency does the product actually need?"</em> — it's the same requirements instinct that opened this page.</li>
+    </ul>
+
+    <h3>"What about DRM?"</h3>
+    <p>
+      Awareness level — nobody expects you to design a key-exchange protocol, but they do expect you to know that DRM
+      <strong>constrains everything upstream of it</strong>, which is the interesting part. Encrypted segments are still static cacheable
+      files (good — the CDN model survives), but the <em>keys</em> are per-user and served by a license server, which is now a piece of
+      infrastructure on your critical path that must be highly available: <strong>if the license server is down, nobody can watch
+      anything, even though every byte is sitting warm on the edge.</strong> DRM also forces you to encode for multiple incompatible
+      systems (Widevine, PlayReady, FairPlay), which multiplies your packaging matrix, and it pushes playback into the browser's
+      Encrypted Media Extensions and a hardware-backed secure path — which is why 4K content refuses to play on some perfectly good
+      monitors. The soundbite: <em>"DRM doesn't change the delivery model — encrypted segments still cache — but it adds a per-user
+      license server to the critical path, and it multiplies my packaging work. It's a business requirement that makes the
+      engineering meaningfully worse, and that's a normal thing to have to accept."</em>
+    </p>
+
+    <h3>"How would you do recommendations?"</h3>
+    <p>
+      <strong>Say it's out of scope, and say why.</strong> Do not bluff. <em>"Recommendations is a machine-learning system — candidate
+      generation, ranking, feature stores, embeddings, offline training with online serving. It's a genuinely separate design
+      interview, and it doesn't interact with anything we've built here except by reading the metadata table. I'd rather spend the
+      time on delivery. If you want, I can sketch the serving architecture at a high level in two minutes, but I'd be honest that
+      it's not my depth."</em> That answer scores <em>higher</em> than a hand-waved ML architecture. Confidently declining is a senior
+      behavior; bluffing is the fastest way to get found out.
+    </p>
+
+    <h3>"How do you count views?"</h3>
+    <p>
+      A streaming aggregation problem, and you already have a page for it (<a href="18-streaming-aggregation.html">18</a>). Players emit
+      heartbeat events → Kafka → a stream processor windows and aggregates → an OLAP store for the creator dashboard, plus a Redis
+      counter for the number under the video. Three things worth naming, because they're where the real questions live: <strong>a "view"
+      is a product definition, not a technical one</strong> (30 seconds watched? 30% of the video? YouTube's actual definition is
+      deliberately fuzzy to frustrate bots); <strong>the counter is high-write and does not belong in the <code>videos</code> row</strong> — it
+      would turn every playback into a database write on the hottest row in the system; and <strong>exact counts are not required</strong>
+      — nobody is harmed if a view count is briefly stale or off by a hundred, so you can batch, sample, and approximate freely. The
+      one place exactness matters is the creator's monetization report, and <em>that</em> path can be a slow, exact, offline batch job.
+      Two different consumers of the same event stream with completely different guarantees — a lovely thing to point out.
+    </p>
+
+    <h3>"Resume where I left off"</h3>
+    <p>
+      Tiny feature, worth thirty seconds, and worth them because it demonstrates product sense: the player periodically writes
+      <code>(user_id, video_id, position_sec)</code> — every 10 seconds, or on pause/unload — to a small key-value store keyed by
+      <code>(user_id, video_id)</code>. On load, read it and seek. It's a last-write-wins blind write, it needs no consistency guarantees
+      whatsoever, it's a few hundred bytes, and it's one of the highest-loved features in every video product ever shipped. The
+      lesson to voice: <em>"not everything that matters to users is architecturally hard, and it's worth saying which is which."</em>
+    </p>
+
+    <h3>"Video search"</h3>
+    <p>
+      A search-index problem, not a video problem (<a href="17-web-crawler-search.html">17</a>). You build an inverted index over
+      <em>metadata</em>: title, description, tags, channel, and — the interesting one — the <strong>auto-generated transcript</strong>, which is
+      simply another output node in your DAG (a speech-to-text step, sitting right next to thumbnails). Suddenly the whole spoken
+      contents of every video is searchable text, and you're back to Elasticsearch and ranking, which is a solved problem you've seen
+      elsewhere. Nobody is searching the pixels. Say <em>"I'd turn the video into text as early as possible and then it's a text search
+      problem"</em> — that reduction is the whole answer.
+    </p>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="qa">Interview Q&amp;A</h2>
+
+    <details class="qa">
+      <summary>"Why can't the client just upload the file to your API server?"</summary>
+      <div class="answer">
+        <p>
+          Because your API servers are the wrong tool, and using them this way takes down the site. A multi-gigabyte upload streaming
+          through a Spring Boot instance holds a connection and a thread (or event-loop slot) for minutes to <em>hours</em>, consuming
+          heap or scratch disk on a machine sized to answer 50 ms JSON requests. A few hundred concurrent uploads exhausts the pool,
+          and that pool is also serving every video page on the site — so a burst of uploads becomes a full outage on the read path.
+          You'd be spending expensive, stateful, latency-critical compute to do the exact job that cheap, dumb, infinitely scalable
+          object storage does better than anything else in existence.
+        </p>
+        <p>
+          The fix is one API call: the client asks for a <strong>presigned URL</strong>, and <code>PUT</code>s the bytes straight at S3, using
+          multipart upload so a failure at 97% resumes rather than restarting. Your app tier handled a few hundred bytes of JSON.
+          The soundbite: <em>"my app servers deal in kilobytes of metadata; the blob store deals in gigabytes of blob. The bytes never
+          touch my application tier."</em>
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"Why must transcoding be asynchronous? Walk me through what the user sees."</summary>
+      <div class="answer">
+        <p>
+          Because a full transcode is minutes to hours of CPU and an HTTP request dies in thirty seconds. It isn't a tuning problem;
+          it's off by two or three orders of magnitude. So the upload completes, you write a row with
+          <code>status = processing</code>, drop a job on a queue, and return <code>202 Accepted</code> <em>immediately</em>. A worker fleet
+          does the work later.
+        </p>
+        <p>
+          And the user sees exactly this, because you've seen it: <em>"Your video is processing — we'll let you know when it's
+          ready."</em> Then the low resolutions become available first and 4K shows up ten minutes later, one rung at a time.
+          <strong>That UI is the architecture leaking through</strong> — the status field, the async queue, the ladder being published
+          progressively as each transcode job lands. Point this out; interviewers enjoy it, and it proves you're reasoning about a
+          real system rather than reciting one.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"A one-hour video doesn't take an hour to process. Why not?"</summary>
+      <div class="answer">
+        <p>
+          Because you don't transcode the video — you transcode <em>chunks</em> of it, in parallel. Split the source at keyframe
+          boundaries into (say) 30-second chunks; each chunk is independently encodable because video compression is essentially
+          local. A one-hour video is 120 chunks, and 120 chunks × 5 rungs is 600 completely independent jobs you scatter across a
+          worker fleet. It is <strong>embarrassingly parallel</strong> — a map/reduce: split, map each (chunk × rendition) job, reduce by
+          stitching each rendition's chunks back in order and packaging into segments.
+        </p>
+        <p>
+          Three payoffs, and name all three: processing latency is bounded by the slowest chunk rather than the length of the video;
+          a failure retries one 30-second chunk instead of an hour of footage; and you get a direct <strong>money-for-latency knob</strong> —
+          want videos live twice as fast, add twice the workers. Being able to buy latency with money is exactly what you want from a
+          batch system.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"A transcode worker dies halfway through a job. What happens?"</summary>
+      <div class="answer">
+        <p>
+          Nothing interesting — and that's the design goal, because on a spot-instance fleet workers dying mid-job is the
+          <em>normal</em> case. The worker leased the message with a visibility timeout; it dies; the lease expires; another worker
+          picks the same message up and redoes the job. That is safe <strong>only because every step is idempotent</strong>: the job writes
+          its output to a deterministic key derived from its inputs (<code>/media/vid_9fk2p/720p/chunk_00042.ts</code>), never to a
+          timestamped or random one. Two workers racing on the same job write identical bytes to the same key; the last writer wins
+          and nobody notices. Nothing accumulates, nothing double-counts.
+        </p>
+        <p>
+          Then: retries with exponential backoff and jitter, a cap on attempts, and a <strong>dead-letter queue</strong> for jobs that keep
+          failing — because sooner or later someone uploads a file that reliably crashes your decoder, and without a retry cap that
+          poison pill will kill worker after worker forever. That last detail is worth volunteering; it's what someone who has
+          actually operated a pipeline says.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"Explain adaptive bitrate. Who decides the quality — and why does that matter so much?"</summary>
+      <div class="answer">
+        <p>
+          <strong>The client decides.</strong> Each rendition is cut into 2–10 second segments; a manifest (<code>.m3u8</code>/<code>.mpd</code>)
+          lists what exists at which bitrate; and the player, before each fetch, picks a rung based on its measured recent throughput
+          and — more importantly — its <strong>buffer health</strong>. Buffer beats throughput: throughput estimates are noisy and
+          backward-looking, but the buffer level is the ground truth about whether you're about to stall. Three seconds of runway
+          means <em>drop quality now</em>. Forty seconds means you can gamble upward. <em>Fall fast, rise slow</em> — because users forgive
+          480p and do not forgive a spinner.
+        </p>
+        <p>
+          Why it matters is the real answer, and it's the sharpest point on the page: <strong>because the server never adapts, every
+          segment is a static file at a stable URL — and therefore any dumb HTTP cache on earth can serve it.</strong> If the server chose
+          the bitrate per client, every response would be personalized and thus uncacheable, and you'd be serving tens of terabits a
+          second from your own origin, which is financially impossible. <em>Client-side ABR and CDN cacheability are the same design
+          decision.</em> The apparent stupidity of the server is what buys you the entire delivery model.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"How does seeking work if the video is being streamed?"</summary>
+      <div class="answer">
+        <p>
+          It's free, and that's the beauty of the format. The video isn't a stream in any exotic sense — it's a directory of numbered
+          segment files. The player wants <code>t = 4:30</code>, divides by segment duration (say 6s), and fetches segment 45. It never
+          downloads the parts you skipped, and it never asks a server to do anything clever. Same mechanism for switching resolution:
+          the player simply starts requesting the next segment from a different rung's directory, and because segments are
+          keyframe-aligned across rungs they splice cleanly.
+        </p>
+        <p>
+          The general lesson, which is worth saying: <strong>a good file format did the work that would otherwise have needed a
+          service.</strong> Seeking, quality switching and resumption all fall out of "cut it into numbered pieces and write down what
+          you have," with no server-side state anywhere.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"You have 5 Tbps of egress. Why not just scale up your origin?"</summary>
+      <div class="answer">
+        <p>
+          Because 5 Tbps sustained — that's just <em>one million</em> concurrent viewers at 5 Mbps — is roughly 1.6 exabytes a month,
+          which at cloud egress list prices lands somewhere in the tens of millions of dollars <em>per month</em>. That's not an
+          infrastructure line item; that's the company. And it's not a bandwidth you provision from a datacenter anyway; it's in the
+          league of national internet exchanges.
+        </p>
+        <p>
+          So the origin's job is not to serve video. <strong>The origin's job is to serve each byte exactly once per edge, and never
+          again.</strong> Everything else is the CDN's. This is why every large video company builds or buys CDN capacity, and why
+          <strong>Netflix manufactures its own hardware</strong> — Open Connect appliances that they give away free to ISPs to rack in their
+          own datacenters, so the bytes reach you from a box inside your ISP's building without ever crossing a paid transit link.
+          They eat the hardware cost because the alternative is paying for those bytes again, every single time. The whole domain
+          reduces to one sentence: <em>do not pay for the same byte twice.</em>
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"Netflix pre-positions content at the edge. Why can't YouTube do the same thing?"</summary>
+      <div class="answer">
+        <p>
+          Because of the catalog, and this is the distinction the whole page turns on. <strong>Netflix</strong> has a small, curated,
+          licensed catalog with extremely concentrated demand — tens of thousands of titles, and when a season drops, tens of millions
+          of people watch <em>the same bytes</em> in the same week. So Netflix can predict what a region will want and push it to the
+          edge <em>before anybody asks</em> — at 3 a.m., when network capacity is idle and bandwidth is nearly free. Near-100% hit
+          ratio, and the expensive traffic has been time-shifted to the cheapest hour of the day.
+        </p>
+        <p>
+          <strong>YouTube</strong> cannot, arithmetically. The catalog is unbounded — hundreds of hours uploaded every minute — and the
+          popularity distribution has a brutal long tail in which the overwhelming majority of videos have essentially zero views.
+          There is no world in which you push billions of never-watched videos onto every edge node; the catalog is orders of
+          magnitude bigger than all the storage at the edge combined. So YouTube caches <strong>reactively</strong>: popular content
+          naturally goes hot at the edges, and the long tail permanently misses and gets served, more slowly and more expensively,
+          from a regional origin. <em>Same archetype, opposite strategy, and the difference is entirely one requirements answer.</em>
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"Why is cache hit ratio described as a business metric rather than an engineering one?"</summary>
+      <div class="answer">
+        <p>
+          Because at high hit ratios, origin cost is proportional to the <em>miss</em> rate, and that makes the relationship viciously
+          nonlinear. On 100 PB/month of viewer traffic, a 99% hit ratio means 1 PB from origin; 98% means 2 PB. <strong>One percentage
+          point of hit ratio just doubled your origin traffic</strong> — and your origin fleet, and your transit bill. One point is
+          millions of dollars a year.
+        </p>
+        <p>
+          Which is why video companies employ people whose entire job is cache hit ratio, and why apparently trivial things get taken
+          very seriously: segment duration (fewer, larger objects cache more densely), long TTLs with immutable URLs (a published
+          segment never changes — <code>max-age=31536000, immutable</code>), and above all <strong>URL stability</strong>. Accidentally append
+          a cache-busting query parameter to your segment URLs and you have instantly converted 100% of your traffic into cache
+          misses and pointed the entire internet at your origin. That is a self-inflicted outage, it is a very expensive one, and it
+          has happened to real companies more than once.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"A brand-new video goes viral. Nothing is cached. What happens to your origin?"</summary>
+      <div class="answer">
+        <p>
+          It's the thundering herd in a new hat: 500,000 viewers across 50 countries all miss on segment 1 at the same instant, and if
+          you're careless, all of those misses become origin fetches for the identical object. Four answers, in order of importance:
+        </p>
+        <ul>
+          <li><strong>Request coalescing at the edge</strong> (request collapsing; <code>proxy_cache_lock</code> in nginx). A thousand simultaneous misses for the same object become <em>one</em> origin fetch, and the other 999 wait on the fill. This is the big one, and it's a config flag, not a system.</li>
+          <li><strong>A tiered CDN / shield origin.</strong> Edges fetch from a regional mid-tier, which fetches from origin — so a global miss costs a handful of origin fetches, not one per edge.</li>
+          <li><strong>Playback's natural shape helps you.</strong> Everyone starts at segment 1 and advances at exactly 1× speed, so the herd is <em>ordered</em> and it warms your cache for you as it moves. The pain lasts seconds.</li>
+          <li><strong>Prewarm the predictable cases</strong> — trending content, scheduled drops. That's just pre-positioning applied selectively.</li>
+        </ul>
+        <p>
+          The wrong answer is "scale up the origin," and say why it's wrong: you'd be sizing a fleet for a ninety-second, unpredictable
+          load that is by definition redundant. The general form — worth stating, because it's what they're really testing —
+          <em>"whenever N clients miss on the same key at the same moment, collapse them into one origin request; don't build an origin
+          that can take N."</em>
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"Most videos on YouTube are never watched. What does that cost you, and what do you do about it?"</summary>
+      <div class="answer">
+        <p>
+          It costs you twice, and both are avoidable. <strong>CPU:</strong> you generated a full ladder — including the 4K AV1 encode, the
+          most expensive job you have — for a birthday video that will be watched four times. <strong>Storage:</strong> you now pay rent,
+          forever, on ten-to-fifteen times the source size, for renditions nobody will ever request. Multiply by millions of uploads a
+          day and it's a very serious number.
+        </p>
+        <p>
+          Two fixes, and volunteer both. <strong>Lazy transcoding:</strong> eagerly encode only the cheap, universally-decodable rungs
+          (360p–720p H.264) so every video is immediately watchable, and generate 1080p/4K/exotic codecs on demand or on a view-count
+          trigger. <em>A video with 3 views does not need a 4K rendition</em> — and the incentives line up beautifully, because a video
+          that <em>does</em> cross the threshold is one where the better codec starts paying for itself in saved egress.
+          <strong>Tiered storage:</strong> lifecycle the dead tail from hot → infrequent-access → cold archive, accepting that a video nobody
+          has watched in two years takes minutes to restore (a perfectly fine experience for an audience of one). The aggressive
+          version: delete the expensive renditions of dead videos entirely and keep the source master, because <em>renditions are
+          derived data, and derived data is a cache.</em>
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"Now make it live. What breaks?"</summary>
+      <div class="answer">
+        <p>
+          Almost everything, because of one sentence: <strong>you cannot pre-transcode the future.</strong> Every comfort in the VOD design
+          came from the video existing in full before anyone watched it.
+        </p>
+        <ul>
+          <li>The pipeline must run at <strong>1× speed forever, with no do-overs</strong>. Fall 5 seconds behind and you never catch up; the stream is degraded for its entire life. Sustained real-time throughput replaces batch throughput as the thing you care about.</li>
+          <li>Ingest becomes a <strong>persistent connection</strong> (RTMP/SRT/WebRTC), not a file upload.</li>
+          <li><strong>The manifest becomes a living document</strong> — a sliding window that changes every few seconds, so it needs a tiny TTL, so it's suddenly a hot, constantly-revalidated object hammered by every viewer at once. In VOD the manifest was immutable and free; in live, <em>the manifest is the scaling problem</em>.</li>
+          <li>
+            And the core trade: <strong>latency vs reliability</strong>. Standard HLS buffers ahead, giving 15–30s of glass-to-glass delay
+            and a rock-solid stream. LL-HLS/LL-DASH cut it to 2–5s with partial segments and chunked transfer (the edge forwards a
+            segment's bytes before the encoder has finished producing it). WebRTC gets sub-second but abandons the CDN model and is
+            brutally expensive. <strong>Every second of latency you remove is a second of buffer you gave up, and buffer is the only
+            thing protecting you from rebuffering.</strong>
+          </li>
+        </ul>
+        <p>Then close with the requirements instinct: <em>"so — how much latency does the product actually need? An auction or a sports book needs sub-second and will pay for it. A concert stream is perfectly happy at twenty seconds."</em></p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"What's the archetype here, and where else does it show up?"</summary>
+      <div class="answer">
+        <p>
+          <strong>Media at scale: big dumb blobs, an async processing pipeline, and delivery economics.</strong> The recipe is always the
+          same three moves. <em>One:</em> split the tiny relational metadata from the enormous opaque bytes, and never let the bytes near
+          your application tier (presigned upload, direct to blob storage). <em>Two:</em> do the expensive transformation
+          asynchronously, on a chunked, parallel, idempotent worker fleet fed by a queue. <em>Three:</em> make the read path so dumb —
+          static files at stable URLs — that a CDN can serve every byte, and then obsess over cache hit ratio, because that ratio
+          <em>is</em> your P&amp;L.
+        </p>
+        <p>
+          It transfers directly to image hosting (upload → resize to a ladder of thumbnails → CDN — <em>the same page with smaller
+          numbers</em>), podcast distribution, large file distribution, software updates, and game patches: Steam pushing a 90 GB update
+          to ten million players on launch day is this exact problem with the video parts filed off. And the reframe transfers even
+          further than the architecture does — <strong>when the payload is big enough, the design question stops being "how do I store
+          this" and becomes "how do I deliver it cheaply."</strong> Most candidates never make that turn. Making it early is the whole
+          game.
+        </p>
+      </div>
+    </details>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="takeaways">What to remember</h2>
+
+    <p>If you have five minutes before the interview, read only this.</p>
+
+    <h3>The one-line summary</h3>
+    <p>
+      <strong>This is not a database problem — it is a bandwidth and storage problem, and therefore a cost problem. The metadata is
+      trivial; the bytes are enormous. So you push the expensive work into an async, chunked, idempotent pipeline, and you engineer
+      the read path to be so dumb that a CDN serves every byte — because the whole game is never paying for the same byte twice.</strong>
+    </p>
+
+    <h3>The numbers</h3>
+    <ul>
+      <li>YouTube ingests <strong>~500 hours of video per minute</strong> → ~720,000 hours/day → <strong>~720 TB/day of raw source</strong>.</li>
+      <li><strong>Transcoding MULTIPLIES storage ~10-15×</strong> — every rung of the ladder is a full extra copy. ~720 TB/day of source becomes <strong>~7 PB/day stored</strong>, forever.</li>
+      <li><strong>1M concurrent viewers × 5 Mbps = 5 Tbps of sustained egress.</strong> ← <strong>This is the number.</strong> Write it on the board.</li>
+      <li>5 Tbps ≈ 1.6 exabytes/month ≈ <strong>tens of millions of dollars a month</strong> at cloud egress list prices. That's not a line item, that's the company. <em>This one figure is why every video company builds or buys CDN capacity.</em></li>
+      <li>Cache hit ratio is nonlinear: <strong>99% → 98% doubles your origin traffic.</strong> One point of hit ratio is millions of dollars.</li>
+    </ul>
+
+    <h3>The decisions, compressed</h3>
+    <ul>
+      <li><strong>Presigned URL, client uploads direct to blob storage.</strong> Proxying a 10 GB upload through your app tier is a catastrophic design — expensive stateful compute doing dumb storage's job, and 200 concurrent uploads take down your read path. Multipart + resumable, always.</li>
+      <li><strong>Metadata/blob split.</strong> Small relational rows in Postgres (a billion × 1 KB = 1 TB — one box, unashamedly); enormous opaque bytes in S3. The <code>renditions</code> table is the ladder, and it's the ledger of your storage bill.</li>
+      <li><strong>Async pipeline, no exceptions.</strong> Transcoding is minutes-to-hours; a request dies in 30 seconds. Return <code>202 processing</code>. <em>"Your video is processing" is the architecture leaking into the UI.</em></li>
+      <li><strong>Chunk and parallelize.</strong> Split at keyframes, transcode chunks independently across a worker fleet — a map/reduce. That's why a 1-hour video takes minutes, why a failure retries 30 seconds not an hour, and why you can buy latency with money.</li>
+      <li><strong>Idempotent, retryable, deterministic keys.</strong> Workers die mid-job as the normal case (spot instances). Visibility timeout + backoff + DLQ, and cap retries or a poison-pill upload will kill your fleet one worker at a time.</li>
+      <li><strong>Transcode the long tail lazily.</strong> Cheap universal rungs eagerly; 4K and exotic codecs on demand or on a view-count trigger. <em>A video with 3 views does not need a 4K rendition.</em> This is the cost-aware instinct that marks a senior candidate.</li>
+      <li><strong>Client-side ABR.</strong> Segments + a manifest; the <em>player</em> picks the bitrate from throughput and — decisively — <strong>buffer health</strong>. Fall fast, rise slow. Rebuffering is what makes users leave.</li>
+      <li><strong>The inversion of control IS the economics.</strong> Because the server never adapts, every segment is a static file at a stable URL, so any cache on earth can serve it. Server-side quality selection would make every response personalized, uncacheable, and financially fatal. <em>ABR and CDN cacheability are the same decision.</em></li>
+      <li><strong>Catalog shape decides caching strategy.</strong> Netflix = curated, concentrated → <em>pre-position</em> the catalog at ISP edges at 3am when bandwidth is cheap (and ship your own hardware to do it). YouTube = unbounded, long-tailed → <em>pull-through</em>, cache reactively, accept that the tail always misses.</li>
+      <li><strong>Protect the origin.</strong> Tiered CDN / shield, request coalescing (the cold-start viral video), immutable URLs with year-long TTLs. The origin serves each byte once per edge and never again.</li>
+      <li><strong>Tiered storage for the dead tail.</strong> Hot → warm → cold archive. Renditions are derived data, and derived data is a cache — so you can delete them and regenerate from the master.</li>
+      <li><strong>Live is a different problem:</strong> you cannot pre-transcode the future. 1× forever, a living manifest, and a hard latency-vs-buffer trade.</li>
+    </ul>
+
+    <h3>The archetype transfer</h3>
+    <p>
+      <strong>Media at scale = big dumb blobs + an async processing pipeline + delivery economics.</strong> Image hosting, podcasts, large
+      file distribution, software updates, game patches — Steam shipping a 90 GB patch to ten million players on launch day is this
+      problem with the video parts filed off. Always the same three moves: <em>keep the bytes away from the app tier</em>, <em>do the
+      expensive transformation asynchronously on an idempotent parallel fleet</em>, and <em>make the read path dumb enough that a CDN can
+      serve all of it</em>. And underneath the architecture sits a habit of mind that outlasts it: once the payload is big enough,
+      the question stops being <em>"how do I store this?"</em> and becomes <strong>"how do I deliver it cheaply?"</strong>
+    </p>
+
+    <div class="senior">The three sentences that carry this round, in order: <em>(1) "The metadata here is trivial — this is a bandwidth and storage problem, so it's a cost problem, and I want to start with the egress arithmetic."</em> — the reframe, in minute one, that most candidates never make. <em>(2) "A million concurrent viewers is five terabits a second; at cloud egress prices that's the whole company, which is why the origin's only job is to serve each byte once and why Netflix literally ships hardware into ISPs."</em> — the derivation that shows you didn't memorize it. <em>(3) "The client picks the bitrate, not the server — and that's what makes every segment a cacheable static file, which is what makes the CDN model work at all."</em> — the elegant core. Say those three things, draw the two diagrams, and you have passed.</div>
+  </section>
+
+  <nav class="page-nav">
+    <a href="15-geospatial-nearby.html">← 15 — Design Nearby / Ride-Hailing</a>
+    <a href="17-web-crawler-search.html">17 — Design a Web Crawler &amp; Search Index →</a>
+  </nav>
+
+</main>
+</body>
+</html>

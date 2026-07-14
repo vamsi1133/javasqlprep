@@ -1,0 +1,1576 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>08 — Heaps &amp; Top-K | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <div class="breadcrumb"><a href="index.html">← Course Home</a></div>
+    <h1>08 — Heaps &amp; Top-K</h1>
+    <p>Priority access without full sorting — JS has no built-in heap, so you write one once and reuse it everywhere.</p>
+  </div>
+</header>
+
+<main class="container">
+
+  <section>
+    <h2>Why interviewers ask this</h2>
+    <p>
+      Heap problems are a staple of enterprise-tier loops — banks, fintech, healthcare, and large non-FAANG product
+      companies (Optum, JPMC, Goldman Sachs and their peers) — because the domain is drowning in priority queues:
+      order books matching the best bid first, job schedulers draining the highest-priority task, alerting systems
+      surfacing the K most critical incidents, rate limiters and hospital triage queues. When a JPMC or Optum
+      interviewer asks "find the K closest points" or "kth largest element," they're asking a sanitized version of a
+      system they run in production, and they're grading one specific instinct: do you reach for an O(n log n) full
+      sort when only K elements matter, or do you know the cheaper tool? At 7 YOE, "sort it and slice" is a yellow
+      flag on a medium — not because it's wrong, but because it signals you don't know <em>why</em> it's wasteful.
+    </p>
+    <p>
+      There's a second, JavaScript-specific reason this topic earns its own tutorial: <strong>JS has no standard-library
+      heap.</strong> Java has <code>PriorityQueue</code>, Python has <code>heapq</code>, C++ has
+      <code>std::priority_queue</code> — a frontend candidate has nothing. Interviewers know this, and it quietly raises
+      the bar: you either write a correct heap from scratch under pressure, or you confidently say "assume a MinHeap
+      class with push/pop/peek — I'll implement it if you want" and keep moving. Both are fine; fumbling between them is
+      not. This tutorial makes you write the class <em>once</em>, properly, so that in the room it's either muscle memory
+      or a one-sentence assumption. And learn the recognition tell now: the phrase <strong>"top K" (or "K closest,"
+      "K most frequent," "kth largest") in a problem statement is a dead giveaway</strong> — the interviewer chose
+      those words because they want a heap (or quickselect) and are waiting to see if you hear it.
+    </p>
+  </section>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ul>
+      <li><a href="#recognize">1. Recognizing the pattern</a></li>
+      <li><a href="#template">2. Heap mechanics</a></li>
+      <li><a href="#minheap">3. Build your MinHeap once</a></li>
+      <li><a href="#warmups">4. Warm-ups</a> — Kth Largest in a Stream · Last Stone Weight</li>
+      <li><a href="#topk">5. Top-K classics</a> — K Closest Points ★ · Kth Largest in an Array ★ (+ quickselect) · Task Scheduler ★ · Design Twitter</li>
+      <li><a href="#stretch">6. Stretch</a> — Merge K Sorted Lists ★ · Find Median from Data Stream ★</li>
+      <li><a href="#qa">Interview Q&amp;A</a></li>
+      <li><a href="#drills">Re-solve drills</a></li>
+    </ul>
+  </div>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="recognize">1. Recognizing the pattern</h2>
+
+    <p>Reach for a <strong>heap</strong> when the problem statement has any of these signals:</p>
+    <ul>
+      <li><strong>"Top K / smallest K / K closest / K most frequent"</strong> — the flagship phrasing. You need the K best elements by some score, and the other n−K elements' relative order is irrelevant. Paying O(n log n) to sort everything is answering a question nobody asked.</li>
+      <li><strong>"Kth largest / kth smallest"</strong> — you need exactly one rank statistic. Heap of size K, or quickselect if the whole array is in memory and you may mutate it.</li>
+      <li><strong>"Streaming" / "design a class with an <code>add()</code> method"</strong> — data arrives one element at a time and you must answer queries between arrivals. Sorting is off the table (you'd re-sort per element); a heap gives O(log n) per arrival. Kth Largest in a Stream and Find Median from a Data Stream are both this signal verbatim.</li>
+      <li><strong>"Schedule / process by priority" / "always take the largest (or smallest) remaining"</strong> — repeated extract-max or extract-min with interleaved inserts. Task Scheduler, Last Stone Weight, meeting-room allocation, CPU scheduling. Any greedy algorithm whose greedy step is "grab the current extreme" runs on a heap.</li>
+      <li><strong>"Merge K sorted things"</strong> — K sorted lists/arrays/iterators, and at each step you want the smallest of the K current heads. That's a K-element min-heap.</li>
+    </ul>
+
+    <h3>Sort vs. heap vs. quickselect — the decision table</h3>
+    <p>
+      Three tools answer "give me the extreme elements," and interviewers explicitly reward choosing among them out
+      loud. The question to ask is: <em>how much order do I actually need, and is the data all here or still arriving?</em>
+    </p>
+    <table>
+      <thead><tr><th>You need…</th><th>Reach for</th><th>Cost</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>The <strong>full sorted order</strong>, or n is small (≤ ~10⁴) and you want zero ceremony</td>
+          <td>Sort</td>
+          <td>O(n log n)</td>
+          <td>Simplest correct code. Also right when you need the K best <em>in sorted order</em> and K ≈ n.</td>
+        </tr>
+        <tr>
+          <td><strong>Top/smallest K</strong> where K ≪ n, or the data is <strong>streaming</strong> / too big for memory</td>
+          <td>Size-K heap</td>
+          <td>O(n log K) time, O(K) space</td>
+          <td>Never holds more than K elements. The only option when n doesn't fit in memory — this is the follow-up interviewers love.</td>
+        </tr>
+        <tr>
+          <td>Exactly the <strong>kth element</strong> (one rank), array fully in memory, mutation allowed</td>
+          <td>Quickselect</td>
+          <td>O(n) average, O(n²) worst</td>
+          <td>Beats both on average. Costs: destroys input order, bad worst case (mitigate with a random pivot), no streaming.</td>
+        </tr>
+        <tr>
+          <td>Repeated <strong>"current min/max"</strong> queries interleaved with inserts (scheduling, simulation)</td>
+          <td>Heap</td>
+          <td>O(log n) per push/pop, O(1) peek</td>
+          <td>Sorting can't absorb inserts; a heap is built for exactly this access pattern.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="senior">The sentence to say before writing any code: <em>"I only need the K largest, not full order, so instead of sorting at O(n log n) I'll keep a min-heap capped at size K — O(n log K) time, O(K) space — and if you'd like I can compare it against quickselect."</em> Thirty seconds, and you've demonstrated the entire decision table. At the enterprise tier this framing is frequently worth more than a perfect implementation, because most candidates jump straight to <code>.sort()</code>.</div>
+
+    <div class="pitfall">"Top K" does <strong>not</strong> mean "use a size-K heap of the K candidates you like" — it means the heap's job is to <em>evict</em>. To keep the K largest you keep a <strong>min</strong>-heap (the weakest of your K champions sits on top, ready to be knocked out); to keep the K smallest you keep a <strong>max</strong>-heap. Candidates reflexively pair "largest" with "max-heap" and end up needing O(n) space. The inversion is counterintuitive exactly once — internalize it in §4 and it's yours forever.</div>
+  </section>
+
+  <!-- ============================================================ -->
+
+  <section>
+    <h2 id="template">2. Heap mechanics</h2>
+
+    <p>
+      A binary heap is a <strong>complete binary tree</strong> — every level full except possibly the last, which fills
+      left to right — obeying one rule, the <em>heap property</em>: <strong>every parent is ≤ both of its children</strong>
+      (min-heap), or ≥ both (max-heap). That's it. Note what it does <em>not</em> promise: siblings are unordered, the
+      second-smallest element could be either child of the root, and an inorder walk gives you garbage. A heap is
+      <strong>partially ordered</strong>, and that laziness is exactly why it's cheap: maintaining "the minimum is on top"
+      costs O(log n), while maintaining "everything is in order" costs O(n log n).
+    </p>
+
+    <h3>2a. The array trick — there is no tree</h3>
+    <p>
+      Because the tree is <em>complete</em>, it has no holes, so you can flatten it into an array in level order and compute
+      the links arithmetically instead of storing pointers. This is the whole implementation secret: a heap is a plain
+      JavaScript array plus three index formulas.
+    </p>
+<pre><code><span class="com">// For a node at index i (0-based):</span>
+parent(i) = (i - <span class="num">1</span>) &gt;&gt; <span class="num">1</span>   <span class="com">// integer divide by 2 — (i-1)/2 floored</span>
+left(i)   = <span class="num">2</span> * i + <span class="num">1</span>
+right(i)  = <span class="num">2</span> * i + <span class="num">2</span>
+
+<span class="com">//        1              index: 0  1  2  3  4  5</span>
+<span class="com">//      /   \            array: [1, 3, 2, 7, 4, 9]</span>
+<span class="com">//     3     2           parent(4) = (4-1)&gt;&gt;1 = 1  -&gt; value 3  OK</span>
+<span class="com">//    / \   /            left(1)   = 3            -&gt; value 7  OK</span>
+<span class="com">//   7   4 9</span>
+</code></pre>
+    <div class="note">Use <code>(i - 1) &gt;&gt; 1</code>, not <code>Math.floor((i - 1) / 2)</code>. Both are correct, but the shift is shorter, faster, and signals you know the array layout is powers-of-two arithmetic — same reason you write <code>2 * i + 1</code> inline rather than calling a helper. The one JS caveat: <code>&gt;&gt;</code> coerces to a 32-bit int, which is irrelevant here (array indices never approach 2³¹) but worth knowing before you reach for it elsewhere.</div>
+
+    <h3>2b. Sift-up (push) vs sift-down (pop)</h3>
+    <p>
+      Every heap operation is "break the invariant in exactly one spot, then walk that violation along a single
+      root-to-leaf path until it's fixed." There are only two directions to walk, and knowing which belongs to which
+      operation <em>is</em> the mechanic:
+    </p>
+    <ul>
+      <li>
+        <strong>Sift-up (bubble-up / heapify-up) — used by <code>push</code>.</strong> Append the new value at the
+        <em>end</em> of the array — the only position that keeps the tree complete. It may outrank its parent, so compare
+        with the parent and swap upward, repeating until it loses to its parent or it reaches index 0. You compare against
+        exactly <strong>one</strong> node per level (the parent), so it costs at most height = ⌊log₂ n⌋ swaps.
+      </li>
+      <li>
+        <strong>Sift-down (bubble-down / heapify-down) — used by <code>pop</code>.</strong> The root is the answer, so you
+        save it — but you can't leave a hole at index 0. Move the <em>last</em> element into the root (again: the only
+        removal that preserves completeness) and let it sink: compare against <strong>both</strong> children, swap with the
+        <em>better</em> one (the smaller, for a min-heap), repeat. Two comparisons per level, at most log n levels.
+      </li>
+    </ul>
+    <div class="pitfall">In <code>_siftDown</code> you must swap with the <strong>smaller of the two children</strong>, not with the first child that happens to beat the parent. Swap with the larger child in a min-heap and you've just made that child the parent of a smaller sibling — the heap property is still broken, silently, and your <code>pop()</code> starts returning wrong answers ten operations later. This is the #1 bug in hand-rolled heaps, and it's why the template computes <code>best</code> across both children before it swaps once.</div>
+
+    <h3>2c. Why building a heap is O(n) but n pushes is O(n log n)</h3>
+    <p>
+      This is the most-asked heap theory question, and most candidates fumble it by hand-waving "n elements × log n each."
+      Both statements are true — they are <em>different algorithms</em>, and the difference is which direction you sift:
+    </p>
+    <ul>
+      <li><strong>n pushes = O(n log n).</strong> Every <code>push</code> appends at a leaf and sifts <em>up</em>. The path from a leaf to the root is the <em>full</em> height, log n. So the worst case genuinely is n × log n — push 1, 2, 3, … n into a min-heap in <em>decreasing</em> order and every single element travels all the way to the root.</li>
+      <li><strong>Floyd's build-heap = O(n).</strong> Take the raw array as-is and sift-<em>down</em> every node from index ⌊n/2⌋−1 (the last node that even has a child) back to index 0. Now each node's cost is bounded by its <strong>height above the leaves</strong>, not the height of the whole tree — and a heap is overwhelmingly leaves. Half the nodes are leaves (height 0 → zero work). A quarter have height 1. An eighth have height 2. Total work ≈ Σ<sub>h</sub> (n / 2<sup>h+1</sup>) × h, a series that converges to <strong>2n</strong>. The one-liner to say: <em>"almost all the nodes are near the bottom and barely move, so the cheap majority dominates and the sum telescopes to O(n)."</em></li>
+    </ul>
+    <p>
+      The practical upshot: if you're handed the whole array up front, <code>heapify</code> it in O(n). If elements arrive
+      one at a time (a stream), you have no choice but to push and you pay O(log n) each. Either way, the <em>pops</em>
+      still cost O(log n) apiece — so draining all n elements is O(n log n) no matter how you built it. That's heapsort,
+      and it's exactly why "just heapify it" never beats sorting when you actually need <em>everything</em> in order.
+    </p>
+
+    <h3>2d. The cost table you should have memorized</h3>
+    <table>
+      <thead><tr><th>Operation</th><th>Cost</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><code>peek()</code></td><td>O(1)</td><td>It's <code>data[0]</code>. Literally no work.</td></tr>
+        <tr><td><code>push(x)</code></td><td>O(log n)</td><td>One sift-up along a single leaf-to-root path.</td></tr>
+        <tr><td><code>pop()</code></td><td>O(log n)</td><td>One sift-down along a single root-to-leaf path.</td></tr>
+        <tr><td>Build from n items (<code>heapify</code>)</td><td><strong>O(n)</strong></td><td>Floyd's bottom-up sift-down; the leaf-heavy sum converges to 2n.</td></tr>
+        <tr><td>Build by n <code>push</code>es</td><td>O(n log n)</td><td>Each push can travel the full height.</td></tr>
+        <tr><td>Find an arbitrary value</td><td>O(n)</td><td><strong>A heap is not a search structure.</strong> Only the extreme is fast.</td></tr>
+        <tr><td>Drain all n (heapsort)</td><td>O(n log n)</td><td>n pops × log n. No free lunch versus sorting.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="senior">"A heap is not a search structure" is a sentence that buys credibility. When the interviewer probes — "could you also delete an arbitrary element? get the 2nd smallest in O(1)? look up by id?" — the answer for a plain heap is <em>no</em>: deletion by value is O(n) because you must scan to find the index first. The real fixes are worth naming: keep a <code>Map</code> from value → index and sift both ways after the swap-out, or use <strong>lazy deletion</strong> (mark it dead in a <code>Set</code>, discard it when it surfaces at the top) — which is what production job schedulers and Dijkstra implementations actually do. Candidates who quietly assume a heap is a sorted array walk straight into this.</div>
+
+    <h3>2e. The knobs — one heap, every problem</h3>
+    <p>Every problem below is this one class with four dials turned:</p>
+    <table>
+      <thead><tr><th>Knob</th><th>Options</th><th>Example</th></tr></thead>
+      <tbody>
+        <tr><td>Comparator</td><td><code>(a,b) =&gt; a - b</code> min-heap · <code>(a,b) =&gt; b - a</code> max-heap · <code>(a,b) =&gt; a.dist - b.dist</code> by field</td><td>Last Stone Weight (max) vs K Closest (min by field)</td></tr>
+        <tr><td>Size cap</td><td>Unbounded, or capped at K (pop the moment <code>size &gt; K</code>)</td><td>Kth Largest in a Stream caps at K; Task Scheduler doesn't</td></tr>
+        <tr><td>What you store</td><td>Number · <code>[score, payload]</code> tuple · object · <em>list node</em></td><td>Merge K Lists stores nodes; Design Twitter stores tuples</td></tr>
+        <tr><td>How many heaps</td><td>One · <strong>two, facing each other</strong></td><td>Find Median runs a max-heap and a min-heap back to back</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="minheap">3. Build your MinHeap once</h2>
+
+    <p>
+      This is the centerpiece of the page. Java hands you <code>PriorityQueue</code>, Python hands you <code>heapq</code>,
+      C++ hands you <code>std::priority_queue</code> — <strong>JavaScript hands you nothing</strong>, and no Node release
+      has changed that. So you write this class once, drill it until it's typing rather than thinking, and paste it above
+      every heap solution for the rest of your career. Forty lines, three minutes to type, and it is the single
+      highest-leverage block of code a JavaScript candidate can commit to memory.
+    </p>
+
+<pre><code><span class="kw">class</span> <span class="typ">MinHeap</span> {
+  <span class="com">// compare(a, b) &lt; 0  =&gt;  a comes out FIRST. Default: numeric ascending (a true min-heap).</span>
+  <span class="kw">constructor</span>(compare = (a, b) =&gt; a - b) {
+    <span class="kw">this</span>.data = [];             <span class="com">// the complete tree, flattened in level order</span>
+    <span class="kw">this</span>.compare = compare;
+  }
+
+  <span class="kw">get</span> size() { <span class="kw">return</span> <span class="kw">this</span>.data.length; }
+  peek()     { <span class="kw">return</span> <span class="kw">this</span>.data[<span class="num">0</span>]; }   <span class="com">// O(1) — the extreme always sits at index 0</span>
+
+  push(val) {
+    <span class="kw">this</span>.data.push(val);                 <span class="com">// the end is the only slot that keeps the tree complete</span>
+    <span class="kw">this</span>._siftUp(<span class="kw">this</span>.data.length - <span class="num">1</span>);
+  }
+
+  pop() {
+    <span class="kw">if</span> (<span class="kw">this</span>.data.length === <span class="num">0</span>) <span class="kw">return</span> <span class="kw">undefined</span>;
+    <span class="kw">const</span> top  = <span class="kw">this</span>.data[<span class="num">0</span>];          <span class="com">// this is the answer we hand back</span>
+    <span class="kw">const</span> last = <span class="kw">this</span>.data.pop();        <span class="com">// removing the LAST leaf keeps the tree complete</span>
+    <span class="kw">if</span> (<span class="kw">this</span>.data.length) {             <span class="com">// if it's empty now, `last` WAS the top — nothing to fix</span>
+      <span class="kw">this</span>.data[<span class="num">0</span>] = last;              <span class="com">// plug the hole at the root...</span>
+      <span class="kw">this</span>._siftDown(<span class="num">0</span>);               <span class="com">// ...and let the misfit sink to its rightful level</span>
+    }
+    <span class="kw">return</span> top;
+  }
+
+  <span class="com">// Walk UP while this node outranks its parent. At most log n swaps (one compare per level).</span>
+  _siftUp(i) {
+    <span class="kw">while</span> (i &gt; <span class="num">0</span>) {
+      <span class="kw">const</span> p = (i - <span class="num">1</span>) &gt;&gt; <span class="num">1</span>;                                  <span class="com">// parent index</span>
+      <span class="kw">if</span> (<span class="kw">this</span>.compare(<span class="kw">this</span>.data[i], <span class="kw">this</span>.data[p]) &gt;= <span class="num">0</span>) <span class="kw">break</span>;  <span class="com">// parent still wins =&gt; done</span>
+      [<span class="kw">this</span>.data[i], <span class="kw">this</span>.data[p]] = [<span class="kw">this</span>.data[p], <span class="kw">this</span>.data[i]];
+      i = p;
+    }
+  }
+
+  <span class="com">// Walk DOWN, always swapping with the BETTER of the two children. At most log n swaps.</span>
+  _siftDown(i) {
+    <span class="kw">const</span> n = <span class="kw">this</span>.data.length;
+    <span class="kw">while</span> (<span class="kw">true</span>) {
+      <span class="kw">const</span> l = <span class="num">2</span> * i + <span class="num">1</span>, r = <span class="num">2</span> * i + <span class="num">2</span>;
+      <span class="kw">let</span> best = i;
+      <span class="kw">if</span> (l &lt; n &amp;&amp; <span class="kw">this</span>.compare(<span class="kw">this</span>.data[l], <span class="kw">this</span>.data[best]) &lt; <span class="num">0</span>) best = l;
+      <span class="kw">if</span> (r &lt; n &amp;&amp; <span class="kw">this</span>.compare(<span class="kw">this</span>.data[r], <span class="kw">this</span>.data[best]) &lt; <span class="num">0</span>) best = r;
+      <span class="kw">if</span> (best === i) <span class="kw">break</span>;               <span class="com">// parent beats both kids =&gt; heap property restored</span>
+      [<span class="kw">this</span>.data[i], <span class="kw">this</span>.data[best]] = [<span class="kw">this</span>.data[best], <span class="kw">this</span>.data[i]];
+      i = best;
+    }
+  }
+
+  <span class="com">// O(n) bulk build (Floyd): sift down every NON-leaf, bottom-up. The leaf half needs no work.</span>
+  <span class="kw">static</span> heapify(arr, compare) {
+    <span class="kw">const</span> h = <span class="kw">new</span> <span class="typ">MinHeap</span>(compare);
+    h.data = arr;                                    <span class="com">// take ownership of the array — no copy, no n pushes</span>
+    <span class="kw">for</span> (<span class="kw">let</span> i = (arr.length &gt;&gt; <span class="num">1</span>) - <span class="num">1</span>; i &gt;= <span class="num">0</span>; i--) h._siftDown(i);
+    <span class="kw">return</span> h;
+  }
+}
+</code></pre>
+
+    <p>The four things to notice, because each one is a question an interviewer can ask:</p>
+    <ul>
+      <li><strong><code>push</code> appends then sifts up; <code>pop</code> swaps in the last leaf then sifts down.</strong> Both mutate the array only at positions that keep the tree <em>complete</em> — that's the invariant that makes the index arithmetic legal in the first place.</li>
+      <li><strong><code>pop</code> guards two cases:</strong> empty (return <code>undefined</code>) and size-1 (after <code>data.pop()</code> the array is empty, so there's nothing to sift). Get the second one wrong and you write <code>undefined</code> into <code>data[0]</code> and resurrect a ghost element. Interviewers <em>do</em> test <code>pop</code> on a one-element heap.</li>
+      <li><strong>The comparator is injected, not hardcoded.</strong> That's what makes this one class serve every problem below.</li>
+      <li><strong><code>heapify</code> is static and O(n)</strong> — it exists so you can say "I'll build in O(n) rather than n pushes" and actually have the code to back it.</li>
+    </ul>
+
+    <h3>3a. The comparator trick: one class, both heaps</h3>
+    <p>
+      Notice there is no <code>MaxHeap</code> class anywhere on this page, and there never will be. <strong>A max-heap is a
+      min-heap that lies about ordering.</strong> Flip the comparator and the same forty lines run backwards:
+    </p>
+<pre><code><span class="kw">const</span> minHeap = <span class="kw">new</span> <span class="typ">MinHeap</span>();                          <span class="com">// smallest number pops first</span>
+<span class="kw">const</span> maxHeap = <span class="kw">new</span> <span class="typ">MinHeap</span>((a, b) =&gt; b - a);            <span class="com">// LARGEST number pops first</span>
+
+<span class="com">// By a field on an object (K Closest Points):</span>
+<span class="kw">const</span> byDist  = <span class="kw">new</span> <span class="typ">MinHeap</span>((a, b) =&gt; a.dist - b.dist);
+
+<span class="com">// By a field in a [score, payload] tuple (Design Twitter — newest tweet first):</span>
+<span class="kw">const</span> byTime  = <span class="kw">new</span> <span class="typ">MinHeap</span>((a, b) =&gt; b[<span class="num">0</span>] - a[<span class="num">0</span>]);
+
+<span class="com">// Multi-key: highest count first, alphabetical tiebreak (K Most Frequent Words)</span>
+<span class="kw">const</span> multi   = <span class="kw">new</span> <span class="typ">MinHeap</span>((a, b) =&gt; b.count - a.count || a.word.localeCompare(b.word));
+</code></pre>
+    <p>
+      Burn in the rule: <strong><code>compare(a, b) &lt; 0</code> means "a pops before b."</strong> It is the exact contract
+      you already know from <code>Array.prototype.sort</code> — <code>sort</code>'s comparator decides which element lands
+      <em>earlier in the array</em>; the heap's decides which element comes <em>out earlier</em>. Same mental model, same
+      <code>a - b</code> / <code>b - a</code> muscle memory, same <code>||</code> chaining for tiebreaks. If you can write
+      the sort comparator, you can write the heap comparator, and you never need a second class.
+    </p>
+
+    <h3>3b. Now the inversion — a min-heap for the K <em>largest</em> (as promised in §1)</h3>
+    <p>
+      Derive it; don't memorize it. You're the bouncer at a club with exactly K spots, and only the strongest K get in.
+      A newcomer walks up. The only question you ever need to answer is: <em>"is this newcomer stronger than the weakest
+      person currently inside?"</em> So the one person you must be able to see instantly — the one standing by the door,
+      on top of the heap — is the <strong>weakest of your current champions</strong>. Weakest on top means
+      <strong>min</strong>-heap. If the newcomer beats them, the weakling is thrown out and the newcomer takes the spot;
+      if not, the newcomer walks away and the heap is untouched.
+    </p>
+<pre><code><span class="com">// Keep the K LARGEST elements of a stream  =&gt;  MIN-heap capped at K.</span>
+<span class="kw">const</span> heap = <span class="kw">new</span> <span class="typ">MinHeap</span>();          <span class="com">// top = weakest champion = the eviction candidate</span>
+<span class="kw">for</span> (<span class="kw">const</span> x <span class="kw">of</span> nums) {
+  heap.push(x);
+  <span class="kw">if</span> (heap.size &gt; k) heap.pop();    <span class="com">// evict the weakest: it can never be in the top K again</span>
+}
+<span class="com">// heap now holds exactly the K largest, and heap.peek() IS the Kth largest.</span>
+</code></pre>
+    <p>
+      And the mirror image: to keep the K <strong>smallest</strong>, keep a <strong>max</strong>-heap, whose top is the
+      <em>worst</em> (largest) of your K survivors — the one to evict the moment something smaller arrives. One sentence
+      covers both directions forever: <strong>the top of the heap is always the element you are most willing to throw
+      away.</strong> Say that out loud in the room and you will never re-derive the inversion under pressure again.
+    </p>
+    <div class="pitfall">The cap check must be <code>&gt; k</code>, not <code>&gt;= k</code>, and it must come <strong>after</strong> the push. Push-then-evict lets the heap hold K+1 elements for one instant, which is what makes the newcomer compete <em>fairly</em> against the sitting weakling — the loser of that comparison is whatever ends up on top, and it gets popped. Check <code>&gt;= k</code> before pushing and you evict a champion to make room for a newcomer that may be worse than everyone. (The "clever" variant — <code>if (heap.size &lt; k) heap.push(x); else if (x &gt; heap.peek()) { heap.pop(); heap.push(x); }</code> — is also correct and slightly faster, since it skips the push for hopeless elements. Write the three-line version, then <em>mention</em> the optimization.)</div>
+    <div class="senior">Why this is O(n log K) and not O(n log n): the heap <strong>never exceeds K elements</strong>, so every push and pop walks a tree of height log K, not log n. With K = 10 and n = 10⁹ — a stream you could not store even if you wanted to — log K ≈ 3.3 and your memory footprint is ten slots. That contrast ("this is the only approach that survives an input which doesn't fit in RAM") is exactly the follow-up an Optum or JPMC interviewer is holding in reserve, and it's the reason they asked a Top-K question in the first place. Volunteer it.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="warmups">4. Warm-ups</h2>
+    <p>
+      Two problems, twenty minutes, and the two comparator directions are yours. Do not skip them because they're rated
+      easy — the size-K min-heap in the first one is the exact skeleton you'll reuse in K Closest Points and Kth Largest
+      in an Array, and the second one is the shortest possible drill for "max-heap = flipped comparator."
+    </p>
+
+    <h3>Kth Largest Element in a Stream (LC #703) <span class="tier tier-3">EASY</span></h3>
+    <p>
+      Design a class <code>KthLargest</code> that tracks the k-th largest element in a <em>stream</em> of numbers. The
+      constructor takes <code>k</code> and an initial array <code>nums</code>. Each call to <code>add(val)</code> appends
+      <code>val</code> to the stream and returns the k-th largest element seen so far — <em>k-th largest by value with
+      duplicates counted separately</em>, i.e. the k-th element in sorted-descending order, not the k-th distinct value.
+      The problem guarantees there are always at least k elements by the time you're asked.
+    </p>
+    <p>
+      <strong>Example 1:</strong> <code>k = 3, nums = [4, 5, 8, 2]</code>. Then
+      <code>add(3)</code> → <code>4</code> (stream sorted desc: 8,5,4,3,2 — third is 4);
+      <code>add(5)</code> → <code>5</code> (8,5,5,4,3,2 — third is 5);
+      <code>add(10)</code> → <code>5</code> (10,8,5,5,4,3,2 — third is 5);
+      <code>add(9)</code> → <code>8</code>; <code>add(4)</code> → <code>8</code>.<br>
+      <strong>Example 2:</strong> <code>k = 1, nums = []</code>. <code>add(-3)</code> → <code>-3</code>;
+      <code>add(-2)</code> → <code>-2</code> — with k = 1 this degenerates to "running maximum," which is a useful sanity
+      check on your code and a hint that <em>the top of the heap is the answer</em>.<br>
+      <strong>Constraints:</strong> 1 ≤ k ≤ 10⁴; 0 ≤ nums.length ≤ 10⁴; −10⁴ ≤ val ≤ 10⁴; at most 10⁴ calls to
+      <code>add</code>; the stream always has ≥ k elements when <code>add</code> returns.
+    </p>
+    <p><a href="https://leetcode.com/problems/kth-largest-element-in-a-stream/" target="_blank" rel="noopener">Solve on LeetCode ↗</a></p>
+
+    <p>
+      <strong>Thinking process.</strong> The brute force is honest and instructive: keep every number in an array, and on
+      each <code>add</code>, sort descending and return index k−1. That's O(n log n) <em>per call</em> — with 10⁴ calls
+      you're re-sorting a growing array ten thousand times, which is O(n² log n) overall. Now ask the question that
+      collapses it: <em>which of those numbers can ever be the answer?</em> Only the top k. The 4000th largest number you
+      ever saw can never become the 3rd largest — new arrivals only push elements <em>down</em> the ranking, never up. So
+      everything below rank k is dead weight and you may discard it permanently. Keep exactly k elements, and make the one
+      you can see in O(1) be the <em>smallest</em> of them — because the smallest of your top-k <strong>is</strong> the
+      k-th largest, and it's also the element you'd evict when something better arrives. Min-heap capped at k. Each
+      <code>add</code> is one push plus maybe one pop: O(log k). This is the club-bouncer inversion from §3b, and it is
+      why this "easy" problem is worth doing carefully — it's the template for three mediums.
+    </p>
+
+    <details class="qa">
+      <summary>Solution (JS) — O(log k) per add · O(k) space</summary>
+      <div class="answer">
+<pre><code><span class="com">// (assumes the MinHeap class from §3 is in scope)</span>
+<span class="kw">class</span> KthLargest {
+  <span class="kw">constructor</span>(k, nums) {
+    <span class="kw">this</span>.k = k;
+    <span class="kw">this</span>.heap = <span class="kw">new</span> <span class="typ">MinHeap</span>();      <span class="com">// MIN-heap: its top is the WEAKEST of our k champions</span>
+    <span class="kw">for</span> (<span class="kw">const</span> n <span class="kw">of</span> nums) <span class="kw">this</span>.add(n);  <span class="com">// reuse add() — no duplicated logic, and it self-trims</span>
+  }
+
+  add(val) {
+    <span class="kw">this</span>.heap.push(val);                     <span class="com">// let the newcomer in unconditionally...</span>
+    <span class="kw">if</span> (<span class="kw">this</span>.heap.size &gt; <span class="kw">this</span>.k) {
+      <span class="kw">this</span>.heap.pop();                       <span class="com">// ...then throw out whoever is now weakest</span>
+    }
+    <span class="com">// The heap holds the k largest; its minimum IS the kth largest.</span>
+    <span class="kw">return</span> <span class="kw">this</span>.heap.peek();
+  }
+}
+</code></pre>
+        <p>
+          <strong>Trace (k = 3, nums = [4, 5, 8, 2]):</strong> the constructor calls <code>add</code> four times — heap
+          grows [4], [4,5], [4,5,8] (size 3, no evictions yet), then <code>add(2)</code> pushes 2 → size 4 → pop evicts
+          <code>2</code> → heap = {4, 5, 8}, top = 4. Now <code>add(3)</code>: push 3, size 4, pop evicts 3 (it's the
+          weakest), heap = {4,5,8}, peek → <strong>4</strong> ✓. <code>add(5)</code>: push 5, size 4, pop evicts 4,
+          heap = {5,5,8}, peek → <strong>5</strong> ✓. <code>add(10)</code>: push 10, pop evicts 5, heap = {5,8,10},
+          peek → <strong>5</strong> ✓. <code>add(9)</code>: push 9, pop evicts 5, heap = {8,9,10}, peek → <strong>8</strong> ✓.
+          <code>add(4)</code>: push 4, it's immediately the weakest, pop evicts it, heap unchanged, peek → <strong>8</strong> ✓.
+        </p>
+        <p>
+          <strong>Complexity:</strong> <code>add</code> does at most one push and one pop on a heap of size ≤ k+1 → O(log k)
+          time. The constructor calls <code>add</code> n times → O(n log k). Space is O(k) — <em>not</em> O(n), and that's
+          the entire point: the class can run forever on an infinite stream with a fixed memory footprint. Say the space
+          bound out loud; it's the reason the problem says "stream."
+        </p>
+        <p><strong>Follow-ups you should expect:</strong></p>
+        <ul>
+          <li><em>"What if k is close to n?"</em> Then log k ≈ log n and the heap's advantage evaporates; a sorted structure is fine. The heap wins when k ≪ n — say so rather than pretending it's always optimal.</li>
+          <li><em>"Now give me the k-th <strong>smallest</strong> in a stream."</em> Same code, one character: <code>new MinHeap((a,b) =&gt; b - a)</code>. Keep the k smallest in a max-heap whose top is the worst survivor.</li>
+          <li><em>"Now the running <strong>median</strong>."</em> That's LC 295 — two heaps. It's the last problem on this page, and this follow-up is exactly how interviewers escalate from easy to hard inside one 45-minute slot.</li>
+          <li><em>"Could you avoid the push when the value is hopeless?"</em> Yes: <code>if (size &lt; k) push; else if (val &gt; peek()) { pop(); push(val); }</code>. Same big-O, fewer operations.</li>
+        </ul>
+      </div>
+    </details>
+
+    <div class="note">Reusing <code>this.add(n)</code> inside the constructor isn't just tidy — it's the version that survives an empty <code>nums</code>. Candidates who write a separate "bulk load then trim" path frequently break on <code>nums = []</code> with <code>k = 1</code>. Reuse the method that already handles one element correctly. (If you want the O(n) build instead: <code>MinHeap.heapify(nums.slice())</code>, then pop until <code>size === k</code>. Faster asymptotically, more code, more places to slip — mention it, don't lead with it.)</div>
+
+    <!-- ============================================================ -->
+    <h3>Last Stone Weight (LC #1046) <span class="tier tier-3">EASY</span></h3>
+    <p>
+      You have an array of stone weights. Each turn, take the two <strong>heaviest</strong> stones, <code>x</code> and
+      <code>y</code> with <code>x ≤ y</code>, and smash them together: if they weigh the same, both are destroyed; if not,
+      the lighter one is destroyed and the heavier one is left with weight <code>y − x</code> (and goes back in the pile).
+      Repeat until at most one stone remains. Return the weight of the last stone, or <code>0</code> if none is left.
+    </p>
+    <p>
+      <strong>Example 1:</strong> Input <code>stones = [2,7,4,1,8,1]</code> → Output <code>1</code>. Smash 8 and 7 → 1
+      remains, pile = [2,4,1,1,1]. Smash 4 and 2 → 2 remains, pile = [2,1,1,1]. Smash 2 and 1 → 1, pile = [1,1,1]. Smash
+      1 and 1 → both destroyed, pile = [1]. One stone left: <strong>1</strong>.<br>
+      <strong>Example 2:</strong> Input <code>stones = [1]</code> → Output <code>1</code> — no smash ever happens; the
+      loop must not run. This is the edge case that breaks naive <code>while (true)</code> code.<br>
+      <strong>Example 3:</strong> Input <code>stones = [2,2]</code> → Output <code>0</code> — equal stones annihilate and
+      the pile empties, so you must handle "the heap is empty" without indexing into <code>undefined</code>.<br>
+      <strong>Constraints:</strong> 1 ≤ stones.length ≤ 30; 1 ≤ stones[i] ≤ 1000.
+    </p>
+    <p><a href="https://leetcode.com/problems/last-stone-weight/" target="_blank" rel="noopener">Solve on LeetCode ↗</a></p>
+
+    <p>
+      <strong>Thinking process.</strong> The simulation is forced on you by the problem — there is no clever closed form
+      (the "can I partition the stones into two near-equal halves?" reformulation is a <em>different</em> problem, LC 1049,
+      and it's DP). So the only question is: what structure answers "give me the current maximum, and let me insert a new
+      value" fastest? Sorting the array every turn is O(n log n) per turn. Scanning for the max twice is O(n) per turn.
+      Repeated extract-max with interleaved inserts is the literal job description of a <strong>max-heap</strong>: pop, pop,
+      maybe push, repeat, at O(log n) a pop. With n ≤ 30 every approach passes, which is exactly why this problem is a
+      <em>signal</em> question — the interviewer isn't testing your throughput, they're testing whether you <em>name</em>
+      the right structure when the constraint doesn't force it. Do it with a heap and say why.
+    </p>
+
+    <details class="qa">
+      <summary>Solution (JS) — O(n log n) time · O(n) space</summary>
+      <div class="answer">
+<pre><code><span class="kw">var</span> lastStoneWeight = <span class="kw">function</span>(stones) {
+  <span class="com">// MAX-heap = MinHeap with an inverted comparator. No second class, ever.</span>
+  <span class="kw">const</span> heap = <span class="typ">MinHeap</span>.heapify(stones.slice(), (a, b) =&gt; b - a);   <span class="com">// O(n) build; slice() = don't mutate input</span>
+
+  <span class="com">// Need TWO stones to smash. size &lt;= 1 ends the game — this guards stones = [1].</span>
+  <span class="kw">while</span> (heap.size &gt; <span class="num">1</span>) {
+    <span class="kw">const</span> y = heap.pop();    <span class="com">// heaviest</span>
+    <span class="kw">const</span> x = heap.pop();    <span class="com">// second heaviest, so x &lt;= y automatically</span>
+    <span class="kw">if</span> (y !== x) {
+      heap.push(y - x);     <span class="com">// survivor rejoins the pile; equal stones just vanish</span>
+    }
+  }
+
+  <span class="com">// pop() on an empty heap returns undefined, so fall back to 0 explicitly.</span>
+  <span class="kw">return</span> heap.size === <span class="num">1</span> ? heap.peek() : <span class="num">0</span>;
+};
+</code></pre>
+        <p>
+          <strong>Trace on <code>[2,7,4,1,8,1]</code>:</strong> heapify → max-heap with 8 on top. Pop 8, pop 7, unequal →
+          push 1. Heap now {4,2,1,1,1}. Pop 4, pop 2 → push 2. Heap {2,1,1,1}. Pop 2, pop 1 → push 1. Heap {1,1,1}. Pop 1,
+          pop 1 → equal, nothing pushed. Heap {1}, size 1 → loop exits → return <strong>1</strong> ✓. On <code>[2,2]</code>:
+          pop 2, pop 2, equal, nothing pushed; heap is empty → return <strong>0</strong> ✓. On <code>[1]</code>: the loop
+          body never runs → return <strong>1</strong> ✓.
+        </p>
+        <p>
+          <strong>Complexity:</strong> the O(n) heapify is free next to the loop. Each iteration removes at least one stone
+          permanently (two pops, at most one push), so there are at most n iterations, each costing O(log n) →
+          <strong>O(n log n)</strong> time. Space O(n) for the heap (O(1) extra if you're allowed to heapify the input array
+          in place, which <code>MinHeap.heapify</code> does by design — drop the <code>.slice()</code> and say so).
+        </p>
+        <p><strong>Follow-ups you should expect:</strong></p>
+        <ul>
+          <li><em>"Why not just sort each round?"</em> Because you only need the top two, not full order, and you re-insert after every smash — that's the exact access pattern (extract-max + insert) a heap is built for. Sorting per round is O(n² log n) overall.</li>
+          <li><em>"n ≤ 30 — wouldn't a sorted array be simpler?"</em> Yes, and you should acknowledge it: at n = 30, <code>sort()</code> + <code>pop()</code> from the tail is genuinely fine and shorter. The heap is the answer that <em>scales</em>, and naming both is the senior move.</li>
+          <li><em>"What if the stones smashed were the two <strong>lightest</strong>?"</em> One character: the default comparator. That's Huffman coding's inner loop, and it's worth saying — Huffman is exactly "repeatedly merge the two smallest," a min-heap.</li>
+          <li><em>"Minimize the last stone's weight by choosing which stones to smash."</em> Different problem entirely (LC 1049, Last Stone Weight II) — it's a subset-sum DP, not greedy. Recognizing that the greedy heap answer is <em>wrong</em> there is a strong signal.</li>
+        </ul>
+      </div>
+    </details>
+
+    <div class="senior">This problem is where you should point out that <strong>greedy simulation runs on heaps</strong>. Whenever a problem says "repeatedly take the largest/smallest remaining, do something, put the result back," the algorithm is a heap loop — Huffman encoding, CPU scheduling, merging files with minimum cost, IPO/capital problems, Task Scheduler later on this page. You're not learning a stone puzzle; you're learning the shape of every greedy-with-reinsertion problem you'll ever see.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="topk">5. Top-K classics</h2>
+    <p>
+      These four are the heap questions that actually get asked at the enterprise tier. K Closest and Kth Largest are the
+      two most common heap mediums in existence; Task Scheduler is the greedy one that separates people who simulate from
+      people who reason; Design Twitter is what happens when a heap shows up inside a design round, which is the shape a
+      lot of enterprise loops prefer over pure algorithm puzzles.
+    </p>
+
+    <h3>K Closest Points to Origin (LC #973) <span class="tier tier-2">MEDIUM</span> ★</h3>
+    <p>
+      You're given an array <code>points</code> where <code>points[i] = [xᵢ, yᵢ]</code> represents a point on the X-Y
+      plane, and an integer <code>k</code>. Return the <code>k</code> points closest to the origin <code>(0, 0)</code>,
+      measured by ordinary Euclidean distance, <code>√(x² + y²)</code>. You may return the answer in <strong>any
+      order</strong>, and the answer is guaranteed to be unique except for the order of the points themselves.
+    </p>
+    <p>
+      <strong>Example 1:</strong> Input <code>points = [[1,3],[-2,2]], k = 1</code> → Output <code>[[-2,2]]</code>.
+      Distances are √10 ≈ 3.16 and √8 ≈ 2.83, so (−2,2) is closer.<br>
+      <strong>Example 2:</strong> Input <code>points = [[3,3],[5,-1],[-2,4]], k = 2</code> → Output
+      <code>[[3,3],[-2,4]]</code> (or <code>[[-2,4],[3,3]]</code> — order is free). Squared distances are 18, 26, 20; the
+      two smallest are 18 and 20.<br>
+      <strong>Constraints:</strong> 1 ≤ k ≤ points.length ≤ 10⁴; −10⁴ ≤ xᵢ, yᵢ ≤ 10⁴.
+    </p>
+    <p><a href="https://leetcode.com/problems/k-closest-points-to-origin/" target="_blank" rel="noopener">Solve on LeetCode ↗</a></p>
+
+    <p>
+      <strong>Thinking process.</strong> Brute force: compute every distance, sort by it, take the first k. That's correct
+      and O(n log n), and if you stop there on a medium at 7 YOE you've left points on the table — you sorted 10⁴ elements
+      to answer a question about k of them. The collapse is the mirror of §3b: you want the k <em>smallest</em>, so you keep
+      a <strong>max</strong>-heap capped at k, whose top is the <em>farthest</em> of your current k finalists — the one to
+      evict the moment something closer shows up. Every point costs one push and maybe one pop on a heap of size ≤ k+1 →
+      <strong>O(n log k)</strong> time, O(k) space, and it works on a stream of points that never fits in memory.
+    </p>
+    <p>
+      Then there's the detail this problem exists to test: <strong>you never need the square root.</strong> Distance is
+      <code>√(x² + y²)</code>, but <code>√</code> is <em>monotonically increasing</em> — if <code>d₁ &lt; d₂</code> then
+      <code>√d₁ &lt; √d₂</code> and vice versa. Since you only ever <em>compare</em> distances and never report one, ranking
+      by <code>x² + y²</code> gives an identical ordering. Dropping <code>Math.sqrt</code> removes n floating-point
+      operations and, more importantly, removes floating-point <em>error</em> from your comparator — with integer inputs,
+      <code>x² + y²</code> is an exact integer, so ties are exact and there's no ε-comparison anywhere. Saying "I'll compare
+      squared distances, since sqrt is monotonic and I never need the actual magnitude" is a free senior signal, and it
+      generalizes: any time you sort or compare by a monotonic transform, apply the comparison <em>before</em> the transform.
+    </p>
+
+    <details class="qa">
+      <summary>Solution (JS) — O(n log k) time · O(k) space</summary>
+      <div class="answer">
+<pre><code><span class="kw">var</span> kClosest = <span class="kw">function</span>(points, k) {
+  <span class="com">// We want the k SMALLEST distances =&gt; MAX-heap, so the top is the FARTHEST</span>
+  <span class="com">// of our current finalists — i.e. the one we're most willing to evict.</span>
+  <span class="com">// Heap items are [sqDist, point]; comparator: bigger sqDist pops first.</span>
+  <span class="kw">const</span> heap = <span class="kw">new</span> <span class="typ">MinHeap</span>((a, b) =&gt; b[<span class="num">0</span>] - a[<span class="num">0</span>]);
+
+  <span class="kw">for</span> (<span class="kw">const</span> [x, y] <span class="kw">of</span> points) {
+    <span class="kw">const</span> d = x * x + y * y;      <span class="com">// NO Math.sqrt — sqrt is monotonic, so it can't change the ranking</span>
+    heap.push([d, [x, y]]);
+    <span class="kw">if</span> (heap.size &gt; k) heap.pop();  <span class="com">// evict the farthest: it can never be in the closest k now</span>
+  }
+
+  <span class="com">// Whatever survived IS the answer; order is unspecified, so just drain it.</span>
+  <span class="kw">return</span> heap.data.map(([, p]) =&gt; p);
+};
+</code></pre>
+        <p>
+          <strong>Trace on <code>[[3,3],[5,-1],[-2,4]], k = 2</code>:</strong> push [18,(3,3)] → heap {18}. Push
+          [26,(5,−1)] → heap top is 26 (max-heap), size 2, no eviction. Push [20,(−2,4)] → size 3 &gt; 2 → pop removes the
+          top, which is the <em>largest</em> squared distance, 26 → (5,−1) is evicted. Heap holds
+          {18 → (3,3), 20 → (−2,4)} → return <code>[[3,3],[-2,4]]</code> ✓. Notice the eviction worked precisely because
+          the top was the worst finalist.
+        </p>
+        <p>
+          <strong>Complexity:</strong> n iterations, each doing O(log k) heap work → <strong>O(n log k)</strong> time.
+          The heap never holds more than k+1 items → <strong>O(k)</strong> space. Compare against the sort baseline:
+          O(n log n) time, O(n) space. With n = 10⁴ and k = 5, log k ≈ 2.3 versus log n ≈ 13 — roughly 5× fewer
+          comparisons, and 2000× less memory.
+        </p>
+        <p><strong>Follow-ups you should expect:</strong></p>
+        <ul>
+          <li><em>"Can you do better than O(n log k)?"</em> Yes — <strong>quickselect</strong> on squared distance gives O(n) average: partition around a pivot until the k-th smallest lands at index k−1, then return <code>points.slice(0, k)</code>. Worst case O(n²), needs the whole array in memory. Full treatment in the next problem.</li>
+          <li><em>"The points arrive as a stream of a billion — what changes?"</em> Nothing. That's the entire selling point of the size-k heap: O(k) memory, one pass, no random access. Quickselect and sorting both die here.</li>
+          <li><em>"Now closest to an arbitrary point (a, b), not the origin."</em> Change one line: <code>d = (x-a)**2 + (y-b)**2</code>. Still no sqrt.</li>
+          <li><em>"Return them sorted by distance."</em> Drain the heap and reverse (a max-heap drains farthest-first), or sort the k survivors — O(k log k) on top, which is negligible.</li>
+        </ul>
+      </div>
+    </details>
+
+    <div class="pitfall">Do not store the point and recompute <code>x*x + y*y</code> inside the comparator. It looks tidy and it re-does the multiplication on <em>every comparison</em> — O(n log k) recomputations instead of n. Compute the score once, store <code>[score, payload]</code>, and compare on <code>[0]</code>. This "decorate, then compare" habit (the Schwartzian transform) is the same reason you precompute sort keys in a React list rather than deriving them in the comparator on every render.</div>
+
+    <!-- ============================================================ -->
+    <h3>Kth Largest Element in an Array (LC #215) <span class="tier tier-2">MEDIUM</span> ★</h3>
+    <p>
+      Given an unsorted integer array <code>nums</code> and an integer <code>k</code>, return the <code>k</code>-th largest
+      element in the array. This is the k-th largest in <strong>sorted order</strong>, <em>not</em> the k-th distinct
+      element — duplicates each occupy their own rank. The problem explicitly asks: can you solve it <strong>without
+      sorting</strong>?
+    </p>
+    <p>
+      <strong>Example 1:</strong> Input <code>nums = [3,2,1,5,6,4], k = 2</code> → Output <code>5</code>. Sorted
+      descending: 6,5,4,3,2,1 — the 2nd is 5.<br>
+      <strong>Example 2:</strong> Input <code>nums = [3,2,3,1,2,4,5,5,6], k = 4</code> → Output <code>4</code>. Sorted
+      descending: 6,5,5,4,3,3,2,2,1 — the 4th is 4. Note the duplicate 5s each consume a rank; a "distinct values" reading
+      would wrongly give 3.<br>
+      <strong>Constraints:</strong> 1 ≤ k ≤ nums.length ≤ 10⁵; −10⁴ ≤ nums[i] ≤ 10⁴.
+    </p>
+    <p><a href="https://leetcode.com/problems/kth-largest-element-in-an-array/" target="_blank" rel="noopener">Solve on LeetCode ↗</a></p>
+
+    <p>
+      <strong>Thinking process.</strong> Baseline: <code>nums.sort((a,b) =&gt; b - a)[k-1]</code> — one line, O(n log n),
+      and completely correct. Say it out loud as your baseline (never pretend you don't see it), then immediately say why
+      it's more than the problem needs: it produces a total order when you asked for a single rank. Two better tools exist,
+      and the interview is watching you <em>choose between them and know their costs</em>:
+    </p>
+    <ul>
+      <li><strong>Size-k min-heap</strong> — the club bouncer from §3b, verbatim. O(n log k) time, O(k) space, works on
+        streams, deterministic, never mutates the input. <strong>This is the answer you give first.</strong></li>
+      <li><strong>Quickselect</strong> — quicksort that only recurses into the <em>half that contains the answer</em>.
+        O(n) <em>average</em> time, O(1) extra space, but O(n²) worst case, and it destroys the input's order.</li>
+    </ul>
+    <p>
+      The quickselect insight is worth deriving properly, because it's the same partition step you already know from
+      quicksort. Pick a pivot and partition the array so everything ≥ pivot is on the left and everything &lt; pivot is on
+      the right. Now the pivot lands at some final index <code>p</code> — and <em>that index is its true rank</em>, forever,
+      regardless of how unsorted both halves still are. If <code>p === k - 1</code>, the pivot is your answer and you're
+      done. If <code>p &gt; k - 1</code>, the k-th largest is somewhere in the left half; recurse there and <strong>throw the
+      right half away without ever looking at it</strong>. That discard is where the speedup comes from: quicksort recurses
+      into <em>both</em> halves (n + n/2·2 + … = n log n), quickselect recurses into <em>one</em>, so the work is
+      n + n/2 + n/4 + … = <strong>2n = O(n)</strong> on average. Beautiful — and fragile.
+    </p>
+    <div class="pitfall">Be honest about quickselect's worst case, out loud, before the interviewer raises it: if your pivot is always the extreme element (which happens on an <em>already sorted</em> array if you always pick the last element), each partition shrinks the range by exactly one and you get n + (n−1) + (n−2) + … = <strong>O(n²)</strong>. The mitigation is a <strong>random pivot</strong>, which makes the O(n²) case require adversarial luck rather than merely sorted input — and you must actually write the randomization, not just mention it. The bulletproof fix, median-of-medians, guarantees O(n) worst case but has a constant so large it's slower in practice; naming it and rejecting it is exactly the right level of depth here. <strong>The heap answer is the safe one to give first</strong>; offer quickselect as the optimization, and let the interviewer ask for it.</div>
+
+    <details class="qa">
+      <summary>Solution 1 (JS) — heap · O(n log k) time · O(k) space</summary>
+      <div class="answer">
+<pre><code><span class="kw">var</span> findKthLargest = <span class="kw">function</span>(nums, k) {
+  <span class="com">// k LARGEST =&gt; MIN-heap of size k. Its top is the weakest champion,</span>
+  <span class="com">// and once we've seen everything, the weakest champion IS the kth largest.</span>
+  <span class="kw">const</span> heap = <span class="kw">new</span> <span class="typ">MinHeap</span>();
+
+  <span class="kw">for</span> (<span class="kw">const</span> x <span class="kw">of</span> nums) {
+    heap.push(x);
+    <span class="kw">if</span> (heap.size &gt; k) heap.pop();   <span class="com">// evict the weakest — it's out of the running for good</span>
+  }
+
+  <span class="kw">return</span> heap.peek();
+};
+</code></pre>
+        <p>
+          <strong>Trace on <code>[3,2,1,5,6,4], k = 2</code>:</strong> push 3 → {3}. Push 2 → {2,3}, size 2, keep. Push 1 →
+          size 3, pop evicts 1 → {2,3}. Push 5 → size 3, pop evicts 2 → {3,5}. Push 6 → pop evicts 3 → {5,6}. Push 4 → pop
+          evicts 4 (it's weaker than 5) → {5,6}. <code>peek()</code> → <strong>5</strong> ✓ — the smallest of the two
+          largest is the 2nd largest.
+        </p>
+        <p>
+          <strong>Complexity:</strong> n pushes and up to n pops on a heap of size ≤ k+1 → <strong>O(n log k)</strong>.
+          Space <strong>O(k)</strong>. Note that when k = n this degrades to O(n log n) — no worse than sorting, and the
+          answer is then just the array minimum, which is worth flagging as a sanity check on your reasoning.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Solution 2 (JS) — quickselect · O(n) average, O(n²) worst · O(1) space</summary>
+      <div class="answer">
+<pre><code><span class="kw">var</span> findKthLargest = <span class="kw">function</span>(nums, k) {
+  <span class="com">// The kth LARGEST sits at index k-1 once the array is sorted DESCENDING.</span>
+  <span class="com">// So partition descending (big on the left) and hunt for final index k-1.</span>
+  <span class="kw">const</span> target = k - <span class="num">1</span>;
+  <span class="kw">let</span> lo = <span class="num">0</span>, hi = nums.length - <span class="num">1</span>;
+
+  <span class="com">// Iterative, not recursive: no call-stack growth, so space is truly O(1).</span>
+  <span class="kw">while</span> (<span class="kw">true</span>) {
+    <span class="kw">const</span> p = partition(nums, lo, hi);
+    <span class="kw">if</span> (p === target) <span class="kw">return</span> nums[p];   <span class="com">// pivot landed on its FINAL rank — that's the answer</span>
+    <span class="kw">if</span> (p &lt; target) lo = p + <span class="num">1</span>;         <span class="com">// answer is to the RIGHT; discard everything left of p</span>
+    <span class="kw">else</span>            hi = p - <span class="num">1</span>;         <span class="com">// answer is to the LEFT;  discard everything right of p</span>
+  }
+};
+
+<span class="com">// Lomuto partition, DESCENDING: everything &gt;= pivot ends up left of the pivot.</span>
+<span class="com">// Returns the pivot's final index, which is its true rank in the array.</span>
+<span class="kw">function</span> partition(nums, lo, hi) {
+  <span class="com">// RANDOM pivot. Without this, a sorted input degrades to O(n^2) — the classic trap.</span>
+  <span class="kw">const</span> r = lo + <span class="typ">Math</span>.floor(<span class="typ">Math</span>.random() * (hi - lo + <span class="num">1</span>));
+  [nums[r], nums[hi]] = [nums[hi], nums[r]];      <span class="com">// park the pivot at the end, out of the way</span>
+
+  <span class="kw">const</span> pivot = nums[hi];
+  <span class="kw">let</span> store = lo;                                <span class="com">// boundary: nums[lo..store-1] are all &gt;= pivot</span>
+
+  <span class="kw">for</span> (<span class="kw">let</span> i = lo; i &lt; hi; i++) {
+    <span class="kw">if</span> (nums[i] &gt; pivot) {                      <span class="com">// strict &gt; keeps duplicates from all piling onto one side</span>
+      [nums[i], nums[store]] = [nums[store], nums[i]];
+      store++;
+    }
+  }
+
+  [nums[store], nums[hi]] = [nums[hi], nums[store]];  <span class="com">// pivot slots into its final home</span>
+  <span class="kw">return</span> store;
+}
+</code></pre>
+        <p>
+          <strong>Trace on <code>[3,2,1,5,6,4], k = 2</code> (target index 1):</strong> suppose the random pivot picks
+          <code>4</code>. Partition descending → everything &gt; 4 goes left: <code>[5,6,4,3,2,1]</code>-ish, with 4 landing
+          at index <strong>2</strong>. Is 2 === 1? No, and 2 &gt; 1, so the answer is to the <em>left</em>: set
+          <code>hi = 1</code> and <strong>never look at indices 3–5 again</strong> — that discard is the whole algorithm.
+          Partition <code>[5,6]</code>: say the pivot is 5; 6 &gt; 5 so 6 moves left, 5 lands at index 1. Is 1 === 1? Yes →
+          return <code>nums[1]</code> = <strong>5</strong> ✓.
+        </p>
+        <p>
+          <strong>Complexity:</strong> each partition is O(range). On average a random pivot splits the range roughly in
+          half, so the total work is n + n/2 + n/4 + … = <strong>2n = O(n) average</strong>. Worst case — every pivot is the
+          extreme — gives n + (n−1) + … + 1 = <strong>O(n²)</strong>; the random pivot makes that vanishingly unlikely rather
+          than impossible. Space is <strong>O(1)</strong>: the loop is iterative and the partition is in place. The costs you
+          must state: it <strong>mutates the caller's array</strong>, it needs the whole array in memory (no streaming), and
+          its runtime is randomized.
+        </p>
+        <p><strong>Follow-ups you should expect:</strong></p>
+        <ul>
+          <li><em>"Which would you ship?"</em> The honest answer, and the one that scores: <em>"heap, unless profiling says otherwise — O(n log k) with a tiny constant, no worst case, no mutation, and it survives a stream. Quickselect is faster on average but I'd only take a randomized O(n²) tail risk in a hot path I've measured."</em></li>
+          <li><em>"Guarantee O(n) worst case."</em> Median-of-medians pivot selection (the BFPRT algorithm) — provably O(n), but the constant is bad enough that it loses to the randomized version in practice. Name it, explain the tradeoff, move on. Nobody expects you to code it.</li>
+          <li><em>"Now the k-th smallest."</em> Flip the partition comparison to <code>&lt;</code>, or just call the same code with <code>k = n - k + 1</code>. Do the substitution out loud; off-by-ones here are the most common failure.</li>
+          <li><em>"nums has 10⁹ elements across 100 machines."</em> Now neither works as written: this is a distributed top-k — each machine computes its local top-k with a heap, ships k elements to a coordinator, and the coordinator merges 100 sorted lists of k. That's Merge K Sorted Lists, later on this page. Enterprise interviewers love this escalation because it's a real system.</li>
+        </ul>
+      </div>
+    </details>
+
+    <!-- ============================================================ -->
+    <h3>Task Scheduler (LC #621) <span class="tier tier-2">MEDIUM</span> ★</h3>
+    <p>
+      You're given an array <code>tasks</code> of CPU tasks, each labeled with an uppercase letter, and an integer
+      <code>n</code> — the <strong>cooldown</strong>: two <em>identical</em> tasks must be separated by at least
+      <code>n</code> intervals. Each interval, the CPU either runs one task or sits <strong>idle</strong>. Tasks may be run
+      in <em>any</em> order. Return the minimum number of intervals needed to finish every task.
+    </p>
+    <p>
+      <strong>Example 1:</strong> Input <code>tasks = ["A","A","A","B","B","B"], n = 2</code> → Output <code>8</code>.
+      A valid schedule: <code>A → B → idle → A → B → idle → A → B</code>. Each A is 3 apart (≥ n+1 = 3) ✓. There aren't
+      enough distinct tasks to fill the gaps, so the CPU idles twice.<br>
+      <strong>Example 2:</strong> Input <code>tasks = ["A","C","A","B","D","B"], n = 1</code> → Output <code>6</code> —
+      <code>A → B → C → D → A → B</code>. <strong>Zero idles:</strong> there was enough variety to pack the gaps, so the
+      answer is simply <code>tasks.length</code>. This is the case that kills naive formulas.<br>
+      <strong>Example 3:</strong> Input <code>tasks = ["A","A","A","B","B","B"], n = 0</code> → Output <code>6</code> — no
+      cooldown at all, so nothing idles.<br>
+      <strong>Constraints:</strong> 1 ≤ tasks.length ≤ 10⁴; tasks[i] is an uppercase English letter; 0 ≤ n ≤ 100.
+    </p>
+    <p><a href="https://leetcode.com/problems/task-scheduler/" target="_blank" rel="noopener">Solve on LeetCode ↗</a></p>
+
+    <p>
+      <strong>Thinking process.</strong> First, notice the labels are irrelevant — only the <em>counts</em> matter. Swap
+      every "A" for every "B" and the answer doesn't change. So the input is really a multiset of frequencies.
+    </p>
+    <p>
+      Now the greedy. At each interval you want to run the task with the <strong>highest remaining count</strong> that
+      isn't on cooldown. Why is greedy correct? Because the bottleneck is the most frequent task: it's the one that will
+      still be pending when everything else is exhausted, so every interval you spend <em>not</em> reducing it is an
+      interval you may have to pay for as an idle later. Draining the biggest first keeps the frequency distribution as
+      flat as possible, and a flat distribution is exactly one with no forced idles. "Always take the largest remaining"
+      + "put it back with a smaller count" = <strong>max-heap with re-insertion</strong>, the shape from Last Stone Weight.
+    </p>
+    <p>
+      The implementation trick that makes it clean: process in <strong>cycles of n+1 intervals</strong>. In one cycle you
+      pop up to n+1 distinct tasks off the max-heap, run one of each, and only <em>after</em> the whole cycle do you push
+      the still-nonzero ones back. Holding them out of the heap for the duration of the cycle <em>is</em> the cooldown —
+      you've made it structurally impossible to schedule the same task twice within n+1 slots. If the heap runs dry
+      mid-cycle, the remaining slots are idles, and you pay for them <em>only if</em> tasks still remain (a partial final
+      cycle costs just the tasks you ran, not the padding).
+    </p>
+
+    <details class="qa">
+      <summary>Solution 1 (JS) — greedy max-heap · O(n_tasks · log 26) ≈ O(n_tasks) time · O(1) space</summary>
+      <div class="answer">
+<pre><code><span class="kw">var</span> leastInterval = <span class="kw">function</span>(tasks, n) {
+  <span class="com">// Labels don't matter — only counts do. At most 26 of them.</span>
+  <span class="kw">const</span> counts = <span class="kw">new</span> <span class="typ">Map</span>();
+  <span class="kw">for</span> (<span class="kw">const</span> t <span class="kw">of</span> tasks) counts.set(t, (counts.get(t) ?? <span class="num">0</span>) + <span class="num">1</span>);
+
+  <span class="com">// MAX-heap of remaining counts: always run the most-pending task first.</span>
+  <span class="kw">const</span> heap = <span class="typ">MinHeap</span>.heapify([...counts.values()], (a, b) =&gt; b - a);
+
+  <span class="kw">let</span> time = <span class="num">0</span>;
+
+  <span class="kw">while</span> (heap.size &gt; <span class="num">0</span>) {
+    <span class="com">// One CYCLE = n+1 slots. Running each task at most once per cycle IS the cooldown.</span>
+    <span class="kw">const</span> ranThisCycle = [];
+
+    <span class="kw">for</span> (<span class="kw">let</span> slot = <span class="num">0</span>; slot &lt;= n; slot++) {   <span class="com">// slot = 0..n  =&gt;  exactly n+1 slots</span>
+      <span class="kw">if</span> (heap.size &gt; <span class="num">0</span>) {
+        <span class="kw">const</span> c = heap.pop() - <span class="num">1</span>;              <span class="com">// run one instance of the most-pending task</span>
+        <span class="kw">if</span> (c &gt; <span class="num">0</span>) ranThisCycle.push(c);      <span class="com">// held OUT of the heap until the cycle ends</span>
+        time++;                                <span class="com">// a real task ran</span>
+      } <span class="kw">else</span> <span class="kw">if</span> (ranThisCycle.length &gt; <span class="num">0</span>) {
+        time++;                                <span class="com">// heap is dry but work remains =&gt; forced IDLE</span>
+      }
+      <span class="com">// If the heap is dry AND nothing is coming back, we're done — don't pad the tail.</span>
+    }
+
+    <span class="kw">for</span> (<span class="kw">const</span> c <span class="kw">of</span> ranThisCycle) heap.push(c);  <span class="com">// cooldown served; they're eligible again</span>
+  }
+
+  <span class="kw">return</span> time;
+};
+</code></pre>
+        <p>
+          <strong>Trace on <code>["A","A","A","B","B","B"], n = 2</code>:</strong> counts = {A:3, B:3}; max-heap {3,3}.
+          <em>Cycle 1</em> (3 slots): pop 3 (an A) → 2, held; time = 1. Pop 3 (a B) → 2, held; time = 2. Slot 3: heap is
+          empty but <code>ranThisCycle</code> has entries → <strong>idle</strong>, time = 3. Push back {2,2}.
+          <em>Cycle 2</em>: same shape → time = 6, push back {1,1}. <em>Cycle 3</em>: pop 1 → 0, not held, time = 7; pop 1 →
+          0, time = 8; slot 3: heap empty <em>and</em> <code>ranThisCycle</code> is empty → no idle charged. Loop exits.
+          Return <strong>8</strong> ✓. On Example 2 the heap always has a distinct task ready, no slot ever idles, and the
+          answer is exactly 6 = <code>tasks.length</code> ✓.
+        </p>
+        <p>
+          <strong>Complexity:</strong> every heap operation is on ≤ 26 elements, so each is O(log 26) = O(1) for practical
+          purposes. Total heap operations are bounded by the number of task instances plus idles → the loop runs O(answer)
+          times, and the answer is O(tasks.length + idles). Treat it as <strong>O(N · log 26) ≈ O(N)</strong> time and
+          <strong>O(1)</strong> space (at most 26 counts, regardless of input size). Stating "the alphabet is bounded at 26,
+          so the heap is effectively O(1)" is the observation that turns a good answer into a strong one.
+        </p>
+      </div>
+    </details>
+
+    <p>
+      <strong>The follow-up: the O(1) math formula.</strong> The simulation is what you write first because it's obviously
+      correct. But the interviewer will very often ask "can you compute it without simulating?" — and there's a beautiful
+      closed form. Think of the schedule as a grid. Take the most frequent task, with count <code>maxFreq</code>. It must
+      appear <code>maxFreq</code> times, and consecutive appearances must be ≥ n+1 apart, which carves the timeline into
+      <code>maxFreq − 1</code> full blocks of width <code>n + 1</code>, plus a final partial row:
+    </p>
+<pre><code><span class="com">// tasks = AAAABBBBCCD, n = 2   =&gt;  maxFreq = 4 (A and B), countOfMax = 2</span>
+
+<span class="com">//   |&lt;-- n+1 = 3 --&gt;|</span>
+<span class="com">//     A   B   C          &lt;-- block 1  \</span>
+<span class="com">//     A   B   C          &lt;-- block 2   |  (maxFreq - 1) = 3 blocks of width (n+1)</span>
+<span class="com">//     A   B   D          &lt;-- block 3  /</span>
+<span class="com">//     A   B               &lt;-- the final row: one slot per task tied at maxFreq</span>
+
+<span class="com">// length = (maxFreq - 1) * (n + 1) + countOfMax = 3 * 3 + 2 = 11</span>
+</code></pre>
+    <p>
+      Every block is <code>n + 1</code> wide (either filled with other tasks or left idle), there are
+      <code>maxFreq − 1</code> of them, and then the final row holds one slot for each task tied at <code>maxFreq</code>.
+      So the schedule length is <code>(maxFreq − 1) × (n + 1) + countOfMax</code>. <strong>The one catch:</strong> if there
+      are so many <em>distinct</em> tasks that they overflow the blocks, there are no idles at all and the answer is simply
+      <code>tasks.length</code>. The formula can under-count in that case, so you take the max of the two:
+    </p>
+
+    <details class="qa">
+      <summary>Solution 2 (JS) — the O(1) formula · O(N) time · O(1) space</summary>
+      <div class="answer">
+<pre><code><span class="kw">var</span> leastInterval = <span class="kw">function</span>(tasks, n) {
+  <span class="kw">const</span> counts = <span class="kw">new</span> <span class="typ">Array</span>(<span class="num">26</span>).fill(<span class="num">0</span>);
+  <span class="kw">for</span> (<span class="kw">const</span> t <span class="kw">of</span> tasks) counts[t.charCodeAt(<span class="num">0</span>) - <span class="num">65</span>]++;   <span class="com">// 65 = 'A'</span>
+
+  <span class="kw">const</span> maxFreq    = <span class="typ">Math</span>.max(...counts);
+  <span class="kw">const</span> countOfMax = counts.filter(c =&gt; c === maxFreq).length;  <span class="com">// how many tasks TIE for most frequent</span>
+
+  <span class="com">// The frame built by the bottleneck task: (maxFreq-1) blocks of width (n+1),</span>
+  <span class="com">// plus one final row holding every task tied at maxFreq.</span>
+  <span class="kw">const</span> framed = (maxFreq - <span class="num">1</span>) * (n + <span class="num">1</span>) + countOfMax;
+
+  <span class="com">// If there's enough VARIETY to fill every gap, no idle ever happens and the</span>
+  <span class="com">// answer is just the task count. The frame can undercount, so take the max.</span>
+  <span class="kw">return</span> <span class="typ">Math</span>.max(framed, tasks.length);
+};
+</code></pre>
+        <p>
+          <strong>Trace on Example 1</strong> (<code>AAABBB, n = 2</code>): maxFreq = 3, countOfMax = 2 (A and B tie),
+          framed = (3−1)×3 + 2 = <strong>8</strong>; tasks.length = 6 → max = <strong>8</strong> ✓.
+          <strong>Example 2</strong> (<code>ACABDB, n = 1</code>): maxFreq = 2, countOfMax = 2 (A and B), framed =
+          1×2 + 2 = 4; tasks.length = 6 → max(4, 6) = <strong>6</strong> ✓ — this is precisely the case the
+          <code>Math.max</code> exists to rescue, and it's the line candidates omit.
+          <strong>Example 3</strong> (<code>n = 0</code>): framed = 2×1 + 2 = 4, tasks.length = 6 → <strong>6</strong> ✓.
+        </p>
+        <p>
+          <strong>Complexity:</strong> one pass to count, one pass over 26 buckets → <strong>O(N)</strong> time,
+          <strong>O(1)</strong> space, and — unlike the heap — <em>no</em> simulation, so the constant is tiny.
+        </p>
+        <p><strong>Follow-ups you should expect:</strong></p>
+        <ul>
+          <li><em>"Prove the greedy is correct."</em> The most frequent task is the bottleneck: it alone forces (maxFreq−1)×(n+1) + countOfMax intervals no matter what else you do, so that's a hard <em>lower</em> bound. The greedy achieves it (it never idles when a distinct task is available), so it's optimal. Lower bound + achievability = proof; that structure is what interviewers want when they say "prove it."</li>
+          <li><em>"Now output the actual schedule, not just the length."</em> The formula can't — you need the heap simulation, and you record which task you popped in each slot. This is exactly why you write the heap version first: it generalizes, the formula doesn't.</li>
+          <li><em>"Tasks now have different durations / priorities / deadlines."</em> The closed form dies immediately; the heap survives with a richer comparator. Real schedulers (and this is the JPMC/Optum batch-job flavor of the question) are always the heap.</li>
+          <li><em>"Why <code>Math.max(framed, tasks.length)</code>?"</em> Because with enough distinct tasks the blocks overflow and there are zero idles — the frame is a lower bound on length, not the length itself.</li>
+        </ul>
+      </div>
+    </details>
+
+    <div class="senior">Give <em>both</em> solutions, in this order: heap first (obviously correct, generalizes, produces a real schedule), then the formula ("and if you only need the length, there's an O(1) counting argument…"). Leading with the formula is a trap — it looks like memorization, and the moment the interviewer perturbs the problem ("now print the schedule", "now tasks have durations") you have nothing. Deriving the simulation and <em>then</em> collapsing it to arithmetic is the exact narrative a 7-YOE candidate is being graded on.</div>
+
+    <!-- ============================================================ -->
+    <h3>Design Twitter (LC #355) <span class="tier tier-2">MEDIUM</span></h3>
+    <p>
+      Design a simplified Twitter. Users post tweets, follow and unfollow each other, and can see the <strong>10 most
+      recent</strong> tweets in their news feed. Implement:
+    </p>
+    <ul>
+      <li><code>postTweet(userId, tweetId)</code> — compose a new tweet.</li>
+      <li><code>getNewsFeed(userId)</code> — return the IDs of the 10 most recent tweets in this user's feed, <strong>most recent first</strong>. The feed contains tweets posted by the user <em>and</em> by everyone they follow.</li>
+      <li><code>follow(followerId, followeeId)</code> · <code>unfollow(followerId, followeeId)</code>.</li>
+    </ul>
+    <p>
+      <strong>Example:</strong> <code>postTweet(1, 5)</code>; <code>getNewsFeed(1)</code> → <code>[5]</code> (your own
+      tweets are always in your feed). <code>follow(1, 2)</code>; <code>postTweet(2, 6)</code>;
+      <code>getNewsFeed(1)</code> → <code>[6, 5]</code> — tweet 6 is newer, so it comes first. <code>unfollow(1, 2)</code>;
+      <code>getNewsFeed(1)</code> → <code>[5]</code>.<br>
+      <strong>Example 2 (the trap):</strong> <code>follow(1, 1)</code> then <code>postTweet(1, 5)</code> then
+      <code>getNewsFeed(1)</code> → <code>[5]</code>, not <code>[5, 5]</code> — a user following themselves must not see
+      their tweets twice. And <code>unfollow(1, 1)</code> must <em>not</em> remove your own tweets from your feed.<br>
+      <strong>Constraints:</strong> 1 ≤ userId, tweetId ≤ 10⁴; at most 3×10⁴ calls total.
+    </p>
+    <p><a href="https://leetcode.com/problems/design-twitter/" target="_blank" rel="noopener">Solve on LeetCode ↗</a></p>
+
+    <p>
+      <strong>Thinking process.</strong> Start with the data model, out loud, before any algorithm: a <code>Map</code> from
+      userId → an <em>append-ordered</em> array of that user's tweets (so each user's own list is already sorted newest-last
+      for free), a <code>Map</code> from userId → a <code>Set</code> of followees, and a single global monotonically
+      increasing counter that timestamps every tweet. The counter is the crux — <em>the only way to order tweets across
+      different users is a global clock</em>, and candidates who store only tweetIds discover in the middle of
+      <code>getNewsFeed</code> that they have no way to interleave two users' lists.
+    </p>
+    <p>
+      Now the feed. Brute force: concatenate every followee's entire tweet list, sort by timestamp descending, take 10.
+      That's O(T log T) where T is <em>every tweet ever posted by everyone you follow</em> — a user following 500 accounts
+      with 10⁵ tweets between them re-sorts 10⁵ items to return ten. The collapse: <strong>each user's list is already
+      sorted</strong>. You have k sorted lists and want the 10 largest across them — that is <em>k-way merge</em>, exactly
+      Merge K Sorted Lists. Seed a max-heap with only the <strong>newest tweet from each followee</strong> (k entries), pop
+      the global newest, and push that user's <em>next</em>-newest back in as a replacement. Ten pops, and each pop touches
+      one heap of size ≤ k. <strong>O(k + 10 log k)</strong> instead of O(T log T), and you never look at the ancient tweets
+      at all.
+    </p>
+
+    <details class="qa">
+      <summary>Solution (JS) — post O(1) · feed O(k + 10 log k) · follow/unfollow O(1)</summary>
+      <div class="answer">
+<pre><code><span class="kw">class</span> Twitter {
+  <span class="kw">constructor</span>() {
+    <span class="kw">this</span>.time    = <span class="num">0</span>;         <span class="com">// GLOBAL clock — the only way to order tweets ACROSS users</span>
+    <span class="kw">this</span>.tweets  = <span class="kw">new</span> <span class="typ">Map</span>();   <span class="com">// userId -&gt; [[time, tweetId], ...] appended in order =&gt; already sorted</span>
+    <span class="kw">this</span>.follows = <span class="kw">new</span> <span class="typ">Map</span>();   <span class="com">// userId -&gt; Set of followeeIds</span>
+  }
+
+  postTweet(userId, tweetId) {
+    <span class="kw">if</span> (!<span class="kw">this</span>.tweets.has(userId)) <span class="kw">this</span>.tweets.set(userId, []);
+    <span class="kw">this</span>.tweets.get(userId).push([<span class="kw">this</span>.time++, tweetId]);   <span class="com">// O(1); list stays sorted by construction</span>
+  }
+
+  follow(followerId, followeeId) {
+    <span class="kw">if</span> (!<span class="kw">this</span>.follows.has(followerId)) <span class="kw">this</span>.follows.set(followerId, <span class="kw">new</span> <span class="typ">Set</span>());
+    <span class="kw">this</span>.follows.get(followerId).add(followeeId);
+  }
+
+  unfollow(followerId, followeeId) {
+    <span class="com">// Set.delete on a missing key is a harmless no-op — no guard needed.</span>
+    <span class="kw">this</span>.follows.get(followerId)?.delete(followeeId);
+  }
+
+  getNewsFeed(userId) {
+    <span class="com">// A Set unions "me" with my followees, so self-follow can't duplicate me.</span>
+    <span class="kw">const</span> sources = <span class="kw">new</span> <span class="typ">Set</span>(<span class="kw">this</span>.follows.get(userId) ?? []);
+    sources.add(userId);                                   <span class="com">// you always see your OWN tweets</span>
+
+    <span class="com">// MAX-heap by timestamp. Each entry: [time, tweetId, ownerId, indexInOwnersList].</span>
+    <span class="com">// Seed it with only the NEWEST tweet per source — k entries, not T.</span>
+    <span class="kw">const</span> heap = <span class="kw">new</span> <span class="typ">MinHeap</span>((a, b) =&gt; b[<span class="num">0</span>] - a[<span class="num">0</span>]);
+
+    <span class="kw">for</span> (<span class="kw">const</span> uid <span class="kw">of</span> sources) {
+      <span class="kw">const</span> list = <span class="kw">this</span>.tweets.get(uid);
+      <span class="kw">if</span> (!list || list.length === <span class="num">0</span>) <span class="kw">continue</span>;
+      <span class="kw">const</span> i = list.length - <span class="num">1</span>;                          <span class="com">// last = newest, since we only ever append</span>
+      heap.push([list[i][<span class="num">0</span>], list[i][<span class="num">1</span>], uid, i]);
+    }
+
+    <span class="kw">const</span> feed = [];
+    <span class="kw">while</span> (feed.length &lt; <span class="num">10</span> &amp;&amp; heap.size &gt; <span class="num">0</span>) {
+      <span class="kw">const</span> [, tweetId, uid, i] = heap.pop();               <span class="com">// globally newest unseen tweet</span>
+      feed.push(tweetId);
+      <span class="kw">if</span> (i &gt; <span class="num">0</span>) {                                        <span class="com">// that user has an older tweet behind it</span>
+        <span class="kw">const</span> list = <span class="kw">this</span>.tweets.get(uid);
+        heap.push([list[i - <span class="num">1</span>][<span class="num">0</span>], list[i - <span class="num">1</span>][<span class="num">1</span>], uid, i - <span class="num">1</span>]);  <span class="com">// advance THAT list by one</span>
+      }
+    }
+    <span class="kw">return</span> feed;
+  }
+}
+</code></pre>
+        <p>
+          <strong>Trace:</strong> <code>postTweet(1,5)</code> → tweets{1: [[0,5]]}, clock = 1.
+          <code>getNewsFeed(1)</code> → sources = {1}; heap seeded with [0,5,1,0]; pop → feed = <strong>[5]</strong> ✓.
+          <code>follow(1,2)</code>; <code>postTweet(2,6)</code> → tweets{2: [[1,6]]}, clock = 2.
+          <code>getNewsFeed(1)</code> → sources = {2, 1}; heap gets [1,6,2,0] and [0,5,1,0]; the max-heap pops timestamp 1
+          first → 6, then timestamp 0 → 5 → <strong>[6, 5]</strong> ✓ — the global clock, not the tweetId, is what ordered
+          them. <code>unfollow(1,2)</code> → sources = {1} → <strong>[5]</strong> ✓.
+        </p>
+        <p>
+          <strong>Complexity:</strong> <code>postTweet</code>, <code>follow</code>, <code>unfollow</code> are all
+          <strong>O(1)</strong>. <code>getNewsFeed</code> seeds k entries (k = people you follow) at O(k log k) — or O(k)
+          if you heapify — then does at most 10 pops and 10 pushes at O(log k) each →
+          <strong>O(k + 10 log k)</strong>, independent of how many tweets exist. Space is O(total tweets + total follow
+          edges) for storage, plus O(k) for the heap during a feed call.
+        </p>
+        <p><strong>Follow-ups you should expect:</strong></p>
+        <ul>
+          <li><em>"A user follows themselves."</em> Handled: <code>sources</code> is a <code>Set</code>, so <code>add(userId)</code> is idempotent — and unfollowing yourself can't hide your own tweets, because <code>add(userId)</code> runs after the followee set is copied. Point this out unprompted; it's the bug most submissions have.</li>
+          <li><em>"Cap each user's stored tweets at their most recent 10."</em> Legal, since the feed is only ever 10 long, and it bounds memory. A nice thing to volunteer — it shows you're thinking about retention, not just correctness.</li>
+          <li><em>"Real Twitter — fan-out on write or fan-out on read?"</em> <strong>This is the actual system-design question hiding inside the LeetCode problem.</strong> What you just wrote is fan-out on <em>read</em> (merge at query time): cheap writes, expensive reads. Fan-out on <em>write</em> pushes each new tweet into every follower's precomputed feed: expensive writes, O(1) reads — great until Taylor Swift tweets to 100M followers. Real systems do <em>both</em>, fanning out on write for normal users and merging on read for celebrities. Saying this sentence in an enterprise loop is worth more than the code.</li>
+          <li><em>"Why store <code>[time, tweetId]</code> instead of just <code>tweetId</code>?"</em> Because tweetIds aren't ordered — LeetCode hands you arbitrary integers. Cross-user ordering <em>requires</em> a monotonic clock. (Real systems solve this with Snowflake IDs: a timestamp baked into the high bits, so the id <em>is</em> the clock.)</li>
+        </ul>
+      </div>
+    </details>
+
+    <div class="note">This is the shape of heap questions in enterprise design rounds: the heap isn't the problem, it's <em>one component</em> of the problem, and the interviewer is watching whether you reach for it at the right moment. Notice how much of the score here lives outside the algorithm — the data model, the self-follow edge case, the fan-out discussion. Talk through the <code>Map</code>/<code>Set</code>/clock choices <em>before</em> you write <code>getNewsFeed</code>, exactly as you'd talk through state shape before writing a React reducer.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="stretch">6. Stretch</h2>
+    <p>
+      Both of these are rated HARD and both are <strong>rarely asked at the enterprise tier</strong> — do them last, after
+      the five above are automatic. But do not skip Find Median from a Data Stream. It is the exception: it's the flagship
+      "two heaps" problem, it is a genuine <strong>fintech favorite</strong> (rolling medians over a price feed are a real
+      thing at Goldman, JPMC and every trading desk), and it's the natural escalation from Kth Largest in a Stream — which
+      means it can land in your loop as a follow-up to an easy problem you already solved. Merge K Sorted Lists is worth
+      it too, for a different reason: it's the same k-way merge you just wrote inside Design Twitter, and it's the answer
+      to the distributed top-k follow-up from LC 215.
+    </p>
+
+    <h3>Merge k Sorted Lists (LC #23) <span class="tier tier-1">HARD</span> ★</h3>
+    <p>
+      You're given an array <code>lists</code> of <code>k</code> linked lists, each one already sorted in ascending order.
+      Merge them into a single sorted linked list and return its head. Individual lists may be empty, and the array itself
+      may be empty.
+    </p>
+    <p>
+      <strong>Example 1:</strong> Input <code>lists = [[1,4,5],[1,3,4],[2,6]]</code> → Output
+      <code>[1,1,2,3,4,4,5,6]</code>. Merging all the nodes into one sorted sequence.<br>
+      <strong>Example 2:</strong> Input <code>lists = []</code> → Output <code>[]</code>. And
+      <code>lists = [[]]</code> → Output <code>[]</code> — an array containing one empty list. These two are separate
+      failure modes and interviewers test both; a solution that seeds the heap with <code>lists[i]</code> unconditionally
+      pushes <code>null</code> and crashes in the comparator.<br>
+      <strong>Constraints:</strong> 0 ≤ k ≤ 10⁴; 0 ≤ lists[i].length ≤ 500; −10⁴ ≤ node.val ≤ 10⁴; each list is sorted
+      ascending; the total node count is ≤ 10⁴.
+    </p>
+    <p><a href="https://leetcode.com/problems/merge-k-sorted-lists/" target="_blank" rel="noopener">Solve on LeetCode ↗</a></p>
+
+    <p>
+      <strong>Thinking process.</strong> Brute force: collect all N node values into an array, sort, rebuild a list. O(N
+      log N), O(N) space, and it throws away the fact that the input was <em>already sorted</em> — which is the entire gift
+      the problem is handing you. Interviewers accept it as a baseline and then ask for better.
+    </p>
+    <p>
+      Here's the insight, and it's tiny: at every step of the merged output, <strong>the next node must be the smallest of
+      the k current heads</strong>. Nothing deeper in any list can beat its own head — each list is sorted. So you never
+      need to look at more than k nodes at a time. Finding the minimum of k values by scanning is O(k) per node, giving
+      O(N·k) overall; finding it with a <strong>min-heap of the k heads</strong> is O(log k) per node, giving
+      <strong>O(N log k)</strong>. The heap holds <em>nodes</em>, not values — that's the trick that lets you advance the
+      right list after each pop: you pop a node, append it to the output, and push <code>node.next</code> as its
+      replacement, so the heap always contains exactly one candidate per still-alive list.
+    </p>
+    <p>
+      Two things worth saying out loud. First, use a <strong>dummy head</strong> and a <code>tail</code> pointer to build
+      the output — the same technique from <a href="06-linked-lists.html">tutorial 06</a>, and for the same reason: it kills
+      the "is this the first node?" special case entirely. Second, the alternative solution is <strong>divide and
+      conquer</strong> — pair the lists up and merge two at a time (using Merge Two Sorted Lists from tutorial 06), halving
+      k on each round. It's also O(N log k), it needs no heap at all, and if the interviewer's language has no priority
+      queue it's arguably the better answer. Naming both, and knowing they hit the same complexity by different routes, is
+      the senior move here.
+    </p>
+
+    <details class="qa">
+      <summary>Solution (JS) — heap of heads · O(N log k) time · O(k) space</summary>
+      <div class="answer">
+<pre><code><span class="com">// Definition for singly-linked list:</span>
+<span class="com">// function ListNode(val, next) { this.val = val; this.next = next; }</span>
+
+<span class="kw">var</span> mergeKLists = <span class="kw">function</span>(lists) {
+  <span class="com">// MIN-heap ordered by node VALUE, but it stores the NODES themselves —</span>
+  <span class="com">// that's what lets us advance the correct list after every pop.</span>
+  <span class="kw">const</span> heap = <span class="kw">new</span> <span class="typ">MinHeap</span>((a, b) =&gt; a.val - b.val);
+
+  <span class="com">// Seed with the head of each NON-EMPTY list. The null guard is the edge case</span>
+  <span class="com">// that kills lists = [] and lists = [[]] — never push null into a heap.</span>
+  <span class="kw">for</span> (<span class="kw">const</span> node <span class="kw">of</span> lists) {
+    <span class="kw">if</span> (node) heap.push(node);
+  }
+
+  <span class="com">// Dummy head: the standard linked-list trick (see tutorial 06) that removes</span>
+  <span class="com">// the "is this the first node?" branch from the loop entirely.</span>
+  <span class="kw">const</span> dummy = { val: <span class="num">0</span>, next: <span class="kw">null</span> };
+  <span class="kw">let</span> tail = dummy;
+
+  <span class="kw">while</span> (heap.size &gt; <span class="num">0</span>) {
+    <span class="kw">const</span> node = heap.pop();    <span class="com">// smallest of the k current heads — nothing deeper can beat it</span>
+    tail.next = node;          <span class="com">// splice it onto the output (we RE-USE nodes; no allocation)</span>
+    tail = node;
+
+    <span class="kw">if</span> (node.next) {
+      heap.push(node.next);    <span class="com">// that list's new head takes its place — heap stays &lt;= k</span>
+    }
+  }
+
+  tail.next = <span class="kw">null</span>;            <span class="com">// sever any stale pointer trailing off the last node</span>
+  <span class="kw">return</span> dummy.next;         <span class="com">// null automatically when every list was empty</span>
+};
+</code></pre>
+        <p>
+          <strong>Trace on <code>[[1,4,5],[1,3,4],[2,6]]</code>:</strong> seed the heap with the three heads → {1ᴬ, 1ᴮ, 2ᶜ}.
+          Pop 1ᴬ → output [1]; push its next, 4ᴬ → heap {1ᴮ, 2ᶜ, 4ᴬ}. Pop 1ᴮ → output [1,1]; push 3ᴮ → heap {2ᶜ, 3ᴮ, 4ᴬ}.
+          Pop 2ᶜ → output [1,1,2]; push 6ᶜ → {3ᴮ, 4ᴬ, 6ᶜ}. Pop 3ᴮ → push 4ᴮ → {4ᴬ, 4ᴮ, 6ᶜ}. Pop 4ᴬ → push 5ᴬ. Pop 4ᴮ (list
+          B is exhausted, nothing pushed) → {5ᴬ, 6ᶜ}. Pop 5ᴬ, pop 6ᶜ → heap empty. Output
+          <strong>[1,1,2,3,4,4,5,6]</strong> ✓. Notice the heap never held more than 3 = k nodes.
+        </p>
+        <p>
+          <strong>Complexity:</strong> every one of the N nodes is pushed exactly once and popped exactly once, and the heap
+          never exceeds k elements → <strong>O(N log k)</strong> time. Space is <strong>O(k)</strong> for the heap — and
+          O(1) extra beyond that, because you're <em>relinking existing nodes</em> rather than allocating new ones. Contrast
+          the baseline (collect-and-sort): O(N log N) time and O(N) space. When k = 4 and N = 10⁶, log k = 2 versus
+          log N = 20 — a 10× win, and the whole reason this problem is asked.
+        </p>
+        <p><strong>Follow-ups you should expect:</strong></p>
+        <ul>
+          <li><em>"No priority queue available."</em> Divide and conquer: merge lists pairwise (lists[0]+lists[1], lists[2]+lists[3], …), halving k each round using the two-list merge from tutorial 06. Same O(N log k) — each of the log k rounds touches all N nodes — with O(1) space if the merge is iterative. It's the answer a lot of interviewers actually prefer.</li>
+          <li><em>"Merge k sorted <strong>arrays</strong> instead."</em> Identical algorithm; the heap stores <code>[value, arrayIndex, elementIndex]</code> tuples instead of nodes, because arrays have no <code>.next</code> pointer to follow. This variant is the one that shows up in distributed systems — see the next bullet.</li>
+          <li><em>"You have 100 machines each holding a sorted shard — give me the global top 10."</em> This <em>is</em> the problem. Each machine ships its local top 10; the coordinator runs a k-way merge over 100 sorted streams and stops after 10 pops. That's the answer to the LC 215 distributed follow-up, and it's the shape of every "merge shards" question in a fintech loop.</li>
+          <li><em>"Stability / duplicates?"</em> Equal values pop in arbitrary order (a heap is not stable). If the problem needs a deterministic tiebreak, put the list index in the comparator: <code>(a,b) =&gt; a.val - b.val || a.listIdx - b.listIdx</code>.</li>
+        </ul>
+      </div>
+    </details>
+
+    <div class="pitfall">Never push <code>null</code> into the heap. If <code>lists</code> contains an empty list, seeding with <code>heap.push(lists[i])</code> unconditionally puts <code>null</code> in <code>data</code>, and the very next comparator call evaluates <code>null.val</code> and throws. The same guard applies to the replacement push: only push <code>node.next</code> <em>if it exists</em>. Two one-line guards, and they are exactly the two test cases (<code>[]</code> and <code>[[]]</code>) that LeetCode leads with.</div>
+
+    <!-- ============================================================ -->
+    <h3>Find Median from a Data Stream (LC #295) <span class="tier tier-1">HARD</span> ★</h3>
+    <p>
+      The median of a list of numbers is the middle value once they're sorted — and if the count is <em>even</em>, it's the
+      <strong>average of the two middle values</strong>. Design a class <code>MedianFinder</code> that supports a stream:
+      <code>addNum(num)</code> adds an integer to the data structure, and <code>findMedian()</code> returns the median of
+      everything added so far. Both are called repeatedly and interleaved — the numbers never stop arriving, and you're
+      asked for the median at arbitrary moments in between.
+    </p>
+    <p>
+      <strong>Example 1:</strong> <code>addNum(1)</code>; <code>addNum(2)</code>; <code>findMedian()</code> →
+      <code>1.5</code> (even count → average of 1 and 2). <code>addNum(3)</code>; <code>findMedian()</code> →
+      <code>2.0</code> (odd count → the true middle).<br>
+      <strong>Example 2:</strong> <code>addNum(-1)</code>; <code>findMedian()</code> → <code>-1.0</code>;
+      <code>addNum(-2)</code>; <code>findMedian()</code> → <code>-1.5</code>; <code>addNum(-3)</code>;
+      <code>findMedian()</code> → <code>-2.0</code>. Negatives and a strictly <em>decreasing</em> stream — the case that
+      breaks lazy rebalancing code, because every new element belongs on the low side.<br>
+      <strong>Constraints:</strong> −10⁵ ≤ num ≤ 10⁵; <code>findMedian()</code> is only called after at least one
+      <code>addNum</code>; up to <strong>5×10⁴</strong> calls. Follow-ups baked into the problem: what if all numbers are
+      in [0, 100]? what if 99% are in [0, 100]?
+    </p>
+    <p><a href="https://leetcode.com/problems/find-median-from-data-stream/" target="_blank" rel="noopener">Solve on LeetCode ↗</a></p>
+
+    <p>
+      <strong>Thinking process — derive it, because this one really is derivable.</strong> Start with the brute force and
+      let it push you to the answer. Keep everything in an array and sort on every <code>findMedian()</code>: O(n log n)
+      per query, hopeless. Improve it: keep the array <em>always</em> sorted, inserting each new number in its correct
+      position via binary search. Now <code>findMedian()</code> is O(1) — just index the middle — but <code>addNum</code> is
+      <strong>O(n)</strong>, because binary search finds the slot in O(log n) and then the <em>splice shifts every later
+      element</em>. With 5×10⁴ calls that's 10⁹ element moves. So close, and yet the shifting kills it.
+    </p>
+    <p>
+      Now ask the question that unlocks the whole problem: <em>how much of that sorted order did I actually use?</em> To
+      compute a median you need <strong>the two elements at the middle boundary</strong> and nothing else. You do not care
+      how the bottom half is arranged internally. You do not care how the top half is arranged internally. You only care
+      about <em>the largest element of the bottom half</em> and <em>the smallest element of the top half</em>. And "give me
+      the max of this pile in O(1)" plus "give me the min of that pile in O(1)" is precisely two heaps standing back to
+      back:
+    </p>
+<pre><code><span class="com">//        lo: MAX-heap                        hi: MIN-heap</span>
+<span class="com">//   (the smaller half)                  (the larger half)</span>
+<span class="com">//</span>
+<span class="com">//     1   2   3   [4]        |        [5]   6   7   8</span>
+<span class="com">//                  ^                    ^</span>
+<span class="com">//            lo.peek() = 4        hi.peek() = 5</span>
+<span class="com">//            (biggest of the        (smallest of the</span>
+<span class="com">//             small half)            big half)</span>
+<span class="com">//</span>
+<span class="com">//   The median is hiding at that seam, and BOTH sides of it are O(1) to read.</span>
+<span class="com">//   Even count  -&gt; (4 + 5) / 2 = 4.5</span>
+<span class="com">//   Odd count   -&gt; whichever heap is allowed to be bigger; here we let `lo` win.</span>
+</code></pre>
+    <p>
+      That's the entire idea: <strong>split the stream at the median and store each half in the heap that puts the median
+      boundary on top.</strong> The bottom half needs its <em>maximum</em> exposed → max-heap. The top half needs its
+      <em>minimum</em> exposed → min-heap. Everything else is bookkeeping.
+    </p>
+
+    <h4>The two invariants (this is what you actually have to get right)</h4>
+    <p>Every <code>addNum</code> must leave both of these true. State them out loud <em>before</em> you write the code:</p>
+    <ol>
+      <li><strong>Ordering:</strong> <code>max(lo) ≤ min(hi)</code> — every element in the bottom half is ≤ every element
+        in the top half. Without this, the two "middle" values aren't middle values at all and the median is garbage.</li>
+      <li><strong>Balance:</strong> the sizes differ by at most 1. Conventionally, let <code>lo</code> be the one allowed to
+        hold the extra element, so <code>lo.size === hi.size</code> or <code>lo.size === hi.size + 1</code>. Then the median
+        read is trivial: if the sizes are equal, average the two tops; otherwise, it's <code>lo.peek()</code>.</li>
+    </ol>
+    <p>
+      The rebalance that maintains both is a two-step dance, and the order matters. <strong>Step 1 — push into
+      <code>lo</code> unconditionally, then immediately move <code>lo</code>'s top into <code>hi</code>.</strong> That
+      forced hand-off is what enforces the <em>ordering</em> invariant: whatever the new number was, after it passes through
+      <code>lo</code>, the element that gets promoted to <code>hi</code> is the largest of the bottom half — which is exactly
+      the element that <em>belongs</em> on the boundary. You never have to write an <code>if (num &lt; lo.peek())</code>
+      comparison at all; the heaps sort it out for you. <strong>Step 2 — if <code>hi</code> is now bigger than
+      <code>lo</code>, push its top back into <code>lo</code>.</strong> That restores the <em>balance</em> invariant. Three
+      lines, no branching on the value, provably correct.
+    </p>
+
+    <details class="qa">
+      <summary>Solution (JS) — addNum O(log n) · findMedian O(1) · O(n) space</summary>
+      <div class="answer">
+<pre><code><span class="kw">class</span> MedianFinder {
+  <span class="kw">constructor</span>() {
+    <span class="com">// lo = the SMALLER half, in a MAX-heap  =&gt; lo.peek() is the biggest of the small half</span>
+    <span class="com">// hi = the LARGER  half, in a MIN-heap  =&gt; hi.peek() is the smallest of the big half</span>
+    <span class="com">// The median lives at the seam between those two tops.</span>
+    <span class="kw">this</span>.lo = <span class="kw">new</span> <span class="typ">MinHeap</span>((a, b) =&gt; b - a);   <span class="com">// max-heap (inverted comparator)</span>
+    <span class="kw">this</span>.hi = <span class="kw">new</span> <span class="typ">MinHeap</span>();                  <span class="com">// min-heap (default)</span>
+    <span class="com">// INVARIANTS:  (1) max(lo) &lt;= min(hi)   (2) lo.size === hi.size  ||  lo.size === hi.size + 1</span>
+  }
+
+  addNum(num) {
+    <span class="com">// STEP 1 — ordering. Push into lo, then hand lo's top to hi.</span>
+    <span class="com">// The forced hand-off means we never compare num against anything ourselves:</span>
+    <span class="com">// whatever ends up on top of lo IS the right element to promote to hi.</span>
+    <span class="kw">this</span>.lo.push(num);
+    <span class="kw">this</span>.hi.push(<span class="kw">this</span>.lo.pop());
+
+    <span class="com">// STEP 2 — balance. That hand-off may have made hi too big; pull one back.</span>
+    <span class="com">// (lo is allowed to be exactly one LARGER than hi — that's our convention.)</span>
+    <span class="kw">if</span> (<span class="kw">this</span>.hi.size &gt; <span class="kw">this</span>.lo.size) {
+      <span class="kw">this</span>.lo.push(<span class="kw">this</span>.hi.pop());
+    }
+  }
+
+  findMedian() {
+    <span class="com">// Odd count: lo holds the extra element, so its top IS the median.</span>
+    <span class="kw">if</span> (<span class="kw">this</span>.lo.size &gt; <span class="kw">this</span>.hi.size) <span class="kw">return</span> <span class="kw">this</span>.lo.peek();
+
+    <span class="com">// Even count: the two middle values are the two tops. Average them.</span>
+    <span class="com">// Divide by 2 (not | 0, not Math.floor) — the median of [1,2] is 1.5, not 1.</span>
+    <span class="kw">return</span> (<span class="kw">this</span>.lo.peek() + <span class="kw">this</span>.hi.peek()) / <span class="num">2</span>;
+  }
+}
+</code></pre>
+        <p>
+          <strong>Trace, step by step (this is the part to rehearse):</strong>
+        </p>
+        <ul>
+          <li><code>addNum(1)</code>: push 1 into lo → lo{1}. Hand off: pop 1 from lo, push into hi → lo{}, hi{1}. Balance: hi.size (1) &gt; lo.size (0) → pull back → <strong>lo{1}, hi{}</strong>. <code>findMedian()</code> → lo is bigger → <strong>1</strong>.</li>
+          <li><code>addNum(2)</code>: push 2 into lo → lo{2, 1} (max-heap, top = 2). Hand off: pop 2, push into hi → lo{1}, hi{2}. Balance: sizes are 1 and 1, equal → no pull-back. State: <strong>lo{1}, hi{2}</strong> — and look: 1 ≤ 2, invariant (1) holds automatically. <code>findMedian()</code> → sizes equal → (1 + 2)/2 = <strong>1.5</strong> ✓.</li>
+          <li><code>addNum(3)</code>: push 3 into lo → lo{3, 1} (top = 3). Hand off: pop 3 → hi{2, 3} (min-heap, top = 2). Now lo{1}, hi{2,3}. Balance: hi.size (2) &gt; lo.size (1) → pull back hi's top (2) into lo → <strong>lo{2, 1}, hi{3}</strong>. <code>findMedian()</code> → lo bigger → lo.peek() = <strong>2</strong> ✓.</li>
+          <li><strong>The decreasing stream (Example 2), which is where the hand-off earns its keep:</strong> <code>addNum(-1)</code> → lo{−1}, hi{}. <code>addNum(-2)</code>: push −2 into lo → lo{−1, −2} (max-heap, top = −1). Hand off pops <strong>−1</strong>, <em>not</em> the number we just added → lo{−2}, hi{−1}. Sizes equal. Median = (−2 + −1)/2 = <strong>−1.5</strong> ✓. Notice the algorithm silently routed the <em>new</em> number to the low side and promoted the <em>old</em> one — with zero explicit comparisons. That's the elegance, and it's why the "push into lo, then hand off" order is not negotiable.</li>
+        </ul>
+        <p>
+          <strong>Complexity:</strong> <code>addNum</code> does a bounded number of heap operations — one push, one pop, one
+          push, and at most one more pop/push pair — each O(log n) on a heap of size ≤ n/2 + 1 → <strong>O(log n)</strong>.
+          <code>findMedian</code> reads at most two tops → <strong>O(1)</strong>, which is the point of the whole design:
+          medians are queried far more often than the stream is added to. Space is <strong>O(n)</strong> — you genuinely
+          must retain every element, because any future arrival can shift the median boundary. Contrast the sorted-array
+          approach: O(n) per <code>addNum</code> from the splice. You've traded an O(n) insert for an O(log n) one and kept
+          the O(1) read.
+        </p>
+        <p><strong>Follow-ups you should expect — and the first two are printed in the problem statement, so they <em>will</em> be asked:</strong></p>
+        <ul>
+          <li><em>"What if all numbers are in the range [0, 100]?"</em> Drop the heaps entirely: keep a <strong>counting array</strong> of 101 buckets. <code>addNum</code> is O(1) (<code>counts[num]++</code>), and <code>findMedian</code> walks the 101 buckets accumulating a running total until it crosses n/2 → O(101) = <strong>O(1)</strong>. A bounded universe always beats a comparison structure. This is the same instinct as counting sort, and it's a strong answer.</li>
+          <li><em>"What if 99% are in [0, 100] but 1% are outliers?"</em> Hybrid: counting buckets for the dense range, plus two small heaps (or two sorted lists) for the values below 0 and above 100, tracking how many fell outside. The median is almost always inside the bucketed range, so you handle the common case in O(1) and only consult the outlier structures for the counts. Saying "I'd bucket the hot path and keep the tails in overflow structures" is the answer they're fishing for.</li>
+          <li><em>"Now give me the median of the last 1000 elements only"</em> (a <strong>rolling</strong> median — this is the actual fintech version: a moving median over a price feed). Two heaps alone can't do it, because you must <em>remove</em> an arbitrary old element and a heap has no O(log n) delete-by-value. The fixes: <strong>lazy deletion</strong> (mark the expired element in a <code>Map</code>, discard it if it ever surfaces at a top, and track "virtual" sizes) — or reach for a balanced BST / order-statistic tree, which is what a production system uses. Knowing <em>why</em> the two-heap solution breaks here is worth more than the fix itself.</li>
+          <li><em>"Why not a balanced BST from the start?"</em> A BST with subtree sizes gives O(log n) insert <em>and</em> O(log n) select-by-rank, so it solves this and the rolling variant. But it's ~150 lines to implement in JS versus ~15 with two heaps. Right tool, wrong budget — say exactly that.</li>
+          <li><em>"What if <code>findMedian</code> is called far more often than <code>addNum</code>?"</em> You already win: the read is O(1). Point out that you designed for that skew deliberately — the sorted-array approach makes the <em>opposite</em> trade, and knowing which side of the trade you're on is the whole discussion.</li>
+        </ul>
+      </div>
+    </details>
+
+    <div class="pitfall">Three ways this goes wrong under pressure. <strong>(1)</strong> Skipping the hand-off and writing <code>if (num &lt;= lo.peek()) lo.push(num) else hi.push(num)</code> — it can work, but you must then handle the empty-<code>lo</code> case (<code>peek()</code> is <code>undefined</code>, and every comparison against <code>undefined</code> is <code>false</code>) <em>and</em> rebalance in both directions. The push-then-hand-off version has none of those branches. <strong>(2)</strong> Integer-dividing the even case — the median of <code>[1, 2]</code> is <code>1.5</code>; LeetCode compares floats and <code>| 0</code> silently fails half the tests. <strong>(3)</strong> Letting the balance drift by 2 because you only rebalance in one direction. Pick the convention (<code>lo</code> may hold the extra), write both invariants in a comment above the class, and check them against your trace.</div>
+
+    <div class="senior">Two-heaps is a <em>pattern</em>, not a trick for one problem, and naming it as such is the senior signal: <strong>whenever you need to track a boundary inside a dynamic set — the median, the k-th element, "the top half versus the bottom half" — split the set in two and store each side in the heap that exposes the boundary element.</strong> It generalizes immediately: IPO (LC 502) runs a min-heap on capital and a max-heap on profit; Sliding Window Median (LC 480) is this exact class plus lazy deletion; and the rolling median over a market data feed is why a Goldman or JPMC interviewer has this problem in their back pocket in the first place. If you get asked Kth Largest in a Stream early in a loop, expect this as the escalation — and now you have the derivation, not just the code.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="qa">Interview Q&amp;A</h2>
+    <p>
+      These are the conceptual questions that get asked <em>around</em> the coding problem — while you're typing, or in the
+      last five minutes. Answer them in two or three sentences. Rambling here is how strong coders lose points.
+    </p>
+
+    <details class="qa">
+      <summary>Why is heapify O(n) and not O(n log n)?</summary>
+      <div class="answer">
+        <p>
+          Because Floyd's build-heap sifts <strong>down</strong>, and the cost of sifting a node down is bounded by its
+          <em>height above the leaves</em> — not by the height of the whole tree. In a complete binary tree, roughly half
+          the nodes are leaves (height 0, zero work), a quarter have height 1, an eighth have height 2, and so on. Summing
+          the work gives Σ<sub>h=0..log n</sub> (n / 2<sup>h+1</sup>) × h, and that series converges to <strong>2n</strong>.
+          The cheap majority dominates.
+        </p>
+        <p>
+          The "obvious" O(n log n) bound comes from the <em>other</em> construction: n separate <code>push</code>es, each of
+          which sifts <strong>up</strong> from a leaf. That path really is the full height every time, so n pushes genuinely
+          is O(n log n). Same data structure, two build strategies, different costs — and the difference is entirely which
+          direction you sift. <em>Say it in one line:</em> "sift-down from the bottom is cheap because most nodes are near
+          the bottom; sift-up from the bottom is expensive because the root is far away."
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>When do you use a heap instead of just sorting?</summary>
+      <div class="answer">
+        <p>Two situations, and only two. Name them both:</p>
+        <ul>
+          <li><strong>Streaming / unbounded input.</strong> The data arrives one element at a time and you must answer
+            queries in between, or it's simply too large to hold. You cannot sort what you cannot hold, and re-sorting on
+            every arrival is O(n log n) <em>per element</em>. A heap absorbs each arrival in O(log n) and answers instantly.
+            Kth Largest in a Stream and Find Median from a Data Stream exist to test exactly this.</li>
+          <li><strong>k ≪ n.</strong> You need only the k best of n, so a size-k heap runs in O(n log k) time and — the part
+            that actually matters — <strong>O(k) space</strong>. With n = 10⁹ and k = 10 that's the difference between ten
+            slots and an out-of-memory error.</li>
+        </ul>
+        <p>
+          The flip side, which you should volunteer, is when a heap is <em>not</em> worth it: when you need the full sorted
+          order anyway, when k ≈ n (log k ≈ log n, so the heap buys nothing), or when n is small enough that
+          <code>.sort()</code> is simpler and the constant factor dominates. <em>"I'd sort — unless it's a stream or k is
+          much smaller than n"</em> is the whole decision rule in one sentence.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>To keep the k <em>largest</em> elements, why do you use a <em>min</em>-heap?</summary>
+      <div class="answer">
+        <p>
+          Because the only element you ever need to see is <strong>the one you're about to throw away</strong> — the weakest
+          of your current k champions — and the top of a min-heap is exactly that. When a new element arrives, the single
+          question is "is it better than my current worst?" If yes, evict the worst and admit the newcomer; if no, discard
+          the newcomer. Both cases need the <em>minimum</em> of the retained set in O(1), so the retained set lives in a
+          min-heap.
+        </p>
+        <p>
+          The mirror follows for free: to keep the k <em>smallest</em>, keep a <strong>max</strong>-heap. And the general
+          rule that makes you never confuse them again: <strong>the top of the heap is always the element you are most
+          willing to throw away.</strong> As a bonus, that min-heap's top is also the <em>k-th largest element</em> itself —
+          which is why LC 215 and LC 703 are one line apart.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>How do you make a max-heap in JavaScript when you've only written a MinHeap?</summary>
+      <div class="answer">
+        <p>
+          You invert the comparator — <code>new MinHeap((a, b) =&gt; b - a)</code> — and you're done. There is no separate
+          class, ever. The comparator contract is identical to <code>Array.prototype.sort</code>'s:
+          <code>compare(a, b) &lt; 0</code> means "a comes out first," so <code>a - b</code> gives you a min-heap and
+          <code>b - a</code> gives you a max-heap. The same trick handles objects (<code>(a,b) =&gt; a.dist - b.dist</code>),
+          tuples (<code>(a,b) =&gt; b[0] - a[0]</code>) and multi-key tiebreaks (<code>a.freq - b.freq || …</code>).
+        </p>
+        <p>
+          The hack you'll see in other people's code — negating every value on the way in and negating again on the way out
+          (<code>heap.push(-x)</code>) — works for plain numbers and breaks the moment you store objects, so don't build the
+          habit. The negation trick exists because Python's <code>heapq</code> has no comparator parameter; JavaScript
+          doesn't have that limitation, because you wrote the class yourself.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Heap vs. quickselect for "find the k-th largest" — which do you actually give?</summary>
+      <div class="answer">
+        <p>
+          Give the <strong>heap</strong> first: O(n log k) time, O(k) space, deterministic, doesn't mutate the input, and it
+          survives a stream. Then <em>offer</em> quickselect as the optimization and let the interviewer pull it out of you:
+          O(n) <strong>average</strong> — partition, and recurse only into the half that contains the answer, so the work is
+          n + n/2 + n/4 + … = 2n.
+        </p>
+        <p>
+          Be honest about quickselect's costs in the same breath, because that honesty <em>is</em> the senior signal: the
+          worst case is <strong>O(n²)</strong> (an adversarial or already-sorted input with a bad pivot rule — mitigate with
+          a <em>random</em> pivot, which you must actually write), it mutates the caller's array, it needs the whole input in
+          memory, and it can't be used on a stream. Median-of-medians guarantees O(n) worst case but its constant is bad
+          enough that it loses in practice. <em>"Heap unless I've measured that this is a hot path"</em> is the correct
+          engineering answer, and it's what a 7-YOE candidate is expected to say.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Can you delete an arbitrary element from a heap? Find an arbitrary element?</summary>
+      <div class="answer">
+        <p>
+          Not efficiently, and you should say so before the interviewer traps you with it. <strong>A heap is not a search
+          structure</strong> — the heap property only orders parents against children, so searching for a value is a linear
+          O(n) scan, and deleting one costs O(n) just to <em>find</em> it (the removal itself, once you know the index, is
+          O(log n): swap with the last element, pop, then sift the replacement <em>both</em> ways — up if it's too small,
+          down if it's too big).
+        </p>
+        <p>The two production fixes are worth naming, because real systems use them constantly:</p>
+        <ul>
+          <li><strong>An index map:</strong> maintain a <code>Map</code> from value → index and update it on every swap. Now delete-by-value is O(log n). This is how you build an indexed priority queue, and it's what a proper Dijkstra with decrease-key needs.</li>
+          <li><strong>Lazy deletion:</strong> don't remove anything. Mark the element dead in a <code>Set</code>, and when it surfaces at the top, pop and discard it instead of returning it. Simpler, and what most schedulers and Sliding Window Median implementations actually do — at the cost of the heap holding garbage for a while.</li>
+        </ul>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Why is a heap stored in a flat array with no pointers?</summary>
+      <div class="answer">
+        <p>
+          Because a heap is a <strong>complete</strong> binary tree — every level is full except possibly the last, which
+          fills strictly left to right. A complete tree has no gaps, so laying it out in level order produces a dense array,
+          and the parent/child links become arithmetic: <code>parent(i) = (i - 1) &gt;&gt; 1</code>,
+          <code>left(i) = 2i + 1</code>, <code>right(i) = 2i + 2</code>. No node objects, no pointer chasing, and the whole
+          structure is contiguous in memory, which is cache-friendly and fast.
+        </p>
+        <p>
+          This is also why <code>push</code> appends at the end and <code>pop</code> removes the last leaf before sifting:
+          those are the <em>only</em> mutations that preserve completeness. Break completeness and the index arithmetic
+          stops being valid, and the entire implementation collapses. Completeness isn't a nice property of a heap — it's a
+          load-bearing one.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Explain the two-heaps technique in one breath.</summary>
+      <div class="answer">
+        <p>
+          <em>"Split the data at the boundary you care about, and store each side in the heap that puts the boundary element
+          on top."</em> For a running median: the lower half goes in a <strong>max</strong>-heap (so its maximum — the left
+          edge of the median — is at <code>peek()</code>), the upper half goes in a <strong>min</strong>-heap (so its
+          minimum — the right edge — is at <code>peek()</code>). Maintain two invariants: <strong>ordering</strong>
+          (<code>max(lo) ≤ min(hi)</code>) and <strong>balance</strong> (sizes differ by at most 1). Then the median is
+          either the top of the bigger heap, or the average of the two tops.
+        </p>
+        <p>
+          The rebalance is three lines and needs no comparisons: push into <code>lo</code>, hand <code>lo</code>'s top over
+          to <code>hi</code> (that enforces ordering), then if <code>hi</code> got bigger, hand its top back (that enforces
+          balance). O(log n) per insert, O(1) per query. The pattern generalizes beyond medians — IPO (LC 502) and Sliding
+          Window Median (LC 480) are the same two-heaps skeleton.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Is a heap sorted? What does <code>heap.data</code> actually look like?</summary>
+      <div class="answer">
+        <p>
+          <strong>No.</strong> A heap is only <em>partially</em> ordered: every parent beats its children, and that's the
+          entire promise. Siblings are unordered relative to each other, the second-smallest element could be at index 1 or
+          index 2, and printing <code>heap.data</code> gives you something that looks almost-but-not-quite sorted —
+          <code>[1, 3, 2, 7, 4, 9]</code> is a perfectly valid min-heap. Trying to read the k-th element off
+          <code>data[k-1]</code> is a real bug candidates ship.
+        </p>
+        <p>
+          The only reliable way to get sorted output is to <strong>pop repeatedly</strong>, which costs O(n log n) — that
+          <em>is</em> heapsort, and it's exactly why a heap never beats sorting when you need the whole order. The one
+          exception on this page: in K Closest Points the answer may be returned in <em>any</em> order, so dumping
+          <code>heap.data</code> straight out is legal and saves you the drain.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Why does JavaScript have no built-in priority queue, and what do you say about it in the interview?</summary>
+      <div class="answer">
+        <p>
+          There's no deep reason — the standard library simply never grew one, and no Node release has added it. Java has
+          <code>PriorityQueue</code>, Python has <code>heapq</code>, C++ has <code>std::priority_queue</code>; JavaScript has
+          <code>Array.prototype.sort</code> and your own two hands.
+        </p>
+        <p>
+          What to say in the room, at the moment you recognize a heap problem: <em>"JavaScript has no built-in heap, so I'll
+          write a small MinHeap class — push, pop, peek, with an injected comparator — unless you'd rather I assume one
+          exists and focus on the algorithm."</em> Then <em>do whichever they pick, without hesitating</em>. Most
+          interviewers will let you assume it, and the ones who don't are handing you a chance to write forty lines of clean,
+          well-named, correctly-guarded code — which is a gift, not a punishment, precisely because most candidates fumble
+          it. The fumbling is the thing being measured; the class itself is easy.
+        </p>
+      </div>
+    </details>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="drills">Re-solve drills</h2>
+    <p>
+      Reading heap code is worthless. The only thing that transfers to the interview room is <strong>typing the MinHeap
+      class from a blank file</strong> until it comes out in one pass with no compile errors. Everything below is built
+      around that.
+    </p>
+
+    <h3>The daily 5-minute drill (do this every single day until the loop)</h3>
+    <p>
+      Open a blank file. Type <code>MinHeap</code> from memory — constructor with the comparator, <code>size</code>,
+      <code>peek</code>, <code>push</code>, <code>pop</code>, <code>_siftUp</code>, <code>_siftDown</code>. Then check
+      yourself against §3 on these five points, which are where it always breaks:
+    </p>
+    <ul>
+      <li><code>(i - 1) &gt;&gt; 1</code> for the parent; <code>2i + 1</code> / <code>2i + 2</code> for the children.</li>
+      <li><code>_siftDown</code> swaps with the <strong>better of the two children</strong>, chosen <em>before</em> any swap happens.</li>
+      <li><code>pop</code> handles the empty heap <em>and</em> the one-element heap (after <code>data.pop()</code> the array is empty — don't write <code>undefined</code> into <code>data[0]</code>).</li>
+      <li>The comparator is <strong>injected</strong>, and <code>compare(a,b) &lt; 0</code> means "a pops first."</li>
+      <li><code>heapify</code> starts at <code>(n &gt;&gt; 1) - 1</code> and walks <em>down</em> to 0.</li>
+    </ul>
+    <p>Five minutes. It should end at zero errors within a week.</p>
+
+    <h3>The spaced-repetition plan</h3>
+    <table>
+      <thead><tr><th>Session</th><th>Do this</th><th>Target</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Day 1</strong> (today)</td>
+          <td>Type the MinHeap cold. Then Kth Largest in a Stream (703) and Last Stone Weight (1046) — both from scratch, no scrolling up.</td>
+          <td>~45 min total. If the heap class fights you, stop and retype it before touching the problems.</td>
+        </tr>
+        <tr>
+          <td><strong>Day 2</strong></td>
+          <td>K Closest Points (973) and Kth Largest in an Array (215) — the heap solution <em>only</em>. Say the O(n log k) / O(k) argument out loud before you type.</td>
+          <td>25 min each. Do not look at quickselect yet.</td>
+        </tr>
+        <tr>
+          <td><strong>Day 3</strong></td>
+          <td>Re-solve 215 with <strong>quickselect</strong>, including the random pivot, from a blank file. Then Task Scheduler (621): heap first, then re-derive the O(1) formula on paper without looking.</td>
+          <td>The partition function is the hard part — expect to get the boundary wrong once. That's the point of drilling it.</td>
+        </tr>
+        <tr>
+          <td><strong>Day 5</strong></td>
+          <td>Design Twitter (355) from scratch. Then <strong>Find Median from a Data Stream (295)</strong> — write the two invariants as a comment <em>before</em> you write <code>addNum</code>.</td>
+          <td>Trace the decreasing stream (−1, −2, −3) by hand. If your trace is right, your code is right.</td>
+        </tr>
+        <tr>
+          <td><strong>Day 7</strong></td>
+          <td>Merge k Sorted Lists (23). Then re-solve <strong>295 again</strong> — it's the one on this page most likely to actually appear, and it's the one that decays fastest.</td>
+          <td>Both from a blank file, 25 min each, MinHeap typed from memory each time.</td>
+        </tr>
+        <tr>
+          <td><strong>Day 14</strong></td>
+          <td>Cold set, 60 minutes, random order, no notes: <strong>703 → 973 → 215 (heap <em>and</em> quickselect) → 295</strong>. Narrate out loud as if someone is watching.</td>
+          <td>This is the real check. Anything you stumble on goes back into the Day-1 slot.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>Extra reps if you have time</h3>
+    <ul>
+      <li><strong>Top K Frequent Elements (LC 347)</strong> — the natural companion: build a frequency <code>Map</code> (tutorial 01), then run a size-k min-heap over the entries. O(n log k). The bucket-sort follow-up gets it to O(n), and interviewers ask for it.</li>
+      <li><strong>K Closest Points, sorted output</strong> — same code, then drain the heap. Confirms you understand that <code>heap.data</code> is <em>not</em> sorted.</li>
+      <li><strong>Sort Characters by Frequency (LC 451)</strong> — a five-minute confidence rep on the frequency-map + heap combo.</li>
+      <li><strong>IPO (LC 502)</strong> — two heaps in the wild (min-heap on capital, max-heap on profit). If Find Median clicked, this one is a victory lap and it's a genuine Goldman-flavored problem.</li>
+    </ul>
+
+    <div class="senior">Before you close this page, do the recall test out loud, without scrolling: (1) parent and child index formulas; (2) why heapify is O(n); (3) why "k largest" means a min-heap; (4) the two invariants of the two-heaps median; (5) quickselect's average <em>and</em> worst case. If you can say all five cleanly, you're ready for a heap question at any enterprise-tier loop. If you stumbled on one, that's tomorrow's five minutes.</div>
+  </section>
+
+  <nav class="page-nav">
+    <a href="07-trees-bst.html">← 07 — Trees &amp; BST</a>
+    <a href="09-backtracking.html">09 — Backtracking →</a>
+  </nav>
+
+</main>
+</body>
+</html>

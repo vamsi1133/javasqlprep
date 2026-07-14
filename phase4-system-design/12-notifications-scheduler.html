@@ -1,0 +1,1957 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>12 — Design a Notification System &amp; Distributed Scheduler | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <div class="breadcrumb"><a href="index.html">← Course Home</a></div>
+    <h1>12 — Design a Notification System &amp; Distributed Scheduler</h1>
+    <p>Archetype: <strong>reliable async delivery to unreliable third parties, plus time-based triggering</strong>. The shape of every "do this later, exactly once, even though the thing I'm calling might fall over" problem.</p>
+  </div>
+</header>
+
+<main class="container">
+
+  <section>
+    <h2>Why this matters in the interview</h2>
+    <p>
+      Notifications look like a soft question and they are not. Every other case study in this block lets you hide behind
+      systems you control: your database, your cache, your service mesh. This one hands you a dependency you cannot fix,
+      cannot restart, and cannot even reliably interrogate — <strong>a third-party provider</strong>. APNs will rate-limit you.
+      Twilio will time out after you've already been charged for the SMS. SES will accept a message and silently drop it into
+      a spam folder. The design question is not "how do I send an email," it's <em>"how do I build something dependable out of
+      parts that aren't."</em> That reframing is the whole page, and it's the thing a 7-YOE candidate is expected to reach for
+      unprompted while a 3-YOE candidate is still drawing arrows to a box labelled "SMS."
+    </p>
+    <p>
+      And the archetype travels further than almost any other in this course. Strip the word "notification" out and what you
+      have is: an event happens, you must perform a side effect on an external system, exactly once as far as the user can
+      tell, possibly at some point in the future, and the external system is allowed to fail. That is webhook delivery. That is
+      a nightly billing run. That is "email the customer their receipt" in <a href="13-payments-orders.html">tutorial 13</a>.
+      That is the retry mechanism inside literally any other system you'll design. The queue, the idempotency key, the
+      exponential backoff, the dead-letter queue, the circuit breaker — those are not notification concepts, they are the
+      standard toolkit for <em>talking to something that might not be there</em>, and this is the page where you learn to
+      assemble them under time pressure. Part B then adds the second half: <strong>durable, distributed cron</strong>, because
+      "in three days, remind them" turns out to be one of the harder small problems in distributed systems, and having a real
+      opinion about what happens when the scheduler was down for an hour is a genuinely strong signal.
+    </p>
+    <p>
+      This page assumes you've done <a href="05-coordination-consensus.html">05</a> (idempotency, the outbox pattern,
+      exactly-once as a myth) and <a href="06-caching-queues-resilience.html">06</a> (queues, backpressure, retries with
+      jitter, circuit breakers, bulkheads, DLQs). Those give you the vocabulary. <strong>This page spends it.</strong> If a term
+      below flies past you, go back — the case study will feel like memorisation without the foundations.
+    </p>
+  </section>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ul>
+      <li><a href="#prompt">1. The prompt</a> — and the two systems hiding inside it</li>
+      <li><a href="#requirements">2. Requirements</a> — a duplicate notification is a <em>product</em> bug</li>
+      <li><a href="#estimation">3. Estimation</a> ★ — the peak-vs-average gap <em>is</em> the design</li>
+      <li><a href="#api">4. API design</a> — internal send API + preferences</li>
+      <li><a href="#data-model">5. Data model</a> — templates, preferences, and the delivery log</li>
+      <li><a href="#hld">6. High-level design</a> — why one queue per channel (bulkheads)</li>
+      <li><a href="#deep-dive-1">7a. Deep dive: reliability against a flaky third party</a> ★ — this is where the interview happens</li>
+      <li><a href="#deep-dive-2">7b. Deep dive: not spamming the user</a> ★ — the product-sense dimension</li>
+      <li><a href="#part-b">PART B — the distributed scheduler</a></li>
+      <li><a href="#scheduler-approaches">8a. Four approaches to delayed jobs, compared</a></li>
+      <li><a href="#scheduler-hard">8b. The hard parts</a> ★ — exactly-once firing, thundering herds, catch-up policy</li>
+      <li><a href="#scaling">9. Scaling &amp; bottlenecks</a> — both halves</li>
+      <li><a href="#tradeoffs">10. Trade-offs</a></li>
+      <li><a href="#followups">11. Follow-ups you should expect</a></li>
+      <li><a href="#qa">Interview Q&amp;A</a></li>
+      <li><a href="#takeaways">What to remember</a></li>
+    </ul>
+  </div>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="prompt">1. The prompt</h2>
+
+    <p>The interviewer gives you one line:</p>
+
+<pre><code>  "Design a notification system. Push, SMS, email — the thing that tells
+   users something happened."
+</code></pre>
+
+    <p>
+      Vague on purpose, as always. But this prompt has a specific tell that most candidates walk straight past: the words "the
+      thing that tells users something happened" imply <em>an event just occurred and we're reacting to it</em> — that's the
+      synchronous half. Real notification systems are at least half <em>asynchronous in time</em>: "your trial expires in three
+      days," "your rent is due tomorrow," "you haven't opened the app in a week." So the first thing you do is split the
+      problem in half, out loud, and get the interviewer to tell you which half they care about.
+    </p>
+
+    <div class="senior">Open with the split: <em>"Before I scope this — there are really two systems in that sentence and they share a lot of machinery but have different hard parts. One is <strong>delivery</strong>: something happened, fan it out to push/SMS/email through third-party providers that will absolutely fail on me, without duplicating and without spamming the user. The other is <strong>triggering</strong>: 'remind me in three days,' 'run the billing emails on the 1st' — that's a distributed scheduler, and its hard parts are exactly-once firing and what you do when it's been down for an hour. I'd like to do delivery first and then bolt the scheduler on, because the scheduler's output is just a message into the delivery pipeline. Does that split work for you?"</em> You've just structured 45 minutes in twenty seconds, and named both hard cores before drawing anything. Interviewers write that down.</div>
+
+    <p>
+      Nine times out of ten they'll say "do both, focus on delivery." Occasionally they'll say "actually, just the scheduler" —
+      which is a gift, because now you know precisely where to spend the clock. Either way, you asked.
+    </p>
+
+    <p>
+      The two secret cores, so you can budget your time deliberately:
+    </p>
+    <ul>
+      <li><strong>Part A's core is failure of things you don't own.</strong> Not the diagram. Anyone can draw producer → queue →
+        worker → Twilio. The interview is in the retry policy, the dedup key, the DLQ, the circuit breaker, and the honest
+        admission that provider failover can duplicate a message.</li>
+      <li><strong>Part B's core is time.</strong> Two workers must not both fire the same job; ten million jobs must not all fire
+        at exactly 00:00:00; and if you were down at 00:00, you must have a policy for the backlog that isn't "self-DDoS."</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="requirements">2. Requirements</h2>
+
+    <p>
+      Ask with a proposed answer attached, so the interviewer's job is to correct you rather than to teach you. The exchange
+      that gets you to a defensible scope:
+    </p>
+
+    <table>
+      <thead><tr><th>You ask</th><th>They answer</th><th>What it just forced</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><em>"Which channels? I'll assume push (iOS + Android), SMS, email, and in-app — and that they behave very differently."</em></td>
+          <td>All four.</td>
+          <td>Four providers, four failure modes, four cost profiles, four throughput ceilings. This is what justifies <strong>a queue per channel</strong> in §6, not one big queue.</td>
+        </tr>
+        <tr>
+          <td><em>"Delivery guarantee — at-least-once with dedup, or are you asking me for exactly-once?"</em></td>
+          <td>Don't lose notifications. Don't send the same one twice.</td>
+          <td><strong>The pivotal answer.</strong> Those two demands are in tension. You get at-least-once from the transport and you <em>manufacture</em> effective-once with an idempotency key at the edge of the provider call. Say that now; it's the spine of deep dive 1.</td>
+        </tr>
+        <tr>
+          <td><em>"Is a duplicate notification a minor annoyance or a real bug?"</em></td>
+          <td>A real bug.</td>
+          <td>Make them say it. A duplicate push at 2am is <strong>user-visible, it's a trust problem, and it gets you uninstalled.</strong> That reframes dedup from "nice hygiene" to a hard requirement with a budget.</td>
+        </tr>
+        <tr>
+          <td><em>"Ordering? If two notifications go out for the same user, must they arrive in order?"</em></td>
+          <td>Best-effort. Not a hard requirement.</td>
+          <td><strong>A huge free simplification — claim it.</strong> Strict per-user ordering would force a partitioned single-consumer queue per user and kill your retry story (a retried message arrives late by definition). Cut it explicitly.</td>
+        </tr>
+        <tr>
+          <td><em>"Latency target? I'd split it: transactional (OTP, 'your ride is here') needs seconds; marketing can take minutes."</em></td>
+          <td>Yes — two classes.</td>
+          <td>You now have a <strong>priority</strong> dimension. A marketing blast must never delay an OTP. That's a separate high-priority lane, not just a flag on a row.</td>
+        </tr>
+        <tr>
+          <td><em>"Scale? I'll assume ~10 million notifications a day."</em></td>
+          <td>10M/day, with campaign spikes.</td>
+          <td>"With campaign spikes" is the four most important words in the round. See §3 — the peak is 100× the average.</td>
+        </tr>
+        <tr>
+          <td><em>"Do we support templates, localisation, and user opt-out preferences?"</em></td>
+          <td>Yes to all three. Legally required for opt-out.</td>
+          <td>Templates + i18n → a rendering step and a template store. Opt-out → a preference check that is <strong>not optional</strong> and cannot be skipped as an optimisation (CAN-SPAM/TCPA/GDPR — say the words at a fintech loop).</td>
+        </tr>
+        <tr>
+          <td><em>"And scheduled/delayed sends — 'remind me in 3 days,' 'billing run on the 1st'?"</em></td>
+          <td>Yes.</td>
+          <td>That's Part B. Confirm it's in scope before you commit half your clock to it.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>Functional requirements</h3>
+    <ul>
+      <li><strong>Send</strong> a notification on one or more channels: <strong>push</strong> (APNs/FCM), <strong>SMS</strong> (Twilio),
+        <strong>email</strong> (SES/SendGrid), <strong>in-app</strong> (your own store, read by the client).</li>
+      <li><strong>Templates:</strong> callers send <code>templateId</code> + variables, not rendered strings. Product can change
+        copy without a deploy, and you get consistency and localisation for free.</li>
+      <li><strong>Localisation:</strong> one template, N locales; render in the user's language.</li>
+      <li><strong>User preferences &amp; opt-out:</strong> per-user, per-channel, per-category. "Email me about billing, never SMS
+        me about promotions." Plus a global unsubscribe. <strong>This is a legal requirement, not a feature.</strong></li>
+      <li><strong>Scheduled &amp; recurring sends:</strong> "in 3 days," "on the 1st of every month." (Part B.)</li>
+      <li><strong>Delivery status:</strong> a queryable log — <em>"why didn't I get my email?"</em> is a support ticket you must be
+        able to answer, and it turns out to be the same table that powers dedup.</li>
+    </ul>
+
+    <h3>Non-functional requirements</h3>
+    <ul>
+      <li><strong>High throughput with a brutal peak-to-average ratio.</strong> ~120/sec average, ~16,000/sec during a blast. The
+        average is a lie; see §3.</li>
+      <li><strong>At-least-once delivery.</strong> Losing an OTP or a fraud alert is unacceptable. So the transport never drops,
+        which means the transport sometimes <em>duplicates</em>. Accepted, then defended against.</li>
+      <li><strong>No duplicate spam.</strong> Effective-once as far as the user's phone is concerned, achieved with an
+        idempotency/dedup key (<a href="05-coordination-consensus.html">05</a>), not by wishing for exactly-once.</li>
+      <li><strong>Per-user rate limits.</strong> Even if fifty services all decide to notify Alice at once, Alice gets a bounded
+        number of buzzes. A system that can spam a user <em>will</em> spam a user. (Mechanism: <a href="09-rate-limiter.html">09</a>.)</li>
+      <li><strong>Resilience to third-party failure.</strong> Assume every provider is down, slow, or lying at some point today.
+        The system must degrade, not collapse — and a slow provider on one channel must not stall the others.</li>
+      <li><strong>Availability &gt; strict consistency.</strong> A notification arriving 30 seconds late is fine. A notification
+        never arriving, or arriving twice, is not.</li>
+    </ul>
+
+    <h3>Explicitly out of scope</h3>
+    <div class="senior"><em>"I'm cutting the analytics side — open rates, click-through, campaign attribution — and the marketing campaign-authoring UI, and the ML that decides the optimal send time. They're real products and they're big, but they sit on top of this pipeline rather than inside it, and they'd eat the clock. I want to spend my time on delivery reliability against providers I don't control, and on the scheduler, because that's where I think the genuine difficulty is. Push back if you'd rather I go elsewhere."</em> Naming the cut and naming <em>why</em> is the difference between triage and omission. Same diagram, different grade.</div>
+
+    <div class="pitfall">Do not treat "user preferences" as a checkbox you mention and move on from. Two things break candidates here. First, <strong>where</strong> the preference check happens: if you check preferences in the calling service, then fifty services each own a copy of the opt-out logic and one of them will get it wrong and SMS someone who unsubscribed — that's a regulatory incident, not a bug. The check belongs in the <em>notification service</em>, on the way in, as a chokepoint. Second, checking preferences is a read on the hot path of a 16k/sec blast — so it needs to be cached, and you should say so before the interviewer asks.</div>
+
+    <div class="note">Notice how much of this design was decided in the requirements section. "A duplicate is a real bug" bought you deep dive 1. "Ordering is best-effort" bought you the freedom to retry. "Campaign spikes" bought you the queue. "Opt-out is legally required" bought you the chokepoint architecture. This is what people mean when they say the requirements phase is the highest-leverage part of the round — every one of those is a design constraint you got the interviewer to hand you, for free, before you drew a box.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="estimation">3. Estimation</h2>
+
+    <p>
+      Do it out loud, round hard, say that you're rounding. Then — and this is the part that scores — say which number actually
+      drives the design. On most case studies that's the read:write ratio or the storage total. <strong>Here it is neither. It's
+      the gap between the average and the peak</strong>, and it is not close.
+    </p>
+
+    <h3>Traffic</h3>
+
+<pre><code>Seconds in a day:   86,400  →  I'll call it 100,000 and say I'm rounding.
+
+Average:   10M notifications / day
+           = 10,000,000 / 100,000 s
+           ≈ 100/sec                  (honest figure: 10M/86,400 ≈ 116/s)
+
+Diurnal peak (normal traffic, evening in the biggest time zone):
+           ~3-5× average              ≈ 400-600/sec
+
+Marketing blast: 10M users, one campaign, product wants it "sent now."
+           10,000,000 / 600 s (10 min)
+           ≈ 16,000/sec               ← 130× the average. THIS is the number.
+</code></pre>
+
+    <div class="senior">Say this exactly, and say it before you draw anything: <em>"The average here is <strong>meaningless</strong> — 116 a second is a laptop. I'm not designing for the average, I'm designing for the blast. Marketing hits 'send' on a campaign to all ten million users and expects it out in ten minutes; that's <strong>sixteen thousand a second</strong>, a hundred-and-thirty-fold spike, and it arrives with no warning from the perspective of my infrastructure. Two consequences. One: I cannot size synchronous capacity for the peak — that's 130× the hardware idling all day. So the peak has to be <strong>absorbed by a queue and drained at whatever rate my workers and my providers can actually sustain</strong> — that's load-levelling, and it's the single reason a queue is non-negotiable in this design. Two: my throughput ceiling is not my code, it's <strong>the provider's rate limit</strong>, so 'ten minutes' is a product promise I need to check against Twilio's contract before I agree to it."</em> That paragraph is most of the difference between a mid and a senior grade on this question, and it is entirely derived from one division.</div>
+
+    <h3>Fan-out per notification</h3>
+
+    <p>
+      One logical notification is not one send. A user who's opted into push and email gets two provider calls. Assume ~1.5
+      channels per notification on average:
+    </p>
+
+<pre><code>Provider calls:  10M × 1.5   ≈ 15M/day   ≈ 175/sec average
+                             blast peak  ≈ 24,000/sec
+
+Channel mix (typical, and the ratios matter more than the numbers):
+   push    ~70%   cheap (~$0), fast, high provider throughput
+   email   ~25%   cheap, slow-ish, very tolerant of delay
+   SMS      ~5%   EXPENSIVE (~$0.007 each), lowest throughput, hard limits
+   in-app  (free — it's just a row in my own DB)
+</code></pre>
+
+    <div class="note">The channel mix is worth saying out loud because it changes the design. SMS is <strong>5% of volume and most of the cost</strong> — 500k SMS/day at $0.007 is ~$3,500/day, ~$1.3M/year, and a bug that double-sends SMS is a bug that costs real money on a real invoice, which is a far more persuasive argument for idempotency than "it'd be untidy." It's also the channel with the tightest provider throughput limits. That combination — expensive, slow, tightly limited — is exactly why SMS gets its own queue, its own worker pool, and its own rate limiter, and why it must never be able to back up behind (or ahead of) push.</div>
+
+    <h3>Storage</h3>
+
+<pre><code>Delivery log — one row per attempted send (needed for dedup + support):
+   notification_id, user_id, channel, template_id, status,
+   provider_msg_id, attempts, timestamps…
+   ≈ 500 bytes/row (round up)
+
+Per day:    15M rows × 500 B      ≈ 7.5 GB/day
+Per year:   7.5 GB × 365          ≈ 2.7 TB/year
+
+Retention: I don't need 5 years of "we sent a push." Keep 90 days hot
+           for support + dedup  →  ~700 GB  →  comfortably one Postgres
+           with partitioning by day; archive older to S3/cold storage.
+
+Device tokens:  ~50M users × 2 devices × ~200 B  ≈ 20 GB   — trivial.
+User prefs:     ~50M × ~200 B                    ≈ 10 GB   — trivial, and
+                                                   fully cacheable in Redis.
+</code></pre>
+
+    <p>
+      So storage is a non-issue and you should say so in one sentence and move on. <strong>Declining to dwell on a number that
+      doesn't matter is itself a signal.</strong> The interesting thing the storage estimate <em>does</em> tell you is that a
+      90-day retention policy turns an unbounded-growth table into a boring one — which means the delivery log can live in
+      Postgres with daily partitions and a drop-partition job, and you don't need to reach for Cassandra to look clever.
+    </p>
+
+    <h3>Which number drives the design?</h3>
+
+    <table>
+      <thead><tr><th>Number</th><th>Value</th><th>What it forces</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Peak : average ratio</strong></td>
+          <td><strong>~130 : 1</strong></td>
+          <td><strong>The queue.</strong> Load-levelling is the entire reason this is an async architecture (<a href="06-caching-queues-resilience.html">06</a>). It also forces a priority lane, so the blast can't starve an OTP.</td>
+        </tr>
+        <tr>
+          <td>Provider rate limits</td>
+          <td>Provider-set, not yours</td>
+          <td>Your real throughput ceiling. Drain rate is negotiated with Twilio, not chosen by you. Forces per-provider rate limiting on the way <em>out</em>.</td>
+        </tr>
+        <tr>
+          <td>SMS cost</td>
+          <td>~$0.007 each</td>
+          <td>Makes duplicates a line item on a finance report. Hardens the case for idempotency.</td>
+        </tr>
+        <tr>
+          <td>Storage</td>
+          <td>~700 GB hot</td>
+          <td>Nothing. One partitioned Postgres. Say it and move on.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="pitfall">The classic failure here is computing 116/sec, saying "that's easy," and designing a synchronous service that calls Twilio inline from the request handler. It works perfectly at the average and it <em>dies the first time marketing runs a campaign</em> — and the way it dies is the interesting part: your API threads all block on a slow provider, your thread pool exhausts, and the failure spreads back into the services that were merely trying to <em>submit</em> notifications. A slow third party takes down your callers. If you compute a peak number and then don't let it change your design, you've wasted the estimate.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="api">4. API design</h2>
+
+    <p>
+      The send API is <strong>internal</strong> — it is not on the public internet. Its callers are your own services: the order
+      service, the auth service, the social service. That single fact changes the design: you can mandate an idempotency key,
+      you can mandate a template ID rather than free text, and you can be strict about the contract, because the clients are
+      colleagues rather than the public.
+    </p>
+
+<pre><code>POST /v1/notifications                    <span class="com">// internal, service-to-service</span>
+  Idempotency-Key: order-4471-shipped     <span class="com">// ← REQUIRED. See below.</span>
+  body: {
+    "userId":     "u_88213",
+    "templateId": "ORDER_SHIPPED",        <span class="com">// not a rendered string</span>
+    "category":   "TRANSACTIONAL",        <span class="com">// vs PROMOTIONAL — drives prefs + priority</span>
+    "priority":   "HIGH",                 <span class="com">// HIGH | NORMAL | BULK</span>
+    "channels":   ["PUSH", "EMAIL"],      <span class="com">// or omit → use the user's preferences</span>
+    "data": {                             <span class="com">// template variables, not copy</span>
+      "orderId":  "4471",
+      "etaDays":  "2"
+    },
+    "sendAt":     null                    <span class="com">// ← non-null hands this to Part B</span>
+  }
+
+  202 Accepted → { "notificationId": "n_01HX…", "status": "QUEUED" }
+  200 OK       → { "notificationId": "n_01HX…", "status": "QUEUED",
+                   "duplicate": true }   <span class="com">// idempotency key replay — same id back</span>
+  400 → unknown template, missing variables for that template
+  429 → caller is over its quota (a runaway service must not take the pipe)
+</code></pre>
+
+    <p>Four things in that shape are worth saying out loud as you write it, because each one is a decision:</p>
+
+    <ul>
+      <li><strong><code>202 Accepted</code>, not <code>200 OK</code>.</strong> You are promising to <em>try</em>, not promising it
+        arrived. The caller must never block on Twilio, and the status code should tell the truth about that. If a caller needs
+        to know what happened, they poll the delivery log or subscribe to a status event — they don't hold a connection open.</li>
+      <li><strong>The idempotency key is required, and the caller supplies it.</strong> It must be derived from the caller's own
+        domain event (<code>order-4471-shipped</code>), not randomly generated — a random key regenerated on retry is not an
+        idempotency key, it's a UUID with extra steps. This is <a href="05-coordination-consensus.html">05</a>'s idempotency key,
+        applied at the front door, and it's the reason a retrying caller can't double-notify.</li>
+      <li><strong><code>templateId</code> + <code>data</code>, never a rendered message.</strong> If callers send strings, then
+        localisation is impossible, product can't fix a typo without a deploy in someone else's repo, and you have fifty
+        services each with their own idea of your brand voice. Rendering belongs to you.</li>
+      <li><strong><code>category</code> is separate from <code>priority</code>.</strong> Category is what the notification is
+        <em>about</em> (drives the opt-out check — a user can unsubscribe from promotions but not from fraud alerts). Priority is
+        how urgently it moves (drives which lane it lands in). Candidates who conflate them end up unable to express "this is
+        promotional but urgent" or "transactional but batchable."</li>
+    </ul>
+
+    <h3>Preference management (user-facing)</h3>
+
+<pre><code>GET  /v1/users/me/preferences
+  200 → { "channels": {
+            "PUSH":  { "TRANSACTIONAL": true, "PROMOTIONAL": false },
+            "SMS":   { "TRANSACTIONAL": true, "PROMOTIONAL": false },
+            "EMAIL": { "TRANSACTIONAL": true, "PROMOTIONAL": true }
+          },
+          "quietHours": { "start": "22:00", "end": "08:00" },
+          "timezone":   "Asia/Kolkata",
+          "globalOptOut": false }
+
+PUT  /v1/users/me/preferences            <span class="com">// full replace; If-Match for optimistic concurrency</span>
+POST /v1/unsubscribe?token=&lt;signed&gt;      <span class="com">// one-click, NO LOGIN — see note</span>
+
+POST /v1/devices                         <span class="com">// register a push token</span>
+  { "token": "fcm:cQ8…", "platform": "ANDROID", "appVersion": "5.2.1" }
+DELETE /v1/devices/{token}               <span class="com">// on logout — and see the invalid-token feedback loop in §7a</span>
+</code></pre>
+
+    <div class="note">The unsubscribe endpoint takes a <strong>signed token in the URL and requires no login</strong>. That's not sloppiness, it's the law and the product both: an unsubscribe link in an email must work in one click for a user who is not logged in, on a device they've never used, while furious. Sign the token (user + category + HMAC) so it can't be forged or enumerated to unsubscribe someone else. Mentioning this unprompted is a small thing that reads as someone who has actually shipped email.</div>
+
+    <div class="pitfall">Don't design the send endpoint as synchronous-with-a-status-response ("<code>200 OK, delivered: true</code>"). It's a trap that feels helpful and quietly forces the caller to wait on APNs. Once your API's latency is a function of a third party's latency, <strong>your callers inherit that third party's outage</strong>, and you've built a system whose whole purpose — decoupling — you've thrown away at the front door. Accept, persist, return, deliver later. That's the contract.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="data-model">5. Data model</h2>
+
+    <p>
+      Four things to store, and they have genuinely different access patterns — which is the justification you'll be asked for.
+    </p>
+
+<pre><code><span class="com">-- 1. TEMPLATES — tiny, read constantly, written almost never.</span>
+<span class="com">--    Cache aggressively; this is basically config.</span>
+<span class="kw">CREATE TABLE</span> templates (
+  template_id   <span class="typ">TEXT</span>,          <span class="com">-- 'ORDER_SHIPPED'</span>
+  locale        <span class="typ">TEXT</span>,          <span class="com">-- 'en-US', 'hi-IN', 'es-MX'</span>
+  channel       <span class="typ">TEXT</span>,          <span class="com">-- PUSH | SMS | EMAIL | IN_APP</span>
+  subject       <span class="typ">TEXT</span>,          <span class="com">-- email only</span>
+  body          <span class="typ">TEXT</span>,          <span class="com">-- 'Order {{orderId}} ships in {{etaDays}} days'</span>
+  version       <span class="typ">INT</span>,
+  <span class="kw">PRIMARY KEY</span> (template_id, locale, channel)
+);
+<span class="com">-- Access pattern: read by (id, locale, channel) at render time. Exact-key</span>
+<span class="com">-- lookup, tiny dataset (~thousands of rows) → cache the whole thing in</span>
+<span class="com">-- memory in every worker, refresh on a version bump. Zero DB load.</span>
+
+<span class="com">-- 2. USER PREFERENCES — read on EVERY send. The hot path.</span>
+<span class="kw">CREATE TABLE</span> user_preferences (
+  user_id       <span class="typ">BIGINT</span> <span class="kw">PRIMARY KEY</span>,
+  channel_prefs <span class="typ">JSONB</span>,        <span class="com">-- {"PUSH": {"PROMOTIONAL": false}, …}</span>
+  quiet_start   <span class="typ">TIME</span>,
+  quiet_end     <span class="typ">TIME</span>,
+  timezone      <span class="typ">TEXT</span>,         <span class="com">-- 'Asia/Kolkata' — IANA, never a UTC offset</span>
+  global_opt_out <span class="typ">BOOLEAN</span> <span class="kw">DEFAULT</span> <span class="kw">false</span>,
+  updated_at    <span class="typ">TIMESTAMPTZ</span>
+);
+<span class="com">-- Access pattern: point read by user_id, 16k/sec at peak, ~never written.</span>
+<span class="com">-- → Redis, cache-aside, long TTL, invalidate on write. Postgres is the</span>
+<span class="com">--   source of truth (this data is legally significant; don't lose it).</span>
+
+<span class="com">-- 3. DEVICES — a user has N push tokens. Tokens go stale constantly.</span>
+<span class="kw">CREATE TABLE</span> devices (
+  user_id       <span class="typ">BIGINT</span>,
+  token         <span class="typ">TEXT</span>,
+  platform      <span class="typ">TEXT</span>,         <span class="com">-- IOS | ANDROID | WEB</span>
+  last_seen_at  <span class="typ">TIMESTAMPTZ</span>,
+  <span class="kw">PRIMARY KEY</span> (user_id, token)
+);
+<span class="com">-- Access pattern: read all tokens for a user_id → the PK prefix covers it.</span>
+
+<span class="com">-- 4. DELIVERY LOG — the workhorse. One row per (notification, channel).</span>
+<span class="com">--    Powers dedup, support ("why didn't I get my email?"), and metrics.</span>
+<span class="kw">CREATE TABLE</span> deliveries (
+  notification_id  <span class="typ">UUID</span>,
+  idempotency_key  <span class="typ">TEXT</span>,      <span class="com">-- from the caller</span>
+  user_id          <span class="typ">BIGINT</span>,
+  channel          <span class="typ">TEXT</span>,
+  template_id      <span class="typ">TEXT</span>,
+  status           <span class="typ">TEXT</span>,      <span class="com">-- QUEUED|SENT|DELIVERED|FAILED|SUPPRESSED|DEAD</span>
+  attempts         <span class="typ">INT</span> <span class="kw">DEFAULT</span> <span class="num">0</span>,
+  provider         <span class="typ">TEXT</span>,      <span class="com">-- 'twilio' | 'sns' — which one actually took it</span>
+  provider_msg_id  <span class="typ">TEXT</span>,      <span class="com">-- their id, for reconciliation + webhooks</span>
+  last_error       <span class="typ">TEXT</span>,
+  created_at       <span class="typ">TIMESTAMPTZ</span>,
+  updated_at       <span class="typ">TIMESTAMPTZ</span>,
+  <span class="kw">PRIMARY KEY</span> (notification_id, channel)
+) <span class="kw">PARTITION BY RANGE</span> (created_at);   <span class="com">-- daily partitions; DROP after 90d</span>
+
+<span class="com">-- THE dedup constraint. This one line is the anti-duplicate guarantee:</span>
+<span class="kw">CREATE UNIQUE INDEX</span> ON deliveries (idempotency_key, channel);
+</code></pre>
+
+    <p>
+      That last line deserves a sentence out loud, because it's doing more work than anything else on the page:
+      <strong>the database's unique constraint is the dedup mechanism.</strong> Not a Redis <code>SETNX</code>, not
+      application-level checking, not hope. An <code>INSERT … ON CONFLICT DO NOTHING</code> that affects zero rows means
+      "somebody already claimed this send," and it is correct under concurrency, across process restarts, and across two
+      workers racing on the same message — which is exactly the property you need, since your queue is at-least-once and
+      <em>will</em> hand the same message to two workers eventually. Redis can be the fast pre-check; Postgres is the arbiter.
+    </p>
+
+    <h3>SQL or NoSQL?</h3>
+
+    <p>Make the call explicitly and defend it, because you will be asked.</p>
+
+    <table>
+      <thead><tr><th>Data</th><th>Store</th><th>Why — the access pattern, not the fashion</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>Templates</td>
+          <td>Postgres + in-process cache</td>
+          <td>Thousands of rows, read constantly, written by humans. It's config. The DB is barely involved after startup.</td>
+        </tr>
+        <tr>
+          <td>Preferences</td>
+          <td>Postgres (truth) + Redis (hot)</td>
+          <td>Point reads by PK at 16k/sec — trivially cacheable. Postgres because this data is <strong>legally significant</strong>: if you lose someone's opt-out you have a compliance incident, and "eventually consistent unsubscribe" is a sentence you don't want to have to defend to a regulator.</td>
+        </tr>
+        <tr>
+          <td>Devices</td>
+          <td>Postgres</td>
+          <td>Small, keyed by user, needs the delete-on-stale-token loop from §7a. No reason to be exotic.</td>
+        </tr>
+        <tr>
+          <td><strong>Delivery log</strong></td>
+          <td><strong>Postgres, partitioned by day</strong> — Cassandra if 10×</td>
+          <td>The only table with real volume: 15M writes/day. It's <em>append-heavy, keyed, time-ordered, and expires</em> — the exact profile Cassandra was built for (LSM-tree, <a href="03-data-storage.html">03</a>). But at 175 writes/sec average, <strong>Postgres with daily partitions is genuinely fine</strong>, and it gives you the unique constraint that powers dedup for free, which Cassandra would make you fake with lightweight transactions. Say: <em>"I'd start on Postgres and I'd move the delivery log to Cassandra when write volume, not storage, forces it — around 10× where the single-writer becomes the ceiling. I'd rather have the unique index today than the horizontal scale I don't need yet."</em></td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="senior">The reflex to resist: reaching for Cassandra because the table is called a "log" and logs are big. <em>"I want to be careful not to pick a data store on vibes. The delivery log is 175 writes a second and 700 gigabytes at a 90-day retention — that is an ordinary Postgres table with daily partitions and a drop-partition cron. And Postgres <strong>gives me the unique index on the idempotency key</strong>, which is the mechanism I'm relying on for dedup; in Cassandra I'd have to reach for lightweight transactions, which are a Paxos round-trip per write and would cost me exactly the throughput I supposedly switched for. I'd revisit at 10× writes."</em> Naming what the "scalable" choice would <em>cost</em> you is the trade-off skill the rubric is actually measuring.</div>
+
+    <div class="note">The timezone column stores an <strong>IANA zone name</strong> (<code>Asia/Kolkata</code>), never a UTC offset. Offsets change twice a year in DST countries; a stored <code>-05:00</code> is wrong for half the year, and "we sent the quiet-hours-respecting notification at 6am" is precisely the bug that generates it. This matters for quiet hours (§7b) and for the scheduler (Part B), and it's a one-line detail that signals you've been burned before.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="hld">6. High-level design</h2>
+
+<pre><code>  Order svc ──┐
+  Auth svc  ──┤ POST /v1/notifications          ┌─ Redis: prefs cache
+  Social svc──┤ (+ Idempotency-Key)             │  Redis: per-user rate limit
+  SCHEDULER ──┘        │                        │  Postgres: templates, prefs
+   (Part B)            ▼                        │
+              ┌──────────────────────┐          │
+              │ NOTIFICATION SERVICE │◀─────────┘
+              │  1. dedup (idem key) │   the CHOKEPOINT — every rule
+              │  2. preferences/optout│  lives here, once, not in 50 callers
+              │  3. per-user rate lim│
+              │  4. render template  │
+              │  5. persist + enqueue│
+              └──────────┬───────────┘
+                         │  one message per (notification, channel)
+        ┌────────────────┼────────────────┬─────────────────┐
+        ▼                ▼                ▼                 ▼
+   ┌─────────┐     ┌─────────┐      ┌─────────┐      ┌─────────┐
+   │ PUSH q  │     │  SMS q  │      │ EMAIL q │      │IN-APP q │   ← BULKHEADS
+   │ (fast,  │     │(slow,   │      │(slow,   │      │(trivial)│
+   │  huge)  │     │ pricey) │      │ bulky)  │      │         │
+   └────┬────┘     └────┬────┘      └────┬────┘      └────┬────┘
+        ▼               ▼                ▼                ▼
+   push workers    sms workers     email workers     in-app writer
+        │               │                │                │
+   [circuit breaker + retry w/ jitter + per-provider rate limit]
+        │               │                │                │
+        ▼               ▼                ▼                ▼
+    APNs / FCM       Twilio           SES / SendGrid   your own DB
+        │               │                │            (client polls/WS — 11)
+        └───────────────┴────────────────┘
+                        │ delivery receipts (webhooks)
+                        ▼
+                 ┌─────────────┐        ┌──────────┐
+                 │ DELIVERY LOG│        │   DLQ    │ ← alarm on depth!
+                 │  (Postgres) │        │(per chan)│   a DLQ nobody watches
+                 └─────────────┘        └──────────┘   is just a trash can
+</code></pre>
+
+    <h3>The write path, end to end</h3>
+
+    <ol>
+      <li><strong>A producer service calls <code>POST /v1/notifications</code></strong> with an idempotency key derived from its
+        own domain event. It gets a <code>202</code> in single-digit milliseconds and goes back to what it was doing. It has no
+        idea whether Twilio is up, and that is the entire point.</li>
+      <li><strong>Dedup.</strong> The notification service tries to claim the idempotency key. Redis <code>SETNX</code> as a fast
+        path; the unique index on <code>deliveries</code> as the authority. If it's already claimed, return the original
+        <code>notificationId</code> with <code>duplicate: true</code> and <strong>do nothing else</strong>. A retrying caller — and
+        callers <em>will</em> retry, because you told them to — cannot double-notify.</li>
+      <li><strong>Preferences and opt-out.</strong> Read from Redis (cache-aside, Postgres behind it). If the user has opted out
+        of this category on this channel, drop the channel and log it as <code>SUPPRESSED</code> — <strong>log it, don't silently
+        vanish it</strong>, or you'll never be able to answer "why didn't I get my email?" and you'll never be able to prove
+        compliance either. Suppression is an outcome, not an absence.</li>
+      <li><strong>Per-user rate limit.</strong> A token bucket in Redis, keyed by user (<a href="09-rate-limiter.html">09</a>). If
+        Alice has already had eight pushes this hour, this one gets deferred or dropped by policy. This is the guard against
+        fifty services independently deciding to buzz Alice at the same instant, and it is <em>not</em> optional (§7b).</li>
+      <li><strong>Render.</strong> Pull the template for <code>(templateId, userLocale, channel)</code> from the in-process cache,
+        interpolate the variables. Rendering is CPU-only — no I/O — so it's cheap and it never fails on a network.</li>
+      <li><strong>Persist, then enqueue.</strong> Write the <code>deliveries</code> rows (status <code>QUEUED</code>) and publish
+        one message per channel. <strong>These two must not diverge</strong> — if you enqueue and then crash before persisting,
+        you can't dedup a redelivery; if you persist and crash before enqueueing, the notification is silently lost forever. This
+        is precisely the dual-write problem, and the fix is the <strong>outbox pattern</strong> from
+        <a href="05-coordination-consensus.html">05</a>: write the row and the outbox record in one local transaction, and have a
+        relay publish from the outbox. <em>Say the words "this is a dual-write, so I'd use the outbox" — it's a three-second
+        sentence that tells the interviewer you've internalised 05.</em></li>
+      <li><strong>Channel workers consume.</strong> Each pool pulls from its own queue at its own rate, wrapped in a circuit
+        breaker and a per-provider rate limiter, and calls the third party. On success: <code>SENT</code>. On failure: retry with
+        exponential backoff and jitter, and after N attempts, to the DLQ. All of §7a.</li>
+      <li><strong>Delivery receipts come back asynchronously.</strong> Providers webhook you later: "delivered," "bounced," "token
+        invalid." That closes the loop from <code>SENT</code> (I handed it over) to <code>DELIVERED</code> (it actually landed) —
+        and those are genuinely different states that candidates routinely conflate.</li>
+    </ol>
+
+    <h3>Why one queue per channel — this is the bulkhead pattern</h3>
+
+    <p>
+      The single most defensible structural decision on this page, and one that a lot of candidates get wrong by drawing one big
+      "notification queue." Here's the failure it prevents, concretely:
+    </p>
+
+    <p>
+      Twilio starts timing out at 30 seconds per request instead of returning in 200ms. With <strong>one shared queue and one
+      shared worker pool</strong>, every worker that happens to pick up an SMS message is now blocked for 30 seconds. Within a
+      minute or two your entire pool is sitting in a socket read on Twilio. The push messages behind them in the queue — 70% of
+      your volume, on a provider that is perfectly healthy — are not being processed. <strong>A Twilio outage has become a push
+      outage.</strong> A failure in your least important, lowest-volume channel has taken down your most important one, and
+      nothing in your architecture stopped it, because you gave them a shared resource to exhaust.
+    </p>
+
+    <div class="senior">Say it in the language of the pattern: <em>"I'm giving each channel its own queue and its own worker pool, and that's a deliberate <strong>bulkhead</strong> — from 06. The channels have wildly different throughput, cost, and failure profiles: push is high-volume and fast, SMS is low-volume, expensive, and rate-limited, email is slow and tolerant. If they share a worker pool, then a slow SMS provider consumes every worker thread and my push notifications stop flowing — <strong>a failure in the channel I care least about takes out the channel I care most about.</strong> Separate queues means the SMS backlog grows, alarms fire, and push doesn't notice. I'm containing the blast radius, and I'm also buying the ability to scale and tune each channel independently, which I need anyway because their rate limits are different numbers."</em> "Blast radius" and "bulkhead" in one breath, with a concrete failure to justify them — that's the sentence.</div>
+
+    <div class="note">There is a second axis of separation, and it's worth one sentence: <strong>priority lanes within a channel</strong>. A ten-million-message marketing blast in the push queue will sit in front of the OTP that a user is staring at their phone waiting for. Fix: a separate high-priority queue per channel (or a priority topic), with workers that always drain HIGH before BULK. Otherwise your "send it now" transactional promise is at the mercy of whatever marketing did five minutes ago. This costs you one extra queue and it's the difference between a design that works on the whiteboard and one that works in production.</div>
+
+    <div class="pitfall">Don't put the preference/opt-out check in the worker, "for efficiency." It seems reasonable — check it just before you send, with the freshest data. But a marketing blast enqueues 10M messages, of which perhaps 4M are for users who opted out, and you've just paid queue storage, worker CPU, and a Redis read for 4M messages you were always going to throw away. Check on the way <strong>in</strong>, at the chokepoint, where the drop is free. (The exception, and it's a real one worth naming: for a job scheduled three days out, the preferences may have changed since it was enqueued — so a delayed send needs a <em>re-check</em> at delivery time. Say both halves and you look like you've thought about it, because you have.)</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="deep-dive-1">7a. Deep dive: reliability against a flaky third party</h2>
+
+    <p>
+      <strong>This is where the interview really happens.</strong> Everything up to here is plumbing that a competent mid-level
+      engineer draws correctly. The question that separates candidates is the one the interviewer is about to ask, and it is
+      always some version of: <em>"Twilio just returned a 500. What happens?"</em> Or the nastier one: <em>"Twilio just
+      <strong>timed out</strong>. What happens?"</em> Those are not the same question, and knowing why is most of the grade.
+    </p>
+
+    <h3>The delivery ladder, and the one guarantee you actually get</h3>
+
+    <p>
+      Start by being honest about what's achievable, because the interviewer is fishing for exactly this and a candidate who
+      claims exactly-once has failed the question in one sentence:
+    </p>
+
+    <table>
+      <thead><tr><th>Guarantee</th><th>Mechanism</th><th>Failure mode</th><th>Verdict here</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>At-most-once</strong></td>
+          <td>Fire and forget. Send, don't retry.</td>
+          <td>Loses messages whenever anything hiccups.</td>
+          <td><strong>No.</strong> A lost OTP or fraud alert is unacceptable. Rejected explicitly.</td>
+        </tr>
+        <tr>
+          <td><strong>At-least-once</strong></td>
+          <td>Persist, send, ack only on confirmed success; retry on anything else.</td>
+          <td>Duplicates. Guaranteed, not hypothetical.</td>
+          <td><strong>Yes — this is what the transport gives you</strong>, and you take it.</td>
+        </tr>
+        <tr>
+          <td><strong>Exactly-once</strong></td>
+          <td>Doesn't exist across a network boundary you don't control.</td>
+          <td>—</td>
+          <td><strong>A myth</strong> (<a href="05-coordination-consensus.html">05</a>). Do not claim it.</td>
+        </tr>
+        <tr>
+          <td><strong>"Effectively once"</strong></td>
+          <td>At-least-once transport + <strong>idempotent delivery</strong> via a dedup key.</td>
+          <td>Duplicates still happen <em>in transit</em>; they're absorbed before the user sees them.</td>
+          <td><strong>The real answer.</strong> This is the sentence to say.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="senior">The line that lands: <em>"I can't have exactly-once — there's a network between me and Twilio and I don't control what's on the other side of it, so there is always a window where I don't know whether my request took effect. What I can have is <strong>at-least-once delivery plus idempotent send</strong>, which gives me 'effectively once' from the user's point of view. Concretely: the queue is allowed to hand me the same message twice, and my job is to make the second attempt a no-op. I do that with a dedup key that I <strong>also pass to the provider</strong> where they support one, so that even a duplicate HTTP request to Twilio collapses on their side. I'm moving the guarantee from the transport, where it's impossible, to the endpoint, where it's achievable."</em></div>
+
+    <h3>The two-layer dedup, and why you need both</h3>
+
+<pre><code><span class="com">// Layer 1 — MY side. Absorbs duplicate MESSAGES from the queue.</span>
+<span class="com">// The queue is at-least-once: after a worker crash mid-send, or a</span>
+<span class="com">// visibility timeout that expires while I'm still working, the SAME</span>
+<span class="com">// message comes back. This is not rare. Design for it.</span>
+
+<span class="ann">@Transactional</span>
+<span class="kw">public void</span> handle(NotificationMessage msg) {
+  <span class="com">// Atomically CLAIM this send. Zero rows updated = someone else has it,</span>
+  <span class="com">// or it's already done. Either way: do nothing, ack, move on.</span>
+  <span class="kw">int</span> claimed = jdbc.update("""
+      <span class="str">UPDATE deliveries
+         SET status = 'SENDING', attempts = attempts + 1, updated_at = now()
+       WHERE notification_id = ? AND channel = ?
+         AND status IN ('QUEUED', 'RETRYING')</span>""",   <span class="com">// ← the guard</span>
+      msg.notificationId(), msg.channel());
+
+  <span class="kw">if</span> (claimed == <span class="num">0</span>) { metrics.inc(<span class="str">"dedup.suppressed"</span>); <span class="kw">return</span>; }
+
+  <span class="com">// Layer 2 — THEIR side. Absorbs duplicate REQUESTS to the provider.</span>
+  <span class="com">// Every serious provider takes an idempotency key. USE IT. This is</span>
+  <span class="com">// what saves you when you retry after a TIMEOUT and the first request</span>
+  <span class="com">// actually succeeded.</span>
+  ProviderResult r = twilio.send(msg.payload(),
+      <span class="str">"Idempotency-Key: "</span> + msg.notificationId() + <span class="str">":"</span> + msg.channel());
+
+  markSent(msg, r.providerMessageId());
+}
+</code></pre>
+
+    <p>
+      Layer 1 alone is not enough, and this is the subtlety worth voicing. Layer 1 protects you when the <em>queue</em>
+      redelivers a message you hadn't started yet. It does <strong>not</strong> protect you when you sent the HTTP request, the
+      request succeeded on Twilio's side, and then the connection died before the response reached you. Your row still says
+      <code>SENDING</code>, you have no <code>provider_msg_id</code>, and you genuinely cannot tell whether the SMS went out. If
+      you retry, you may double-send. If you don't retry, you may have lost it. <strong>Layer 2 is the only thing that resolves
+      that</strong> — because Twilio, seeing the same idempotency key, returns the original result instead of sending a second
+      message.
+    </p>
+
+    <div class="pitfall">The single most common wrong answer here: <em>"I'd check the delivery log before sending, and if it says SENT I skip it."</em> That is a check-then-act race with no atomicity — two workers both read <code>QUEUED</code>, both decide to send, both send. Dedup must be a <strong>single atomic operation that both checks and claims</strong>: a conditional <code>UPDATE … WHERE status = 'QUEUED'</code> whose row count you inspect, an <code>INSERT … ON CONFLICT DO NOTHING</code>, or a Redis <code>SETNX</code>. If your answer contains the words "check if" followed later by "then send," the interviewer will find the race and you will have to find it with them.</div>
+
+    <h3>Retries: exponential backoff, jitter, and knowing what <em>not</em> to retry</h3>
+
+    <p>
+      Retrying is easy. Retrying <em>correctly</em> is the part that gets probed, and it has three parts.
+    </p>
+
+    <p><strong>First: only retry what's retryable.</strong> Blindly retrying everything is a bug that looks like resilience.</p>
+
+    <table>
+      <thead><tr><th>Provider response</th><th>Retry?</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>5xx</code>, connection reset, <strong>timeout</strong></td>
+          <td><strong>Yes</strong></td>
+          <td>Transient. It might work in ten seconds. (And a timeout is the ambiguous case — retry it, but only because layer-2 idempotency makes that safe.)</td>
+        </tr>
+        <tr>
+          <td><code>429 Too Many Requests</code></td>
+          <td><strong>Yes</strong> — but obey <code>Retry-After</code></td>
+          <td>You're the problem. Back off harder than usual and <em>slow the whole worker pool</em>, not just this message — this is backpressure (<a href="06-caching-queues-resilience.html">06</a>) arriving from downstream.</td>
+        </tr>
+        <tr>
+          <td><code>400</code> malformed payload</td>
+          <td><strong>No</strong> — DLQ immediately</td>
+          <td>It will fail identically forever. Retrying it 5 times is 5 wasted calls and a delayed alarm. <strong>Fail fast on permanent errors.</strong></td>
+        </tr>
+        <tr>
+          <td><code>401 / 403</code> bad credentials</td>
+          <td><strong>No</strong> — DLQ + <strong>page someone</strong></td>
+          <td>Your API key expired. No amount of retrying fixes that, and every channel is now failing. This is an incident, not a message problem.</td>
+        </tr>
+        <tr>
+          <td>Invalid device token / hard bounce</td>
+          <td><strong>No</strong> — and <em>delete the token</em></td>
+          <td>The app was uninstalled or the address is dead. This is a <strong>feedback loop</strong>, not a failure: consume it and clean your own data. See below.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p><strong>Second: exponential backoff with jitter.</strong> The backoff is obvious; the jitter is the part people omit and the part interviewers ask about.</p>
+
+<pre><code>attempt 1 → wait   1s      Without jitter, every message that failed
+attempt 2 → wait   4s      during the SAME provider blip retries at the
+attempt 3 → wait  16s      SAME instant. You've built a synchronised
+attempt 4 → wait  64s      herd that hammers a recovering provider with
+attempt 5 → wait 256s      a perfectly-aligned spike — and knocks it
+attempt 6 → DLQ            over again. This is the thundering herd (06).
+
+With jitter:  wait = random(0, min(cap, base * 2^attempt))
+              ("full jitter" — spread the herd across the window)
+</code></pre>
+
+    <div class="senior">Say the causal chain, not the formula: <em>"Backoff with <strong>jitter</strong>, and the jitter is the important half. If ten thousand messages all fail during the same thirty-second Twilio blip, then without jitter all ten thousand retry at exactly t+1s, then all ten thousand at t+5s — I've built a synchronised herd that re-DDoSes a provider at the precise moment it's trying to come back up, and I turn a thirty-second blip into a ten-minute outage <strong>that I caused</strong>. Full jitter spreads those retries uniformly across the backoff window and the recovering provider sees a ramp instead of a wall."</em></div>
+
+    <p>
+      <strong>Third: don't retry in-process.</strong> A worker that sleeps 256 seconds inside a message handler is a worker you're
+      paying for and can't use, and if it's holding a queue message with a visibility timeout, the message will be redelivered
+      to <em>another</em> worker while this one sleeps — so you get a duplicate <em>and</em> a wasted thread. Instead, re-enqueue
+      with a delay (SQS <code>DelaySeconds</code>, a Kafka retry topic per delay tier, or a row in the scheduler from Part B).
+      <em>"Retries are just delayed jobs, so they go through the same scheduling machinery as everything else"</em> is a
+      genuinely nice unifying observation, and it's the sentence that ties the two halves of this page together.
+    </p>
+
+    <h3>Dead-letter queues — and the operational point that matters more than the mechanism</h3>
+
+    <p>
+      After N attempts (5 is a reasonable default; SMS maybe 3 because each attempt costs money, email maybe 8 because it's free
+      and nobody's in a hurry), the message goes to a <strong>dead-letter queue</strong> for its channel. Status becomes
+      <code>DEAD</code> in the delivery log. The message is preserved with its full history — payload, attempts, every error.
+    </p>
+
+    <div class="senior">This is the sentence that separates someone who has read about DLQs from someone who has been on call for one: <em>"A DLQ that nobody monitors is just a <strong>trash can with extra steps.</strong> The DLQ is not the solution — it's a bucket where I put the problems so they stop hurting the live pipeline. The actual requirements are: <strong>DLQ depth is a paged alarm</strong>, not a dashboard nobody opens; there's a documented triage path and a <strong>replay tool</strong> so that once we fix the bug we can re-drive the messages back through the pipeline (and the replay is safe <em>precisely because</em> everything is keyed by idempotency key — I can re-drive without double-sending, which is a real payoff for the dedup work); and messages carry enough context to debug from. I've seen DLQs with four hundred thousand messages in them that nobody had looked at in a year. That's not a dead-letter queue, that's a data loss incident with a nicer name."</em></div>
+
+    <p>
+      A concrete alarm to name, because specificity beats hand-waving: <strong>page if DLQ depth increases by more than X in 5
+      minutes</strong> (a sudden spike = a systemic failure — a bad deploy, an expired key, a provider outage), and separately
+      <strong>alert if DLQ depth &gt; 0 for more than an hour</strong> (a slow leak nobody's triaging). Two different failures, two
+      different alarms.
+    </p>
+
+    <h3>Circuit breakers: when the provider is down, stop hammering it</h3>
+
+    <p>
+      Retries assume the failure is transient and isolated. When Twilio is <em>entirely</em> down, retries become the problem:
+      every message burns 5 attempts and 5 timeouts, each timeout ties up a worker for 30 seconds, your worker pool saturates on
+      calls that are certain to fail, and your queue backs up behind work that cannot possibly succeed. You are spending 100% of
+      your capacity discovering, over and over, a fact you already know.
+    </p>
+
+<pre><code>       CLOSED  ───(failure rate &gt; 50% over last 20 calls)───▶  OPEN
+    (normal:                                              (fail fast:
+     let calls                                             don't even try.
+     through)                                              Costs 0 threads,
+        ▲                                                  0 seconds.)
+        │                                                      │
+        │                                             after cooldown (30s)
+        │                                                      ▼
+        └───(trial call succeeds)─────────────────────  HALF-OPEN
+                                                      (let ONE call through
+                                                       and see what happens;
+                                                       fail → back to OPEN)
+</code></pre>
+
+    <p>
+      Wrap <strong>each provider</strong> in its own breaker (<a href="06-caching-queues-resilience.html">06</a>) — not one breaker
+      for "sending," a breaker per provider, because that's the unit that fails. When the SMS breaker opens, the interesting
+      question is what you do with the messages, and you have three defensible answers:
+    </p>
+
+    <ul>
+      <li><strong>Leave them in the queue.</strong> Stop consuming, let the backlog build, drain when the breaker closes. Correct
+        for anything delay-tolerant, which is most things. The queue is a shock absorber — <em>let it absorb</em>. Your only
+        obligations are to alarm on queue depth and to make sure the queue's retention (SQS: max 14 days) exceeds any plausible
+        outage.</li>
+      <li><strong>Fail over to a secondary provider.</strong> Correct for anything where the delay is unacceptable — an OTP is
+        worthless in ten minutes. But this is <em>much</em> harder than it looks, and the next subsection is entirely about why.</li>
+      <li><strong>Degrade to another channel.</strong> Genuinely underrated and very strong to volunteer: SMS is down and the
+        message is an OTP, so <strong>send it as a push instead</strong>. You didn't need Twilio; you needed to reach the user.
+        Product-level failover rather than infrastructure-level. Interviewers light up at this one because it shows you're
+        reasoning about the <em>goal</em>, not the box you drew.</li>
+    </ul>
+
+    <h3>Provider failover, and why it's harder than it looks</h3>
+
+    <p>
+      "Just fail over to a backup SMS provider" is the answer everyone gives. Here's the question that breaks it, and if you get
+      there before the interviewer does, you've won the deep dive:
+    </p>
+
+    <div class="pitfall"><strong>You sent the request to Twilio. It timed out.</strong> Now: did the SMS go out or not? <strong>You cannot know.</strong> A timeout tells you nothing about whether the other side acted — it only tells you that you stopped waiting. Maybe the request never arrived. Maybe it arrived, Twilio sent the SMS, charged you, and the response packet was lost on the way back. If you fail over to Vonage and resend, you may have just sent the user two identical OTPs and paid twice. If you <em>don't</em> resend, you may have sent them nothing and they're locked out of their account. <strong>This is the at-least-once tax, and here it is made completely concrete: failover risks a duplicate, and there is no clever protocol that removes the risk — only mechanisms that mitigate it.</strong></div>
+
+    <p>What you actually do about it — three mitigations, all partial, and saying so is the point:</p>
+
+    <ol>
+      <li><strong>Cross-provider idempotency doesn't exist.</strong> Twilio's idempotency key means nothing to Vonage. So the
+        dedup that saves you <em>within</em> a provider gives you exactly zero protection <em>across</em> providers. Say this out
+        loud — recognising that your favourite tool doesn't apply here is a stronger signal than pretending it does.</li>
+      <li><strong>So decide by category, and make it a product decision, not an engineering one.</strong> For an OTP, a duplicate
+        SMS is mildly annoying and a <em>missing</em> one is a lockout — so fail over, accept the duplicate risk, and be able to
+        defend that choice. For a promotional message, a duplicate is worse than a delay — so <strong>don't fail over</strong>,
+        leave it in the queue. The right answer is different per message class, and the fact that it's different is the insight.</li>
+      <li><strong>Reconcile after the fact.</strong> Query Twilio's status API for your <code>provider_msg_id</code> once it's back
+        (this is why you store it) and repair the delivery log. That doesn't un-send a duplicate SMS, but it makes your records
+        true, which matters for billing, for support, and for the next outage. This is the same reconciliation loop you'll build
+        in <a href="13-payments-orders.html">tutorial 13</a> for payments, for exactly the same reason: <strong>when you can't
+        prevent ambiguity, you detect and repair it afterwards.</strong></li>
+    </ol>
+
+    <div class="senior">The whole deep dive, compressed into the answer you'd actually give: <em>"My failure policy is per-error-class, not one-size-fits-all. Transient errors get exponential backoff with full jitter, re-enqueued with a delay rather than slept in-process, capped at five attempts. Permanent errors — a 400, a bad token — skip retries entirely and go straight to the DLQ, because retrying a permanent failure is just five slower failures. If a provider's error rate crosses a threshold I <strong>open a circuit breaker</strong> and stop calling it at all, which frees my workers instead of burning them on calls I know will fail. Then the real question is what happens to those messages, and my answer depends on the message: delay-tolerant things stay in the queue and drain when the breaker closes; time-critical things fail over — <strong>knowing that failover risks a duplicate, because a timeout doesn't tell me whether the first send succeeded, and no idempotency key crosses a provider boundary.</strong> For an OTP I'll take a duplicate over a lockout. For a marketing message I won't. And I reconcile against the provider's status API afterwards so my delivery log ends up true even when my sending was ambiguous."</em></div>
+
+    <h3>The feedback loop nobody mentions: cleaning your own data</h3>
+
+    <p>
+      One more thing, and volunteering it is free marks because it shows you've thought about the system's second week rather
+      than its first day. Providers tell you when your data is <em>wrong</em>, and most designs throw that information away.
+      APNs/FCM return "invalid token" when the app was uninstalled. SES sends a hard-bounce webhook when the address doesn't
+      exist. If you ignore those, you spend forever sending pushes into the void, your delivery-rate metric slowly rots, your
+      email sender reputation degrades until SES starts throttling you, and eventually your legitimate email lands in spam
+      because you look like a spammer — <em>because you are behaving like one</em>. So: <strong>consume the bounce and invalidate
+      webhooks, delete the dead token, mark the address undeliverable, suppress it permanently.</strong> The provider's failure
+      response is not just an error; it's a data-quality signal, and it's the cheapest one you'll ever get.
+    </p>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="deep-dive-2">7b. Deep dive: not spamming the user</h2>
+
+    <p>
+      This is the section that separates a real design from a whiteboard one, and it's the one candidates skip. Everything in
+      §7a was about <em>correctness</em> — did the message arrive, exactly once. This section is about something the system can do
+      perfectly correctly and still be a disaster: <strong>five people like your photo and your phone buzzes five times.</strong>
+      Every message was delivered exactly once. Every retry behaved. The delivery log is pristine. And the user turned off
+      notifications, or deleted the app.
+    </p>
+
+    <p>
+      Interviewers love this dimension because it's where engineering judgment meets product sense, and because a system whose
+      only goal is "deliver the message" will reliably produce a product nobody wants. Bring it up <strong>unprompted</strong> —
+      that's the whole trick. If they have to ask "what if the user gets too many of these?", you've lost the free marks.
+    </p>
+
+    <h3>1. Aggregation: collapse N events into one notification</h3>
+
+    <p>
+      The canonical case. A photo gets five likes in a minute. The naive pipeline sends five pushes. What you want is one push
+      that says "Sarah and 4 others liked your photo."
+    </p>
+
+<pre><code>Events arriving:  like(photo=9, by=Sarah)   t=0s
+                  like(photo=9, by=Raj)     t=8s
+                  like(photo=9, by=Ana)     t=22s
+                  like(photo=9, by=Tom)     t=31s
+                  like(photo=9, by=Li)      t=44s
+
+Naive:            5 pushes.  😠  (correct! and terrible)
+
+Aggregated (batching window, keyed by (user, photo, event_type)):
+   t=0     first event arrives → CREATE an aggregation bucket in Redis,
+                                 start a 60s timer (a delayed job! → Part B)
+   t=8..44 subsequent events → APPEND to the bucket. Send nothing.
+   t=60    timer fires → read bucket, render ONE notification:
+           "Sarah and 4 others liked your photo"  →  send  →  clear bucket
+
+Result:           1 push.  🙂
+</code></pre>
+
+    <p>
+      The trade-off to name, because it is the entire design decision here: <strong>the batching window trades latency for
+      quietness.</strong> A 60-second window means the first liker's notification is up to 60 seconds late. For social events
+      that is completely fine and nobody notices. For an OTP it is unthinkable. So <strong>aggregation is per-category, and
+      transactional categories are never aggregated.</strong> Say that explicitly — it's the sentence that proves you're applying
+      the pattern rather than reciting it.
+    </p>
+
+    <div class="note">Two window strategies, and the difference is worth knowing: a <strong>fixed window</strong> (60s from the first event, send regardless) bounds the delay but may split a burst awkwardly across two notifications. A <strong>sliding/debounce window</strong> (send 60s after the <em>last</em> event) groups the burst perfectly but can be delayed indefinitely by a steady trickle — a photo that gets a like every 55 seconds never notifies anyone. The production answer is a debounce <strong>with a hard cap</strong>: "send 60s after the last event, but never more than 5 minutes after the first." If the word <em>debounce</em> feels familiar, it should — this is exactly the debounce-vs-throttle problem you already solve on search inputs in React (21), with the same failure mode and the same fix. Saying that out loud is a nice bridge from your actual experience.</div>
+
+    <h3>2. Per-user rate limits: the ceiling that saves you</h3>
+
+    <p>
+      Aggregation handles <em>similar</em> events. It does nothing about the case where fifty <em>different</em> services each
+      decide, correctly and independently, to notify Alice within the same minute. Nobody is at fault and Alice's phone is
+      vibrating like a pager.
+    </p>
+
+    <p>
+      So you need a hard ceiling that lives at the chokepoint, applied to every notification regardless of who sent it: a
+      <strong>token bucket per (user, channel)</strong> in Redis (<a href="09-rate-limiter.html">09</a> — you already know the
+      mechanism, so name it and move on rather than re-deriving it). Say, 10 pushes/hour, 30/day, 3 SMS/day. When the bucket is
+      empty, you have a policy choice, and having a policy is the point:
+    </p>
+
+    <table>
+      <thead><tr><th>Over the limit → what?</th><th>Good for</th><th>Cost</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Drop</strong> (log as <code>SUPPRESSED</code>)</td>
+          <td>Promotional. Nobody needs the 11th promo of the hour.</td>
+          <td>A message the user never sees. Fine — but <strong>log it</strong>, so support and compliance can see it happened.</td>
+        </tr>
+        <tr>
+          <td><strong>Defer</strong> into the next window</td>
+          <td>Anything worth sending late.</td>
+          <td>Delay, plus a backlog that can itself become a burst. Cap it.</td>
+        </tr>
+        <tr>
+          <td><strong>Digest</strong> — roll everything suppressed into one summary</td>
+          <td>The best answer for social/content. "Here's what you missed."</td>
+          <td>Extra machinery. Also the most user-loved outcome.</td>
+        </tr>
+        <tr>
+          <td><strong>Bypass the limit</strong></td>
+          <td><strong>Critical transactional only</strong> — OTP, fraud alert, 2FA.</td>
+          <td>None, and it's mandatory. A rate limiter that can block a fraud alert is a liability. <strong>The limit applies to categories, not to everything.</strong></td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>3. Quiet hours and time zones</h3>
+
+    <p>
+      A 3am push is worse than no push. Every user has quiet hours (default 22:00–08:00, user-configurable), and here is where
+      almost everyone gets it wrong: <strong>quiet hours are in the user's local time, not yours, and not UTC.</strong> A blast
+      scheduled for "9am" must go out at 9am in Tokyo and then, eight and a half hours later, at 9am in Mumbai. That's not one
+      send job; that's <strong>a send job per time zone</strong>, and it converts a single scheduled task into ~24 staggered ones —
+      which, incidentally, also solves half your thundering-herd problem for free by spreading the blast across the day.
+    </p>
+
+    <div class="pitfall">Store the user's IANA time-zone name (<code>Asia/Kolkata</code>), never a fixed UTC offset. Offsets change with DST — a stored <code>-05:00</code> is simply wrong for half of every year, and the resulting bug is "we woke up every user in New York an hour early, once, in March." Also: if you defer a message because it's currently quiet hours, <strong>you now have a delayed job</strong> — "deliver this at 08:00 local." That's Part B again. Notice how many of Part A's product requirements quietly turn into scheduling problems: this is exactly why the two systems belong on one page.</div>
+
+    <h3>4. The kill switch</h3>
+
+    <p>
+      Volunteer this one; it's short and it reads as operational maturity. <strong>You need a global kill switch</strong>, and a
+      per-category and per-campaign one, that stops sends immediately without a deploy.
+    </p>
+
+    <p>
+      The reason is concrete and it has happened at every company that has ever sent notifications: someone ships a bug in a
+      template, or a badly-written loop, and the system starts sending. Your pipeline is <em>excellent</em> — it's got backoff and
+      circuit breakers and it scales to 16k/sec — so it does its job with tremendous efficiency and spams ten million people
+      before anyone can get a fix reviewed, merged, and deployed. <strong>A high-throughput notification system with no brake is a
+      loaded weapon.</strong> The kill switch is a flag in Redis that every worker checks before sending — cheap, boring, and the
+      thing you'll be grateful for at 2am.
+    </p>
+
+    <div class="senior">The whole section in one breath: <em>"Delivering correctly isn't the same as behaving well, and a notification system that only optimises for delivery produces a product users mute. So at the chokepoint I'd add four things beyond delivery. <strong>Aggregation</strong> — collapse five 'likes' into one push via a short batching window, keyed by (user, object, event type), with the window trading latency for quietness, which is why I only do it for non-transactional categories. <strong>Per-user rate limits</strong> — a token bucket per user and channel, so that fifty services each behaving reasonably can't collectively spam one person; critical transactional messages bypass it. <strong>Quiet hours in the user's local time zone</strong>, which quietly turns a global blast into one job per time zone. And a <strong>kill switch</strong>, because the first time a bad template gets deployed, my very reliable, very fast pipeline will spam ten million people extremely efficiently, and I want a brake that doesn't require a deploy. Those four are what make it a notification <em>product</em> rather than a message pump."</em></div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="part-b">PART B — the distributed scheduler</h2>
+
+    <p>
+      Part A answers "how do I reliably send this." Part B answers <strong>"how do I reliably send this <em>later</em>."</strong>
+      They share all the machinery downstream — the scheduler's only job is to drop a message into the notification service's
+      front door at the right moment — but the hard parts are completely different, and they're time-shaped rather than
+      network-shaped.
+    </p>
+
+    <p>The requirements, stated plainly:</p>
+    <ul>
+      <li><strong>Delayed, one-shot jobs.</strong> "Send this reminder in 3 days." "Retry this failed SMS in 5 minutes." "The
+        aggregation window closes in 60 seconds." "Quiet hours end at 08:00 local — send it then."</li>
+      <li><strong>Recurring jobs.</strong> "Run billing emails on the 1st of every month." "Send the weekly digest every Monday at
+        09:00 in the user's time zone."</li>
+      <li><strong>Durable.</strong> A job scheduled for three days from now must survive every process restart, deploy, and
+        machine failure between now and then. <strong>An in-memory <code>ScheduledExecutorService</code> is not a scheduler; it's
+        a scheduler-shaped hole in your reliability.</strong> Say this — it's the first thing they're checking for.</li>
+      <li><strong>Fires once.</strong> Two workers must not both trigger the same billing run. This is the whole game.</li>
+      <li><strong>Scales.</strong> Millions of pending jobs, tens of thousands due in the same second.</li>
+    </ul>
+
+    <div class="note">You already have a hidden dependency on this. Look back at Part A: the retry delays (§7a), the aggregation windows (§7b), and the quiet-hours deferrals (§7b) are all <em>delayed jobs</em>. They were scheduling problems wearing a delivery costume. That's the unifying observation that makes this one coherent page rather than two: <strong>"retry in 5 minutes" and "remind me in 3 days" are the same primitive with different arguments.</strong> Build it once.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="scheduler-approaches">8a. Four approaches to delayed jobs, compared</h2>
+
+    <h3>Approach 1: the boring database table — and it's the right first answer</h3>
+
+    <p>
+      A table with a <code>run_at</code> column, polled by workers. Say this <strong>first</strong>, and say it without apology,
+      because the instinct to skip straight to something clever is the thing that gets punished here.
+    </p>
+
+<pre><code><span class="kw">CREATE TABLE</span> scheduled_jobs (
+  job_id       <span class="typ">UUID</span> <span class="kw">PRIMARY KEY</span>,
+  run_at       <span class="typ">TIMESTAMPTZ</span> <span class="kw">NOT NULL</span>,
+  status       <span class="typ">TEXT</span> <span class="kw">NOT NULL</span>,     <span class="com">-- PENDING | RUNNING | DONE | FAILED</span>
+  payload      <span class="typ">JSONB</span>,               <span class="com">-- the notification request to submit</span>
+  attempts     <span class="typ">INT</span> <span class="kw">DEFAULT</span> <span class="num">0</span>,
+  locked_until <span class="typ">TIMESTAMPTZ</span>,         <span class="com">-- the LEASE. see §8b.</span>
+  idempotency_key <span class="typ">TEXT</span> <span class="kw">UNIQUE</span>       <span class="com">-- so a job fires effectively-once</span>
+);
+<span class="com">-- The index that makes the whole thing work — partial, so it only</span>
+<span class="com">-- covers the tiny set of rows you actually poll for:</span>
+<span class="kw">CREATE INDEX</span> ON scheduled_jobs (run_at) <span class="kw">WHERE</span> status = <span class="str">'PENDING'</span>;
+
+<span class="com">-- Every worker, every second. This is the entire scheduler:</span>
+<span class="kw">BEGIN</span>;
+  <span class="kw">SELECT</span> * <span class="kw">FROM</span> scheduled_jobs
+   <span class="kw">WHERE</span> status = <span class="str">'PENDING'</span> <span class="kw">AND</span> run_at &lt;= now()
+   <span class="kw">ORDER BY</span> run_at
+   <span class="kw">LIMIT</span> <span class="num">100</span>
+     <span class="kw">FOR UPDATE SKIP LOCKED</span>;      <span class="com">-- ← the magic words</span>
+
+  <span class="kw">UPDATE</span> scheduled_jobs <span class="kw">SET</span> status = <span class="str">'RUNNING'</span>,
+         locked_until = now() + <span class="kw">interval</span> <span class="str">'5 minutes'</span>
+   <span class="kw">WHERE</span> job_id = <span class="kw">ANY</span>(...);
+<span class="kw">COMMIT</span>;
+<span class="com">-- then: submit each payload to POST /v1/notifications, mark DONE.</span>
+</code></pre>
+
+    <p>
+      <code>FOR UPDATE SKIP LOCKED</code> is the load-bearing phrase and you should explain it rather than just typing it: it
+      locks the rows this worker selected and makes <em>other</em> workers skip straight past them instead of blocking on them.
+      Twenty workers can poll the same table concurrently, each grab a disjoint batch of 100 jobs, and none of them contend.
+      <strong>That's the whole concurrency story, in one clause, provided by the database.</strong> It's the same mechanism as the
+      outbox relay in <a href="05-coordination-consensus.html">05</a> — the same tool, a different job.
+    </p>
+
+    <div class="senior">Lead with this, and pre-empt the accusation of being unambitious: <em>"My first answer is the boring one: a Postgres table with a <code>run_at</code> column and workers polling it with <code>SELECT … FOR UPDATE SKIP LOCKED</code>. And I want to defend that rather than apologise for it, because it <strong>scales considerably further than people expect</strong> — with a partial index on <code>run_at WHERE status='PENDING'</code>, that query touches only the due rows, not the millions of future ones, and one Postgres will comfortably run tens of thousands of jobs a minute. It's durable, it's transactional, it gives me exactly-once claiming for free from the row lock, I can cancel a job with an <code>UPDATE</code>, and I can debug it with <code>SELECT</code>. <strong>I'd only move off it when the polling rate or the due-row volume actually forces me to</strong> — and I'd want to see the metric that forces it, not just a feeling that databases are unfashionable."</em> Interviewers are actively testing whether you reach for complexity you can't justify. Choosing the simple thing <em>and defending it with a mechanism</em> is the senior move; choosing it because you don't know the alternatives is not — which is why you follow up with the alternatives.</div>
+
+    <h3>Approach 2: Redis sorted set — score = timestamp</h3>
+
+    <p>
+      The natural fit, because a sorted set is exactly "a set of things ordered by a number," and the number you want is a Unix
+      timestamp.
+    </p>
+
+<pre><code>ZADD  jobs:due  1739577600  "job:a1b2"    <span class="com"># score = run_at (unix seconds)</span>
+ZADD  jobs:due  1739577605  "job:c3d4"
+
+<span class="com"># Every worker, every ~200ms — pop everything now due, ATOMICALLY.</span>
+<span class="com"># Must be a Lua script (or ZRANGESTORE+ZREM in a MULTI), because a</span>
+<span class="com"># plain ZRANGEBYSCORE followed by a ZREM is a check-then-act race:</span>
+<span class="com"># two workers both read the same job and both fire it.</span>
+EVAL "
+  local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, 100)
+  if #due &gt; 0 then redis.call('ZREM', KEYS[1], unpack(due)) end
+  return due
+" 1 jobs:due 1739577600
+</code></pre>
+
+    <table>
+      <thead><tr><th>Redis sorted set</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Wins:</strong> sub-millisecond. O(log N) insert, O(log N + M) to pop the M due jobs. Handles millions of pending jobs on one node and doesn't care how far in the future they are. This is why it's the standard implementation of delayed queues (it's roughly what Sidekiq, Celery, and Bull all do).</td></tr>
+        <tr><td><strong>Loses:</strong> <strong>durability is only as good as your Redis persistence.</strong> Default AOF fsync is once per second — so a hard crash can lose the last second of scheduled jobs, and if those were "charge this customer," you have a real problem. RDB snapshots are far worse. You can set <code>appendfsync always</code>, but you've now given up most of the speed you switched for, which is a trade you should name rather than discover. Redis is also memory-bound: 10M jobs × ~200 bytes ≈ 2 GB, which is fine, but it's RAM, and RAM is where your cache also lives.</td></tr>
+        <tr><td><strong>Verdict:</strong> excellent for <em>short-horizon, regenerable</em> jobs — retry backoffs, aggregation windows, rate-limit deferrals. All of those can be re-derived from the delivery log if you lose them. <strong>Don't put "run the billing" in a Redis sorted set</strong> unless the durability config genuinely holds, and say why: <em>"the consequence of losing this job is not symmetric with the consequence of running it 200ms slower."</em></td></tr>
+      </tbody>
+    </table>
+
+    <div class="senior">The hybrid is the answer that scores, and it's the one people don't reach: <em>"I'd actually run both, and split by consequence-of-loss. <strong>Postgres is the durable source of truth</strong> for every scheduled job. A poller then pulls the next, say, <strong>five minutes</strong> of due jobs into a <strong>Redis sorted set</strong>, which acts as the precise, low-latency firing layer. That way Redis only ever holds a small, bounded, <em>reconstructible</em> window — if Redis dies I lose nothing, because I just re-hydrate that window from Postgres — and Postgres only ever gets polled once every few minutes rather than every second, so the load on it is trivial regardless of how many hundreds of millions of future jobs it holds. <strong>Durability where I need it, latency where I need it, and a clean recovery story.</strong>"</em> That is the mature version of this design and it's almost exactly what real job systems converge on, for exactly this reason.</div>
+
+    <h3>Approach 3: hashed timer wheel — awareness level, and be honest that it is</h3>
+
+    <p>
+      A ring of N buckets, one per time tick. To schedule something T ticks away, put it in bucket
+      <code>(current + T) mod N</code>, and if T &gt; N, also record how many full rotations remain. A single hand advances one
+      bucket per tick and fires whatever's in it. Insert is <strong>O(1)</strong> and firing is <strong>O(1)</strong> — no heap, no
+      sort, no index. Kafka uses a hierarchical timing wheel for its delayed operations (purgatory); so do the Linux kernel and
+      Netty.
+    </p>
+
+<pre><code>            bucket:  0    1    2    3    4    5    6    7
+                   ┌────┬────┬────┬────┬────┬────┬────┬────┐
+                   │    │ j1 │    │ j2 │    │    │ j3 │    │
+                   └────┴────┴────┴────┴────┴────┴────┴────┘
+                     ▲
+                   hand (advances 1 bucket per tick; fires that bucket)
+
+   schedule(job, +3 ticks) → bucket (hand + 3) mod 8.  O(1). No sorting.
+   For longer delays: hierarchical wheels (seconds → minutes → hours),
+   like a mechanical clock's gears; jobs cascade down as they get close.
+</code></pre>
+
+    <div class="note"><strong>Mark this as awareness-level out loud and move on.</strong> <em>"A timer wheel gets me O(1) insert instead of the sorted set's O(log N), which matters if I'm scheduling millions of timers per second — that's why Kafka uses one internally for request purgatory. But it's an <strong>in-memory data structure</strong>, so on its own it has no durability at all, and at my scale the sorted set's log N is not remotely my bottleneck. I'd know it exists; I wouldn't build it here."</em> That is a <em>better</em> answer than describing the cascade mechanism in loving detail, because it demonstrates the judgment to <strong>not</strong> use something you know about. Interviewers are not scoring you on timer-wheel trivia. Nobody is going to ask you to implement one, and if they do, you're in a systems-programming interview, not a system-design one.</div>
+
+    <h3>Approach 4: cloud-native primitives — and their sharp edges</h3>
+
+    <ul>
+      <li><strong>SQS delay queues / <code>DelaySeconds</code>:</strong> trivially easy, fully managed, durable. <strong>Capped at 15
+        minutes.</strong> That cap is the whole story: it makes SQS delays perfect for retry backoffs and aggregation windows and
+        <em>useless</em> for "in 3 days." Knowing the number is a small, cheap credibility signal — candidates who've actually used
+        SQS know it's 15 minutes; candidates who've read a blog post say "you can just use a delay queue."</li>
+      <li><strong>EventBridge Scheduler / cron:</strong> managed cron, supports one-off schedules at arbitrary future times, scales to
+        millions of schedules. This is genuinely the right answer for a lot of real systems and you should say so — <em>"if I'm on
+        AWS and this is a product feature rather than the product, I'd seriously consider not building a scheduler at all."</em>
+        The catch: it's a black box you can't easily query ("show me every pending job for user X" is awkward), cancellation is an
+        API call to a service rather than an <code>UPDATE</code> you control, and you're now coupled to a cloud.</li>
+      <li><strong>Kafka + delay topics:</strong> a topic per delay tier (5s, 1m, 10m, 1h) with a consumer that pauses the partition
+        until the message is due. Works, and it keeps everything in one system, but it's awkward — Kafka is a log, not a priority
+        queue, and long delays mean holding consumer offsets back for a long time.</li>
+      <li><strong>Quartz / ShedLock (Spring):</strong> worth naming at an enterprise loop, because it's what they're probably running.
+        Quartz with a JDBC job store <em>is</em> approach 1 with a framework around it, and ShedLock is the lease from §8b as a
+        library. <em>"In a Spring shop I'd reach for Quartz's clustered JDBC store rather than write the polling loop myself"</em> is a
+        very good sentence at JPMC or Optum, and a slightly wasted one at a FAANG loop. Know your room.</li>
+    </ul>
+
+    <h3>The comparison table</h3>
+
+    <table>
+      <thead><tr><th>Approach</th><th>Durability</th><th>Latency / precision</th><th>Scale ceiling</th><th>Cancel a job?</th><th>Use when</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>DB table + <code>SKIP LOCKED</code> poll</strong></td>
+          <td><strong>Full.</strong> ACID, survives everything.</td>
+          <td>~poll interval (1s). Fine for almost everything.</td>
+          <td>Tens of thousands/min on one node; shard by time bucket beyond that.</td>
+          <td>Trivial — <code>UPDATE status='CANCELLED'</code>.</td>
+          <td><strong>Your default. Say it first.</strong> Anything where losing a job is unacceptable: billing, reminders, anything a user paid for.</td>
+        </tr>
+        <tr>
+          <td><strong>Redis ZSET</strong></td>
+          <td>Weak — bounded by AOF fsync policy. Can lose the last ~1s.</td>
+          <td><strong>Sub-ms.</strong> Best in class.</td>
+          <td>Millions of pending jobs per node; memory-bound.</td>
+          <td>Easy — <code>ZREM</code>.</td>
+          <td>Short-horizon, <strong>regenerable</strong> jobs: retry backoffs, aggregation windows, quiet-hours deferrals.</td>
+        </tr>
+        <tr>
+          <td><strong>Postgres + Redis hybrid</strong></td>
+          <td><strong>Full</strong> (Postgres is truth; Redis holds a rebuildable 5-min window).</td>
+          <td>Sub-ms firing, and the DB is polled once every few minutes.</td>
+          <td>Very high. Decouples "how many jobs exist" from "how fast do they fire."</td>
+          <td><code>UPDATE</code> + <code>ZREM</code> (and check the flag at fire time, in case it was already hydrated).</td>
+          <td><strong>The grown-up answer at scale.</strong> What you'd actually build.</td>
+        </tr>
+        <tr>
+          <td><strong>Timer wheel</strong></td>
+          <td>None on its own (in-memory).</td>
+          <td>O(1) insert &amp; fire. Excellent.</td>
+          <td>Enormous — millions of timers/sec.</td>
+          <td>Fiddly.</td>
+          <td><strong>Awareness only.</strong> Inside a broker (Kafka purgatory), not as your app's scheduler.</td>
+        </tr>
+        <tr>
+          <td><strong>SQS <code>DelaySeconds</code></strong></td>
+          <td>Full (managed).</td>
+          <td>Good.</td>
+          <td>Managed — effectively unbounded.</td>
+          <td><strong>No.</strong> You can't un-send it; you must check a cancellation flag at fire time.</td>
+          <td>Retry backoffs and short windows only — <strong>the 15-minute cap rules out everything else.</strong></td>
+        </tr>
+        <tr>
+          <td><strong>EventBridge / managed cron</strong></td>
+          <td>Full (managed).</td>
+          <td>~seconds. Fine.</td>
+          <td>Managed.</td>
+          <td>Yes, via API.</td>
+          <td>Recurring jobs and long one-offs when you're happy to be cloud-coupled and don't need to query pending jobs yourself.</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="scheduler-hard">8b. The hard parts of scheduling</h2>
+
+    <p>
+      The table above is the easy half. <strong>This is where the scheduler interview actually happens</strong>, and there are four
+      questions. Have an opinion on all four; the fourth is the one almost nobody has thought about, and it's the one that most
+      reliably impresses.
+    </p>
+
+    <h3>1. Exactly-once triggering: two workers must not both fire the billing run</h3>
+
+    <p>
+      Twenty workers are polling the same job table. The failure you must prevent is two of them claiming the same row and both
+      charging the customer. The mechanism is the same one you'd use for any distributed claim, and you already have it from
+      <a href="05-coordination-consensus.html">05</a>: <strong>an atomic conditional update — a lease.</strong>
+    </p>
+
+<pre><code><span class="com">-- The claim: ONE statement that both checks and takes. Not two.</span>
+<span class="kw">UPDATE</span> scheduled_jobs
+   <span class="kw">SET</span> status = <span class="str">'RUNNING'</span>,
+       owner  = <span class="str">'worker-7'</span>,
+       locked_until = now() + <span class="kw">interval</span> <span class="str">'5 minutes'</span>   <span class="com">-- ← the LEASE</span>
+ <span class="kw">WHERE</span> job_id = ?
+   <span class="kw">AND</span> (status = <span class="str">'PENDING'</span>
+        <span class="kw">OR</span> (status = <span class="str">'RUNNING'</span> <span class="kw">AND</span> locked_until &lt; now()))  <span class="com">-- reclaim a dead</span>
+<span class="kw">RETURNING</span> job_id;                                    <span class="com">-- worker's job</span>
+
+<span class="com">-- 1 row back → I own it, fire it.</span>
+<span class="com">-- 0 rows back → someone else owns it. Do nothing. No retry, no complaint.</span>
+</code></pre>
+
+    <p>
+      The <strong>lease</strong> (<code>locked_until</code>) is doing subtle and important work: it's what lets you recover from a
+      worker that claims a job and then dies. Without it, that job is stuck in <code>RUNNING</code> forever and the billing never
+      runs — you've traded a duplicate for a silent, permanent loss, which is usually worse. With it, another worker reclaims the
+      job once the lease expires.
+    </p>
+
+    <div class="pitfall">And now the honest bit, which you should volunteer because the interviewer is about to derive it and it's much better coming from you: <strong>the lease reintroduces the duplicate.</strong> A worker claims the job, takes a 6-minute GC pause or gets network-partitioned, its 5-minute lease expires, another worker reclaims and fires the job — and then the first worker wakes up, entirely unaware, and fires it too. <strong>A lease is a bet on a timeout, and timeouts are not correctness.</strong> This is exactly the distributed-lock problem from 05, and it means <strong>the scheduler cannot give you exactly-once either.</strong> The answer is the same as Part A's, which is precisely why the two halves belong together: <em>"the lease gets me exactly-once in the common case and at-least-once in the pathological one, so <strong>the job itself must be idempotent</strong> — I make the fired job carry a deterministic idempotency key (<code>job_id</code> + scheduled fire time), and the notification service's dedup absorbs the double-fire. The scheduler doesn't need to be perfect; it needs to be safe to be wrong."</em> That sentence — <strong>make the triggering at-least-once and the effect idempotent</strong> — is the thesis of this entire page, and it's the one to walk out of here with.</div>
+
+    <h3>2. The thundering herd at midnight</h3>
+
+    <p>
+      Ten million users have a subscription that renews "on the 1st." A naive implementation stores <code>run_at = '2026-08-01
+      00:00:00'</code> for all ten million. At <code>00:00:00.000</code>, your poller's query returns ten million due rows, and:
+    </p>
+
+    <ul>
+      <li>The scheduler tries to fire 10M jobs in one second and falls over.</li>
+      <li>The notification service gets 10M requests in one second — a spike far beyond even the marketing-blast peak you sized
+        for.</li>
+      <li>Every downstream service the jobs touch gets the same spike simultaneously.</li>
+      <li>The DB query itself is now scanning and locking millions of rows in a single transaction.</li>
+      <li>Everything that was <em>also</em> scheduled for shortly after midnight is starved behind the pile.</li>
+    </ul>
+
+    <p>
+      This is the <strong>thundering herd</strong> from <a href="06-caching-queues-resilience.html">06</a>, and the fix is the same
+      as the fix for retry storms, and it's almost embarrassingly simple: <strong>jitter the scheduled times.</strong> Don't store
+      what the user asked for; store what the user asked for, plus noise.
+    </p>
+
+<pre><code><span class="com">// Nobody asked for their billing email at EXACTLY 00:00:00.000.</span>
+<span class="com">// "On the 1st" is a promise with hours of slack in it. Use the slack.</span>
+Instant runAt = scheduledTime.plusSeconds(random.nextInt(<span class="num">3600</span>));  <span class="com">// ±1h</span>
+
+<span class="com">// 10M jobs spread over an hour = ~2,800/sec instead of 10,000,000/sec.</span>
+<span class="com">// That is a number my pipeline already handles. The herd is gone, and</span>
+<span class="com">// it cost one line.</span>
+</code></pre>
+
+    <p>
+      Two things make this a strong answer rather than just a trick. First, <strong>the jitter window is a product decision</strong>:
+      an hour is fine for a billing email, ten seconds might be the limit for "your ride arrives in 2 minutes," and zero is the
+      only acceptable answer for a market-open trade. Ask what the tolerance is instead of assuming. Second — and this connects
+      to §7b — <strong>you often get the jitter for free from the time-zone requirement</strong>: if "9am" means 9am <em>local</em>,
+      your 10M jobs are already spread across ~24 hourly waves before you add any noise at all. Point that out; it's a nice
+      demonstration that you're looking at the whole system rather than one component.
+    </p>
+
+    <div class="senior"><em>"I'd never store ten million jobs at exactly midnight. <strong>I jitter the scheduled time</strong> — plus or minus an hour for something like a billing email — because nobody actually asked for 00:00:00.000, they asked for 'the 1st,' and that phrasing has an hour of slack in it that I'm entitled to spend. That turns a ten-million-job spike into a couple of thousand a second, which is a load my pipeline already handles on an ordinary evening. It's the same fix as jitter on retries, and it's the same underlying failure — <strong>a synchronised herd — which is why I'd go looking for it anywhere a lot of things share a deadline.</strong> The one thing I'd check first is how much slack the product actually has: an hour for billing, near-zero for 'your ride is arriving.'"</em></div>
+
+    <h3>3. Clock skew</h3>
+
+    <p>
+      Worker A thinks it's 00:00:01. Worker B thinks it's 23:59:58. Both are polling <code>WHERE run_at &lt;= now()</code>. If
+      <code>now()</code> is each machine's local wall clock, they disagree about which jobs are due — and worse, a machine whose
+      clock jumps backward (NTP correction, VM migration) can re-fire jobs it already fired.
+    </p>
+
+    <p>The mitigations, in order of how much you should lean on them:</p>
+    <ul>
+      <li><strong>Use one clock: the database's.</strong> <code>WHERE run_at &lt;= now()</code> evaluated <em>server-side in Postgres</em>
+        means every worker is reading the same clock, and the problem largely evaporates. This is the answer, and it's another
+        quiet argument for the boring DB-table approach. <em>"I'd let the database be the clock"</em> is a good line.</li>
+      <li><strong>NTP everywhere</strong>, and treat clock skew as a monitored metric with an alarm, not an assumption. Skew is a
+        thing that <em>happens</em>, silently, and then explains a week of weird bugs.</li>
+      <li><strong>Never use wall-clock differences to measure elapsed time</strong> — use a monotonic clock
+        (<code>System.nanoTime()</code>, not <code>System.currentTimeMillis()</code>). Wall clocks go backwards; monotonic clocks
+        don't.</li>
+      <li><strong>And ultimately: idempotency again.</strong> Skew can cause a double-fire; the dedup key absorbs it. Every road on
+        this page leads back to the same place, and that's not a coincidence — it's the archetype.</li>
+    </ul>
+
+    <div class="note">Awareness-level, worth exactly one sentence if it comes up: this is the shallow end of the pool that Google's TrueTime and Spanner's commit-wait are the deep end of — bounding clock uncertainty is genuinely hard, which is why Spanner needs atomic clocks and GPS receivers in every datacentre to do it properly. You are not building Spanner. You are avoiding the problem by having a single clock. <strong>Knowing that the hard version exists, and that you've dodged it, is the right depth here.</strong></div>
+
+    <h3>4. The catch-up problem — the scheduler was down for an hour</h3>
+
+    <p>
+      <strong>This is the question that most reliably separates candidates, and almost nobody has an opinion ready.</strong> Your
+      scheduler was down from 02:00 to 03:00. It comes back. There are 400,000 jobs whose <code>run_at</code> has passed. What
+      happens now?
+    </p>
+
+    <p>
+      The naive implementation does the obvious thing: <code>WHERE run_at &lt;= now()</code> matches all 400,000, and it fires all
+      of them, immediately, as fast as it can. <strong>Your scheduler recovers from an outage by immediately DDoSing your own
+      production system</strong> — and every downstream service it calls, most of which were perfectly healthy until you came
+      back. The recovery is worse than the outage. This is a real and very common production failure, and it has a name worth
+      using: a <em>self-inflicted thundering herd on recovery</em>.
+    </p>
+
+    <p>
+      You need an explicit <strong>catch-up policy</strong>, and the correct answer is that it depends on the job — so you make it
+      a property of the job, not a property of the scheduler:
+    </p>
+
+    <table>
+      <thead><tr><th>Policy</th><th>What it does</th><th>Right for</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Fire all, rate-limited</strong></td>
+          <td>Drain the backlog through a token bucket at, say, 2× normal throughput. Nothing is lost; everything is late; the system stays up.</td>
+          <td><strong>The sane default.</strong> Billing, reminders — anything where the job must eventually run.</td>
+        </tr>
+        <tr>
+          <td><strong>Skip if stale</strong></td>
+          <td>Each job carries a <code>max_delay</code>. If <code>now() - run_at &gt; max_delay</code>, drop it and log it.</td>
+          <td>Time-sensitive and worthless-if-late: "your ride is 2 minutes away" (they're gone), "flash sale ends in 5 minutes" (it ended), a 30-second OTP (expired).</td>
+        </tr>
+        <tr>
+          <td><strong>Coalesce</strong></td>
+          <td>The recurring job missed 12 five-minute runs. Run it <strong>once</strong>, not twelve times.</td>
+          <td>Idempotent recurring syncs and refreshes. Running "recompute the digest" twelve times in a row is pure waste.</td>
+        </tr>
+        <tr>
+          <td><strong>Fire all, immediately</strong></td>
+          <td>The naive default.</td>
+          <td><strong>Nothing.</strong> This is the bug. Name it as the bug.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="senior">The answer that makes an interviewer sit up, because it shows you've thought about the day <em>after</em> the incident: <em>"If the scheduler is down for an hour, the naive behaviour is that it comes back and fires four hundred thousand overdue jobs as fast as it can — which means <strong>my recovery procedure is a self-inflicted DDoS on a system that's already fragile</strong>, and I take down the downstream services that survived the original outage. So catch-up needs an explicit policy, and it has to be <strong>per-job, because the right answer genuinely differs</strong>: a billing job must run even if it's an hour late, so it's 'fire all, but drained through a rate limiter at maybe twice normal throughput.' A 'your ride is 2 minutes away' push is <em>worthless</em> an hour late and actively confusing, so it carries a <code>max_delay</code> and gets dropped and logged. A recurring sync that missed twelve runs gets <strong>coalesced</strong> into one. So I'd put a <code>catch_up_policy</code> and a <code>max_delay</code> on the job row itself, and I'd make the choice at schedule time, when someone actually knows what the job is for — rather than at 3am, when nobody does."</em></div>
+
+    <h3>Recurring jobs, briefly</h3>
+
+    <p>
+      Store the cron expression, not a materialised list of every future occurrence. <strong>When a job fires, compute the next
+      <code>run_at</code> and insert the next occurrence in the same transaction as marking this one done.</strong> That's the whole
+      trick, and doing it transactionally is what stops a crash between "fired" and "rescheduled" from silently ending the
+      recurrence forever — a bug whose symptom is "the weekly digest just stopped one week in March and nobody noticed for a
+      month."
+    </p>
+
+    <p>
+      Two edge cases to have ready, because they're cheap and they read as experience: <strong>DST</strong> (a job scheduled for
+      02:30 daily happens <em>twice</em> on the day the clocks go back, and <em>not at all</em> on the day they spring forward —
+      which is exactly why you store IANA zone names and use a cron library that handles it, rather than adding 86,400 seconds),
+      and <strong>impossible dates</strong> ("run on the 31st" in a 30-day month; you need a policy, usually "last day of month").
+    </p>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="scaling">9. Scaling &amp; bottlenecks</h2>
+
+    <p>
+      "What breaks first at 10×?" — 100M notifications/day, 160k/sec at blast peak. Go in order of what actually breaks, and be
+      specific about the mechanism, because "add more workers" is not an answer.
+    </p>
+
+    <table>
+      <thead><tr><th>#</th><th>What breaks</th><th>Why</th><th>The fix</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>1</td>
+          <td><strong>The provider's rate limit</strong></td>
+          <td><strong>This is the real ceiling and it breaks first — say so.</strong> Adding workers doesn't help; it just gets you 429s faster. You cannot scale past a limit you don't own.</td>
+          <td>Negotiate higher limits (a commercial conversation, not an engineering one — <em>and saying that is itself the senior observation</em>). Shard across <strong>multiple provider accounts</strong> or multiple providers. Add a per-provider rate limiter on the way out so you self-throttle to just under their limit instead of discovering it by getting throttled. Then accept that the drain rate is fixed and let the queue absorb the rest — which is what it's <em>for</em>.</td>
+        </tr>
+        <tr>
+          <td>2</td>
+          <td>Delivery-log writes</td>
+          <td>150M rows/day at 10×, ~1,700 writes/sec sustained, far more at peak. Single-writer Postgres starts to strain.</td>
+          <td>In order: batch the status updates (don't do one <code>UPDATE</code> per message — buffer and write 100 at a time; this alone buys you most of a 10×). Keep daily partitions and drop old ones. Then move it to <strong>Cassandra</strong> — append-heavy, keyed, time-ordered, TTL'd, no joins: it's the textbook LSM workload (<a href="03-data-storage.html">03</a>). Accept losing the unique index and move the dedup claim to Redis with Postgres/Cassandra LWT as backstop.</td>
+        </tr>
+        <tr>
+          <td>3</td>
+          <td>The preferences read on the hot path</td>
+          <td>160k reads/sec at peak, one per notification.</td>
+          <td>Already Redis. Beyond that: it's a point read on immutable-ish data, so add an <strong>in-process LRU</strong> in front of Redis with a short TTL (seconds) — a blast targets many users once each, so the hit rate is poor, but a <em>campaign</em> re-notifying a segment hits the same users repeatedly. Better: for a bulk campaign, <strong>batch-load preferences for the whole segment once</strong> rather than one lookup per message. Turning 10M point reads into 10k range reads is the actual fix.</td>
+        </tr>
+        <tr>
+          <td>4</td>
+          <td>The scheduler's poll query</td>
+          <td>Hundreds of millions of pending jobs. Even with a partial index, every worker hitting the table every second is a lot of contention on the same hot rows (they're all sorted by <code>run_at</code>, so the due ones are physically adjacent — the workers pile onto the same index pages).</td>
+          <td><strong>Shard the job table by time bucket.</strong> Partition by <code>run_at</code> (hourly or daily), so the poller only ever touches the current partition and the other 8,000 partitions are cold. Then <strong>shard by <code>hash(job_id) % N</code></strong> and assign each shard to a worker (or a group), so workers stop contending with each other entirely. Add the <strong>Postgres→Redis hydration layer</strong> from §8a so the DB is polled once every 5 minutes instead of every second — that's usually the biggest single win, and it's the one to lead with.</td>
+        </tr>
+        <tr>
+          <td>5</td>
+          <td>A single hot queue partition</td>
+          <td>If you key the queue by <code>user_id</code> for ordering, a celebrity or a system account (<code>user_id = 0</code>) makes one partition hot.</td>
+          <td>You cut per-user ordering in §2 <em>precisely so you wouldn't have to key by user</em> — so key by <code>notification_id</code> and let messages spread evenly. <strong>This is the requirement you cut in the second minute paying you back in the fortieth. Point that out; it's the kind of callback that lands.</strong></td>
+        </tr>
+        <tr>
+          <td>6</td>
+          <td>The notification service itself</td>
+          <td>Stateless request handling at 160k/sec.</td>
+          <td>Genuinely the easy one. It's stateless — horizontal scale behind a load balancer, autoscale on queue-submission latency. <strong>Say it in one sentence and move on;</strong> spending time here signals you don't know where the hard part is.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="senior">The framing to lead with, before you touch the table: <em>"The thing that breaks first at 10× is <strong>not my system</strong> — it's the provider's rate limit. I can autoscale my workers to a thousand pods and all I'll achieve is getting 429'd faster and possibly getting my account throttled. That reframes the whole scaling conversation: my job stops being 'go faster' and becomes <strong>'absorb the peak gracefully and drain at whatever rate the provider will actually accept'</strong> — which means the queue depth is my real scaling metric, the rate limiter on the outbound side is a first-class component rather than an afterthought, and the next lever is commercial rather than technical: more provider accounts, a second provider, or a contract renegotiation. <strong>Knowing which bottleneck you can't engineer your way out of is the point of doing this analysis.</strong>"</em></div>
+
+    <div class="note">Observability is a scaling concern, not a nice-to-have, and this is the natural place to say so. The four metrics that matter, and each maps to a specific failure you'd otherwise find out about from a user: <strong>delivery rate per channel per provider</strong> (a sudden drop = a provider issue or a bad deploy — it's your smoke alarm), <strong>end-to-end latency p50/p99 from submit to provider-accepted</strong> (rising p99 = you're falling behind the drain rate), <strong>queue depth per channel</strong> (the leading indicator — it moves <em>before</em> latency does, which is what makes it worth paging on), and <strong>DLQ depth</strong> (any sustained non-zero value is a bug nobody has triaged). Add a <strong>synthetic canary</strong>: send one notification to a test user through every channel every minute and alarm if it doesn't arrive. It's the only way to catch the failure mode where the provider accepts your message with a cheerful 200 and then silently drops it — <em>which is a real thing that really happens, and no amount of monitoring your own code will ever detect it.</em></div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="tradeoffs">10. Trade-offs</h2>
+
+    <p>Every real decision on this page, the alternative, and the condition under which you'd flip. This is the table to revise from.</p>
+
+    <table>
+      <thead><tr><th>Decision</th><th>Alternative</th><th>Why this one</th><th>When you'd flip</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Async (queue) delivery</strong></td>
+          <td>Synchronous call to the provider from the API handler</td>
+          <td>130× peak-to-average; load-levelling. Callers must not inherit a third party's latency or outage.</td>
+          <td>Never for this system. (A tiny internal tool with 10 notifications/day? Sure, call SES inline — and <em>say</em> that, so it's clear the complexity is a choice, not a reflex.)</td>
+        </tr>
+        <tr>
+          <td><strong>One queue per channel (bulkhead)</strong></td>
+          <td>One shared queue + worker pool</td>
+          <td>Blast-radius containment. A slow Twilio must not stall push. Also allows independent scaling and tuning per channel.</td>
+          <td>Only if you had one channel. The moment there are two providers with different SLAs, bulkhead.</td>
+        </tr>
+        <tr>
+          <td><strong>At-least-once + idempotency key</strong></td>
+          <td>At-most-once (fire and forget)</td>
+          <td>Losing an OTP is unacceptable; duplicates are absorbable. You manufacture "effectively once" at the endpoint.</td>
+          <td>If the notification were purely cosmetic and duplicates were <em>more</em> costly than loss — e.g. a "you were charged" SMS where a duplicate triggers a support call. Then you'd bias toward at-most-once for that category. Very rare; name it to show you know the axis has two ends.</td>
+        </tr>
+        <tr>
+          <td><strong>Preference check at the chokepoint (in)</strong></td>
+          <td>Check in the worker (at send time)</td>
+          <td>Drops suppressed messages before you pay to enqueue and process them. One implementation, not fifty. Compliance lives in one place.</td>
+          <td><strong>Both, for delayed jobs</strong> — a job scheduled 3 days out must re-check at fire time, because the user may have unsubscribed in the meantime. Sending to someone who unsubscribed yesterday is the incident.</td>
+        </tr>
+        <tr>
+          <td><strong>Postgres delivery log</strong></td>
+          <td>Cassandra / DynamoDB</td>
+          <td>175 writes/sec is nothing. The unique index gives you dedup for free — a real, load-bearing feature.</td>
+          <td>~10× writes, when the single writer becomes the ceiling. Then LSM, and rebuild dedup on Redis.</td>
+        </tr>
+        <tr>
+          <td><strong>Scheduler: DB table + <code>SKIP LOCKED</code></strong></td>
+          <td>Redis ZSET · timer wheel · managed cron</td>
+          <td>Durable, transactional, cancellable, debuggable with <code>SELECT</code>. Scales further than people think.</td>
+          <td>At high volume or sub-second precision → the <strong>Postgres-truth + Redis-firing-window hybrid</strong>. If on AWS and this isn't core → EventBridge, and don't build it at all.</td>
+        </tr>
+        <tr>
+          <td><strong>Lease-based job claiming</strong></td>
+          <td>A distributed lock (ZooKeeper/etcd), or a single leader scheduler</td>
+          <td>Simple, no extra infra, self-healing when a worker dies. Row lock is the coordination primitive.</td>
+          <td>A single leader is actually fine and simpler if job volume is low — one scheduler with leader election, and no claiming at all. Flip when the coordination cost exceeds the job volume.</td>
+        </tr>
+        <tr>
+          <td><strong>Jittered schedule times</strong></td>
+          <td>Exact times as requested</td>
+          <td>Kills the midnight thundering herd for one line of code, using slack the product already had.</td>
+          <td>When the product genuinely needs precision — a market open, a live-event countdown, a synchronised drop. Then you pre-scale for the spike instead, and you'd better know it's coming.</td>
+        </tr>
+        <tr>
+          <td><strong>Per-job catch-up policy</strong></td>
+          <td>Always fire everything overdue</td>
+          <td>Prevents self-DDoS on recovery. Different jobs genuinely want different behaviour.</td>
+          <td>Never. The alternative is a bug.</td>
+        </tr>
+        <tr>
+          <td><strong>Aggregation windows</strong></td>
+          <td>Send every event immediately</td>
+          <td>The difference between a product and a spam cannon.</td>
+          <td>Transactional categories — <strong>never aggregate an OTP</strong>. Latency budget decides.</td>
+        </tr>
+        <tr>
+          <td><strong>No per-user ordering</strong></td>
+          <td>Strict per-user FIFO</td>
+          <td>Ordering forces a partition-per-user and a single consumer, which is incompatible with retries (a retried message is late by definition) and creates hot partitions.</td>
+          <td>If the product truly needs it (a message thread — see <a href="11-chat-system.html">11</a>, where ordering <em>is</em> the requirement), you key the queue by user and accept the hot-partition cost. Different system, different answer.</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="followups">11. Follow-ups you should expect</h2>
+
+    <h3>"How do you cancel a scheduled job?"</h3>
+    <p>
+      Sounds trivial; it's a small trap, and the trap is that <strong>you cannot un-send a message you've already handed to a
+      queue.</strong> So the answer has two halves.
+    </p>
+    <ul>
+      <li>If it's still in the job table: <code>UPDATE scheduled_jobs SET status='CANCELLED' WHERE job_id=? AND status='PENDING'</code>.
+        Conditional, so you can't cancel a job that's already running. Trivial, and it's a genuine argument for the DB approach.</li>
+      <li><strong>If it's already been enqueued</strong> (it hydrated into Redis, or it's an SQS delay message): you cannot recall
+        it. SQS has no un-send. So the fired job must <strong>re-check a cancellation flag at execution time</strong> — the queue
+        message carries a <code>job_id</code>, and the worker looks it up and drops it if cancelled. <em>"The queue is a promise you
+        can't take back, so cancellation has to be a check at the point of execution, not a deletion at the point of scheduling"</em>
+        is the sentence.</li>
+      <li>The race that remains: cancel arrives while the job is mid-flight to Twilio. You lose — the SMS goes out. Say so plainly.
+        <strong>You can shrink the window; you can't close it.</strong> Candidates who claim they can close it are wrong, and the
+        interviewer knows it.</li>
+    </ul>
+
+    <h3>"A poison message crashes the worker every single time. What happens?"</h3>
+    <p>
+      The nastiest failure in any queue system, and worth understanding as a <em>loop</em>, not an error: worker picks up message
+      → deserialises it → hits a null pointer → crashes. The message is never acked, so its visibility timeout expires, so it
+      goes back on the queue → the next worker picks it up → crashes. <strong>One malformed message takes down your entire worker
+      fleet, one pod at a time, in a rolling loop that looks exactly like a mass outage.</strong> And because the pods keep
+      restarting, your dashboards show "workers unhealthy" rather than "one bad message," which is why this one is so vicious in
+      practice: <em>the symptom points away from the cause.</em>
+    </p>
+    <ul>
+      <li><strong>Track the delivery/receive count</strong> and DLQ after N attempts — <em>on the receive count, not on your own
+        success/failure logic</em>, because your logic never runs, it crashes. SQS's <code>ApproximateReceiveCount</code> and a
+        redrive policy do this for you; that's precisely what a redrive policy is for. <strong>This is the fix.</strong></li>
+      <li><strong>Never let a deserialisation failure crash the process.</strong> Catch <code>Throwable</code> at the message
+        boundary, log it, DLQ it, ack it, move on. A message handler that can throw out of its own frame is a bug.</li>
+      <li>Validate the payload at the API edge so poison messages are hard to create in the first place — schema validation at
+        submit time is cheaper than a fleet outage.</li>
+      <li>And note the killer detail: <strong>the crash means you may have already sent the notification before dying.</strong> The
+        message wasn't acked, so it'll be redelivered — and this is, again, why the dedup key matters. Every failure mode on this
+        page ends in the same place.</li>
+    </ul>
+
+    <h3>"How do you test this?"</h3>
+    <p>
+      A question that reads as gentle and is actually probing whether you've built systems or only drawn them.
+    </p>
+    <ul>
+      <li><strong>A provider abstraction with a fake implementation.</strong> Your code talks to a <code>SmsProvider</code> interface,
+        not to Twilio's SDK. The fake can be told to fail, to time out, to 429, to succeed-then-time-out (the ambiguous case from
+        §7a — <em>the one that actually matters and the one a naive test suite never covers</em>).</li>
+      <li><strong>Test the failure paths, not the happy path.</strong> The happy path is three lines and it works. The interesting
+        tests are: does a duplicate message get suppressed? does a 400 skip retries and go straight to the DLQ? does the breaker
+        open at the threshold and half-open after the cooldown? does a redelivered message after a crash produce exactly one
+        send?</li>
+      <li><strong>Fake the clock.</strong> A scheduler you can't test without waiting three days is a scheduler you won't test.
+        Inject a <code>Clock</code>; advance it in tests. This one line of design is what makes Part B testable at all.</li>
+      <li><strong>Load-test the blast, not the average</strong> — that's the whole point of §3, and a load test at 120/sec proves
+        nothing.</li>
+      <li><strong>Staging sends to a sink, never to real users.</strong> The classic incident is a test campaign hitting the
+        production user table. Every company has done this once.</li>
+      <li><strong>The synthetic canary in production</strong> (from §9). It's the only thing that catches a provider that accepts
+        your message and drops it.</li>
+    </ul>
+
+    <h3>"What ordering guarantees do you provide?"</h3>
+    <p>
+      <strong>Best-effort, and I cut strict ordering deliberately in the requirements</strong> — reference the moment you did it.
+      Then explain why it's not a cop-out: strict per-user ordering requires a single partition per user consumed by a single
+      worker, which (a) creates hot partitions for heavy users, (b) means one stuck message head-of-line-blocks every subsequent
+      notification for that user, and (c) is <em>fundamentally incompatible with retries</em> — a message that fails and retries
+      with 16 seconds of backoff arrives after the ones behind it, by construction. <strong>You cannot have both retries and strict
+      ordering.</strong> Pick. For notifications, retries win, easily. If a specific pair of notifications must be ordered ("payment
+      failed" then "account suspended"), model that as <em>one</em> notification, or have the second job depend on the first's
+      completion — <em>solve it at the domain level, not in the transport.</em>
+    </p>
+
+    <h3>"What about GDPR / a user deletes their account?"</h3>
+    <p>
+      Worth 30 seconds, and it's a strong signal at a fintech or enterprise loop where it's a compliance requirement rather than
+      a nicety. The delivery log contains personal data (email addresses, phone numbers, rendered message bodies that may embed
+      PII). So: <strong>don't store the rendered body</strong> — store the <code>template_id</code> plus the variables, or better,
+      just a reference to them; the 90-day retention limits exposure; deletion must cascade to the delivery log, the device
+      table, and the preference table; and pending scheduled jobs for a deleted user must be cancelled, which is a nicely
+      concrete reason the job payload should reference a <code>user_id</code> rather than embed a snapshotted email address.
+      <em>"A scheduled job holding a copy of a user's email address for three days is a GDPR problem with a three-day fuse."</em>
+    </p>
+
+    <h3>"How do you handle a user with 50 devices? Or a group notification to 100,000 users?"</h3>
+    <p>
+      One notification is not one send — fan-out lives in the notification service, and where you do it matters. Fan out
+      <strong>lazily</strong>: don't enqueue 100,000 messages from the API handler (that request will time out and you'll have half
+      a campaign). Enqueue <em>one</em> "campaign" message, and have a <strong>fan-out worker</strong> read the segment in pages and
+      enqueue the individual sends in batches — checkpointing as it goes, so a crash resumes rather than restarts (and doesn't
+      re-notify the first 40,000 people, which the idempotency key would catch anyway, but you'd rather not rely on that). This
+      is the same fan-out-on-write machinery as <a href="10-news-feed.html">tutorial 10</a>, and saying so is a nice cross-link
+      that shows you're seeing the archetypes.
+    </p>
+
+    <h3>"Push notification specifics — how does APNs/FCM actually work?"</h3>
+    <p>
+      Awareness-level, and don't over-invest here. The device holds a persistent connection to Apple's or Google's servers — not
+      to you. You cannot reach the device; <strong>only APNs and FCM can</strong>, which is the entire reason this design has a
+      third-party dependency you can't remove. You send to APNs with a device token; they deliver (or don't — a phone that's off
+      is best-effort, and APNs will hold it for a while and may drop it). Tokens rotate and go stale constantly, which is the
+      feedback loop from §7a. <strong>The one thing worth saying:</strong> <em>"push delivery is fundamentally best-effort and not
+      acknowledged end-to-end — APNs telling me it accepted the message is not the phone telling me it showed it. So if the
+      notification genuinely matters, push cannot be my only channel."</em> That's a judgment sentence, not a trivia sentence, and
+      it's what they're listening for.
+    </p>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="qa">Interview Q&amp;A</h2>
+
+    <details class="qa">
+      <summary>Can you guarantee exactly-once delivery of a notification?</summary>
+      <div class="answer">
+        <p>
+          <strong>No, and anyone who says yes is wrong.</strong> There is a network between me and the provider, and there is
+          always a window — the request timed out — where I cannot know whether my message took effect. That's not an
+          implementation gap, it's a property of distributed systems.
+        </p>
+        <p>
+          What I build instead is <strong>at-least-once delivery plus idempotent send</strong>, which produces "effectively once"
+          from the user's point of view. Two layers. <em>My</em> side: an atomic conditional claim on the delivery row
+          (<code>UPDATE … WHERE status='QUEUED'</code>, check the row count) so that a message redelivered by the queue becomes a
+          no-op. <em>Their</em> side: pass an idempotency key to the provider, so that even a duplicate HTTP request — the one I
+          send after a timeout, not knowing whether the first landed — collapses on their end.
+        </p>
+        <p>
+          I'm moving the guarantee from the transport, where it's impossible, to the endpoint, where it's achievable. That
+          reframing <em>is</em> the answer.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Why one queue per channel instead of one queue for everything?</summary>
+      <div class="answer">
+        <p>
+          <strong>Bulkheads.</strong> The channels have wildly different throughput, cost, and failure characteristics: push is
+          high-volume and fast, SMS is low-volume, expensive and tightly rate-limited, email is slow and delay-tolerant.
+        </p>
+        <p>
+          With a shared queue and a shared worker pool, a Twilio outage where requests hang for 30 seconds means every worker
+          that picks up an SMS message is blocked for 30 seconds. Within a couple of minutes the whole pool is sitting in a
+          socket read on Twilio, and my push notifications — 70% of volume, on a completely healthy provider — stop flowing.
+          <strong>A failure in the channel I care least about has taken out the channel I care most about</strong>, because I gave
+          them a shared resource to exhaust.
+        </p>
+        <p>
+          Separate queues and pools contain the blast radius: the SMS backlog grows, an alarm fires, push never notices. It also
+          lets me scale and rate-limit each channel independently, which I need anyway because each provider's limit is a
+          different number.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Twilio is completely down. Walk me through what happens.</summary>
+      <div class="answer">
+        <p>
+          First, the <strong>circuit breaker for the SMS provider opens</strong> — its error rate crosses the threshold and I stop
+          calling it entirely. That's the important bit: retrying into a dead provider burns my workers on calls that are certain
+          to fail, and each one costs a 30-second timeout. Failing fast costs zero threads.
+        </p>
+        <p>
+          Then the interesting question, which is what happens to the messages, and my answer depends on the message class:
+        </p>
+        <ul>
+          <li><strong>Delay-tolerant</strong> (most things): they stay in the SMS queue. Consumption stops, the backlog builds, and it
+            drains when the breaker closes. The queue is a shock absorber — this is what it's for. My obligations are to alarm on
+            queue depth and to be sure the queue's retention window exceeds any plausible outage.</li>
+          <li><strong>Time-critical</strong> (an OTP): fail over to a secondary provider, <strong>knowing that failover risks a
+            duplicate</strong> — because a timeout doesn't tell me whether the first send succeeded, and Twilio's idempotency key
+            means nothing to Vonage. For an OTP I'd rather the user get two codes than get locked out. For a marketing message
+            I'd make the opposite call.</li>
+          <li><strong>Better still, degrade the channel:</strong> if it's an OTP and I have a push token, <strong>send it as a
+            push</strong>. I never needed Twilio; I needed to reach the user.</li>
+        </ul>
+        <p>Afterwards, I reconcile against Twilio's status API using the stored <code>provider_msg_id</code>, so my delivery log ends up true even where my sending was ambiguous.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Why is jitter necessary on retries? Isn't exponential backoff enough?</summary>
+      <div class="answer">
+        <p>
+          No, and the reason is the failure that backoff <em>alone</em> creates. Ten thousand messages fail during the same
+          thirty-second provider blip. With pure exponential backoff, all ten thousand retry at exactly t+1s. Then all ten
+          thousand at t+5s. I've built a <strong>synchronised herd</strong> that hammers a recovering provider with a
+          perfectly-aligned spike at the precise moment it's trying to come back up — and I knock it over again. I have turned a
+          thirty-second blip into a ten-minute outage <em>that I caused</em>.
+        </p>
+        <p>
+          Full jitter — <code>wait = random(0, min(cap, base × 2^attempt))</code> — spreads those retries uniformly across the
+          window, so the recovering provider sees a ramp instead of a wall.
+        </p>
+        <p>
+          And notice it's the <em>same</em> failure as the midnight thundering herd in the scheduler, with the same fix. Any time a
+          lot of independent things share a deadline, you have a herd. That pattern-match is worth more than the formula.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>What's actually in a dead-letter queue, and what do you do with it?</summary>
+      <div class="answer">
+        <p>
+          Messages that have exhausted their retries (N ≈ 5, tuned per channel — fewer for SMS because each attempt costs money,
+          more for email because it's free and nobody's waiting), plus messages that failed <em>permanently</em> on the first try
+          and skipped retries entirely: a 400 malformed payload, a dead device token, a hard bounce. Retrying a permanent failure
+          is just five slower failures.
+        </p>
+        <p>
+          <strong>The point that actually matters: a DLQ nobody monitors is just a trash can with extra steps.</strong> The DLQ
+          isn't a solution, it's a bucket where I put the problems so they stop hurting the live pipeline. So it needs three
+          things: <strong>DLQ depth as a paged alarm</strong> (I'd page on a sharp increase — that's a systemic failure like a bad
+          deploy or an expired API key — and separately alert on any sustained non-zero depth, which is a slow leak nobody's
+          triaging); a documented triage path; and a <strong>replay tool</strong> so that once the bug is fixed I can re-drive the
+          messages through the pipeline — <em>which is safe precisely because everything is keyed by idempotency key</em>, so
+          replay can't double-send. That's a real payoff for the dedup work.
+        </p>
+        <p>I've seen DLQs with 400,000 messages that nobody had opened in a year. That's not a dead-letter queue, that's a data-loss incident with a friendlier name.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Five people like my photo in a minute. How many notifications do I get?</summary>
+      <div class="answer">
+        <p>
+          <strong>One.</strong> "Sarah and 4 others liked your photo." Getting five buzzes is a system that is <em>perfectly
+          correct</em> and <em>completely broken as a product</em> — every message delivered exactly once, and the user turns off
+          notifications.
+        </p>
+        <p>
+          Mechanism: an <strong>aggregation window</strong> keyed by <code>(user, object, event_type)</code>. The first event creates a
+          bucket in Redis and starts a ~60-second timer (which is itself a delayed job — Part B). Subsequent events append to the
+          bucket and send nothing. When the timer fires, render one notification from the bucket and clear it.
+        </p>
+        <p>
+          The trade-off to name explicitly: <strong>the window trades latency for quietness.</strong> 60 seconds of delay is
+          invisible for a social event and unthinkable for an OTP — so aggregation is <strong>per-category, and transactional
+          categories are never aggregated</strong>. In production I'd use a debounce (60s after the <em>last</em> event) with a hard
+          cap (never more than 5 minutes after the first), so a steady trickle of likes can't defer the notification forever.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Design the scheduler. What's your first answer, and why isn't it something cleverer?</summary>
+      <div class="answer">
+        <p>
+          <strong>A Postgres table with a <code>run_at</code> column, polled by workers with <code>SELECT … WHERE run_at &lt;= now()
+          AND status='PENDING' ORDER BY run_at LIMIT 100 FOR UPDATE SKIP LOCKED</code>.</strong> And I want to defend that rather
+          than apologise for it.
+        </p>
+        <p>
+          <code>SKIP LOCKED</code> is the load-bearing clause: it locks the rows this worker took and makes other workers skip past
+          them rather than block, so twenty workers poll the same table concurrently, each grabs a disjoint batch, and none of
+          them contend. That's the entire concurrency story, handed to me by the database. It's the same mechanism as the outbox
+          relay.
+        </p>
+        <p>
+          It's durable, transactional, cancellable with an <code>UPDATE</code>, debuggable with a <code>SELECT</code>, and with a
+          <strong>partial index on <code>run_at WHERE status='PENDING'</code></strong> the poll only touches the due rows, not the
+          millions of future ones. It scales much further than people assume — tens of thousands of jobs a minute on one box.
+        </p>
+        <p>
+          <strong>Where I'd go next, when a metric forces me:</strong> the hybrid. Postgres stays the durable source of truth, and a
+          poller hydrates the next five minutes of due jobs into a <strong>Redis sorted set</strong> (score = timestamp) as a
+          precise, sub-millisecond firing layer. Redis then only ever holds a small, bounded, <em>reconstructible</em> window — if
+          it dies, I re-hydrate from Postgres and lose nothing — and Postgres gets polled once every few minutes instead of every
+          second. Durability where I need it, latency where I need it.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Two scheduler workers both pick up the "run monthly billing" job. How do you stop the double charge?</summary>
+      <div class="answer">
+        <p>
+          A <strong>lease</strong>: an atomic conditional update that both checks and claims in one statement —
+          <code>UPDATE jobs SET status='RUNNING', owner=?, locked_until=now()+interval '5 min' WHERE job_id=? AND (status='PENDING'
+          OR (status='RUNNING' AND locked_until &lt; now()))</code>. One row back means I own it; zero rows means someone else does,
+          so I do nothing. The <code>locked_until</code> half lets another worker reclaim the job if the owner dies — without it, a
+          crashed worker leaves the billing job stuck in <code>RUNNING</code> forever, and I've traded a duplicate for a silent
+          permanent loss, which is worse.
+        </p>
+        <p>
+          <strong>Then the honest part, which I'd volunteer rather than wait to be caught on:</strong> the lease reintroduces the
+          duplicate. A worker claims the job, hits a 6-minute GC pause, its 5-minute lease expires, a second worker reclaims and
+          fires it — and then the first worker wakes up and fires it too, entirely unaware. <strong>A lease is a bet on a timeout,
+          and timeouts are not correctness.</strong> So the scheduler cannot give me exactly-once either.
+        </p>
+        <p>
+          Which means the answer is the same as it was for delivery, and that's the whole thesis of this design: <strong>make the
+          triggering at-least-once and make the effect idempotent.</strong> The fired job carries a deterministic idempotency key
+          (<code>job_id</code> + scheduled fire time), and the downstream service dedupes on it. The scheduler doesn't need to be
+          perfect. It needs to be <em>safe to be wrong.</em>
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>10 million users have a job scheduled for exactly midnight on the 1st. What happens?</summary>
+      <div class="answer">
+        <p>
+          Disaster, if I stored the time naively. At <code>00:00:00.000</code> the poll returns ten million due rows; the scheduler
+          tries to fire them all at once; the notification service takes a spike far beyond even the marketing-blast peak I sized
+          for; every downstream service gets hit simultaneously; and anything scheduled for 00:05 is starved behind the pile.
+          That's the <strong>thundering herd</strong>.
+        </p>
+        <p>
+          The fix is one line: <strong>jitter the scheduled times.</strong> <code>runAt = scheduledTime.plusSeconds(random(0,
+          3600))</code>. Ten million jobs spread over an hour is ~2,800/sec, which my pipeline handles on an ordinary evening.
+        </p>
+        <p>
+          Two things that make this more than a trick. <strong>The jitter window is a product decision</strong> — nobody asked for
+          00:00:00.000, they asked for "the 1st," and that phrasing has an hour of slack in it that I'm entitled to spend; but for
+          "your ride arrives in 2 minutes" the slack is seconds, and for a market open it's zero, so I'd ask. And
+          <strong>I often get jitter for free from time zones</strong>: if "9am" means 9am <em>local</em>, the blast is already
+          spread across roughly 24 hourly waves before I add any noise at all.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Your scheduler was down for an hour. It comes back up. Now what?</summary>
+      <div class="answer">
+        <p>
+          <strong>The question I most want to be asked, because the naive answer is a genuine production disaster.</strong> Naively,
+          <code>WHERE run_at &lt;= now()</code> matches 400,000 overdue jobs and the scheduler fires them all as fast as it can — so
+          <strong>my recovery procedure is a self-inflicted DDoS</strong> on a system that's already fragile, and I take down the
+          downstream services that survived the original outage. The recovery is worse than the outage.
+        </p>
+        <p>So catch-up needs an explicit policy, and it has to be <strong>per-job</strong>, because the right answer genuinely differs:</p>
+        <ul>
+          <li><strong>Fire all, rate-limited</strong> — drain the backlog through a token bucket at ~2× normal throughput. The sane
+            default: billing, reminders, anything that must eventually run. Nothing is lost, everything is late, the system stays
+            up.</li>
+          <li><strong>Skip if stale</strong> — the job carries a <code>max_delay</code>; if it's exceeded, drop and log. "Your ride is 2
+            minutes away" is worthless an hour later and actively confusing. So is an expired OTP.</li>
+          <li><strong>Coalesce</strong> — a recurring sync that missed twelve five-minute runs should run <em>once</em>, not twelve
+            times.</li>
+        </ul>
+        <p>
+          So I'd put <code>catch_up_policy</code> and <code>max_delay</code> on the job row, and make the decision at schedule time —
+          when someone actually knows what the job is for — rather than at 3am, when nobody does.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>A message crashes the worker every time it's processed. What happens to your fleet?</summary>
+      <div class="answer">
+        <p>
+          Without a fix: <strong>it dies, one pod at a time, in a rolling loop.</strong> Worker picks up the poison message,
+          deserialises it, hits a null pointer, crashes. The message is never acked, its visibility timeout expires, it goes back
+          on the queue, the next worker picks it up, crashes. One malformed message takes down the whole fleet — and the
+          <em>really</em> nasty part is that the dashboards say "workers unhealthy," not "one bad message," so <strong>the symptom
+          points away from the cause</strong> and you spend the first twenty minutes of the incident debugging your deployment.
+        </p>
+        <p>The fixes, in order:</p>
+        <ul>
+          <li><strong>DLQ on the receive count, not on my own error handling</strong> — because my error handling never runs, it
+            crashes. SQS's <code>ApproximateReceiveCount</code> plus a redrive policy does exactly this; that's what a redrive policy
+            <em>is</em>. After N receives, the message is quarantined regardless of what my code did.</li>
+          <li><strong>Catch <code>Throwable</code> at the message boundary.</strong> Log, DLQ, ack, move on. A handler that can throw
+            out of its own frame is a bug.</li>
+          <li>Validate payloads at the API edge, so poison messages are hard to create at all.</li>
+          <li>And note: the crash might have happened <em>after</em> the send. The message will be redelivered — so once again, the
+            dedup key is what makes this safe.</li>
+        </ul>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>You have 120 notifications/second on average. Why not just call the provider synchronously?</summary>
+      <div class="answer">
+        <p>
+          <strong>Because the average is meaningless here, and that's the single most important sentence in this design.</strong>
+          120/sec is a laptop. But marketing hits "send" on a campaign to ten million users and expects it out in ten minutes —
+          that's <strong>16,000/sec, a 130× spike, arriving with no warning.</strong>
+        </p>
+        <p>Two consequences, and they're the reason for the whole architecture:</p>
+        <ul>
+          <li>I can't size synchronous capacity for the peak — that's 130× the hardware idle all day. So the peak must be
+            <strong>absorbed by a queue and drained at whatever rate my workers and my providers actually sustain</strong>. That's
+            load-levelling, and it's the non-negotiable reason for the queue.</li>
+          <li>Synchronous delivery means my API's latency is a function of Twilio's latency. When Twilio hangs, my request threads
+            block, my pool exhausts, and <strong>the failure propagates backwards into the services that were merely trying to
+            <em>submit</em> a notification.</strong> A third-party outage becomes an outage of my callers. I'd have thrown away the
+            decoupling that is the entire purpose of the system, at the front door.
+          </li>
+        </ul>
+        <p>Accept, persist, return <code>202</code>, deliver later. And if this genuinely were a system with ten notifications a day and no spikes, I'd call SES inline and say so — the complexity has to be earned.</p>
+      </div>
+    </details>
+
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="takeaways">What to remember</h2>
+
+    <p><strong>The archetype, and it's the most transferable one in this block:</strong> <em>reliable async delivery to an unreliable third party, plus time-based triggering.</em> Strip out the word "notification" and what's left is — an event happens, you must cause a side effect on a system you don't control, effectively once, possibly later, and that system is allowed to fail. That is <strong>webhook delivery. Email. A billing run. Order confirmations in <a href="13-payments-orders.html">13</a>. The retry mechanism inside every other system you will ever design.</strong> Learn the shape, not the diagram.</p>
+
+    <h3>The one sentence</h3>
+    <div class="senior"><strong>Make the transport at-least-once, and make the effect idempotent.</strong> Every single hard problem on this page — queue redelivery, provider timeouts, circuit-breaker failover, lease expiry during a GC pause, clock skew, poison-message replay, DLQ re-drive — resolves to that one sentence. You cannot prevent the duplicate. You can make it harmless. <em>Exactly-once is not something you achieve; it's something you simulate at the endpoint.</em></div>
+
+    <h3>Part A — delivery</h3>
+    <ul>
+      <li><strong>The average is meaningless; design for the blast.</strong> 120/sec average, 16,000/sec during a campaign — a 130× gap. That gap is the entire justification for the queue (load-levelling), and saying it out loud is the senior move in the estimation section.</li>
+      <li><strong>One queue and worker pool per channel — bulkheads.</strong> A slow SMS provider must not consume the workers that deliver your push notifications. A failure in the channel you care least about must not take out the one you care most about.</li>
+      <li><strong>Two-layer dedup.</strong> An atomic conditional claim on your side (absorbs queue redelivery); an idempotency key passed to the provider (absorbs your own retry-after-timeout). Layer 1 alone doesn't save you from the ambiguous timeout — <em>only layer 2 does.</em></li>
+      <li><strong>Retry only what's retryable.</strong> 5xx and timeouts: yes, with exponential backoff and <strong>full jitter</strong> (no jitter = a synchronised herd that re-kills a recovering provider). 400s and dead tokens: straight to the DLQ, and <em>delete the token</em> — a provider's failure response is a data-quality signal.</li>
+      <li><strong>Circuit-break each provider.</strong> When it's down, stop hammering it — retrying into a dead provider burns your workers on calls that are certain to fail.</li>
+      <li><strong>A DLQ nobody monitors is just a trash can.</strong> Depth is a paged alarm; there's a replay tool; replay is safe <em>because</em> of the idempotency key.</li>
+      <li><strong>Failover risks a duplicate and there is no way around it.</strong> A timeout doesn't tell you whether the first send landed, and no idempotency key crosses a provider boundary. So decide by category: duplicate an OTP rather than lose it; delay a promo rather than duplicate it. Then reconcile afterwards.</li>
+      <li><strong>Delivering correctly ≠ behaving well.</strong> Aggregation windows (5 likes → 1 push), per-user rate limits, quiet hours in the user's <em>local</em> time zone (IANA names, never UTC offsets), and a <strong>kill switch</strong> — because a fast, reliable pipeline with a bad template will spam ten million people extremely efficiently.</li>
+    </ul>
+
+    <h3>Part B — the scheduler</h3>
+    <ul>
+      <li><strong>Say the boring answer first, and defend it:</strong> a Postgres table with <code>run_at</code>, a partial index, and workers polling with <code>FOR UPDATE SKIP LOCKED</code>. Durable, transactional, cancellable, debuggable — and it scales much further than people think.</li>
+      <li><strong>Then the grown-up version:</strong> Postgres as the durable truth, hydrating a 5-minute window into a <strong>Redis sorted set</strong> for sub-millisecond firing. Redis holds only a bounded, <em>rebuildable</em> window, so losing it costs nothing.</li>
+      <li><strong>Timer wheels are awareness-level.</strong> O(1) insert, used inside Kafka's purgatory. Know it exists; say you wouldn't build it. <em>Declining to use something you know about is a stronger signal than describing it.</em></li>
+      <li><strong>SQS delay queues cap at 15 minutes.</strong> Great for retry backoffs, useless for "in 3 days." Knowing the number is cheap credibility.</li>
+      <li><strong>Claim jobs with a lease</strong> (atomic conditional update + <code>locked_until</code>) — and admit that the lease is a bet on a timeout, so a GC pause can still double-fire. Hence: the job must be idempotent. Same thesis, again.</li>
+      <li><strong>Jitter the scheduled times.</strong> 10M jobs at exactly midnight is a thundering herd; ±1 hour of jitter turns it into 2,800/sec. Nobody asked for 00:00:00.000 — spend the slack. (And time zones give you much of that spread for free.)</li>
+      <li><strong>Let the database be the clock</strong> to sidestep skew. Monotonic clocks for elapsed time, never wall clocks.</li>
+      <li><strong>Have a catch-up policy, per job.</strong> Firing 400,000 overdue jobs the instant you recover is a self-inflicted DDoS. Fire-all-rate-limited (billing) · skip-if-stale (a stale "your ride is here") · coalesce (a missed recurring sync). Having an opinion here is one of the strongest signals on the page.</li>
+    </ul>
+
+    <h3>The lines to have ready</h3>
+    <ul>
+      <li><em>"There are two systems in that prompt — delivery and triggering. They share machinery and have different hard parts. Let me split them."</em></li>
+      <li><em>"The average is meaningless here. I'm designing for the blast."</em></li>
+      <li><em>"I can't have exactly-once. I can have at-least-once plus idempotent send, which is effectively once from the user's point of view."</em></li>
+      <li><em>"A DLQ that nobody monitors is just a trash can with extra steps."</em></li>
+      <li><em>"Failover risks a duplicate, and I'd take that trade for an OTP but not for a promo."</em></li>
+      <li><em>"My first answer is a Postgres table with SKIP LOCKED, and I want to defend that rather than apologise for it."</em></li>
+      <li><em>"If the scheduler is down for an hour, the naive recovery is a self-inflicted DDoS. Catch-up needs a policy, per job."</em></li>
+      <li><em>"What breaks first at 10× isn't my system — it's the provider's rate limit, and I can't engineer my way past a limit I don't own."</em></li>
+    </ul>
+
+    <div class="note">Next up is <a href="13-payments-orders.html">13 — Payments &amp; Orders</a>, and you've just built most of its foundations. The idempotency key, the outbox, at-least-once with idempotent effects, the reconciliation loop against an external provider you can't trust — payments is this page with money attached, which raises the stakes on every one of those mechanisms and adds a ledger. If this page felt like it kept returning to the same idea, that's because it did, and 13 will return to it again. <strong>That repetition is the archetype announcing itself.</strong></div>
+  </section>
+
+  <nav class="page-nav">
+    <a href="11-chat-system.html">← 11 — Design a Chat System</a>
+    <a href="13-payments-orders.html">13 — Design a Payment / Order System →</a>
+  </nav>
+
+</main>
+</body>
+</html>

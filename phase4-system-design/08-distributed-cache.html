@@ -1,0 +1,1186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>08 — Design a Distributed Cache / Key-Value Store | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <div class="breadcrumb"><a href="index.html">← Course Home</a></div>
+    <h1>08 — Design a Distributed Cache / Key-Value Store</h1>
+    <p>Every other case study <em>uses</em> a cache. This one builds it — and the foundations stop being vocabulary and become machinery.</p>
+  </div>
+</header>
+
+<main class="container">
+
+  <section>
+    <h2>Why this matters in the interview</h2>
+    <p>
+      In tutorial 07 you drew a box labelled "Redis" and moved on. In 09 you'll store rate-limit counters in it. In 10 you'll
+      cache the feed in it, in 11 the presence map, in 14 the seat holds. <strong>This is the page where you open that box.</strong>
+      "Design Redis," "design Memcached," "design DynamoDB" and "design a distributed key-value store" are the same question, and
+      it is a genuine FAANG favourite — Amazon in particular, because the Dynamo paper is theirs and they know it cold. It is also
+      the single best page in this phase for demonstrating distributed-systems depth, because it has nowhere to hide. There's no
+      product cleverness to fall back on, no clever schema, no CDN to hand-wave at. It is consistent hashing, replication, quorums,
+      failure detection and conflict resolution, standing in the open with the lights on.
+    </p>
+    <p>
+      That's exactly why it's worth your time even though it looks like the most "infrastructure-y" question on the list. Everything
+      you learned in 04 (the ring, virtual nodes, hot keys) and 05 (quorums, R + W &gt; N, the impossibility of distinguishing slow
+      from dead) was vocabulary. Here it becomes machinery you have to actually assemble, and the interviewer gets to watch you do it.
+      A candidate who can say <em>"replicas are the next N distinct physical nodes clockwise on the ring, and I'll use hinted handoff so
+      a write doesn't fail just because one of them is rebooting"</em> has, in one sentence, demonstrated more than an hour of
+      box-drawing. And the payoff generalises: once you can build a KV store, every other case study's "and then I'd cache it" becomes
+      a claim you can defend rather than a phrase you're repeating.
+    </p>
+  </section>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ul>
+      <li><a href="#prompt">1. The prompt</a></li>
+      <li><a href="#requirements">2. Requirements</a> — the one question that changes everything ★</li>
+      <li><a href="#estimation">3. Estimation</a> — the arithmetic that forces distribution</li>
+      <li><a href="#api">4. API design</a> — get, put, delete… and CAS</li>
+      <li><a href="#datamodel">5. Data model &amp; the single-node engine</a> — hash map + doubly-linked list</li>
+      <li><a href="#hld">6. High-level design</a> — and <em>where does the routing live?</em></li>
+      <li><a href="#dd1">7. Deep dive 1: partitioning, membership &amp; failure detection</a> ★</li>
+      <li><a href="#dd2">8. Deep dive 2: replication &amp; tunable consistency</a> ★</li>
+      <li><a href="#eviction">9. Eviction &amp; memory pressure</a></li>
+      <li><a href="#scaling">10. Scaling &amp; bottlenecks</a></li>
+      <li><a href="#tradeoffs">11. Trade-offs</a></li>
+      <li><a href="#followups">12. Follow-ups you should expect</a></li>
+      <li><a href="#qa">Interview Q&amp;A</a></li>
+      <li><a href="#takeaways">What to remember</a></li>
+    </ul>
+  </div>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="prompt">1. The prompt</h2>
+
+    <p>The interviewer says, and this is close to verbatim:</p>
+
+    <blockquote style="border-left:4px solid #cbd5e1; margin:1.2rem 0; padding:.4rem 1.1rem; color:#374151;">
+      <em>"Design a distributed cache. Something like Redis or Memcached — clients can put a key and get it back, and it should
+      scale across many machines."</em>
+    </blockquote>
+
+    <p>
+      Deliberately vague, and vague in a specific direction. Notice what is <em>not</em> in that sentence: nothing about durability,
+      nothing about consistency, nothing about what happens when a machine dies. Those omissions aren't sloppiness — they're the
+      question. A weak candidate hears "cache" and starts drawing a hash ring in minute one. A strong candidate hears "distributed"
+      and "scale across many machines" and knows that the entire design hinges on facts the interviewer hasn't given them yet.
+    </p>
+
+    <p>
+      There are really three questions hiding in there, and you should surface all three before you draw anything:
+    </p>
+    <ol>
+      <li><strong>Is this a cache or a store?</strong> Can I lose data on a node failure, or is losing data a bug? (§2 — this one reshapes everything.)</li>
+      <li><strong>Do clients need to read their own writes?</strong> Or is stale-for-a-second acceptable? That's the AP/CP posture.</li>
+      <li><strong>Who routes?</strong> Is the client allowed to be smart, or must it be a dumb HTTP caller? That decides whether you need a proxy tier.</li>
+    </ol>
+
+    <div class="senior">Open with this and you have already outperformed most candidates: <em>"Before I draw anything — is this a cache, where losing data on a node failure is acceptable and eviction is a feature, or a key-value store, where losing data is a bug? Because that single answer changes the replication scheme, the durability story, and whether I need conflict resolution at all. I'll assume it's a cache with an optional durable mode, and I'll flag where those two designs diverge."</em> Then actually do that. Interviewers remember candidates who name the fork in the road and then walk both branches.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="requirements">2. Requirements</h2>
+
+    <h3>The fork in the road: cache vs store</h3>
+    <p>
+      This is the highest-leverage clarifying question in the whole phase, so it deserves a table rather than a paragraph. The same
+      words — "distributed key-value system" — describe two systems that disagree about almost everything:
+    </p>
+
+    <table>
+      <thead><tr><th>Dimension</th><th>Cache (Memcached, Redis-as-cache)</th><th>Store (DynamoDB, Cassandra, Redis-as-database)</th></tr></thead>
+      <tbody>
+        <tr><td>Losing a key</td><td><strong>Acceptable.</strong> It's a miss; you re-read from the source of truth.</td><td><strong>A bug.</strong> There is no source of truth behind you. You <em>are</em> it.</td></tr>
+        <tr><td>Eviction</td><td>A <em>feature</em>. Memory is a fixed budget; the cache's job is to keep the useful 5%.</td><td>A <em>disaster</em>. Nothing may be evicted. Full means you add nodes.</td></tr>
+        <tr><td>Durability</td><td>None needed. RAM only. A restart starts cold and that's fine.</td><td>Required. Write-ahead log, snapshots, replication to disk on N nodes.</td></tr>
+        <tr><td>Replication</td><td>Often <em>none</em>. A dead node = a cold third of the key space = a spike in DB load. Survivable.</td><td>Mandatory, N ≥ 3. A dead node must not lose the only copy of anything.</td></tr>
+        <tr><td>Conflict resolution</td><td>Barely matters. Wrong version = one stale read = a slightly wrong page.</td><td>Matters enormously. A lost write is lost money.</td></tr>
+        <tr><td>Node failure</td><td>Re-hash, serve misses, refill. Minutes of elevated DB load.</td><td>Promote a replica, hinted handoff, anti-entropy repair. No data loss permitted.</td></tr>
+      </tbody>
+    </table>
+
+    <p>
+      <strong>Design for the cache, then show where the store diverges.</strong> That ordering is deliberate: the cache is the simpler
+      system, it's what the prompt literally asked for, and every store feature (replication, quorums, hinted handoff) is an
+      <em>addition</em> to it rather than a rewrite of it. So you build the cache, and then at each deep dive you say "…and if this were
+      a store instead, here's what changes." You end up having designed both, in the same 45 minutes, and demonstrated that you know
+      which knobs are which.
+    </p>
+
+    <h3>Functional requirements</h3>
+    <ul>
+      <li><code>get(key)</code> → value or null.</li>
+      <li><code>put(key, value, ttl?)</code> → stores, overwrites, optionally expires.</li>
+      <li><code>delete(key)</code>.</li>
+      <li><strong>TTL / expiry</strong> per key. Non-negotiable in a cache — it's the only correctness mechanism you have for staleness.</li>
+      <li><strong>Eviction</strong> when memory is full (LRU by default). Also non-negotiable, and see §9 for why "true LRU" is the wrong answer.</li>
+      <li><strong>Compare-and-set</strong> — <code>cas(key, expectedVersion, newValue)</code>. Cheap to add, and it's the operation that turns a cache into a coordination primitive (§4).</li>
+    </ul>
+
+    <h3>Explicitly out of scope</h3>
+    <p>Say these out loud and cut them; scoping is graded.</p>
+    <ul>
+      <li><strong>Rich data types</strong> — Redis lists/sets/sorted-sets/streams. Great products, orthogonal to the distributed problem. "I'd design the cluster layer first; the value can be an opaque byte array, and richer types are a single-node concern."</li>
+      <li><strong>Range queries / secondary indexes.</strong> It's a <em>key</em>-value store. Point lookups only. (If the interviewer wants ranges, they're asking for tutorial 03's LSM-tree, not this.)</li>
+      <li><strong>Multi-key transactions.</strong> Keys live on different nodes; a transaction across them is 2PC (tutorial 05), which is a different question and a much worse system.</li>
+      <li><strong>Multi-region.</strong> Park it — bring it back as a follow-up (§12).</li>
+    </ul>
+
+    <h3>Non-functional requirements — the ones that actually drive the design</h3>
+    <table>
+      <thead><tr><th>Requirement</th><th>Target</th><th>What it forces</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Latency</strong></td><td>P99 &lt; 5 ms end-to-end; P50 ≈ 1 ms</td><td>Everything in RAM. No disk in the read path. At most <em>one</em> network hop from client to owning node — which is why routing (§6) is a real decision and not a detail.</td></tr>
+        <tr><td><strong>Throughput</strong></td><td>1M QPS aggregate</td><td>Horizontal scale. No single coordinator on the data path.</td></tr>
+        <tr><td><strong>Scalability</strong></td><td>Add/remove nodes without a full reshuffle</td><td>Consistent hashing (tutorial 04). This requirement <em>is</em> the reason the ring exists.</td></tr>
+        <tr><td><strong>Availability</strong></td><td>Serve reads/writes during node failures and network partitions</td><td>An <strong>AP</strong> posture: replication with quorums, not a leader with consensus. You accept temporary inconsistency in exchange for never being down.</td></tr>
+        <tr><td><strong>Consistency</strong></td><td><em>Tunable.</em> Per-request R and W.</td><td>Quorum reads/writes (§8). Callers who need read-your-writes pay for it; callers who don't, don't.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="senior">The CAP sentence to have ready, because you <em>will</em> be asked: <em>"For a cache I'm firmly AP. If a partition splits my cluster, I'd rather serve a slightly stale value than return an error — because the alternative is that a cache outage becomes a database outage, and the database is the thing that actually falls over. I'd only go CP if this is a store holding the only copy of the data, or if it's being used for locking, where a stale read is a correctness violation rather than an inconvenience."</em> Note what that does: it makes CAP a <em>consequence of the use case</em>, not a slogan.</div>
+
+    <div class="pitfall">Don't say "it's a cache, so consistency doesn't matter." It does — just differently. A cache that returns a value you deleted 30 seconds ago is serving a bug, and "cache invalidation" is a famously hard problem precisely because caches <em>are</em> consistency-critical in the small. What's relaxed is <em>durability</em>, not correctness. Keep those two words separate and you'll sound precise; conflate them and you'll sound like you're reciting.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="estimation">3. Estimation</h2>
+
+    <p>
+      Here the estimation does something unusually direct: it doesn't just size the cluster, <strong>it proves that you need a
+      cluster at all</strong>. That's the framing to use out loud. Everything downstream — the ring, gossip, replication — exists
+      because of one number that falls out of this arithmetic.
+    </p>
+
+    <h3>Given (assume these, state them)</h3>
+    <ul>
+      <li>Working set: <strong>1 TB</strong> of hot data.</li>
+      <li>Traffic: <strong>1M QPS</strong> aggregate, read-heavy — say 9:1 reads:writes.</li>
+      <li>Average value: <strong>2 KB</strong>. Average key: ~50 bytes.</li>
+    </ul>
+
+    <h3>How many nodes?</h3>
+<pre><code>Usable RAM per node
+  Rent a 64 GB instance. You do NOT get 64 GB of cache:
+    - OS + process overhead ................. ~4 GB
+    - per-entry overhead (key, ptrs, TTL,
+      LRU links, hash bucket): ~60-100 B/entry
+    - fragmentation + headroom (never run a
+      cache at 100% — GC/copy needs slack) .. ~20%
+
+  Usable ≈ 64 × 0.75 ≈ 48 GB per node.   ← round DOWN, aggressively
+
+Node count for capacity
+  1 TB / 48 GB  ≈  21 nodes.   Call it 25 for headroom.
+
+Node count for throughput
+  A single-threaded in-memory KV node does 100k-200k ops/s
+  comfortably (Redis is famously ~100k+/s on one core).
+  1,000,000 QPS / 100,000 per node = 10 nodes.
+
+Binding constraint = MEMORY (25), not CPU (10).</code></pre>
+
+    <p>
+      <strong>That's the sentence.</strong> "Memory binds before CPU, so the node count is set by the working set, and I need
+      about 25 nodes." And 25 nodes is exactly the number that makes this a distributed-systems problem: one node can't hold the
+      data, so the data must be split, so something must decide <em>which node owns which key</em> — and that something must survive
+      nodes joining and leaving. <strong>That is consistent hashing, and I just derived it from the arithmetic rather than
+      asserting it.</strong> Say that too.
+    </p>
+
+    <h3>The other numbers, quickly</h3>
+<pre><code>Storage with replication (N = 3)
+  1 TB × 3 = 3 TB total  →  3 TB / 48 GB ≈ 63 nodes.
+  Replication TRIPLES the fleet. That is the real cost of durability,
+  and it's a cost you should name before the interviewer does.
+
+Bandwidth (this one surprises people)
+  1M QPS × 2 KB              = 2 GB/s  = 16 Gbps aggregate
+  Spread over 25 nodes       = 640 Mbps per node — fine on 10 GbE.
+  BUT a quorum write (W=2) sends the value to 2-3 nodes:
+    write traffic ×3 on the internal network.
+  → the cluster's east-west traffic can exceed its north-south traffic.
+
+Per-node QPS
+  1M / 25 = 40k QPS per node. Comfortably under the ~100k ceiling.
+  So a node loss doesn't just cost capacity — the survivors absorb
+  its 40k QPS. 25 nodes → 24 means +1.7k QPS each. Absorbable.
+  A 5-node cluster losing one node means +25% each. Not absorbable.
+  Small clusters are FRAGILE. That's a real insight; use it.</code></pre>
+
+    <div class="note">Notice the shape of this: <em>reads</em> are what you have a million of, but <em>memory</em> is what you're short of, and <em>replication</em> is what actually sets the bill. In tutorial 07 the read:write ratio drove the design; here it's the working-set size. Different case study, different driving number — and identifying <em>which</em> number drives the design is the estimation skill being graded, not the arithmetic itself.</div>
+
+    <div class="senior">Round brutally and say you're rounding: <em>"I'm going to call 64 GB of RAM 48 GB usable and 1 TB / 48 GB about 25 nodes. I don't care about the exact number — I care that it's tens, not one, and not thousands. Tens means consistent hashing and gossip are worth it and a central config service would also have been fine. Thousands would mean I need to think much harder about gossip's O(n) chattiness."</em> Naming what the number <em>changes</em> is the point of estimating. An estimate that doesn't change a decision was a waste of five minutes, and interviewers know it.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="api">4. API design</h2>
+
+    <p>The surface is tiny, and that's the point — a KV store's power is in what's <em>behind</em> the API, not in the API. Four operations:</p>
+
+<pre><code><span class="com">// The core three</span>
+<span class="typ">byte</span>[]  get(<span class="typ">String</span> key);
+<span class="typ">void</span>    put(<span class="typ">String</span> key, <span class="typ">byte</span>[] value, <span class="typ">int</span> ttlSeconds);
+<span class="typ">boolean</span> delete(<span class="typ">String</span> key);
+
+<span class="com">// The one that changes what the system can be used for</span>
+<span class="typ">boolean</span> cas(<span class="typ">String</span> key, <span class="typ">long</span> expectedVersion, <span class="typ">byte</span>[] newValue);
+
+<span class="com">// Tunable consistency: R and W per call, not per cluster</span>
+<span class="typ">byte</span>[]  get(<span class="typ">String</span> key, <span class="typ">int</span> R);          <span class="com">// R = replicas that must respond</span>
+<span class="typ">void</span>    put(<span class="typ">String</span> key, <span class="typ">byte</span>[] v, <span class="typ">int</span> ttl, <span class="typ">int</span> W);</code></pre>
+
+    <h3>Why CAS is the interesting one</h3>
+    <p>
+      <code>get</code> and <code>put</code> make a cache. <code>cas</code> makes a <em>coordination primitive</em>. Without it,
+      "increment this counter" is read-modify-write, which is a lost-update race the moment two clients do it concurrently — you
+      read 5, they read 5, you both write 6, and one increment vanished. With CAS, the loser's write is rejected and it retries.
+      That's optimistic concurrency control, and you already know it: it is exactly the <code>@Version</code> column and
+      <code>OptimisticLockException</code> from JPA in Phase 1, just with the version living in a cache node instead of a Postgres row.
+    </p>
+    <p>Every response therefore carries a version (a monotonically increasing counter per key, or a vector clock — see §8):</p>
+<pre><code>GET /v1/keys/user:42
+  200 OK
+  { "value": "&lt;base64&gt;", "version": 17, "ttl_remaining": 240 }
+
+PUT /v1/keys/user:42?w=2
+  If-Match: 17                 &lt;-- the CAS condition; reject if version moved
+  { "value": "&lt;base64&gt;", "ttl": 300 }
+  200 OK   { "version": 18 }
+  409 Conflict  &lt;-- someone else wrote first; re-read and retry</code></pre>
+
+    <p>
+      Two things worth saying out loud about this shape. First, <strong>the HTTP framing is a lie you tell for whiteboard clarity</strong> —
+      a real cache does not speak HTTP. HTTP/JSON costs you hundreds of microseconds in parsing and header overhead on a 1 ms budget,
+      which is a large fraction of your latency SLO spent on ceremony. Real systems use a compact binary protocol over a persistent TCP
+      connection (Redis's RESP, Memcached's binary protocol) with pipelining, so a client can have a hundred requests in flight on one
+      socket. Say that; it's a cheap, high-signal detail. Second, <code>If-Match</code>/<code>409</code> is not an accident — it's the
+      same optimistic-concurrency semantics as HTTP ETags, which you already use on the frontend. Same idea, same failure mode, different tier.
+    </p>
+
+    <div class="senior">The CAS soundbite: <em>"I'd expose compare-and-set, because it's ~10 lines on the server and it's what lets callers build counters and locks safely. Without CAS, every client that wants to increment a value has a lost-update race. With it, the write is conditional on the version they read — optimistic concurrency, same as a JPA @Version column. And I'd be honest that a lock built on this is only safe with a fencing token, because a client can pause on a GC and wake up after its lease expired — that's tutorial 05's distributed-lock problem, and a cache doesn't make it go away."</em></div>
+
+    <div class="pitfall">Do not offer a <code>keys("prefix:*")</code> or "list all keys" endpoint just because it seems convenient. In a partitioned store it is a scatter-gather across every node, it's O(everything), and in Redis <code>KEYS *</code> is a famous production outage generator because it blocks the single-threaded server for as long as the scan takes. If asked, the honest answer is: "I wouldn't. It doesn't partition. If you need enumeration you need a different index, and probably a different system."</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="datamodel">5. Data model &amp; the single-node engine</h2>
+
+    <p>
+      There is no schema here — that's the whole point of a KV store, and saying "the value is an opaque blob; I don't interpret it,
+      and that's precisely why this scales" is a fine 10-second answer to "what's your data model?". The interesting question is one
+      level down: <strong>what does a single node actually look like inside?</strong> Get this right and the cluster is a wrapper around
+      it; get it wrong and no amount of ring diagram saves your P99.
+    </p>
+
+    <h3>You have already built this</h3>
+    <div class="note"><strong>Callback:</strong> the single-node engine is an <strong>LRU cache</strong> — a hash map plus a doubly-linked list, O(1) get and O(1) put. You built exactly this in <a href="../phase3-dsa/06-linked-lists.html#lru">Phase 3, tutorial 06 (Linked Lists → Design: LRU Cache)</a>. That LeetCode problem is not a toy. It is the core data structure of Redis, Memcached, your CPU's L2 cache, and the page cache in the kernel you're reading this on. <strong>This is one of the most satisfying moments in the whole prep:</strong> the DSA problem you ground through in Phase 3 <em>is</em> the answer to the hardest system design question in Phase 4. Say so in the interview — "the node itself is the LRU cache problem: hash map for O(1) lookup, doubly-linked list for O(1) recency reordering" — and you have connected two rounds of the loop in one sentence.</div>
+
+<pre><code>SINGLE NODE — internals
+
+   hash table (key → node*)          doubly-linked list (recency order)
+  ┌──────────────────────┐          MRU ◀────────────────────▶ LRU
+  │ "user:42"   ──────┐  │       ┌──────┐  ┌──────┐  ┌──────┐
+  │ "cart:7"    ───┐  │  │       │user  │◀▶│cart  │◀▶│sess  │
+  │ "sess:9a"   ─┐ │  │  │       │:42   │  │:7    │  │:9a   │
+  └──────────────┼─┼──┼──┘       │val,  │  │val,  │  │val,  │
+                 │ │  │          │ttl,  │  │ttl,  │  │ttl,  │
+                 │ │  └─────────▶│ver   │  │ver   │  │ver   │
+                 │ └────────────────────────▶      │  │      │
+                 └─────────────────────────────────────▶     │
+                                └──────┘  └──────┘  └──────┘
+                                                        ▲
+   get(k):  hash lookup → O(1)                          │
+            move node to head → O(1)          evict from HERE when full
+   put(k):  insert at head; if over budget, drop tail → O(1)</code></pre>
+
+    <p>Each entry carries more than you'd think, and the overhead is the reason your 64 GB box holds 48 GB of cache:</p>
+
+    <table>
+      <thead><tr><th>Field</th><th>Purpose</th><th>Cost</th></tr></thead>
+      <tbody>
+        <tr><td><code>key</code></td><td>Identity. Stored, because the hash bucket needs it to resolve collisions.</td><td>~50 B</td></tr>
+        <tr><td><code>value</code></td><td>Opaque bytes.</td><td>~2 KB (capped — see below)</td></tr>
+        <tr><td><code>expiresAt</code></td><td>Absolute epoch ms, <em>not</em> a countdown. Absolute means expiry survives a replica handoff and doesn't need a timer per key.</td><td>8 B</td></tr>
+        <tr><td><code>version</code></td><td>Monotonic counter for CAS and for conflict resolution (§8).</td><td>8 B</td></tr>
+        <tr><td><code>prev</code>, <code>next</code></td><td>The LRU list links.</td><td>16 B</td></tr>
+        <tr><td><code>lastAccess</code> / freq counter</td><td>For LFU or for approximated LRU (§9).</td><td>4–8 B</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Why you cap value size</h3>
+    <p>
+      Redis's limit is 512 MB per value; Memcached's default is <strong>1 MB</strong>, and Memcached is right. Cap values at 1 MB and
+      say why:
+    </p>
+    <ul>
+      <li><strong>Head-of-line blocking.</strong> A single-threaded event loop serving a 50 MB value spends tens of milliseconds writing it to a socket. Every other request on that node — thousands of them — waits. One fat key destroys the P99 for everybody. This is the same disease as a slow SQL query holding a connection, and the same fix: bound the work per request.</li>
+      <li><strong>Memory fragmentation.</strong> Huge, variably-sized allocations shred the allocator's free lists. You end up with a heap that's 60% "free" and can't satisfy a 4 MB request.</li>
+      <li><strong>It's a smell.</strong> A 50 MB cache value almost always means someone is using the cache as a blob store. Point them at S3 and cache the URL.</li>
+    </ul>
+
+    <h3>Slab allocation <span class="tier tier-3">AWARENESS</span></h3>
+    <p>
+      <em>Awareness level — worth 30 seconds, not 3 minutes, and only if the interviewer pushes on memory.</em> A naive
+      <code>malloc</code>/<code>free</code> per entry fragments badly: you free a 900-byte entry and later want 1,100 bytes, and the hole
+      is useless. Memcached's answer is <strong>slab allocation</strong> — pre-carve memory into classes of fixed-size chunks (96 B,
+      120 B, 152 B, … growing by a factor of ~1.25) and round every allocation up to the nearest class. Allocation and free become O(1)
+      pointer moves onto a free list, and fragmentation is bounded and predictable.
+    </p>
+    <p>
+      The cost is <strong>internal fragmentation</strong> (a 130-byte value in a 152-byte chunk wastes 22 bytes — you eat ~10–20% waste
+      by design) and the notorious <strong>slab calcification</strong> problem: memory assigned to the 1 KB class stays there, so if your
+      workload shifts from 1 KB values to 100 KB values, you'll evict from the 100 KB class while gigabytes sit idle in the 1 KB class.
+      Redis dodges the whole question by using jemalloc, which is a general allocator tuned for exactly this pattern.
+    </p>
+
+    <div class="senior">The trade-off line, and it's a lesson that recurs all over this page: <em>"Slab allocation trades a predictable 10–20% memory waste for O(1) allocation and bounded fragmentation. That's the right trade for a cache — a cache would rather waste 15% of RAM than have an unpredictable latency spike from allocator pressure. In a cache, predictable beats optimal, every time."</em> Hold onto that sentence — it is the same argument that justifies approximated LRU in §9 and hinted handoff in §8.</div>
+
+    <h3>Threading: the "single-threaded is fine" answer</h3>
+    <p>
+      Redis is famously single-threaded for command execution, and candidates find this shocking. Explain it and you look like you've
+      read source rather than blog posts: an in-memory hash-table lookup is <em>nanoseconds</em>. The work is not the computing — it's the
+      <em>syscalls</em>, the network I/O. A single thread on an epoll event loop can saturate a NIC before it saturates a core. Adding
+      threads to the command path would buy you very little and cost you locks on every data structure, which would be slower <em>and</em>
+      buggier. So: one thread for commands, an event loop for I/O, and if you need more CPU you run more <em>processes</em> — which you're
+      already doing, because you're already sharded. <strong>The cluster is the concurrency model.</strong> (Redis 6+ does thread the I/O
+      read/write path while keeping command execution single-threaded — a nice detail if you have it.)
+    </p>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="hld">6. High-level design</h2>
+
+    <p>
+      Twenty-five nodes, no leader, no master, no central coordinator on the data path. Every node is identical and every node can
+      answer for the keys it owns. The ring from tutorial 04 decides who owns what.
+    </p>
+
+<pre><code>                      ┌──────────┐  ┌──────────┐  ┌──────────┐
+    clients ─────────▶│ client   │  │ client   │  │ client   │
+                      │ library  │  │ library  │  │ library  │
+                      │ (knows   │  │ (knows   │  │ (knows   │
+                      │  the ring)│ │  the ring)│ │  the ring)│
+                      └────┬─────┘  └────┬─────┘  └────┬─────┘
+                           │             │             │
+                  hash(key) → walk ring clockwise → owning node
+                           │             │             │
+        ┌──────────────────┴─────────────┴─────────────┴────────────┐
+        │                  THE RING (0 … 2^32-1)                    │
+        │                                                            │
+        │      N1 ····· N2 ····· N3 ····· N4 ····· N5 ····· N1      │
+        │      ▲ owns keys hashing into the arc BEFORE it            │
+        │                                                            │
+        │   every node gossips membership with 3 random peers/sec    │
+        └────────────────────────────────────────────────────────────┘
+             each node: hash map + LRU list + replica set for its arc</code></pre>
+
+    <h3>One write, end to end (W = 2, N = 3)</h3>
+    <ol>
+      <li>Client calls <code>put("user:42", v, ttl=300)</code>.</li>
+      <li>Client library computes <code>h = hash("user:42")</code>, walks the ring clockwise, finds the first virtual node → its physical node, <strong>N3</strong>. That's the <em>coordinator</em> for this key. (Any node <em>can</em> coordinate; routing to the owner just saves a hop.)</li>
+      <li>N3 identifies the <strong>preference list</strong>: itself plus the next 2 <em>distinct physical</em> nodes clockwise — N4, N7. It writes locally and forwards to both.</li>
+      <li>As soon as <strong>W = 2</strong> nodes have acked (N3 itself + whichever of N4/N7 answers first), N3 returns success to the client. The third replica is still in flight — that's fine, and that's what "eventually consistent" concretely means.</li>
+      <li>If N7 is down, N3 sends the write to N8 instead, tagged <em>"this is really N7's, hold it for them"</em>. That's <strong>hinted handoff</strong> (§8), and it's why a node being down does not make writes fail.</li>
+    </ol>
+
+    <h3>One read (R = 2)</h3>
+    <ol>
+      <li>Client hashes, walks, hits N3.</li>
+      <li>N3 asks the preference list for the value and waits for <strong>R = 2</strong> responses (including its own).</li>
+      <li>If the versions agree → return it. If they disagree → the newest wins (or the client is handed both — §8), and N3 <strong>writes the winner back to the stale replica</strong>. That's <strong>read repair</strong>: the read path quietly heals the data as a side effect, for free, on exactly the keys people actually care about.</li>
+      <li>Check TTL <em>on read</em> — an expired key returns null even if it's physically still in memory (lazy expiry, §9).</li>
+    </ol>
+
+    <h3 id="routing">Where does the routing live? — the question candidates fumble</h3>
+    <p>
+      This is a genuinely good interview question and it comes up constantly, in the form "so how does the client <em>know</em> which
+      node to talk to?" There are exactly three answers, they map to three real systems, and having all three ready is a strong signal.
+    </p>
+
+    <table>
+      <thead><tr><th></th><th>A. Fat client (client-side routing)</th><th>B. Proxy tier</th><th>C. Server-side redirect</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Who knows the ring</strong></td><td>Every client</td><td>The proxies only</td><td>Every server; client learns lazily</td></tr>
+        <tr><td><strong>Real system</strong></td><td>Memcached clients, Cassandra drivers</td><td>Twemproxy, mcrouter, Envoy</td><td>Redis Cluster (<code>MOVED</code>/<code>ASK</code>)</td></tr>
+        <tr><td><strong>Hops</strong></td><td><strong>1</strong> — the minimum</td><td>2 — client → proxy → node</td><td>1 warm, 2 on the first miss after a move</td></tr>
+        <tr><td><strong>Client complexity</strong></td><td>High. A fat library in every language you support.</td><td>Zero. Clients talk to one address.</td><td>Medium — must handle a redirect and cache the mapping.</td></tr>
+        <tr><td><strong>Killer weakness</strong></td><td><strong>Every client must agree on the ring.</strong> Roll out a topology change and you're now doing a coordinated deploy of every service that uses the cache. Disagreement = clients reading from the wrong node = silent stale data.</td><td><strong>An extra hop on a 1 ms budget</strong> — that's a 30–50% latency tax. And the proxy tier is a new thing to scale, monitor and fail over.</td><td>Servers must gossip the topology <em>and</em> handle keys that are mid-migration (that's what <code>ASK</code> is for). More complexity on the server.</td></tr>
+        <tr><td><strong>Choose when</strong></td><td>Latency is sacred and you control the clients (one language, one org).</td><td>Many client languages, or clients you don't control. Also lets you add caching, batching and connection pooling in one place.</td><td>You want thin-ish clients <em>and</em> one hop, and you can afford server-side complexity.</td></tr>
+      </tbody>
+    </table>
+
+    <p>
+      <strong>Pick B for the interview and say why.</strong> "I'd start with a proxy tier — mcrouter-style — because it keeps every
+      client dumb and lets me change the topology without redeploying a dozen services. It costs me a network hop, roughly 0.3 ms, which
+      I can afford in a 5 ms P99 budget. If profiling later showed that hop was the P99, I'd move to a fat client for the one or two
+      highest-QPS services and keep the proxy for everyone else." <strong>That's the senior answer: pick one, name its cost in a real
+      unit, and describe the condition under which you'd flip.</strong>
+    </p>
+
+    <p>And a fourth option worth one sentence: <strong>a config service</strong> (ZooKeeper/etcd — tutorial 05) holding the authoritative ring, with clients or proxies watching it for changes. This is what most enterprise systems actually do, it's much simpler to reason about than gossip, and at 25 nodes it is genuinely the right call. Gossip earns its keep at hundreds of nodes; below that, a strongly-consistent config store is less code and fewer failure modes. Saying <em>that</em> — "gossip is cool, but at my scale I'd use etcd" — is a maturity signal, not a retreat.</p>
+
+    <div class="pitfall">Candidates draw a single "load balancer" or "router" box in front of the cache nodes and stop there. Push on it and the design collapses: if a plain L4 load balancer picks a random node, that node doesn't have the key — <em>every request is a miss</em>. A cache in front of a cache. <strong>A KV cluster cannot be fronted by a round-robin load balancer</strong>, because routing must be a function of the key, not of load. If you take one thing from this section: the routing is <em>key-aware</em>, always, everywhere, or the system does not work at all.</div>
+
+    <div class="senior">There is no leader, and you should say so explicitly: <em>"Note there's no master node here. Every node is identical, any node can coordinate any request, and membership is decentralised. That's a deliberate AP choice — a leader is a single point of failure and a consensus bottleneck on the write path, and for a cache the availability is worth more to me than the strong consistency a leader would buy. If this were a store that needed linearizable writes, I'd flip to leader-per-shard with Raft, and I'd accept that a leader election means a few seconds of unavailability for that shard."</em> That one paragraph shows you know both architectures and chose between them.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="dd1">7. Deep dive 1: partitioning, membership &amp; failure detection</h2>
+
+    <p><strong>This is where the interview really happens.</strong> Sections 1–6 were the setup; a competent mid-level candidate gets that far. The next two sections are what separates you.</p>
+
+    <h3>7a. The ring, used rather than explained</h3>
+    <p>
+      You already derived consistent hashing in <a href="04-partitioning-hashing.html#ring">tutorial 04</a>, so <strong>do not re-teach
+      it here</strong> — in the interview, spend 60 seconds, not 10 minutes. The compressed version you say out loud:
+    </p>
+    <blockquote style="border-left:4px solid #cbd5e1; margin:1.2rem 0; padding:.4rem 1.1rem; color:#374151;">
+      <em>"Hash the key space onto a 32-bit ring. Hash each node onto the same ring, and a key belongs to the first node clockwise from
+      it. Adding or removing a node only moves the keys in one arc — K/N of them — instead of the ~100% you'd remap with hash mod N. I'd
+      give each physical node about 150 virtual nodes so the arcs are even and so a dying node's load spreads across <em>all</em>
+      survivors rather than dumping entirely onto its clockwise neighbour."</em>
+    </blockquote>
+    <p>Then move immediately to what's <em>new</em> here — the three things the cluster does with the ring that tutorial 04 didn't cover:</p>
+
+    <table>
+      <thead><tr><th>Ring fact</th><th>What the KV store does with it</th></tr></thead>
+      <tbody>
+        <tr><td>First node clockwise</td><td>The <strong>coordinator</strong> — the node the client routes to.</td></tr>
+        <tr><td>Next N−1 <em>distinct physical</em> nodes clockwise</td><td>The <strong>preference list</strong> — the replicas (§8). "Distinct physical" is load-bearing: with virtual nodes, the next 2 vnodes clockwise might belong to the <em>same</em> box you're already on. Replicating a key three times onto one machine is worse than useless — it's three copies with one blast radius. <strong>You must skip vnodes whose physical node is already in the list.</strong></td></tr>
+        <tr><td>Rack/AZ of each node</td><td>Extend the skip rule: prefer replicas in <em>different availability zones</em>. Now an AZ outage costs you one replica, not all three. Dynamo calls this the rack-aware preference list. It costs you cross-AZ latency and bandwidth on every write — a real bill, worth naming.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="senior">The "distinct physical nodes" detail is a small trap and a big signal. <em>"With virtual nodes, walking clockwise for replicas can hand you three vnodes that all belong to the same physical machine — so the replica-selection walk has to skip vnodes whose physical host is already in the preference list, and ideally prefer a different AZ. It's an easy bug to write and a catastrophic one to ship: you'd think you had three replicas and you'd have one machine."</em> Very few candidates volunteer this. It's the kind of thing you only notice if you've thought about actually implementing it — which is exactly the impression you want to leave.</div>
+
+    <h3>7b. Membership: how do nodes even know about each other?</h3>
+    <p>
+      The ring is a function of the membership list. So who has the membership list? "The config file" is a fine answer for 3 nodes and a
+      terrible one for 250 — you can't redeploy the fleet every time a machine dies. Two real options:
+    </p>
+
+    <p>
+      <strong>Option 1 — a strongly-consistent config service (ZooKeeper / etcd).</strong> One authoritative membership list, linearizable,
+      watchable. Nodes register on boot, take out a session, and if a node's session lapses everyone learns immediately and consistently.
+      <em>Simple, correct, and it's what most companies actually run.</em> The cost: you've added a CP dependency to an AP system. If ZooKeeper
+      is partitioned away, you can't change membership — though, crucially, you can keep <em>serving</em> from the last known ring, which is
+      why this is tolerable. (See tutorial 05 for what ZooKeeper actually guarantees.)
+    </p>
+
+    <p>
+      <strong>Option 2 — gossip.</strong> No coordinator at all. This is what Dynamo, Cassandra, Riak and Redis Cluster do, and it's what
+      the interviewer wants to hear about.
+    </p>
+
+<pre><code>GOSSIP — one round, on every node, every ~1 second
+
+  1. pick k random peers (k = 3 is typical)
+  2. send them my view of the world:
+        { N1: alive, hb=8814, ver=12 }
+        { N2: alive, hb=9902, ver=41 }
+        { N7: suspect, hb=4410, ver=39 }   ← haven't heard from N7
+  3. peer merges: for each node, keep the entry with the
+     HIGHER heartbeat counter (that's the more recent truth)
+  4. peer replies with ITS view; I merge the same way
+
+  Convergence: each round roughly TRIPLES the number of nodes
+  that know a fact → O(log n) rounds to reach everyone.
+    250 nodes, k=3, 1 round/sec  →  ~5-6 seconds to full convergence.
+
+  Cost: O(n) state carried per message, k messages/sec/node.
+        At 250 nodes that's trivial. At 10,000 nodes the
+        membership list ITSELF becomes the bottleneck — which is
+        why very large fleets shard the gossip or go back to
+        a config service.</code></pre>
+
+    <p>
+      The property that makes gossip beautiful: <strong>it has no leader, no single point of failure, and it converges anyway.</strong>
+      The property that makes it hard: <strong>it is eventually consistent about membership</strong>, so during those 5 seconds, two nodes
+      genuinely disagree about who is in the cluster — and therefore about who owns a key. A client routed by node A's ring and a client
+      routed by node B's ring can, for a few seconds, write the same key to different nodes. That's not a bug you can eliminate; it's a
+      property you must design around (which is what §8's quorums and read repair are for).
+    </p>
+
+    <div class="note">Gossip's convergence is the same mathematics as an epidemic — hence the literature calling these "epidemic protocols." Each infected node infects k more per round, so the infected fraction grows exponentially until it saturates. It's also why gossip is <em>robust</em>: killing any single node, or losing any batch of messages, doesn't stop the spread — there is no message whose loss matters, because the information is redundantly carried by everyone who has it.</div>
+
+    <h3>7c. Failure detection — and the problem you cannot solve</h3>
+    <p>
+      Node N7 hasn't answered in 3 seconds. Is it dead? <strong>You cannot know.</strong> This is the single most important sentence in
+      distributed systems and it came up in <a href="05-coordination-consensus.html#hard">tutorial 05</a>: in an asynchronous network you
+      <em>cannot distinguish a crashed node from a slow node from a partitioned node</em>. There is no timeout that is correct. There is no
+      algorithm that fixes it. The only choice available to you is which mistake you'd rather make.
+    </p>
+
+    <table>
+      <thead><tr><th>Approach</th><th>How it works</th><th>The problem with it</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Fixed-timeout heartbeat</strong></td><td>Ping every second; declare dead after 3 misses.</td><td>The timeout is a guess. Too short → healthy nodes get evicted during a GC pause or a network blip. Too long → you serve errors from a dead node for 30 seconds. And the right value <em>changes</em> with load and time of day.</td></tr>
+        <tr><td><strong>Phi-accrual detector</strong> <span class="tier tier-3">AWARENESS</span></td><td>Don't output a boolean; output a <em>suspicion level</em>. Track the distribution of inter-arrival times of heartbeats from each node, and compute φ = how surprising this silence is, given that node's own history. φ rises smoothly as silence grows. Callers pick their own threshold: a cheap read acts at φ=3, a rebalance acts at φ=12.</td><td>Still just a better guess — it adapts to the network instead of assuming it. But it can't see through a partition either. (Cassandra and Akka use it.)</td></tr>
+        <tr><td><strong>Indirect probing</strong> (SWIM-style)</td><td>Before I declare N7 dead, I ask 3 other nodes to ping it. If <em>they</em> can reach it, the problem is <em>my</em> link, not N7.</td><td>Cheap, effective, and it dramatically cuts false positives caused by one bad link. This is the practical answer and it's underrated in interviews.</td></tr>
+      </tbody>
+    </table>
+
+    <p><strong>What happens when you falsely suspect a live node</strong> — the follow-up that separates people:</p>
+    <ul>
+      <li>The ring reshapes. N7's arc is reassigned to its clockwise successors.</li>
+      <li>Those successors start serving N7's keys — <em>cold</em>. Every request is a miss until they refill. A false positive therefore <strong>manufactures a load spike on your database</strong>: the exact thing the cache exists to prevent.</li>
+      <li>Meanwhile N7 is alive and still serving clients that haven't heard the news yet, still accepting writes for keys it no longer owns. Now the same key has two owners writing divergent values. (Quorums + read repair are your safety net; without them you'd silently lose writes.)</li>
+      <li>When N7 comes back, it has to be told it's been demoted, hand back its arc, and the data has to converge.</li>
+    </ul>
+
+    <div class="senior">The line that shows you've actually operated systems: <em>"Because a false positive is expensive — it dumps a cold cache's worth of load onto the database and it creates a window where a key has two owners — I'd bias the failure detector towards being slow and sure. I'd use indirect probing before declaring anything dead, and I'd separate 'suspect' from 'dead': a suspected node stops receiving new traffic but I don't reshuffle the ring for it. Only a node that stays down past a longer threshold — tens of seconds — triggers actual rebalancing. Transient blips are common; real node deaths are rare. The system should be tuned for the common case."</em> That "suspect vs dead" distinction is exactly what Redis Cluster does (PFAIL → FAIL, requiring a majority of masters to agree) and naming it is a strong close.</div>
+
+    <div class="pitfall">The most common failure-detection mistake in interviews is treating it as a solved problem — "I'll heartbeat every second and mark it dead after 3 seconds," said with confidence, then moving on. The interviewer's next question is <em>"what if it was just a long GC pause?"</em> and if you don't have an answer you've revealed the gap. <strong>Volunteer the impossibility yourself.</strong> "There's no correct timeout here — I can't distinguish slow from dead, so I'm choosing which error to make, and I'd rather be slow to evict than wrong to evict."</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="dd2">8. Deep dive 2: replication &amp; tunable consistency</h2>
+
+    <p>
+      Deep dive 1 decided <em>who owns a key</em>. This one decides <em>how many copies exist and what happens when they disagree</em>.
+      If the interviewer only lets you go deep on one thing, make it this one — it is the richest 15 minutes on the page, and it's where
+      the Dynamo vocabulary lives.
+    </p>
+
+    <h3>8a. Where the replicas go</h3>
+    <p>
+      Replicate each key to the <strong>next N distinct physical nodes clockwise</strong> from its position on the ring — the preference
+      list from §7a. N = 3 is the industry default and you should just say "N=3" and justify it: two replicas survive one failure; three
+      survive one failure <em>while</em> one node is being upgraded, which is the state your cluster is actually in most of the time.
+    </p>
+
+<pre><code>       key "user:42" hashes here
+                │
+                ▼
+   ─── N3 ───── ● ───── N4 ───── N7 ───── N8 ─── (ring, clockwise ▶)
+        │               │        │
+    coordinator      replica   replica
+                     └──── preference list (N=3): N3, N4, N7 ────┘
+
+   If N7 is down at write time:
+   ─── N3 ───── ● ───── N4 ───── [N7 ✗] ───── N8 ───
+                                              │
+                              write goes HERE, tagged "for N7"
+                                     = HINTED HANDOFF</code></pre>
+
+    <h3>8b. Quorums, used with real numbers</h3>
+    <p>
+      <a href="05-coordination-consensus.html#quorums">Tutorial 05</a> gave you the inequality. Here you <em>use</em> it. With N replicas,
+      W nodes acked on write, R nodes consulted on read:
+    </p>
+    <p style="text-align:center; font-size:1.15rem;"><strong>R + W &gt; N ⟹ the read set and the write set must overlap in at least one node ⟹ every read sees the latest write.</strong></p>
+    <p>
+      The reason is one sentence of pigeonhole: if you wrote to W nodes and you read from R nodes and R + W &gt; N, those two sets cannot
+      be disjoint, so at least one node you asked <em>has</em> the new value. Now the configurations, and what each one <em>means</em> for a real caller:
+    </p>
+
+    <table>
+      <thead><tr><th>N</th><th>W</th><th>R</th><th>R+W&gt;N?</th><th>What you actually get</th><th>Use it for</th></tr></thead>
+      <tbody>
+        <tr><td>3</td><td>1</td><td>1</td><td>No (2 ≤ 3)</td><td><strong>Fastest possible.</strong> Write acks after one node. Reads may be stale. Writes survive a node death only by luck.</td><td>A pure cache. Session data. Anything where a miss is cheap and speed is everything.</td></tr>
+        <tr><td>3</td><td>2</td><td>2</td><td><strong>Yes</strong> (4 &gt; 3)</td><td><strong>The default. Strongly consistent reads, tolerates one node down for both reads and writes.</strong> Latency = the 2nd-fastest of 3 replicas, which is <em>better</em> than the slowest — you're immune to one straggler.</td><td>Almost everything. This is the answer if the interviewer asks for one.</td></tr>
+        <tr><td>3</td><td>3</td><td>1</td><td>Yes (4 &gt; 3)</td><td>Reads are single-node fast. But <strong>a single node down blocks every write.</strong> Terrible availability.</td><td>Extremely read-heavy, write-rare config data.</td></tr>
+        <tr><td>3</td><td>1</td><td>3</td><td>Yes (4 &gt; 3)</td><td>Writes are instant, reads pay for it. And a node down blocks every <em>read</em>.</td><td>Write-heavy ingest where reads are rare and can be slow.</td></tr>
+      </tbody>
+    </table>
+
+    <p>
+      <strong>Tunable</strong> means R and W are per-request, not per-cluster. The same store can serve <code>get(key, R=1)</code> for a
+      product thumbnail and <code>get(key, R=2)</code> for a shopping-cart total. That flexibility is the entire selling point of the
+      Dynamo model, and it's the sentence to say: <em>"I'd make R and W per-call parameters with a sane default of N=3, W=2, R=2, and let
+      individual call-sites relax it. The cart pays for consistency; the thumbnail doesn't."</em>
+    </p>
+
+    <div class="pitfall">"R + W &gt; N gives you strong consistency" is <strong>not quite true</strong>, and a sharp interviewer will test it. It's a quorum overlap guarantee under a bunch of assumptions that reality violates: with sloppy quorums and hinted handoff (below), the W nodes that acked might not be the N nodes in the preference list at all — so a subsequent R-quorum read of the "real" replicas can miss the write entirely. Concurrent writes can still produce two values with no ordering between them. And it says nothing about a write that failed <em>after</em> being applied to one node. The precise statement is: <strong>"R + W &gt; N guarantees the read quorum overlaps the write quorum, which gives you read-your-writes in the absence of failures and concurrent writers. It is not linearizability. If I need linearizability I need consensus — Raft — not quorums."</strong> Say <em>that</em> and you've just outclassed the question.</div>
+
+    <h3>8c. Conflict resolution — two replicas, two values, now what?</h3>
+    <p>
+      Node A and node B both hold <code>user:42</code>. A says <code>"Alice"</code>, B says <code>"Alicia"</code>. Both writes were accepted;
+      neither is a failure. Which wins? This is the hardest question in the whole design and there is no free answer.
+    </p>
+
+    <h4>Option 1 — Last-Write-Wins (LWW)</h4>
+    <p>
+      Attach a timestamp to every write; on conflict, the higher timestamp wins. Cassandra does this. It is <strong>trivially simple</strong>
+      — one comparison, no client involvement, conflicts resolve themselves silently and forever.
+    </p>
+    <p>
+      <strong>And it silently loses data.</strong> That's not hyperbole, it's the definition: if two writes conflict, LWW <em>discards one of
+      them without telling anyone</em>. And "the higher timestamp" is a lie in a distributed system, because <strong>clocks skew</strong>.
+      Node A's clock is 40 ms ahead of node B's. A write that genuinely happened <em>after</em> another can carry a lower timestamp and lose.
+      NTP typically keeps you within tens of milliseconds — which is fine for logging and catastrophic for ordering writes that arrive
+      milliseconds apart.
+    </p>
+<pre><code>t=100 (A's clock)   client 1 writes "Alice"   → node A, ts=100
+t=100 (real time)   client 2 writes "Alicia"  → node B, ts=60
+                    (B's clock is 40ms SLOW)
+
+Reconciliation: 100 &gt; 60, so "Alice" wins.
+But "Alicia" was written LATER in real time. It's gone.
+Nobody logged it. Nobody was told. The user's edit vanished.</code></pre>
+
+    <h4>Option 2 — Vector clocks</h4>
+    <p>
+      Track causality instead of time. Each write carries a vector of per-node counters, e.g. <code>[(A,2), (B,1)]</code>. Given two versions
+      you can now <em>prove</em> the relationship: if every counter in X is ≥ every counter in Y, then X <strong>descends from</strong> Y and
+      X simply wins — no data loss, no clocks involved. If neither dominates, the writes are genuinely <strong>concurrent</strong>, and the
+      system <em>knows</em> it is looking at a real conflict rather than guessing.
+    </p>
+<pre><code>write 1 on A:  value="Alice"   clock=[(A,1)]
+write 2 on A:  value="Alan"    clock=[(A,2)]     → descends from [(A,1)], A wins cleanly
+
+partition! two clients write concurrently:
+  on A:  value="Alice"   clock=[(A,3)]
+  on B:  value="Alicia"  clock=[(A,2),(B,1)]
+
+  Is [(A,3)] ≥ [(A,2),(B,1)] ? No  (B: 0 &lt; 1)
+  Is [(A,2),(B,1)] ≥ [(A,3)] ? No  (A: 2 &lt; 3)
+  → NEITHER dominates → genuinely CONCURRENT → a real conflict.
+
+Dynamo's answer: return BOTH values to the client. You decide.</code></pre>
+    <p>
+      This is strictly more correct than LWW and nobody uses it, which is itself the lesson. <strong>Why Dynamo used vector clocks and
+      Cassandra didn't:</strong>
+    </p>
+    <ul>
+      <li><strong>They're expensive.</strong> The clock grows with the number of nodes that have touched the key. Dynamo needed truncation heuristics (drop the oldest entry past 10), which can <em>reintroduce</em> false conflicts — so even the correct solution isn't fully correct in practice.</li>
+      <li><strong>They push the problem to the client.</strong> "Here are two shopping carts, you merge them" is a fine API for Amazon's cart (where the merge rule is <em>union the items</em> — you'd rather a deleted item reappear than lose an item someone tried to buy — which is why the Dynamo paper's canonical example is a shopping cart, and it's the only example that works this cleanly). It's a <em>terrible</em> API for a general-purpose store, because most application developers have no idea what to do with two versions of a user profile.</li>
+      <li><strong>Cassandra chose developer ergonomics.</strong> LWW with a client-supplied timestamp, conflicts resolved silently, no siblings ever returned. Simpler to use, and it loses writes. That trade won in the market — and that's worth saying out loud, because it demonstrates you understand that the "more correct" design is not automatically the right one.</li>
+    </ul>
+
+    <div class="senior">The honest, pragmatic answer, and the one to actually give: <em>"For a cache I'd use last-write-wins, because a lost write means a stale cache entry that TTLs out in five minutes — the blast radius is nil, and vector clocks aren't worth the complexity. For a store, LWW is a data-loss bug dressed as a policy, and I'd want either vector clocks with an application-defined merge, or — better — I'd make the values CRDTs or otherwise commutative, so that conflicts can't happen: a counter that only increments, a set that only grows. The best conflict resolution is a data model where conflicts don't exist. And if the business genuinely needs a single linearizable answer, then this is the wrong system and I'd put that key in a CP store with consensus and pay the latency."</em> That answer names three options, picks per use case, and knows when to walk away from the architecture entirely. It is a complete senior answer.</div>
+
+    <h3>8d. The Dynamo trio — hinted handoff, read repair, Merkle trees</h3>
+    <p>
+      Three mechanisms that keep an AP system converging. <strong>Naming all three, in order, scores heavily</strong> — they are the
+      shibboleth for "this person has read the Dynamo paper" — and more importantly they answer three distinct questions.
+    </p>
+
+    <h4>1. Hinted handoff — "what if a replica is down when I write?"</h4>
+    <p>
+      Don't fail the write. Send it to the next healthy node on the ring, tagged with a <em>hint</em>: "this really belongs to N7; hold it and
+      deliver it when N7 comes back." N8 keeps it in a separate local store, not in its own key space, and periodically retries N7. When N7
+      returns, N8 replays the hints and deletes them.
+    </p>
+    <p>
+      This is what makes the system a <strong>"sloppy quorum"</strong> — W=2 was satisfied, but possibly by nodes that aren't in the key's real
+      preference list. You've traded strict quorum semantics for write availability, and <strong>you should name that trade explicitly</strong>:
+      <em>"Hinted handoff means my quorum is sloppy: a write can succeed without ever reaching a node in the preference list, so R+W&gt;N no longer
+      strictly guarantees overlap. I'm accepting a weaker consistency guarantee to buy write availability during failures — which for a cache is
+      obviously the right trade, and for a ledger obviously isn't."</em>
+    </p>
+
+    <h4>2. Read repair — "what if a replica is stale when I read?"</h4>
+    <p>
+      The read quorum comes back with disagreeing versions. Return the winner to the client <em>and</em> asynchronously push it to the stale
+      replicas. Cost: nearly zero — you already had the data in hand and you're already talking to those nodes. Benefit: <strong>the data
+      self-heals on exactly the keys that are being read</strong>, i.e. the keys anyone cares about. Popular keys converge fast; cold keys don't
+      converge at all, which is fine, because nobody is reading them. It is a beautifully lazy mechanism and it is the primary anti-entropy path
+      in practice.
+    </p>
+
+    <h4>3. Merkle trees — "what about the keys nobody reads?"</h4>
+    <p>
+      Read repair never touches cold keys. So replicas can silently drift — a node was down for an hour, missed 10,000 writes, and hinted handoff
+      only covers the ones written <em>during</em> the outage window it was hinted for. You need a background <strong>anti-entropy</strong> process
+      that compares two replicas' entire key ranges. Naively that means shipping millions of keys across the network to compare them. Merkle trees
+      make it cheap:
+    </p>
+<pre><code>Each node builds a hash tree over its key range:
+
+                    root = H(H1 + H2)
+                   /                 \
+          H1 = H(A+B)            H2 = H(C+D)
+          /       \               /       \
+    A=H(k1..k9) B=H(k10..k19) C=...     D=...
+
+Compare two replicas:
+  1. exchange ROOTS. Equal? → the entire range is identical. DONE.
+     ONE hash exchanged. Millions of keys verified. This is the win.
+  2. Roots differ → exchange the two children. Recurse only into
+     the subtree that differs.
+  3. Reach a differing leaf → transfer only THOSE keys.
+
+  Cost: O(log n) round trips and O(differences) data transferred,
+  instead of O(n) data transferred. If the replicas agree — which is
+  the overwhelmingly common case — it costs a single hash comparison.</code></pre>
+    <p>
+      The catch, worth one line: rebuilding the tree is expensive, and any write invalidates the path from that leaf to the root — so you rebuild
+      lazily, on a schedule, not per-write. Anti-entropy is a background job that runs nightly or hourly, not a real-time mechanism. It's the
+      backstop, not the primary path.
+    </p>
+
+    <div class="note">Map the trio to the three failure windows and it becomes impossible to forget: <strong>hinted handoff</strong> covers a replica being down <em>at write time</em> · <strong>read repair</strong> covers a replica being stale <em>at read time</em> · <strong>Merkle-tree anti-entropy</strong> covers a replica being stale and <em>nobody is reading it</em>. Write, read, neither. Three windows, three mechanisms, no gaps. That framing is worth memorizing verbatim.</div>
+
+    <h3>8e. Sync vs async replication, in one paragraph</h3>
+    <p>
+      W=1 is asynchronous replication: ack the client, replicate in the background. Sub-millisecond writes, and if that node dies in the next 50 ms
+      the write is <strong>gone</strong> and the client was <em>told it succeeded</em>. W=N is synchronous: no write is acked until every replica has
+      it, so nothing is ever lost, and your write latency is now the latency of your <em>slowest</em> replica plus you're unavailable for writes any
+      time <em>any</em> replica is down. <strong>W=2 of N=3 is the compromise everyone lands on</strong>, and it's a good compromise: durable across one
+      failure, and latency bounded by the <em>second</em>-fastest replica rather than the slowest — which quietly makes you immune to one straggler.
+      That last point is subtle and worth saying: quorums don't just buy consistency, <strong>they buy tail-latency insurance.</strong>
+    </p>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="eviction">9. Eviction &amp; memory pressure</h2>
+
+    <p>
+      Memory is a fixed budget. Sooner or later a <code>put</code> arrives and there is no room. What you do in that microsecond is a real design
+      decision — and in a <em>cache</em> it's a feature, while in a <em>store</em> it's an outage. Say that fork out loud one more time; it pays every time.
+    </p>
+
+    <h3>Expiry: TTL is not eviction</h3>
+    <p>Two different things that candidates merge. <strong>Expiry</strong> is the key telling you it's no longer valid. <strong>Eviction</strong> is you telling the key to leave because you need its RAM. How do you actually remove expired keys?</p>
+    <ul>
+      <li><strong>Lazy / passive expiry:</strong> check <code>expiresAt</code> on read; if it's past, return null and delete. Free — zero background cost. But an expired key that nobody reads occupies RAM <em>forever</em>. If your workload writes a million keys with a 60s TTL and never reads them, lazy expiry alone leaks the whole million.</li>
+      <li><strong>Active / sampled expiry:</strong> a background job wakes up 10× a second, samples ~20 random keys with TTLs, deletes the expired ones, and <em>if more than 25% of the sample was expired, immediately does it again</em>. That adaptive loop is exactly what Redis does, and it's clever: it does almost no work when little is expiring, and it ramps up automatically when a lot is.</li>
+      <li><strong>Both.</strong> That's the answer. Lazy for correctness (an expired key is never <em>served</em>), active for memory reclamation (an expired key doesn't live forever).</li>
+    </ul>
+
+    <h3>Eviction policies</h3>
+    <table>
+      <thead><tr><th>Policy</th><th>What it keeps</th><th>Cost</th><th>When it's right / wrong</th></tr></thead>
+      <tbody>
+        <tr><td><strong>LRU</strong> (least-recently-used)</td><td>Recently touched keys.</td><td>O(1) with the hash-map + DLL from §5, but every <em>read</em> becomes a write (you relink the list) — which means a lock, or a cache-line bounce, on the hottest path in the system.</td><td><strong>The default and the right first answer.</strong> Fails on a scan: one batch job reading a million cold keys evicts your entire hot set. This is "cache pollution" and it's a real production incident, not a hypothetical.</td></tr>
+        <tr><td><strong>LFU</strong> (least-frequently-used)</td><td>Frequently touched keys.</td><td>A counter per key; needs decay, or a key that was hot last Christmas stays resident forever.</td><td>Better than LRU for stable, skewed workloads (the classic 80/20 popularity curve) and <strong>immune to the scan-pollution problem</strong> — a key read once has frequency 1 and gets evicted immediately. Worse when popularity genuinely shifts.</td></tr>
+        <tr><td><strong>TTL-based</strong></td><td>Whatever hasn't expired.</td><td>Free — you're tracking it anyway.</td><td>Only sane when every key has a meaningful TTL. "Evict the one expiring soonest" is a fine tiebreak, and a poor primary policy.</td></tr>
+        <tr><td><strong>Random</strong></td><td>Nothing in particular.</td><td><strong>Zero.</strong> No list, no counter, no metadata, no lock.</td><td>Sounds like a joke. Isn't. See below.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>The detail that wins the section: Redis doesn't do real LRU</h3>
+    <p>
+      True LRU requires the doubly-linked list, and that list costs you <strong>16 bytes per key</strong> and a <em>mutation on every read</em>. On a
+      cache holding 400 million keys, those pointers are 6.4 GB of RAM spent on bookkeeping — memory that could have held actual cache entries.
+    </p>
+    <p>
+      So Redis cheats. Its <code>allkeys-lru</code> policy <strong>samples 5 random keys and evicts the least-recently-used one among them</strong>
+      (tunable via <code>maxmemory-samples</code>). No global list. No relinking on read. Just a 24-bit timestamp on each object and five random probes
+      when it needs to free something.
+    </p>
+<pre><code>TRUE LRU        : maintain global recency order.
+                  Correct. 16 B/key. A write on every read.
+
+REDIS "LRU"     : sample 5 random keys, evict the oldest of them.
+                  Approximate. ~0 B/key. Nothing on the read path.
+
+How much worse is it? With 5 samples, the evicted key is usually
+in the bottom ~10-15% by recency. With 10 samples it's very close
+to true LRU. The eviction hit-rate difference vs. true LRU is
+small — a few percent — and the memory and lock savings are large.
+
+The lesson, and it generalises: for a HEURISTIC, an approximate
+answer that is cheap beats an exact answer that is expensive.
+LRU is not a correctness property. It is a GUESS about the future.
+Paying full price for a perfectly-computed guess is a bad trade.</code></pre>
+
+    <div class="senior">This is one of the best things you can drop in this interview: <em>"I'd point out that Redis doesn't actually implement true LRU — it samples a handful of random keys and evicts the oldest among them, because maintaining a global recency list costs 16 bytes per key and a write on every read. The approximation is within a few percent of true LRU on hit-rate and costs essentially nothing. The general principle is that eviction is a heuristic, not a correctness property — it's a guess about the future — so it should be as cheap as a guess deserves to be. I'd apply the same reasoning to failure detection and to anti-entropy: approximate, cheap, and good enough."</em> It shows depth, it shows you know a real system's real implementation, and it generalises into a design principle. That is exactly the shape of a senior answer.</div>
+
+    <h3>What happens when memory fills</h3>
+    <p>Redis's <code>maxmemory-policy</code> is a genuinely instructive menu, and "which one would you pick?" is a fair question:</p>
+    <ul>
+      <li><code>allkeys-lru</code> — evict anything. <strong>The cache answer.</strong> Always able to accept a write.</li>
+      <li><code>volatile-lru</code> — evict only keys that have a TTL set. Useful in a <em>mixed</em> instance where some keys are cache and some are precious. Its failure mode is nasty: if no key has a TTL, there's nothing eligible, and it degenerates to <code>noeviction</code> without telling you.</li>
+      <li><code>noeviction</code> — reject writes with an error when full. <strong>The store answer.</strong> Reads keep working; writes fail loudly. Correct if losing data is a bug — you'd rather be told than silently lose something.</li>
+      <li><code>allkeys-lfu</code>, <code>volatile-ttl</code>, <code>allkeys-random</code> — the specialists.</li>
+    </ul>
+    <p>
+      <strong>Pick per use case and say so:</strong> <em>"For a cache: allkeys-lru, with an alert on the eviction rate — because a rising eviction rate is
+      the leading indicator that my working set has outgrown my cluster and my hit-rate is about to fall off a cliff. For a store: noeviction, and I add
+      nodes before I get there, with an alert at 75% memory. In a store, hitting maxmemory is an incident; in a cache, it's Tuesday."</em>
+    </p>
+
+    <div class="pitfall">Watch out for the <strong>eviction death spiral</strong>, which is a real and underappreciated failure mode. Memory fills → eviction rate climbs → hit rate falls → more requests miss and go to the database → the application re-populates the cache with the missed keys → which evicts more keys → hit rate falls further. Meanwhile the database, which was sized assuming a 95% cache hit rate, is now taking 5× its designed load and starts timing out. <strong>The cache doesn't fail loudly; it degrades, and it takes the database down with it.</strong> The metric that catches this early is <em>eviction rate</em>, not memory usage — memory sits pegged at 100% by design, so it tells you nothing. Watch evictions/sec and hit-rate. Saying this shows you've thought past the happy path.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="scaling">10. Scaling &amp; bottlenecks</h2>
+
+    <p>What breaks first at 10×, in the order it actually breaks.</p>
+
+    <h3>10a. Hot keys — the one thing consistent hashing does NOT fix</h3>
+    <p>
+      Consistent hashing distributes <em>keys</em> evenly. It says <em>nothing</em> about distributing <em>load</em>. If a single key —
+      <code>celebrity:justin_bieber</code>, or the flash-sale product, or the feature-flag config that every request reads — takes 200k QPS, then
+      <strong>one node takes 200k QPS</strong>, and no amount of virtual nodes helps, because it's one key and one key hashes to one place. This was
+      §8 of <a href="04-partitioning-hashing.html#hot">tutorial 04</a> and it comes back here as the number-one scaling bottleneck of a KV store.
+      Volunteer it before the interviewer asks — <em>"the thing consistent hashing doesn't solve is hot keys, so let me address that"</em> — because
+      being asked about it after you've claimed the ring solved your distribution problem is a bad moment.
+    </p>
+    <table>
+      <thead><tr><th>Fix</th><th>How</th><th>Cost</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Key splitting</strong></td><td>Write to <code>hot_key:0</code> … <code>hot_key:9</code>, chosen at random per request; readers pick a random suffix (or read all 10 and merge, for counters).</td><td>The application must know the key is hot. Ugly, effective, and universally used. For counters it's perfect; for a single value it means N copies to invalidate.</td></tr>
+        <tr><td><strong>Replicate hot keys everywhere</strong></td><td>Detect keys above a QPS threshold and copy them to <em>all</em> nodes; any node can serve them.</td><td>Writes to that key must now fan out to the whole cluster. Great for read-only hot keys (config, feature flags), useless for hot <em>writes</em>.</td></tr>
+        <tr><td><strong>A client-side cache in front of the cache</strong></td><td>The application process caches the hot key locally for 1 second.</td><td><strong>The best answer for read-hot keys.</strong> A 1-second local TTL turns 200k QPS into (number of app servers) QPS — a reduction of three orders of magnitude. The price is 1 second of staleness, which for a feature flag or a trending list is free. This is exactly the near-cache/far-cache pattern from tutorial 06.</td></tr>
+        <tr><td><strong>Hot-write keys</strong></td><td>Nothing sharding-based will save you. A single key with 200k writes/sec is a single serialization point by definition.</td><td>Change the data model: make it a commutative counter you can shard and sum, or batch/aggregate upstream. <strong>"You can't shard a single key; you have to change what the key means."</strong></td></tr>
+      </tbody>
+    </table>
+
+    <h3>10b. Adding a node — the data-migration dance</h3>
+    <p>
+      This is where the "cache or store?" fork bites hardest, and it's a great place to show that you're carrying the answer forward:
+    </p>
+    <ul>
+      <li><strong>Cache:</strong> just add it. New node joins the ring, claims its arcs, and those keys are now <em>missing</em> on it. Every request for them misses, hits the database, and repopulates. <strong>You don't migrate anything.</strong> You just eat a temporary dip in hit rate. The only thing you must do is <em>stagger</em> the rollout — adding 10 nodes at once to a 25-node cluster cold-starts ~30% of the key space simultaneously, and that DB spike can be the outage. Add nodes one at a time and let the hit-rate recover between each.</li>
+      <li><strong>Store:</strong> you must <em>actually move the data</em>, and you must do it while serving traffic. The dance: (1) the new node joins and announces its token ranges but serves nothing; (2) it <em>streams</em> the keys in its new arcs from the current owners in the background; (3) meanwhile all writes to those keys go to <em>both</em> old and new owner (double-write), so the new node doesn't fall behind while it's catching up; (4) once streaming completes and the new node has caught up, flip the ring so it becomes the authority; (5) the old owners drop the arcs they no longer own. Redis Cluster's <code>ASK</code> redirect exists precisely for the window where a key is mid-migration — "not here yet, but it's moving; go ask over there."</li>
+    </ul>
+
+    <div class="senior">Say the sentence that turns this from mechanics into judgment: <em>"Notice that adding a node to a cache is nearly free and adding a node to a store is a supervised data migration with a correctness window. That asymmetry is the single biggest reason to be crisp about which system you're building — it changes your operational model, not just your architecture. A cache scales by shrugging; a store scales by streaming."</em></div>
+
+    <h3>10c. Cold start — the empty-cache thundering herd</h3>
+    <p>
+      A node restarts. It comes back with <strong>zero</strong> keys. It rejoins the ring, immediately starts receiving its 40k QPS, and
+      <em>every single one is a miss</em>. All 40k QPS pass straight through to the database, which was sized for a 95% hit rate and is now taking
+      20× its expected load from that shard. <strong>The cache's recovery is the database's outage.</strong> This is the highest-value scaling
+      answer on the page because it's the one that actually pages people at 3am.
+    </p>
+    <ul>
+      <li><strong>Warm the cache before joining the ring.</strong> On boot, replay from a replica (if you have replication) or from a periodic snapshot on local disk, and only announce yourself as ready once you're at, say, 80% populated. Redis's RDB snapshot exists partly for exactly this.</li>
+      <li><strong>Ramp traffic in.</strong> Don't take 100% of your share at t=0. Accept 10%, then 25%, then 50% over a few minutes, so the misses trickle into the database instead of arriving as a wall.</li>
+      <li><strong>Request coalescing / single-flight.</strong> If 5,000 concurrent requests miss on the <em>same</em> key, do not send 5,000 queries to the database. Let the first one through, make the other 4,999 wait on its result. This is the thundering-herd fix from tutorial 06 and it belongs in the client library, not in the cache. It is the single highest-leverage line of code in a caching system.</li>
+      <li><strong>Never let a cold cache take down the DB:</strong> a circuit breaker and a concurrency limit on the database connection pool means the DB sheds load and stays up, serving degraded, rather than falling over and serving nothing.</li>
+    </ul>
+
+    <h3>10d. The network becomes the bottleneck before the CPU does</h3>
+    <p>
+      Do the arithmetic and it's obvious, which is why so few people do it. A node doing 100k QPS at 2 KB per value is pushing
+      <strong>200 MB/s = 1.6 Gbps</strong> — and that's just the read responses. Add quorum writes (each write's value crosses the network 3×), gossip
+      chatter, replication streams and anti-entropy, and a busy node's <em>east-west</em> (node-to-node) traffic can genuinely exceed its
+      <em>north-south</em> (client-facing) traffic. On a 10 GbE NIC you will saturate the network long before you saturate a modern CPU on a hash-map
+      lookup that takes nanoseconds. <strong>The mitigations are all about moving fewer bytes:</strong> compress values (CPU is free here, bandwidth
+      isn't), cap value size (§5), batch/pipeline requests so you pay TCP and syscall overhead once for a hundred operations, and keep replicas
+      in-AZ where you can, because cross-AZ bandwidth is both slower and — on a cloud bill — the expensive kind.
+    </p>
+
+    <div class="note">Everything on this page eventually reduces to one of three resources: <strong>RAM</strong> (which sets the node count), <strong>network</strong> (which sets the per-node ceiling), and <strong>the coordination overhead of nodes knowing about each other</strong> (which sets the practical cluster size). CPU essentially never binds in a KV store. If you can recite <em>that</em> hierarchy, you can reason about a bottleneck you've never seen before — which is the actual skill being tested.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="tradeoffs">11. Trade-offs</h2>
+
+    <p>Every real decision on this page, its alternative, and the condition that flips it. This table is the night-before revision sheet.</p>
+
+    <table>
+      <thead><tr><th>Decision</th><th>I chose</th><th>The alternative</th><th>Why</th><th>I'd flip when…</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Cache vs store</strong></td>
+          <td>Cache (lossy, evicting, RAM-only)</td>
+          <td>Durable KV store</td>
+          <td>The prompt said "cache," there's a source of truth behind me, and losing a key costs one DB read. Every simplification on this page descends from this.</td>
+          <td>There is no source of truth behind me. Then: N≥3 mandatory, <code>noeviction</code>, persistence on, and conflict resolution suddenly matters enormously.</td>
+        </tr>
+        <tr>
+          <td><strong>CAP posture</strong></td>
+          <td>AP — serve stale rather than error</td>
+          <td>CP — refuse to serve rather than be wrong</td>
+          <td>A cache that returns errors during a partition converts a cache outage into a database outage. Stale beats down.</td>
+          <td>The cache backs locking, quotas, or money. Then a stale read is a correctness bug, and I want consensus (Raft), not quorums.</td>
+        </tr>
+        <tr>
+          <td><strong>Routing</strong></td>
+          <td>Proxy tier (mcrouter-style)</td>
+          <td>Fat client · server-side <code>MOVED</code></td>
+          <td>Dumb clients in any language; topology changes don't require redeploying every service. Costs ~0.3 ms — affordable in a 5 ms budget.</td>
+          <td>The proxy hop shows up as my P99. Then fat client for the top one or two services; proxy for the rest.</td>
+        </tr>
+        <tr>
+          <td><strong>Membership</strong></td>
+          <td>Gossip</td>
+          <td>ZooKeeper/etcd config service</td>
+          <td>No coordinator, no SPOF, converges in O(log n) rounds. It's what Dynamo/Cassandra do and what the interviewer wants discussed.</td>
+          <td>Honestly, at 25 nodes I'd genuinely use etcd — less code, fewer failure modes, no membership-flap surprises. Gossip earns its keep at hundreds of nodes.</td>
+        </tr>
+        <tr>
+          <td><strong>Quorum</strong></td>
+          <td>N=3, W=2, R=2</td>
+          <td>W=1/R=1 (fast) · W=3 (safe)</td>
+          <td>R+W&gt;N gives read-your-writes; survives one node down for both reads and writes; latency is the 2nd-fastest replica, so one straggler can't hurt me.</td>
+          <td>Pure cache with a cheap backing store → W=1,R=1 and take the speed. Financial data → W=3 and accept losing writes when any replica is down.</td>
+        </tr>
+        <tr>
+          <td><strong>Conflict resolution</strong></td>
+          <td>Last-write-wins</td>
+          <td>Vector clocks · CRDTs</td>
+          <td>Simple, invisible, and for a cache a lost write is a stale entry that TTLs out. The blast radius is nil.</td>
+          <td>It's a store. LWW is then a silent data-loss bug caused by clock skew. Prefer commutative values (CRDTs) so conflicts can't happen; vector clocks with an app-level merge if they can.</td>
+        </tr>
+        <tr>
+          <td><strong>Replication timing</strong></td>
+          <td>Async beyond the W quorum</td>
+          <td>Fully synchronous to all N</td>
+          <td>Ack at W=2 and let the 3rd replica catch up. Bounded latency, and the durability is already there.</td>
+          <td>Zero-tolerance durability → W=N, and accept that any single replica being down blocks all writes.</td>
+        </tr>
+        <tr>
+          <td><strong>Eviction</strong></td>
+          <td>Approximated LRU (sampled)</td>
+          <td>True LRU · LFU · random</td>
+          <td>True LRU costs 16 B/key plus a write on every read for a few percent of hit-rate. Eviction is a heuristic; don't pay exact prices for a guess.</td>
+          <td>Scan-heavy workloads pollute the cache → LFU, which is immune (a once-read key has frequency 1). Store → <code>noeviction</code>.</td>
+        </tr>
+        <tr>
+          <td><strong>Write availability</strong></td>
+          <td>Hinted handoff (sloppy quorum)</td>
+          <td>Strict quorum — fail the write</td>
+          <td>A replica rebooting shouldn't fail writes. Availability during the common failure is worth the weakened guarantee.</td>
+          <td>I need R+W&gt;N to actually hold. Sloppy quorums break it. A ledger wants a failed write, not a maybe-written one.</td>
+        </tr>
+        <tr>
+          <td><strong>Value size</strong></td>
+          <td>Capped at 1 MB</td>
+          <td>Unbounded (Redis allows 512 MB)</td>
+          <td>One fat value on a single-threaded node blocks every other request on that node. One key destroys everyone's P99.</td>
+          <td>Never, really. If they need 50 MB values, they want a blob store — cache the S3 URL, not the blob.</td>
+        </tr>
+        <tr>
+          <td><strong>Persistence</strong></td>
+          <td>Off (cache) / snapshot only</td>
+          <td>AOF write-ahead log</td>
+          <td>Disk in the write path costs latency for durability I don't need. A periodic snapshot buys warm restarts, which is the part I <em>do</em> want.</td>
+          <td>Store → AOF with <code>fsync everysec</code>, accepting up to 1 s of loss, or <code>fsync always</code> and a 10× write-latency hit.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="senior">If you only remember one meta-lesson from this table: <strong>every row is the same trade in a different costume — you are repeatedly buying availability and latency with consistency and durability.</strong> The reason that's acceptable here is that a cache has a source of truth behind it, so a mistake is recoverable. Take the source of truth away and <em>every single row flips</em>. That's why "is this a cache or a store?" is the first question and the only one that really matters — everything else is downstream of it. Say that when you close, and the interviewer will remember the answer.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="followups">12. Follow-ups you should expect</h2>
+
+    <h3>"How would you make it durable? What are the persistence options?"</h3>
+    <p>
+      Two mechanisms, and Redis's names for them are the standard vocabulary (see also tutorial 06):
+    </p>
+    <ul>
+      <li><strong>Snapshot / RDB:</strong> periodically fork the process and dump the entire dataset to disk. Copy-on-write means the fork is cheap and the parent keeps serving. <em>Fast restarts</em> — you load one compact binary file. <em>You lose everything since the last snapshot</em>, which could be minutes. Also, the fork's copy-on-write can double your memory usage in the worst case if the parent rewrites everything during the dump — a real production surprise on a memory-tight box.</li>
+      <li><strong>Append-only file / AOF:</strong> a write-ahead log — append every mutating command to a file. Durability is tunable by fsync policy: <code>always</code> (safe, ~10× slower writes), <code>everysec</code> (lose ≤ 1 s, the default and the right choice), <code>no</code> (let the OS decide, effectively no durability). The log grows forever, so it must be periodically rewritten/compacted. <em>Slow restarts</em> — you replay the entire log.</li>
+      <li><strong>Both, which is what people actually run:</strong> AOF for the durability window, RDB snapshots so restarts don't replay a 40 GB log.</li>
+    </ul>
+    <p>You already know this pattern: <strong>it's the WAL from Postgres</strong> (Phase 1), and it's the same trade — the log gives you durability and the checkpoint gives you fast recovery. Say that. Connecting a distributed-systems answer back to the database internals you learned last month is exactly the kind of transfer interviewers are hoping to see.</p>
+
+    <h3>"How do you upgrade the cluster with no downtime?"</h3>
+    <p>
+      <strong>Rolling restart, one node at a time, and this is where N=3 earns its keep.</strong> Take a node out of rotation (mark it leaving, so the ring
+      routes around it rather than declaring it failed — a <em>graceful</em> departure is very different from a crash and you should say so). Its keys are
+      still on 2 other replicas, so R=2 quorum reads still succeed and W=2 writes still succeed. Upgrade it, bring it back, let it re-sync via hinted-handoff
+      replay and anti-entropy, wait for it to be caught up and warm, <em>then</em> move to the next node. Never take two nodes down at once with N=3 — that's
+      the whole point of the third replica, and it's why "N=3 lets you survive one failure while one node is being upgraded" is the correct justification for
+      N=3 rather than N=2.
+    </p>
+    <p>For a pure cache with no replication it's even easier and worth contrasting: take a node out, its keys go cold, hit rate dips a percent or two, the DB absorbs it. Just don't do ten at once. <em>Again</em>, the cache/store fork changes the answer.</p>
+
+    <h3>"What about multi-region?"</h3>
+    <p>
+      The physics come first: <strong>cross-region round-trip latency is 70–150 ms.</strong> That is 30× your entire latency budget. A synchronous quorum
+      spanning regions is <em>not a design, it's an error</em> — you cannot have a 5 ms P99 and a synchronous write to Frankfurt. So:
+    </p>
+    <ul>
+      <li><strong>Independent per-region clusters, asynchronous replication between them.</strong> Each region reads and writes locally at full speed; changes propagate across the WAN in the background. You accept cross-region eventual consistency — and, crucially, the possibility of <strong>concurrent conflicting writes in two regions</strong>, which brings §8c's conflict resolution back with real teeth. LWW across regions with skewed clocks is a genuinely bad idea; this is where CRDTs or a designated home region per key earns its complexity.</li>
+      <li><strong>Or: one writer region, read-only replicas elsewhere.</strong> Writes pay the cross-region hop (accept the 100 ms), reads are local and fast. Much simpler, and correct — this is often the right answer and candidates skip it because it sounds unambitious.</li>
+      <li><strong>Or (best, when it fits): partition by geography.</strong> European users' keys live in Europe. No cross-region conflict is even <em>possible</em>, because no key has two homes. It only works if users don't move between regions — which, for most products, they mostly don't. It also happens to be what data-residency law increasingly requires anyway, so you may get it for free.</li>
+    </ul>
+
+    <h3>"How does Redis Cluster differ from Redis Sentinel?"</h3>
+    <p>A crisp factual question, and a good one, because the answer is that they solve <em>different problems</em> and people confuse them constantly:</p>
+    <table>
+      <thead><tr><th></th><th>Redis Sentinel</th><th>Redis Cluster</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Problem it solves</strong></td><td><strong>Availability.</strong> Automatic failover of a single master.</td><td><strong>Scale.</strong> Sharding the key space across many masters.</td></tr>
+        <tr><td><strong>Topology</strong></td><td>One master, N replicas. <em>The whole dataset is on every node.</em></td><td>Many masters, each owning a slice of 16,384 hash slots, each with its own replicas.</td></tr>
+        <tr><td><strong>Sharding</strong></td><td><strong>None.</strong> You are still bounded by one machine's RAM and one machine's writes.</td><td>Yes — that's the entire point.</td></tr>
+        <tr><td><strong>Who does failover</strong></td><td>A separate quorum of Sentinel processes watching the master; they elect and promote a replica.</td><td>The masters themselves, via gossip. A majority of masters must agree a node has FAILed.</td></tr>
+        <tr><td><strong>Use it when</strong></td><td>Your data fits on one box and you just need it not to go down. <em>This is most companies.</em></td><td>Your data does <em>not</em> fit on one box. Then you accept the cost: no multi-key ops across slots, a smarter client, and a harder operational story.</td></tr>
+      </tbody>
+    </table>
+    <p>The senior framing: <em>"Sentinel is HA without sharding; Cluster is sharding with HA built in. Most teams reaching for Cluster actually needed Sentinel — they had an availability problem, not a capacity problem, and they took on partitioning they didn't need. I'd check the working set size against one machine's RAM before choosing."</em> That's this phase's recurring theme — <strong>distribute only when the arithmetic forces you to</strong> — and it maps directly onto §1 of tutorial 04.</p>
+
+    <h3>"So why not just use DynamoDB / ElastiCache?"</h3>
+    <p>
+      This looks like a trap and it is not. It's a fairness question, and the <strong>honest answer is the strong one</strong>:
+    </p>
+    <div class="senior"><em>"You should. In production I'd absolutely use ElastiCache or DynamoDB, and I'd need a very specific reason not to — the operational cost of running a stateful distributed cluster yourself (upgrades, rebalancing, failure handling, on-call at 3am for a gossip partition) is enormous and it's not where the business value is. The point of designing it from scratch is that I now know exactly what DynamoDB is doing for me: I know why it charges me for provisioned capacity per partition, I know why a hot partition throttles even when I'm under my table's total limit, I know why eventually-consistent reads are half the price of strongly-consistent ones — because a strongly-consistent read is a quorum read hitting more replicas. I can debug it, cost it, and choose it deliberately. That understanding is worth more than the ability to actually run it. And the one case where I would build it myself is where the managed service's model genuinely doesn't fit — an unusual consistency requirement, a latency floor below what a managed hop allows, or a scale where the bill exceeds the salary of the team who'd run it."</em></div>
+    <p>
+      That answer does three things at once: it shows commercial judgment, it demonstrates that the exercise taught you something operational, and it names the
+      exact conditions under which the build-vs-buy decision flips. Never be embarrassed to say "I'd use the managed service." Being able to say <em>why the
+      managed service behaves the way it does</em> is the thing that was being tested all along.
+    </p>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="qa">Interview Q&amp;A</h2>
+
+    <details class="qa">
+      <summary>What's the very first question you'd ask when given "design a distributed cache"?</summary>
+      <div class="answer">
+        <p><strong>"Is this a cache or a store?"</strong> — i.e. is there a source of truth behind me, so that losing a key on a node failure is acceptable and eviction is a feature? Or am I the source of truth, so losing a key is a bug and running out of memory is an outage?</p>
+        <p>That one answer changes: whether I replicate at all, whether I need durability, whether conflict resolution matters, what I do when memory fills (<code>allkeys-lru</code> vs <code>noeviction</code>), and how I add a node (shrug vs supervised migration). Every trade-off in the design descends from it. Asking it in the first thirty seconds is the strongest opening move available, and it costs you nothing.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Explain consistent hashing in 60 seconds, and then tell me what it does <em>not</em> solve.</summary>
+      <div class="answer">
+        <p>Hash keys and nodes onto the same 32-bit ring; a key is owned by the first node clockwise from it. Adding or removing a node only remaps the keys in one arc — K/N of them — instead of the ~100% you'd remap under <code>hash(key) % N</code>. Give each physical node ~150 virtual nodes so the arcs are even and a dying node's load spreads across all survivors rather than dumping entirely on its clockwise neighbour.</p>
+        <p><strong>What it does not solve: hot keys.</strong> It distributes <em>keys</em> evenly; it says nothing about <em>load</em>. A single key at 200k QPS lands on a single node no matter how many virtual nodes you have, because one key hashes to one place. That needs a different fix entirely — key splitting, replicating the hot key to every node, or (best for read-hot keys) a 1-second client-side cache in the application process, which collapses 200k QPS down to one request per app server. It also doesn't solve <em>hot writes</em> at all: you cannot shard a single key, you have to change what the key means.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>A client needs to find the node holding key K. Walk me through the options.</summary>
+      <div class="answer">
+        <p>Three, and they're real systems:</p>
+        <p><strong>Fat client</strong> (Memcached clients, Cassandra drivers): the client library holds the ring and routes directly. One hop, minimum latency. The killer weakness is that <em>every client must agree on the ring</em> — a topology change becomes a coordinated deploy of every service that talks to the cache, and disagreement means clients silently reading from the wrong node.</p>
+        <p><strong>Proxy tier</strong> (Twemproxy, mcrouter, Envoy): clients are dumb and talk to one address; the proxy knows the ring. Costs an extra network hop — roughly 0.3 ms, a 30–50% latency tax on a 1 ms budget — and the proxy tier is one more thing to scale and fail over. But you can change topology without touching any client.</p>
+        <p><strong>Server-side redirect</strong> (Redis Cluster): the client guesses, and if it's wrong the server replies <code>MOVED &lt;slot&gt; &lt;host&gt;</code> and the client caches the correction. One hop when warm, two on the first miss after a topology change. <code>ASK</code> handles keys that are mid-migration.</p>
+        <p>I'd pick the proxy and name its cost. And I'd mention the fourth option nobody says: put the authoritative ring in etcd/ZooKeeper and have clients or proxies watch it. At 25 nodes that's simpler and more correct than gossip, and it's what most enterprises actually run.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>What is gossip and why does it converge?</summary>
+      <div class="answer">
+        <p>Every node, every second, picks ~3 random peers and exchanges its view of cluster membership — each entry tagged with a heartbeat counter. On merge, the higher heartbeat wins. No coordinator, no leader, no single point of failure.</p>
+        <p>It converges because it's an epidemic: each round roughly triples the number of nodes that know a given fact, so it reaches everyone in <strong>O(log n) rounds</strong> — around 5–6 seconds for 250 nodes at one round per second. It's robust because no individual message matters; the information is redundantly carried by everyone who has it, so dropping messages or killing nodes just slows it slightly.</p>
+        <p>The cost: it's <em>eventually</em> consistent about membership. For those few seconds, two nodes genuinely disagree about who's in the cluster and therefore about who owns a key — so two clients can write the same key to different nodes. You can't eliminate that; you design around it with quorums and read repair. And the state carried per message is O(n), so at ~10,000 nodes the membership list itself becomes the bottleneck.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>A node stops responding for 5 seconds. Is it dead? What do you do?</summary>
+      <div class="answer">
+        <p><strong>You cannot know.</strong> In an asynchronous network you cannot distinguish a crashed node from a slow node from a partitioned node — there is no correct timeout and no algorithm that fixes it. All you get to choose is which mistake you'd rather make.</p>
+        <p>A false positive is expensive here specifically: you reshuffle the ring, the successors start serving that arc <em>cold</em>, and every request misses — so a false positive <strong>manufactures a load spike on the database</strong>, which is precisely what the cache exists to prevent. Worse, the "dead" node is still alive and still accepting writes for keys it no longer owns, so a key briefly has two owners writing divergent values.</p>
+        <p>So I'd bias towards slow-and-sure: <strong>indirect probing</strong> (ask 3 other nodes to ping it before believing my own link) to kill false positives from one bad link, and a separation of <strong>suspect</strong> from <strong>dead</strong> — a suspected node stops receiving new traffic but does not trigger a ring reshuffle; only sustained failure over tens of seconds does. That's what Redis Cluster's PFAIL → FAIL transition is, and it requires a majority of masters to agree. A phi-accrual detector is the sophisticated version: instead of a boolean it outputs a suspicion level based on that node's own heartbeat history, so different callers can act at different thresholds.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Explain R + W &gt; N. Then tell me why it's not actually strong consistency.</summary>
+      <div class="answer">
+        <p>With N replicas, W acks required on write and R responses required on read: if R + W &gt; N, the read set and the write set cannot be disjoint, so any read quorum contains at least one node that saw the latest write. Pigeonhole. N=3, W=2, R=2 is the default — it survives one node down for both reads and writes, and its latency is the <em>second</em>-fastest replica, which quietly makes you immune to one straggler.</p>
+        <p><strong>But it is not strong consistency</strong>, and this is where most candidates overclaim. With sloppy quorums and hinted handoff, the W nodes that acked may not be in the key's preference list at all — so a later R-quorum read of the "real" replicas can miss the write entirely. Concurrent writes still produce two versions with no ordering between them. And it says nothing about a write that failed after landing on one node.</p>
+        <p>The precise statement: <em>R + W &gt; N guarantees quorum overlap, which gives read-your-writes in the absence of failures and concurrent writers. It is not linearizability. If I need linearizability I need consensus — Raft — not quorums.</em></p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Two replicas disagree about a key's value. How do you resolve it?</summary>
+      <div class="answer">
+        <p>Three options, and the choice is a use-case decision, not a technical one:</p>
+        <p><strong>Last-write-wins:</strong> higher timestamp wins. Trivially simple, and it <strong>silently loses data</strong> — that's not a bug, it's the definition of what it does. And "higher timestamp" is a lie across machines because clocks skew by tens of milliseconds under NTP, so a write that genuinely happened <em>later</em> can carry a lower timestamp and lose. Fine for a cache (a lost write is a stale entry that TTLs out); a data-loss bug in a store.</p>
+        <p><strong>Vector clocks:</strong> per-node counters that track causality rather than time. If every counter in X ≥ every counter in Y, X descends from Y and wins cleanly. If neither dominates, the writes are genuinely concurrent and the system <em>knows</em> it's a real conflict instead of guessing. Dynamo returns both versions and the client merges (which works beautifully for a shopping cart, where the merge rule is "union the items" — you'd rather a deleted item reappear than lose a purchase). Cassandra rejected them because they grow with the number of nodes touching the key, need lossy truncation, and push a hard problem onto application developers who mostly don't want it.</p>
+        <p><strong>The best answer: make conflicts impossible.</strong> Design values to be commutative — a grow-only set, an increment-only counter, a CRDT. If merge is associative and commutative, "conflict" stops being a category. And if the business genuinely needs one linearizable answer, this is the wrong system: put that key in a CP store with consensus and pay the latency.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>What are hinted handoff, read repair, and Merkle-tree anti-entropy — and why do you need all three?</summary>
+      <div class="answer">
+        <p>They cover three distinct failure windows, and mapping them that way is why the trio is easy to remember:</p>
+        <p><strong>Hinted handoff</strong> — a replica is down <em>at write time</em>. Don't fail the write; send it to the next healthy node tagged "this belongs to N7, hold it for them," and it's replayed to N7 when N7 returns. This is what makes the quorum "sloppy" (the write may never have touched the real preference list), and that's a real weakening of R+W&gt;N that you should name rather than hide.</p>
+        <p><strong>Read repair</strong> — a replica is stale <em>at read time</em>. The read quorum disagrees; return the winner to the client and asynchronously push it to the stale replicas. Nearly free (you already have the data and the connections) and it self-heals exactly the keys people actually read. Popular keys converge fast; cold keys don't converge at all — which is fine, because nobody's reading them.</p>
+        <p><strong>Merkle trees</strong> — a replica is stale and <em>nobody is reading it</em>. A background job compares whole key ranges by exchanging a hash tree: if the roots match, millions of keys are verified identical with <em>one hash comparison</em>; if they differ, you recurse only into the differing subtree and transfer only the differing keys. O(log n) round trips instead of O(n) data. The catch is that writes invalidate the path to the root, so you rebuild lazily on a schedule — it's the backstop, not the primary path.</p>
+        <p>Write, read, neither. Three windows, three mechanisms, no gaps.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>How do you implement eviction? And why doesn't Redis use true LRU?</summary>
+      <div class="answer">
+        <p>True LRU is a hash map plus a doubly-linked list — O(1) get, O(1) put, move-to-head on access. It's literally the LeetCode LRU Cache problem, and it's the core of every cache ever built.</p>
+        <p>Redis doesn't do it, because the list costs <strong>16 bytes per key</strong> (two pointers) plus <em>a mutation on every read</em>, which means a lock or a cache-line bounce on the hottest path in the system. On 400 million keys that's 6.4 GB of RAM spent on bookkeeping instead of on cache entries. So Redis <strong>samples 5 random keys and evicts the least-recently-used among them</strong>. No global list, nothing on the read path, just a 24-bit timestamp per object. The hit-rate difference versus true LRU is a few percent; with 10 samples it's nearly indistinguishable.</p>
+        <p>The generalisable lesson, and the reason this is worth saying out loud: <strong>eviction is a heuristic, not a correctness property — it's a guess about the future.</strong> Paying full price for a perfectly computed guess is a bad trade. The same reasoning justifies approximate failure detection and lazy anti-entropy. Approximate, cheap, good enough.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>A cache node restarts. What happens to your database?</summary>
+      <div class="answer">
+        <p>It gets hit, hard, and this is the failure mode that actually pages people. The node comes back with zero keys, rejoins the ring, immediately takes its full share of traffic — 40k QPS in our sizing — and <em>every single request is a miss</em>. All of it lands on a database that was capacity-planned assuming a 95% hit rate, so that shard's DB load goes up ~20×. <strong>The cache's recovery becomes the database's outage.</strong></p>
+        <p>Four fixes, and I'd do all four: <strong>warm before joining</strong> (populate from a replica or a local RDB snapshot, and only announce ready at ~80% populated); <strong>ramp traffic in</strong> (10% → 25% → 50% over minutes, so misses trickle rather than arrive as a wall); <strong>single-flight / request coalescing</strong> (5,000 concurrent misses on the same key must produce <em>one</em> DB query, not 5,000 — the highest-leverage line of code in any caching system); and a <strong>concurrency limit plus circuit breaker</strong> on the DB pool, so that in the worst case the database sheds load and stays up degraded rather than falling over completely.</p>
+        <p>Same logic applies to <em>adding</em> nodes: stagger it. Adding 10 nodes to a 25-node cluster at once cold-starts ~30% of the key space simultaneously, and that spike is the outage.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>What's the difference between Redis Sentinel and Redis Cluster?</summary>
+      <div class="answer">
+        <p><strong>Sentinel solves availability. Cluster solves scale.</strong> They're not competing options; they answer different questions.</p>
+        <p>Sentinel: one master, N replicas, <em>the entire dataset on every node</em>. A separate quorum of Sentinel processes watches the master and promotes a replica on failure. There is <strong>no sharding</strong> — you are still bounded by one machine's RAM and one machine's write throughput.</p>
+        <p>Cluster: many masters, each owning a slice of the 16,384 hash slots, each with its own replicas. The masters gossip and a majority of them must agree that a node has failed before failover. You get sharding, and you pay for it: no multi-key operations across slots, a smarter client that handles <code>MOVED</code>/<code>ASK</code>, and a much harder operational story.</p>
+        <p>The judgment line: <em>most teams who reach for Cluster actually needed Sentinel.</em> They had an availability problem, not a capacity problem, and they took on partitioning they didn't need. Check the working set against one machine's RAM first — a modern box holds a lot.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Why would you ever build this instead of using DynamoDB or ElastiCache?</summary>
+      <div class="answer">
+        <p><strong>Mostly you wouldn't, and saying so is the strong answer, not the weak one.</strong> Running a stateful distributed cluster yourself means owning upgrades, rebalancing, failure handling and 3am on-call for a gossip partition — an enormous operational cost that produces zero business value.</p>
+        <p>The value of designing it from scratch is that you now know exactly what the managed service is doing for you. You know why DynamoDB throttles a hot partition even when you're under your table's total provisioned capacity (because capacity is per-partition, and consistent hashing doesn't fix hot keys). You know why an eventually-consistent read costs half of a strongly-consistent one (because the strong read is a quorum read touching more replicas). You know why there's a 400 KB item limit (head-of-line blocking and fragmentation). That means you can debug it, cost it, and choose it deliberately instead of superstitiously.</p>
+        <p>And the honest exceptions: you'd build it yourself when the managed model genuinely doesn't fit — an unusual consistency requirement, a latency floor below what a managed hop allows, or a scale at which the bill exceeds the salary of the team who'd run it.</p>
+      </div>
+    </details>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="takeaways">What to remember</h2>
+
+    <ul>
+      <li><strong>"Cache or store?" is the first question and the only one that really matters.</strong> Every other trade-off is downstream of it. Cache: lossy is fine, eviction is a feature, replication optional, LWW is harmless, adding a node is a shrug. Store: losing data is a bug, <code>noeviction</code>, N≥3, conflict resolution matters enormously, adding a node is a supervised migration.</li>
+      <li><strong>Estimation forces the architecture.</strong> 1 TB working set ÷ ~48 GB usable per node ≈ 25 nodes. <em>Memory binds before CPU.</em> 25 nodes is why you need consistent hashing at all — derive the ring from the arithmetic instead of asserting it. And replication with N=3 triples the fleet: that's the true price of durability.</li>
+      <li><strong>The single node is the LRU Cache problem</strong> — hash map + doubly-linked list, O(1) both ways. You built it in <a href="../phase3-dsa/06-linked-lists.html#lru">Phase 3, tutorial 06</a>. Cap values at ~1 MB, because one fat value on a single-threaded node blocks everyone's P99.</li>
+      <li><strong>Routing must be key-aware.</strong> A round-robin load balancer in front of a KV cluster means every request is a miss. Three options: fat client (1 hop, but every client must agree on the ring) · proxy (dumb clients, +0.3 ms) · server-side <code>MOVED</code> (Redis Cluster). Pick one, name its cost in real units, say when you'd flip.</li>
+      <li><strong>Replicas = the next N <em>distinct physical</em> nodes clockwise.</strong> "Distinct physical" is load-bearing — with virtual nodes you can otherwise put all three replicas on one machine. Prefer distinct AZs too.</li>
+      <li><strong>Gossip</strong>: exchange membership with ~3 random peers per second; converges in O(log n) rounds; no leader, no SPOF. At 25 nodes, etcd would honestly be simpler — <em>say that</em>. It's a maturity signal, not a retreat.</li>
+      <li><strong>You cannot distinguish slow from dead.</strong> There is no correct timeout. Bias towards slow-and-sure (indirect probing; separate "suspect" from "dead"), because a false positive dumps a cold-cache load spike onto your database — the exact thing the cache exists to prevent.</li>
+      <li><strong>R + W &gt; N</strong> means the read and write quorums overlap. N=3/W=2/R=2 is the default: survives one node down, and latency is the second-fastest replica, so one straggler can't hurt you. <em>But it is not linearizability</em> — sloppy quorums break the guarantee. Say that before they catch you.</li>
+      <li><strong>LWW silently loses data</strong> (clock skew makes "latest" a lie). <strong>Vector clocks</strong> detect true concurrency but grow, need truncation, and push merging onto the client — which is why Dynamo used them and Cassandra didn't. <strong>Best: make conflicts impossible</strong> with commutative values.</li>
+      <li><strong>The Dynamo trio, by failure window:</strong> hinted handoff (replica down <em>at write</em>) · read repair (replica stale <em>at read</em>) · Merkle-tree anti-entropy (stale and <em>nobody's reading</em>). Write, read, neither. Naming all three scores heavily.</li>
+      <li><strong>Redis doesn't do true LRU</strong> — it samples 5 random keys and evicts the oldest, because a real recency list costs 16 B/key and a write on every read. <em>Eviction is a heuristic, not a correctness property; approximate is cheaper and good enough.</em> That principle recurs everywhere on this page.</li>
+      <li><strong>Consistent hashing does not fix hot keys.</strong> It distributes keys, not load. Fix with key splitting, hot-key replication, or (best for read-hot keys) a 1-second client-side cache. Hot <em>writes</em> can't be sharded at all — you have to change what the key means.</li>
+      <li><strong>Cold start is the outage.</strong> A restarted node with zero keys sends 100% of its traffic to a database sized for a 95% hit rate. Warm before joining, ramp traffic in, and coalesce duplicate misses into a single DB query.</li>
+      <li><strong>Watch eviction rate, not memory usage.</strong> Memory is pegged at 100% by design, so it tells you nothing. A rising eviction rate is the leading indicator of the death spiral: evictions ↑ → hit rate ↓ → DB load ↑ → timeouts.</li>
+      <li><strong>"Why not just use DynamoDB?" — you should.</strong> The point of the exercise is that you now know what it's doing for you: why hot partitions throttle, why strong reads cost double, why there's an item-size limit. Understanding beats operating.</li>
+    </ul>
+
+    <div class="senior">The one-paragraph version, for the night before: <em>"It's a ring of ~25 identical nodes with no leader. Clients route by key — through a proxy, so topology changes don't redeploy the fleet. Each node is a hash map plus an LRU list. Keys replicate to the next 3 distinct physical nodes clockwise, and I read and write quorums of 2 so that R + W &gt; N. Nodes find each other by gossip and I'm deliberately slow to declare anyone dead, because a false positive cold-starts a shard and spikes the database. When a replica is down I take the write anyway via hinted handoff, I heal stale replicas on read via read repair, and Merkle trees catch whatever nobody reads. Eviction is approximated LRU, because eviction is a guess and a guess should be cheap. And in production I'd run ElastiCache — the value of building it is knowing exactly what ElastiCache is doing for me."</em> If you can say that fluently in ninety seconds, you can pass this round.</div>
+  </section>
+
+  <nav class="page-nav">
+    <a href="07-url-shortener.html">← 07 — Design a URL Shortener</a>
+    <a href="09-rate-limiter.html">09 — Design a Rate Limiter →</a>
+  </nav>
+
+</main>
+</body>
+</html>

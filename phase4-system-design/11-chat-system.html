@@ -1,0 +1,1727 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>11 — Design a Chat System (WhatsApp / Slack) | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <div class="breadcrumb"><a href="index.html">← Course Home</a></div>
+    <h1>11 — Design a Chat System (WhatsApp / Slack)</h1>
+    <p>Archetype: <strong>real-time push with stateful connections</strong>. The first system in this course where the server cannot be stateless — and that one fact rewrites everything.</p>
+  </div>
+</header>
+
+<main class="container">
+
+  <section>
+    <h2>Why this matters in the interview</h2>
+    <p>
+      Every case study so far has quietly rested on one assumption you probably didn't notice you were making: <strong>the
+      service is stateless.</strong> Any box can serve any request, so you put twenty of them behind a load balancer, scale
+      horizontally by adding boxes, and let a box die without anyone caring. Shorteners, feeds, rate limiters, caches — all
+      stateless request/response. That assumption is what made them tractable. <em>Chat breaks it.</em> To deliver a message to
+      user B, you must push bytes down <strong>B's specific TCP connection</strong>, and that connection is terminated on
+      <strong>one specific machine</strong> out of a thousand. You cannot round-robin your way to B. You have to <em>find</em>
+      B's box. The moment you accept that, you have a routing problem, a registry problem, a failure problem, and — the one
+      almost nobody has thought about — a <em>deployment</em> problem. That is the whole interview, and it is why chat is a
+      genuine step up in difficulty from 07–10 rather than just another diagram.
+    </p>
+    <p>
+      Learn the shape, not the app. <strong>Anything where the server must push to a specific connected client is this same
+      system.</strong> Live sports scores. A trading dashboard streaming ticks. Multiplayer game state. Uber's "your driver is
+      2 minutes away". Collaborative editing (tutorial 23 is this page's front end, and
+      it inherits every problem on it). Notifications pushed to an open web app. Every one of them has connections pinned to
+      boxes, a registry mapping user → box, an inter-server hop, presence, reconnect storms, and an ordering story. Say that out
+      loud in the interview — <em>"this is the real-time-push archetype; the transport is a detail, the stateful routing is the
+      problem"</em> — and you've told the interviewer you're reasoning about a class of systems rather than reciting one.
+      <a href="02-networking-delivery.html">Tutorial 02</a> already sold you WebSockets over SSE and polling and told you the
+      hard part came later. This is later.
+    </p>
+  </section>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ul>
+      <li><a href="#prompt">1. The prompt</a> — and where its hard core actually is</li>
+      <li><a href="#requirements">2. Requirements</a> — the ladder, the ordering guarantee, the scope cut</li>
+      <li><a href="#estimation">3. Estimation</a> — <strong>connections per box</strong> is the number ★</li>
+      <li><a href="#api">4. API design</a> — WS events + a REST spine</li>
+      <li><a href="#data-model">5. Data model</a> — the canonical case for Cassandra, defended</li>
+      <li><a href="#hld">6. High-level design</a> — one message, end to end</li>
+      <li><a href="#deep-dive-1">7a. Deep dive: connection state &amp; routing</a> ★ — including the deploy question</li>
+      <li><a href="#deep-dive-2">7b. Deep dive: delivery guarantees &amp; ordering</a> ★</li>
+      <li><a href="#presence">7c. Presence</a> — the surprisingly expensive feature</li>
+      <li><a href="#groups">7d. Group chat</a> — fan-out comes back wearing a hat</li>
+      <li><a href="#scaling">8. Scaling &amp; bottlenecks</a></li>
+      <li><a href="#tradeoffs">9. Trade-offs</a></li>
+      <li><a href="#followups">10. Follow-ups you should expect</a> — E2E encryption, media, search</li>
+      <li><a href="#qa">Interview Q&amp;A</a></li>
+      <li><a href="#takeaways">What to remember</a></li>
+    </ul>
+  </div>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="prompt">1. The prompt</h2>
+
+    <p>It arrives with the usual generosity:</p>
+
+<pre><code>  "Design a chat system. Something like WhatsApp, or Slack."
+</code></pre>
+
+    <p>
+      Two words of scope, and they hide an enormous fork. WhatsApp is mostly <strong>1:1 and small groups, mobile-first,
+      end-to-end encrypted, offline-heavy</strong> — the hard parts are connection management and delivery to a phone that's in
+      a tunnel. Slack is mostly <strong>large persistent channels, desktop-first, server-readable, search-heavy</strong> — the
+      hard parts are fan-out and history. They are different systems. Ask which one, or pick one and say why; do not design a
+      blurry average of both.
+    </p>
+
+    <p>
+      And know where the hard core sits before you touch the pen. It is <em>not</em> "which transport?" — you'll spend thirty
+      seconds saying WebSocket and move on. It is <strong>the server is stateful.</strong> A message for B has to reach the one
+      machine in your fleet that is holding B's socket open. Everything the interviewer is going to push on — the registry, the
+      inter-server hop, what happens when that machine dies, what happens when you <em>deploy</em>, presence, ordering,
+      offline — is downstream of that single sentence. Budget your 45 minutes so that the routing story and the delivery story
+      get twenty of them.
+    </p>
+
+    <div class="senior">Open with the fork and the core, in one breath: <em>"Before I draw anything — WhatsApp and Slack are different problems, so let me pick. I'll do a WhatsApp-shaped system: 1:1 plus small groups, mobile clients that go offline constantly, and durability as the top non-functional. And I'll flag now what I think the hard part is: unlike every other system I'd design, <strong>this one can't be stateless</strong>. A user's connection lives on one specific box, so delivering a message means locating that box. That routing problem is where I want to spend most of our time — is that where you'd like to go too?"</em> You have named the archetype, chosen a scope, and pre-committed the interviewer to the deep dive you're strongest on. That is what driving the round looks like.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="requirements">2. Requirements</h2>
+
+    <p>
+      Ask, but always propose the answer with the question — the interviewer's job is to correct you, not to teach you. The
+      exchange, roughly:
+    </p>
+
+    <table>
+      <thead><tr><th>You ask</th><th>They answer</th><th>What it just forced</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><em>"1:1 only, or groups too? And if groups — small ones, or 50,000-person broadcast channels?"</em></td>
+          <td>1:1 and groups. Assume groups cap around 100 members.</td>
+          <td>A 100-member cap keeps you on <strong>fan-out on write</strong> (§7d). If they'd said "channels of 100k", the answer flips to fan-out on read and the design changes materially. Ask; don't guess.</td>
+        </tr>
+        <tr>
+          <td><em>"Do we need presence — the green dot — and typing indicators?"</em></td>
+          <td>Yes to presence. Typing indicators are nice-to-have.</td>
+          <td>Presence looks free and isn't. It's an O(n²) chatter problem and a whole deep-dive (§7c). It is also the best <em>requirement to negotiate down</em> in the entire question.</td>
+        </tr>
+        <tr>
+          <td><em>"Delivery receipts? The full sent / delivered / read ladder, WhatsApp-style?"</em></td>
+          <td>Yes, all three ticks.</td>
+          <td>Each rung is a <strong>separate ack travelling backwards</strong> through the system. That's three extra message flows, not one. Most candidates draw the forward path and forget the ladder entirely.</td>
+        </tr>
+        <tr>
+          <td><em>"What happens if the recipient is offline? Store and forward, or drop?"</em></td>
+          <td>Store. They must get it when they come back, and get a push notification meanwhile.</td>
+          <td>You now need a durable store, a per-user offline inbox, and a hook into a push service (<a href="12-notifications-scheduler.html">tutorial 12</a>). This kills any "just relay it through memory" design.</td>
+        </tr>
+        <tr>
+          <td><em>"How bad is losing a message? I'd assume it's the worst thing that can happen."</em></td>
+          <td>Unacceptable. Never lose a message.</td>
+          <td><strong>The most important answer in the round.</strong> Durability beats latency. It means you <em>persist before you ack</em> — the sender doesn't get a tick until the message is safely written. That one line dictates the whole write path.</td>
+        </tr>
+        <tr>
+          <td><em>"Ordering — do messages have to arrive in order? Globally, or just within a conversation?"</em></td>
+          <td>Within a conversation. Global order is meaningless.</td>
+          <td>Enormous simplification, and one you should <em>claim out loud</em>. Per-conversation ordering means a conversation can live on <strong>one partition</strong> with a monotonic sequence number. Global ordering would need distributed consensus and would be both expensive and pointless.</td>
+        </tr>
+        <tr>
+          <td><em>"Scale? I'll assume 500 million daily actives and something like 50 million concurrent connections."</em></td>
+          <td>Yes.</td>
+          <td>50M concurrent is the number that creates the entire problem. See §3.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>Functional requirements</h3>
+    <ul>
+      <li><strong>1:1 messaging</strong> — send a message to another user, in near real time.</li>
+      <li><strong>Group chat</strong> — up to ~100 members.</li>
+      <li><strong>Online presence</strong> — the green dot, and "last seen".</li>
+      <li><strong>Delivery receipts</strong> — the sent → delivered → read ladder.</li>
+      <li><strong>Message history</strong> — scroll back; sync across a user's devices.</li>
+      <li><strong>Offline delivery</strong> — messages queue for a disconnected user and arrive on reconnect.</li>
+      <li><strong>Push notifications</strong> — when the app is closed entirely, wake the phone via APNs/FCM.</li>
+    </ul>
+
+    <h3>Non-functional requirements</h3>
+    <ul>
+      <li><strong>Durability &gt; everything.</strong> Losing a message is unacceptable. Persist, <em>then</em> ack. This is the hinge of the design.</li>
+      <li><strong>Low latency.</strong> End-to-end p99 under ~200ms for an online recipient. Chat that lags feels broken in a way a slow feed does not.</li>
+      <li><strong>Ordering within a conversation.</strong> Not globally. Server-assigned sequence numbers, not client clocks (§7b).</li>
+      <li><strong>Scale: ~50M concurrent connections</strong>, 500M DAU. This is the constraint that makes the system hard.</li>
+      <li><strong>Availability</strong> — high, but note the honest nuance: a brief inability to <em>deliver in real time</em> is survivable (the client retries, the message sits in the store); an inability to <em>durably accept</em> a message is not. Those are different SLOs and a senior candidate separates them.</li>
+    </ul>
+
+    <h3>Explicitly out of scope</h3>
+    <div class="senior"><em>"I'm cutting three things and I want to name them rather than have them quietly missing. <strong>Huge broadcast channels</strong> — 100k-member Slack channels or Telegram channels — because they invert the fan-out decision and I'd rather do the 100-member case properly and then tell you exactly what changes at 100k, which I will, at the end. <strong>Voice and video calling</strong>, which is a completely different system: WebRTC, SFUs, UDP, and none of the durability requirements we just agreed on. And <strong>end-to-end encryption</strong> — I'll design a server that can read messages, and then in the follow-ups I'll tell you precisely which parts of my design E2E breaks, because it breaks more than people expect. Does that scoping work?"</em> Each cut comes with a promise to return to it. That is how you triage without looking like you're dodging.</div>
+
+    <div class="pitfall">Do not let "typing indicators" and "presence" go by as freebies you nod at and never mention again. They are the highest chatter-to-value ratio features in the product — typing indicators generate <em>more events than actual messages</em>, and they are pure ephemera nobody would pay to store. An interviewer who hears you say <em>"presence and typing are fire-and-forget; I will not persist them, and I'll happily degrade them under load before I degrade message delivery"</em> has learned more about your judgment than from anything you'll draw.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="estimation">3. Estimation</h2>
+
+    <p>
+      Round hard, say you're rounding, and — the part most candidates skip — <strong>use the number afterwards</strong>. On this
+      question there is one derived figure that is worth more than all the others combined, and it is not QPS. It's
+      <em>connections per box</em>.
+    </p>
+
+    <h3>Messages</h3>
+
+<pre><code>DAU:              500,000,000
+Messages/user/day: 40           (chat is bursty and social; 40 is a
+                                 reasonable round number — say so)
+
+Messages/day:     500M × 40  = 20,000,000,000   ≈ 20B/day
+Seconds/day:      86,400     →  call it 100,000  (rounding up, deliberately)
+
+Write QPS:        20B / 100,000  ≈ 200,000 msg/sec   ← ~230k/s if you use
+                                                        the honest 86,400
+Peak (3×):        ≈ 600,000 msg/sec
+</code></pre>
+
+    <p>
+      230k writes/sec is genuinely a lot — it rules out a single relational primary immediately and is the first hint about the
+      store (§5). But note it's not <em>shocking</em>; sharded, that's a couple of hundred boxes' worth of writes. Hold that
+      thought, because the next number is the one that hurts.
+    </p>
+
+    <h3>Storage</h3>
+
+<pre><code>Per message:  message_id, conversation_id, sender_id, seq, timestamp,
+              body (text, usually short), status flags
+              ≈ 200 bytes  (round up; most chat messages are tiny)
+
+Per day:      20B × 200 B      = 4 TB/day
+Per year:     4 TB × 365       ≈ 1.5 PB/year
+With replication (×3):         ≈ 4.5 PB/year
+</code></pre>
+
+    <p>
+      Petabytes a year, append-only, never updated, and read overwhelmingly as "the last N messages in this conversation."
+      Remember that sentence — it is going to <em>write the data-model section for you</em> in §5.
+    </p>
+
+    <h3>The number that actually drives the design: connections per box</h3>
+
+<pre><code>Concurrent connections:        50,000,000   (given)
+
+How many WebSocket connections fit on one server?
+  · Each idle connection costs: kernel socket buffers (send + recv),
+    a file descriptor, and your app's per-connection state
+    (user_id, session, TLS context, write queue) — call it
+    ~10 KB of real memory per connection, being generous but honest.
+  · 50,000 conns × 10 KB   ≈ 500 MB just for connection state.
+  · Plus TLS, plus the JVM/heap, plus headroom for bursts.
+  · File descriptors: fine, you raise ulimit; not the binding constraint.
+  ⇒ ~50,000 connections per box is a sane, defensible working figure.
+    (Tuned C/Rust servers push past this; a JVM service in a container
+     with real business logic on it, 50k is honest. SAY WHICH.)
+
+  50,000,000 / 50,000  =  1,000 chat servers.
+</code></pre>
+
+    <div class="senior">This is the sentence the whole page exists to teach you to say: <em>"So I need roughly <strong>a thousand chat servers</strong>, each holding fifty thousand live sockets. And that single fact is the design. It means user B's connection is on <em>one</em> of a thousand boxes, and when A sends B a message, the box A is connected to has to <strong>find out which one</strong> — so I've just turned a messaging problem into a <strong>routing problem</strong>. That's what I'm going to spend most of my time on. It also means I have a thousand stateful boxes to deploy, restart, and lose, which is a problem I'd like to come back to because it's the one that actually pages you at 3am."</em> Notice what that does: you derived the routing problem from arithmetic instead of asserting it. Every claim after this is now grounded.</div>
+
+    <h3>Bandwidth, and why it's a footnote</h3>
+
+<pre><code>Message payload:  ~200 B
+Ingress:  230k/s × 200 B         ≈ 46 MB/s     — trivial.
+Egress:   fan-out multiplier ~2× (1:1 + small groups)
+          ≈ 100 MB/s across 1,000 boxes         — 100 KB/s per box. Nothing.
+
+The bytes are NOT the problem. The CONNECTIONS are the problem.
+</code></pre>
+
+    <p>
+      Say that last line out loud. Chat is a system where the data volume is small and the <em>connection</em> volume is
+      enormous — the exact inverse of <a href="16-video-streaming.html">video streaming</a>. Candidates who pattern-match "big
+      system → bandwidth" waste four minutes on a number that doesn't constrain anything.
+    </p>
+
+    <div class="note">Two more figures worth having ready because interviewers poke at them. <strong>Presence/heartbeat traffic:</strong> if 50M clients heartbeat every 30 seconds, that's 50M/30 ≈ <strong>1.7M heartbeats/sec</strong> — nearly <em>ten times</em> your message rate. Presence is not a small feature (§7c). <strong>Typing indicators:</strong> a single message typed generates several "typing" events, so typing traffic can exceed message traffic outright. Both are reasons to keep ephemeral events off the durable path entirely.</div>
+
+    <div class="pitfall">Don't quote "1 million connections per box" because you once read about the C10M problem. It's true in a benchmark — a hand-tuned event loop doing nothing but echoing bytes. It is not true of a service that terminates TLS, deserializes JSON, holds session state, talks to Redis and Kafka, and runs on a JVM in a 4 GB container. If you give a big number, <strong>give the assumptions with it</strong>, and be ready for "what's the memory per connection?" — which is the follow-up, every time. A defended 50k beats an undefended 1M.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="api">4. API design</h2>
+
+    <p>
+      Chat has <strong>two APIs, not one</strong>, and saying that explicitly is worth a mark. There's a persistent bidirectional
+      channel for anything real-time, and a boring REST API for everything that isn't. Candidates who try to do history
+      pagination over the WebSocket are over-applying the hammer; candidates who try to do message delivery over REST have
+      missed the question.
+    </p>
+
+    <h3>The connection: HTTP first, then upgraded</h3>
+
+<pre><code>GET /ws  HTTP/1.1
+Host: chat.example.com
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
+Sec-WebSocket-Version: 13
+Authorization: Bearer &lt;jwt&gt;              <span class="com">// auth happens HERE, on the</span>
+                                         <span class="com">// HTTP handshake — cheap and</span>
+                                         <span class="com">// standard. Don't invent a</span>
+                                         <span class="com">// custom auth frame.</span>
+
+HTTP/1.1 101 Switching Protocols
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+
+<span class="com">// From here on the TCP connection is a full-duplex frame pipe.
+// It stays open for hours. It is pinned to ONE server. That is the
+// entire premise of this design.</span>
+</code></pre>
+
+    <p>
+      Two things to say while you write that. First: <strong>the connection starts as an ordinary HTTP request</strong> and is
+      upgraded in place — which is exactly why WebSockets traverse proxies and corporate firewalls that would eat a raw TCP
+      socket, and why your L7 load balancer needs to be configured to pass the <code>Upgrade</code> header through rather than
+      terminating it. Second: <strong>authenticate on the handshake.</strong> One JWT check, once, at connect time, and then the
+      socket carries an authenticated identity for its lifetime. Re-authenticating per frame would be absurd, and inventing a
+      bespoke "login" frame after the connection opens means you've spent 10 KB of server memory on an unauthenticated client.
+    </p>
+
+    <h3>WebSocket events (the real-time API)</h3>
+
+<pre><code><span class="com">// ── client → server ────────────────────────────────────────────</span>
+{ "type": "SEND",
+  "clientMsgId": "8f2a-…",          <span class="com">// client-generated UUID.
+                                       THE dedup + idempotency key.
+                                       See §7b — this is load-bearing.</span>
+  "conversationId": "c_912",
+  "body":  "are we still on for 6?" }
+
+{ "type": "ACK_DELIVERED", "messageId": "m_5571" }   <span class="com">// I received it</span>
+{ "type": "ACK_READ",      "conversationId": "c_912",
+                           "upToSeq": 4471 }         <span class="com">// I read up to here
+                                                        (a POINTER, not per-message)</span>
+{ "type": "TYPING",   "conversationId": "c_912" }    <span class="com">// fire-and-forget</span>
+{ "type": "HEARTBEAT" }                              <span class="com">// every ~30s; keeps
+                                                        the presence TTL alive</span>
+{ "type": "SYNC", "conversationId": "c_912",
+                  "sinceSeq": 4460 }                 <span class="com">// on reconnect: catch me up</span>
+
+<span class="com">// ── server → client ────────────────────────────────────────────</span>
+{ "type": "SENT",                                    <span class="com">// tick 1: durably stored</span>
+  "clientMsgId": "8f2a-…",                           <span class="com">// echoed back so the client
+                                                        can match it to its optimistic
+                                                        bubble — exactly like a React
+                                                        optimistic update reconciling</span>
+  "messageId": "m_5571", "seq": 4471, "ts": 1763… }
+
+{ "type": "MESSAGE",                                 <span class="com">// an inbound message</span>
+  "messageId": "m_5571", "conversationId": "c_912",
+  "senderId": "u_77", "seq": 4471,
+  "body": "are we still on for 6?", "ts": 1763… }
+
+{ "type": "DELIVERED", "messageId": "m_5571" }       <span class="com">// tick 2 (back to sender)</span>
+{ "type": "READ", "conversationId": "c_912",
+                  "upToSeq": 4471, "by": "u_88" }    <span class="com">// tick 3</span>
+{ "type": "PRESENCE", "userId": "u_88",
+                      "status": "online" }
+</code></pre>
+
+    <h3>REST (the boring, essential half)</h3>
+
+<pre><code>POST /api/v1/auth/token          → JWT, used on the WS handshake
+GET  /api/v1/conversations       → the sidebar: convos + unread counts
+                                   + last message preview
+
+GET  /api/v1/conversations/{id}/messages?before={seq}&amp;limit=50
+                                 → history, paginated by SEQUENCE NUMBER,
+                                   not offset. Cursor pagination — and
+                                   here the cursor is free, because the
+                                   seq already exists and is monotonic.
+                                   (No offset drift; cf. tutorial 10.)
+
+POST /api/v1/conversations       → create a conversation / group
+POST /api/v1/conversations/{id}/participants   → add member
+POST /api/v1/media               → returns a PRESIGNED UPLOAD URL
+                                   (§10 — bytes never touch your servers)
+</code></pre>
+
+    <table>
+      <thead><tr><th>Goes over WebSocket</th><th>Goes over REST</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>New messages, acks, typing, presence</td>
+          <td>—</td>
+          <td>Server-initiated, latency-sensitive, high-frequency. This is precisely what a persistent channel is <em>for</em>.</td>
+        </tr>
+        <tr>
+          <td>—</td>
+          <td>History, conversation list, auth, group admin, media upload</td>
+          <td>Client-initiated, cacheable, paginated, infrequent. Ordinary request/response with all the HTTP machinery — status codes, retries, CDN, caching — that you'd throw away by tunnelling it through a socket.</td>
+        </tr>
+        <tr>
+          <td>SYNC (catch-up on reconnect)</td>
+          <td>…or REST, honestly</td>
+          <td>Either is defensible. Over the socket it's one round trip on a connection you just opened anyway; over REST it's easier to paginate a large backlog. <strong>Say that both work and pick one</strong> — naming a genuine coin-flip as a coin-flip is a senior tell.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="note">You already know this pattern from React. The <code>clientMsgId</code> + echoed <code>SENT</code> is exactly an <strong>optimistic update</strong>: the client renders the bubble immediately in a "sending" state keyed by its own UUID, and when the server's <code>SENT</code> comes back it swaps in the real <code>messageId</code> and <code>seq</code> and flips the tick. If no ack arrives, the bubble stays grey and the client retries with <em>the same</em> <code>clientMsgId</code> — which is what makes the retry safe. Frontend intuition, load-bearing backend consequence.</div>
+
+    <div class="pitfall">Don't design read receipts as one ack per message. In a busy conversation a user scrolls past forty messages in one second and you've just generated forty writes fanned out to everyone. Read state is a <strong>pointer</strong> — "user u_88 has read conversation c_912 up to seq 4471" — one row per (user, conversation), <em>updated</em>, not appended. One write instead of forty, and the client can derive the tick state for every message from it. This is a small design detail that interviewers notice immediately because it's where sloppy candidates generate O(n) writes for free.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="data-model">5. Data model</h2>
+
+    <p>
+      Derive the store from the access patterns, never the other way round. So write the access patterns on the board
+      <em>first</em> — literally, before you name a single database:
+    </p>
+
+    <table>
+      <thead><tr><th>Access pattern</th><th>Frequency</th><th>Shape</th></tr></thead>
+      <tbody>
+        <tr><td>Append a message to a conversation</td><td><strong>230k/sec</strong></td><td>Pure write. Never updated afterwards. Never deleted (mostly).</td></tr>
+        <tr><td>Load the last 50 messages of a conversation</td><td>Very common</td><td>Point lookup by <code>conversation_id</code> + a <strong>range scan</strong> over recent <code>seq</code>, descending.</td></tr>
+        <tr><td>Scroll back / sync since seq N</td><td>Common</td><td>Same: same partition, a contiguous slice of the sort key.</td></tr>
+        <tr><td>Load a user's conversation list</td><td>On app open</td><td>Small, by <code>user_id</code>.</td></tr>
+        <tr><td>Update "last read up to seq N"</td><td>Moderate</td><td>Single-row upsert by (user, conversation).</td></tr>
+        <tr><td>Search all my messages for "invoice"</td><td>Rare</td><td>Full-text. <strong>Not this store's job</strong> — see §10.</td></tr>
+      </tbody>
+    </table>
+
+    <p>
+      Now read those back to yourself. <strong>Write-heavy. Append-only. Never updated. Queried by a single partition key plus a
+      time/sequence range. No joins. No ad-hoc queries. No transactions across conversations.</strong> That is not a
+      description of a workload that wants a B-tree. That is a description of the workload that
+      <strong>LSM-tree storage engines were invented for</strong>, and this is the moment
+      <a href="03-data-storage.html#engines">tutorial 03's B-tree vs LSM section</a> pays for itself.
+    </p>
+
+    <h3>Why Cassandra (and not Postgres), defended properly</h3>
+
+    <table>
+      <thead><tr><th></th><th>Postgres (B-tree)</th><th>Cassandra / ScyllaDB (LSM, wide-column)</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Write path</strong></td>
+          <td>Random writes into B-tree pages, plus WAL. Every insert may dirty a page anywhere on disk, and index maintenance is read-modify-write. Write amplification hurts at 230k/s.</td>
+          <td>Append to a commit log, insert into an in-memory memtable, flush sequentially to an immutable SSTable. <strong>Writes are sequential appends</strong> — the fastest thing a disk does. Compaction pays the cost later, in the background, off the critical path.</td>
+        </tr>
+        <tr>
+          <td><strong>Our read pattern</strong></td>
+          <td>Great at everything, including joins and ad-hoc queries we don't need.</td>
+          <td>Perfect at <em>exactly</em> our one read: one partition, contiguous slice of the clustering key. That's a single node, a handful of SSTables, one sequential read. Bad at everything else — which we don't do.</td>
+        </tr>
+        <tr>
+          <td><strong>Scale-out</strong></td>
+          <td>Sharding is something <em>you</em> build and operate (routing, rebalancing, cross-shard queries). Real work.</td>
+          <td>Consistent hashing and rebalancing are built in (<a href="04-partitioning-hashing.html">tutorial 04</a>). Adding capacity is adding nodes. Multi-datacenter replication is a config line.</td>
+        </tr>
+        <tr>
+          <td><strong>Deletes / mutation</strong></td>
+          <td>Cheap and natural.</td>
+          <td>Genuinely worse. Deletes are tombstones; heavy mutation degrades reads. <strong>Fine for us — we never update a message.</strong> A message is an immutable event.</td>
+        </tr>
+        <tr>
+          <td><strong>Consistency</strong></td>
+          <td>ACID, strong, single-node transactions.</td>
+          <td>Tunable quorum (R + W &gt; N, <a href="05-coordination-consensus.html">tutorial 05</a>). We write at QUORUM for durability and can read at QUORUM too — chat has no cross-row invariant to protect. There is no "balance must not go negative" here.</td>
+        </tr>
+        <tr>
+          <td><strong>Verdict</strong></td>
+          <td>Keep it — for <em>users, conversations, participants</em>. Small, relational, low-volume, and you want the constraints.</td>
+          <td><strong>Messages.</strong> Petabytes, append-only, one query shape. This is the textbook fit.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="senior">Say the justification in cause-and-effect order, never as a preference: <em>"My workload is 230k appends a second, petabytes a year, immutable once written, and read by exactly one query — 'give me a slice of one conversation, ordered by sequence.' No joins, no cross-row transactions, no ad-hoc analytics. That is the canonical shape for an <strong>LSM-tree wide-column store</strong>: writes become sequential appends instead of random B-tree page updates, and my read is one partition, one contiguous scan. So messages go in <strong>Cassandra</strong>. But I'll keep users, conversations and group membership in <strong>Postgres</strong> — that data is small, relational, and I want foreign keys and real transactions on it. Two stores, each chosen for its access pattern, is a feature, not a hedge."</em> The interviewer is not testing whether you like Cassandra. They're testing whether "NoSQL" is a reflex or a derivation.</div>
+
+    <h3>Schema</h3>
+
+<pre><code><span class="com">-- ═══ Cassandra: the message store ═══════════════════════════</span>
+<span class="kw">CREATE TABLE</span> messages (
+  conversation_id  <span class="typ">uuid</span>,        <span class="com">-- PARTITION KEY</span>
+  seq              <span class="typ">bigint</span>,      <span class="com">-- CLUSTERING KEY, server-assigned,</span>
+                                <span class="com">-- monotonic within the conversation</span>
+  message_id       <span class="typ">uuid</span>,
+  client_msg_id    <span class="typ">uuid</span>,        <span class="com">-- for idempotency / dedup (§7b)</span>
+  sender_id        <span class="typ">uuid</span>,
+  body             <span class="typ">text</span>,
+  media_url        <span class="typ">text</span>,
+  created_at       <span class="typ">timestamp</span>,
+  <span class="kw">PRIMARY KEY</span> ((conversation_id), seq)
+) <span class="kw">WITH CLUSTERING ORDER BY</span> (seq <span class="kw">DESC</span>);
+<span class="com">-- ↑ DESC so "the most recent 50" is a scan from the head of the
+--   partition. The default read is free.</span>
+
+<span class="com">-- The one query this table exists to serve:</span>
+<span class="kw">SELECT</span> * <span class="kw">FROM</span> messages
+ <span class="kw">WHERE</span> conversation_id = ? <span class="kw">AND</span> seq &lt; ?     <span class="com">-- cursor</span>
+ <span class="kw">LIMIT</span> <span class="num">50</span>;
+<span class="com">-- One partition. One node. One sequential slice. That's the whole point.</span>
+
+<span class="com">-- ═══ Cassandra: per-user offline inbox (§7b) ════════════════</span>
+<span class="kw">CREATE TABLE</span> user_inbox (
+  user_id          <span class="typ">uuid</span>,        <span class="com">-- PARTITION KEY</span>
+  seq              <span class="typ">bigint</span>,      <span class="com">-- per-user monotonic</span>
+  conversation_id  <span class="typ">uuid</span>,
+  message_id       <span class="typ">uuid</span>,
+  <span class="kw">PRIMARY KEY</span> ((user_id), seq)
+);
+<span class="com">-- Undelivered pointers for a user who's offline. On reconnect the
+-- client drains this from its last-seen seq. Pointers, not bodies —
+-- the body already lives exactly once, in `messages`.</span>
+
+<span class="com">-- ═══ Postgres: the small relational spine ═══════════════════</span>
+<span class="kw">CREATE TABLE</span> users (
+  user_id      <span class="typ">UUID</span> <span class="kw">PRIMARY KEY</span>,
+  phone        <span class="typ">TEXT</span> <span class="kw">UNIQUE</span>,
+  display_name <span class="typ">TEXT</span>
+);
+
+<span class="kw">CREATE TABLE</span> conversations (
+  conversation_id <span class="typ">UUID</span> <span class="kw">PRIMARY KEY</span>,
+  type            <span class="typ">TEXT</span>,        <span class="com">-- 'direct' | 'group'</span>
+  name            <span class="typ">TEXT</span>,
+  created_at      <span class="typ">TIMESTAMPTZ</span>
+);
+
+<span class="kw">CREATE TABLE</span> participants (
+  conversation_id <span class="typ">UUID</span> <span class="kw">REFERENCES</span> conversations,
+  user_id         <span class="typ">UUID</span> <span class="kw">REFERENCES</span> users,
+  joined_at       <span class="typ">TIMESTAMPTZ</span>,
+  <span class="kw">PRIMARY KEY</span> (conversation_id, user_id)
+);
+<span class="kw">CREATE INDEX</span> ON participants (user_id);   <span class="com">-- "my conversations"</span>
+
+<span class="kw">CREATE TABLE</span> read_state (             <span class="com">-- the read-receipt POINTER</span>
+  user_id         <span class="typ">UUID</span>,
+  conversation_id <span class="typ">UUID</span>,
+  last_read_seq   <span class="typ">BIGINT</span>,           <span class="com">-- UPDATED in place, not appended</span>
+  <span class="kw">PRIMARY KEY</span> (user_id, conversation_id)
+);
+<span class="com">-- Unread count = conversation.max_seq − last_read_seq. Cheap.
+-- Read ticks for the whole conversation derive from ONE row per member.</span>
+</code></pre>
+
+    <h3>The partitioning decision, said out loud</h3>
+
+    <p>
+      <strong>Partition by <code>conversation_id</code>, not by <code>user_id</code> and not by <code>message_id</code>.</strong>
+      This is the one partitioning call in the design and it follows directly from the ordering requirement you negotiated in §2.
+      You promised order <em>within a conversation</em>. Ordering is trivial if a conversation lives on one partition with a
+      monotonic counter, and hellish if its messages are scattered across a thousand nodes and you have to merge them by
+      wall-clock time. So: <em>one conversation, one partition</em>. The ordering guarantee and the partition key are the same
+      decision wearing two hats.
+    </p>
+
+    <div class="pitfall">The trap is partitioning by <code>message_id</code> "for even distribution." It <em>is</em> perfectly even — and it destroys the system, because your single most common query, "the last 50 messages of this conversation," now has to scatter-gather across every node in the cluster and sort the results. Even distribution is worthless if it's even distribution of the thing you never query by. <strong>Partition by what you read by.</strong> That sentence is most of <a href="04-partitioning-hashing.html">tutorial 04</a>.</div>
+
+    <div class="note">The cost of conversation-as-partition, and you should raise it before they do: a <strong>hot/wide partition</strong>. A hugely active group chat becomes one giant, hot partition on one node, which is the celebrity problem from <a href="10-news-feed.html">tutorial 10</a> in a new costume. The standard fix is <strong>bucketing the partition key</strong> — <code>(conversation_id, time_bucket)</code>, e.g. one bucket per month — which caps partition size and spreads a busy conversation across nodes, at the cost of a read occasionally spanning two buckets. Mention it as the thing you'd do <em>if</em> the group cap ever came off. It's a ten-second remark that shows you know your own design's failure mode.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="hld">6. High-level design</h2>
+
+    <p>
+      Draw the stateless half and the stateful half as visibly different things. The whole story of this system is that one box
+      in the middle is <em>not</em> like the others.
+    </p>
+
+<pre><code>                    ┌──────────────────────────────────────┐
+   Client A ═══WS═══│  Chat Server #17   (STATEFUL)        │
+                    │  holds 50k live sockets              │
+                    └──┬────────────┬──────────────┬───────┘
+                       │            │              │
+        who has B? ────┤            │ persist      │ publish
+                       ▼            ▼              ▼
+             ┌──────────────┐  ┌─────────┐  ┌──────────────┐
+             │  CONNECTION  │  │ Message │  │  Kafka /     │
+             │  REGISTRY    │  │ Store   │  │  pub-sub     │
+             │  (Redis)     │  │(Cassan- │  │  topic per   │
+             │ user → server│  │  dra)   │  │  chat server │
+             │  + TTL       │  └─────────┘  └──────┬───────┘
+             └──────────────┘                      │
+                       "B is on #402"              │ deliver to #402
+                                                   ▼
+                    ┌──────────────────────────────────────┐
+   Client B ═══WS═══│  Chat Server #402  (STATEFUL)        │
+                    └──────────────────────────────────────┘
+</code></pre>
+
+    <p>And the supporting cast, which is all ordinary stateless stuff:</p>
+
+<pre><code>  Clients ──▶ L4/L7 LB ──▶ [ 1,000 × Chat Servers ]   ← WS, sticky
+          └──▶ API Gateway ─▶ [ REST services ]  ──▶ Postgres
+                                (history, auth,        (users, convos,
+                                 groups, media)         participants)
+                                       │
+                                       └──▶ Cassandra (history reads)
+
+  Chat Server ──▶ Notification Service ──▶ APNs / FCM   (→ tutorial 12)
+                     (only when the recipient has NO live connection)
+
+  Chat Server ──▶ Presence (Redis, key = user, TTL = 45s)
+  Client ──▶ S3 / blob store via presigned URL  (media never transits
+                                                  the chat servers)
+</code></pre>
+
+    <h3>One message, end to end — say every hop</h3>
+
+    <p>This walkthrough <em>is</em> the answer to "how does it work?". Narrate it hop by hop; don't wave at the diagram.</p>
+
+    <ol>
+      <li>
+        <strong>A sends.</strong> A's client emits <code>SEND</code> with a client-generated <code>clientMsgId</code> over its
+        already-open socket to <strong>Chat Server #17</strong> — the one box holding A's connection. It optimistically renders
+        the bubble with a clock icon.
+      </li>
+      <li>
+        <strong>#17 persists — before anything else.</strong> It assigns a <code>seq</code> from the conversation's counter, a
+        <code>message_id</code>, and writes to Cassandra at QUORUM. <em>This ordering is the durability requirement made
+        physical.</em> If the box dies at this instant, the message is either safely stored or was never accepted — and A's
+        client, having never seen an ack, will retry with the same <code>clientMsgId</code>. There is no window in which A
+        believes the message was sent and it wasn't.
+      </li>
+      <li>
+        <strong>Tick one.</strong> #17 sends <code>SENT</code> back down A's socket, echoing <code>clientMsgId</code> and
+        carrying the real <code>messageId</code>/<code>seq</code>. A's grey clock becomes one tick. <strong>Note what that tick
+        means: "durably stored", not "delivered".</strong> Being precise about what each tick asserts is a real senior signal.
+      </li>
+      <li>
+        <strong>Route.</strong> #17 asks the <strong>connection registry</strong> in Redis: <code>GET conn:u_B</code>. Answer:
+        <code>server_402</code>. This is the lookup that only exists because the service is stateful — and it's the step
+        candidates forget entirely, silently assuming the message teleports.
+      </li>
+      <li>
+        <strong>Hop.</strong> #17 hands the message to #402 — via Kafka topic <code>chat.server.402</code>, or a direct gRPC
+        call, or a Redis pub/sub channel. (§7a compares these; they are not equivalent.)
+      </li>
+      <li>
+        <strong>Push.</strong> #402 looks up B's socket in its own in-memory map (<code>user_id → socket</code>) and writes the
+        <code>MESSAGE</code> frame down it. B's phone buzzes. Total elapsed: tens of milliseconds.
+      </li>
+      <li>
+        <strong>Tick two.</strong> B's client sends <code>ACK_DELIVERED</code>. That ack travels the <em>whole path in
+        reverse</em> — #402 → registry lookup for A → #17 → A's socket — and A's single tick becomes double. <strong>Every rung
+        of the ladder is a full round trip through the same routing machinery.</strong> Draw the return arrow. Candidates never
+        draw the return arrow.
+      </li>
+      <li>
+        <strong>Tick three.</strong> When B actually opens the conversation, the client sends <code>ACK_READ</code> with
+        <code>upToSeq</code>. The server upserts <code>read_state</code> and pushes <code>READ</code> to A. Blue ticks. One row
+        written, however many messages were read.
+      </li>
+    </ol>
+
+    <h3>…and the branch where B is offline</h3>
+
+    <ol start="4">
+      <li>
+        <strong>Route → miss.</strong> <code>GET conn:u_B</code> returns nil. B has no live connection. The message is
+        <em>already durably stored</em> (step 2), so nothing is at risk — this is the payoff for persisting first.
+      </li>
+      <li>
+        <strong>Enqueue.</strong> #17 appends a pointer to <code>user_inbox[u_B]</code>. B's backlog now exists, durably, and
+        contains a pointer rather than a copy — the body lives exactly once.
+      </li>
+      <li>
+        <strong>Wake the phone.</strong> #17 emits an event to the <strong>notification service</strong>
+        (<a href="12-notifications-scheduler.html">tutorial 12</a>), which calls APNs or FCM. The push arrives on B's lock
+        screen. Note the boundary: <em>this is now someone else's problem</em> — third-party retries, dedup, and dead-letter
+        queues live in tutorial 12, and saying "I'd hand off to the notification service here" is a scope call, not a dodge.
+      </li>
+      <li>
+        <strong>B returns.</strong> B opens the app, connects (landing on <em>any</em> chat server — say #883), which registers
+        <code>conn:u_B → server_883</code> and sends <code>SYNC</code> with B's last-seen seq. The server drains the inbox from
+        there. B gets everything they missed, in order, exactly once from the client's point of view, and the ladder catches up.
+      </li>
+    </ol>
+
+    <div class="senior">The sentence that makes an interviewer sit up: <em>"Notice the ordering here — <strong>I persist before I ack, and I persist before I route</strong>. That's the durability requirement being cashed in. If I routed first for latency and the store write failed, I'd have delivered a message to B that doesn't exist in history, and A would have a tick for a message that vanishes on their next sync. Delivering fast and losing state is worse than delivering 5ms slower. The persist is on the critical path <em>on purpose</em>."</em> You have just explained a latency cost as a deliberate correctness purchase. That is the exact thing 7 YOE is graded on.</div>
+
+    <div class="note">Where does <code>seq</code> come from? A monotonic per-conversation counter. Cheapest realistic implementation: <code>INCR seq:{conversation_id}</code> in Redis — an atomic counter, one hop, sub-millisecond, and the conversation is already the unit of partitioning so there's no contention beyond the conversation itself. Persist the high-water mark periodically so it survives a Redis restart, and note that a small <em>gap</em> in sequence numbers after a failure is harmless: you need <strong>monotonic and ordered</strong>, not <em>gapless</em>. If gaplessness were required — it isn't — you'd need consensus, and you'd be paying a lot for nothing.</div>
+
+    <div class="pitfall">The single most common structural mistake on this question: drawing the chat servers behind the load balancer exactly like stateless app servers, and then never explaining how server #17 reaches server #402. If A and B happen to be on the same box, that design works — with 1,000 boxes, that's a <strong>0.1% chance</strong>. Ninety-nine point nine percent of your messages need an inter-server hop that isn't on the diagram. If you take nothing else from this page: <strong>draw the registry and draw the hop.</strong></div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="deep-dive-1">7a. Deep dive: connection state &amp; routing</h2>
+
+    <p><strong>This is where the interview really happens.</strong></p>
+
+    <p>
+      Everything in this section descends from one sentence you should be able to say cold: <em>"the chat servers are the only
+      stateful tier in the system, and every hard problem I have comes from that."</em> A stateless service has no identity — any
+      box will do, a dead box is replaced without ceremony, and deploys are a rolling shrug. A chat server has 50,000 users'
+      TCP connections in its memory. It is not interchangeable. It cannot be casually killed. It has to be
+      <em>findable</em>. Four sub-problems fall out, and a strong candidate hits all four.
+    </p>
+
+    <h3>(a) The load balancer, and what "sticky" really means here</h3>
+
+    <p>
+      The WebSocket handshake is an HTTP request that gets upgraded and then <em>never ends</em>. So the LB isn't routing a
+      request, it's <strong>assigning a long-lived tenancy</strong> — the client will sit on whichever box the LB picks for the
+      next several hours. Two consequences people miss:
+    </p>
+
+    <ul>
+      <li>
+        <strong>Stickiness is automatic for the life of the connection</strong> — it's one TCP connection; it can't wander. What
+        you actually need the LB to do is (i) pass the <code>Upgrade</code>/<code>Connection</code> headers through instead of
+        terminating them, and (ii) hold its idle timeout well above your heartbeat interval, or it will helpfully murder healthy
+        idle sockets. An LB idle timeout <em>shorter than your heartbeat</em> is a classic production bug: everything works in
+        staging, and in production every connection dies every 60 seconds.
+      </li>
+      <li>
+        <strong>Balance drifts.</strong> Round-robin balances <em>connection attempts</em>, not <em>connections</em>. A box that
+        was restarted an hour ago is empty; boxes that survived last night's reconnect storm are full. Over days, load skews
+        badly. The fix is to balance on <em>current connection count</em> (least-connections), and to have servers report load
+        so the LB — or a connection-broker endpoint the client hits first — can steer new connections toward drained boxes.
+      </li>
+    </ul>
+
+    <div class="note">A genuinely nice alternative worth one sentence: skip LB assignment and give the client a
+    <strong>discovery endpoint</strong> — <code>GET /connect</code> over plain HTTP returns "connect to
+    <code>chat-402.example.com</code>, here's a token." Now <em>you</em> control placement in application code (least-loaded,
+    same-region, avoid-draining-boxes), which is far more expressive than any LB algorithm, and it makes graceful drain trivial:
+    a draining box simply stops being handed out. This is roughly how large real deployments do it, and almost no candidate
+    mentions it.</div>
+
+    <h3>(b) The connection registry — the heart of the design</h3>
+
+    <p>
+      Somebody must know that <code>u_B</code> is on <code>server_402</code>. That somebody is the registry: a small, hot,
+      brutally simple Redis map.
+    </p>
+
+<pre><code><span class="com"># On connect (server_402 handling user u_B):</span>
+SET conn:u_B "server_402" EX 45          <span class="com"># 45-second TTL</span>
+
+<span class="com"># Every 30s, on heartbeat from the client:</span>
+EXPIRE conn:u_B 45                       <span class="com"># refresh the lease</span>
+
+<span class="com"># On clean disconnect:</span>
+DEL conn:u_B
+
+<span class="com"># On lookup (server_17 routing a message to B):</span>
+GET conn:u_B      →  "server_402"   |   nil (B is offline → inbox + push)
+</code></pre>
+
+    <p>
+      The <strong>TTL is the entire trick</strong>, and it deserves a sentence out loud. A registry entry is not a fact, it's a
+      <em>lease</em>. If server #402 is hit by a truck, it will never run <code>DEL</code> — so without a TTL, the registry would
+      insist forever that B is reachable on a box that no longer exists, and every message to B would be routed into a black
+      hole. With a TTL, a dead server's entries simply <strong>expire themselves</strong> within 45 seconds and B correctly
+      becomes "offline". You have made failure cleanup a property of the data, not a task somebody has to remember to run. That
+      is exactly the same reasoning as the presence TTL in §7c, and it's a pattern worth naming as a pattern.
+    </p>
+
+    <div class="senior">Say this and you've shown you think about failure, not just about the happy path: <em>"The registry entry is a <strong>lease, not a fact</strong> — it's a TTL refreshed by the client's heartbeat, so if a chat server dies violently, its 50,000 stale entries clean themselves up in under a minute without any coordination or cleanup job. In the gap I'll route some messages at a dead box; those sends will fail fast, and my fallback on a failed hop is the same as my fallback for an offline user — write to the inbox and fire a push notification. <strong>The failure path and the offline path are the same path</strong>, which means I get failure handling for free from a feature I already had to build."</em> Collapsing two error cases into one existing path is the kind of thing that reads as real experience.</div>
+
+    <p>
+      Two refinements worth having in your pocket if pushed: <strong>multi-device</strong> — the key becomes a set, not a string
+      (<code>SADD conn:u_B "server_402:phone" "server_119:desktop"</code>), because a user with a phone and a laptop has two
+      sockets on two boxes and both must receive; and <strong>caching</strong> — a chat server can cache
+      <code>user → server</code> locally for a few seconds, since the mapping is stable for hours, which cuts a Redis round trip
+      off the hot path. Just be prepared to be wrong sometimes and fall back on a failed hop.
+    </p>
+
+    <h3>(c) The inter-server hop — three options, genuinely different</h3>
+
+    <table>
+      <thead><tr><th>Approach</th><th>How</th><th>Pro</th><th>Con</th><th>Use when</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Direct RPC</strong> (gRPC)</td>
+          <td>#17 looks up #402 in the registry, opens/reuses a gRPC connection, calls <code>Deliver(msg)</code>.</td>
+          <td>Lowest latency — one hop, no broker. Simple to reason about. You get an immediate success/failure signal.</td>
+          <td><strong>N² connection mesh:</strong> 1,000 servers × 1,000 peers = a million potential connections to manage. No buffering — if #402 is briefly busy or restarting, the message has nowhere to wait, so <em>you</em> must handle the retry.</td>
+          <td>Small fleets, or when you're latency-obsessed and have solid fallbacks.</td>
+        </tr>
+        <tr>
+          <td><strong>Pub/sub topic per server</strong> (Redis pub/sub)</td>
+          <td>Each server subscribes to <code>chan:server_402</code>. #17 publishes there. No direct connections between chat servers at all.</td>
+          <td>No mesh. Trivially simple. Adding a server = one more subscription.</td>
+          <td>Redis pub/sub is <strong>fire-and-forget</strong> — no persistence, no replay. If #402 is momentarily disconnected from Redis, the message is <em>gone</em>. That collides head-on with "never lose a message" — <em>unless</em> the message is already durably in Cassandra, which in our design it is. Say that; it's the reason this works.</td>
+          <td>You've persisted first and pub/sub is only a <em>hint</em> to push. Very common, very defensible.</td>
+        </tr>
+        <tr>
+          <td><strong>Kafka</strong>, partition/topic per server</td>
+          <td>#17 produces to a topic keyed by target server; #402 consumes its own partition.</td>
+          <td>Durable, buffered, replayable. Absorbs a slow or restarting consumer — the backlog just waits. Natural backpressure.</td>
+          <td>Higher latency (a few ms to tens of ms) and real operational weight. Rebalancing partitions when the server fleet changes is fiddly, and a topic-per-server across 1,000 servers strains a cluster.</td>
+          <td>You want the delivery pipeline itself to be durable, or you're already on Kafka for everything else.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="senior">The answer that wins this comparison is the one that refuses to treat it as a beauty contest: <em>"It depends on what I've already guaranteed. <strong>Because I persist to Cassandra before I route, the inter-server hop doesn't need to be durable at all</strong> — it's just a fast hint that says 'wake up, there's a message'. If the hint is lost, B's client will pull it on the next sync or reconnect anyway. So I'd take the cheapest, simplest thing — <strong>Redis pub/sub, one channel per server</strong> — and I'd accept that it's lossy, <em>because I've already put the durability somewhere else</em>. If I hadn't persisted first, I'd be forced onto Kafka and I'd be paying for durability twice. The choice of hop is downstream of where I chose to put the durability."</em> That is a systems-thinking answer: two components look independent and are not.</div>
+
+    <h3>(d) The deploy question — and this is the one that separates candidates</h3>
+
+    <div class="pitfall">You have <strong>1,000 stateful boxes holding 50,000 live sockets each</strong>, and you ship code twice a week. Every deploy therefore destroys and recreates <strong>50 million TCP connections</strong>. Almost every candidate designs a chat system without ever asking how they would deploy it, and this is a devastating question to get asked cold, because there is no way to bluff it — the answer is either in your head or it isn't. Interviewers love it precisely because it's the one part of the design that cannot be memorized from a blog diagram.</div>
+
+    <p>Here is the answer. Four mechanisms, and you need all four; any one alone fails.</p>
+
+    <h4>1. Graceful drain, not restart</h4>
+    <p>
+      A deploying box does <em>not</em> get SIGKILLed with its sockets open. It goes into <strong>draining</strong>: it
+      deregisters from the load balancer (or the discovery endpoint stops handing it out) so it takes no new connections, then it
+      tells its existing clients to leave — a <code>GOAWAY</code>-style frame: <em>"reconnect, but not immediately."</em> It
+      stops refreshing its registry entries, finishes in-flight writes, and only then exits. Drain slowly: shedding 50k
+      connections over <strong>ten minutes</strong> rather than ten seconds is the difference between a gentle trickle and a
+      cliff. Nothing else you do matters if the box slams the door.
+    </p>
+
+    <h4>2. Client reconnect with exponential backoff <em>and jitter</em></h4>
+    <p>
+      The client must reconnect — but not instantly, and above all not <em>in unison</em>.
+      <a href="06-caching-queues-resilience.html">Tutorial 06</a> taught you this and here is where it earns its keep:
+    </p>
+
+<pre><code><span class="kw">let</span> attempt = <span class="num">0</span>;
+
+<span class="kw">function</span> reconnectDelay() {
+  <span class="kw">const</span> base   = Math.min(<span class="num">30000</span>, <span class="num">500</span> * <span class="num">2</span> ** attempt);  <span class="com">// cap at 30s</span>
+  <span class="kw">const</span> jitter = Math.random() * base;               <span class="com">// FULL jitter</span>
+  attempt++;
+  <span class="kw">return</span> jitter;                                     <span class="com">// ← 0..base, uniformly</span>
+}
+
+<span class="com">// Exponential backoff WITHOUT jitter does not solve the problem.
+// It just moves the synchronised stampede to t = 500ms, then to
+// t = 1s, then t = 2s. Every client backs off by the SAME amount and
+// they collide again, forever, in lockstep. The randomness is not a
+// nicety — it is the entire mechanism. Say the word "jitter" out loud;
+// it is the single highest-signal word in this whole answer.</span>
+</code></pre>
+
+    <h4>3. Server-directed reconnect delay — the trick most people miss</h4>
+    <p>
+      Don't leave the timing entirely to the client. The drain frame can <strong>carry a delay</strong>:
+      <code>{"type":"GOAWAY","reconnectAfterMs": 47000}</code>, with the server assigning each client a different random value
+      spread across a window. Now the box <em>schedules its own drain</em>: it decides that its 50,000 clients will come back
+      smeared uniformly over the next ten minutes, ~80 per second, which every remaining box absorbs without noticing. You have
+      converted an uncontrolled stampede into a controlled, server-planned migration. It costs one integer in a frame.
+    </p>
+
+    <h4>4. Accept-rate limiting on the receiving side</h4>
+    <p>
+      Belt and braces, because clients lie, clients have bugs, and a network partition can produce a stampede nobody scheduled.
+      Every chat server caps its <strong>connection-accept rate</strong> (say 500/sec) and its total connections, and sheds the
+      excess with a <code>503</code> and a <code>Retry-After</code> — which the client, having jittered backoff, handles
+      gracefully. Better to reject 2,000 reconnects politely than to accept 50,000 and OOM the box, taking down the 50,000
+      connections it was <em>already</em> serving.
+    </p>
+
+    <div class="senior">The thundering-herd sentence that lands: <em>"The failure mode I'm most worried about isn't a server dying — it's <strong>a server dying and taking the next one down with it</strong>. Fifty thousand clients lose their box, they all reconnect at the same instant, the LB hands them to a neighbour, and that neighbour now eats fifty thousand simultaneous TLS handshakes plus fifty thousand registry writes plus fifty thousand backlog syncs. It falls over. Its fifty thousand clients now reconnect too. That's <strong>cascading failure</strong>, and it's how a single-box incident becomes an outage. So: full-jitter backoff on the client, a server-assigned reconnect window on the drain frame, accept-rate limiting on every box, and enough headroom that the fleet can absorb one box's worth of users — with 1,000 boxes, losing one means 50 extra connections per surviving box, which is nothing <strong>as long as they arrive spread out</strong>. The whole problem is arrival <em>shape</em>, not arrival <em>volume</em>."</em></div>
+
+    <div class="note">The re-sync amplifier, worth naming because it's the second-order effect people miss: a reconnecting client doesn't just open a socket, it also fires <code>SYNC</code> to fetch everything it missed. So a reconnect storm is simultaneously a <em>connection</em> storm and a <em>read</em> storm against Cassandra. Fifty thousand sync queries landing in one second will do to your database exactly what the connections did to your box. Mitigations: jitter covers this too (the sync rides along with the spread-out reconnect); cap the sync response size and paginate; and if the client has been away for hours, don't replay the backlog at all — hand it a "load history from the API" hint and let it lazily page. <strong>Reconnect and re-sync are the same storm, and they must be smeared by the same jitter.</strong></div>
+
+    <h3>What happens when a chat server just dies</h3>
+
+    <p>Compress the whole failure story into one crisp sequence — interviewers love a candidate who has one ready:</p>
+
+    <ol>
+      <li>50k TCP connections are severed. Clients detect it (a failed heartbeat, or the socket close event) within seconds.</li>
+      <li>Its registry entries stop being refreshed and <strong>expire within 45 seconds</strong>. No cleanup job runs. Nobody is paged.</li>
+      <li>In that window, messages to those users route at a dead box, the hop fails, and the fallback fires: <strong>store in the inbox + push notification</strong> — the same path as an offline user. <em>No message is lost, because the message was persisted before it was routed.</em></li>
+      <li>Clients reconnect with jittered backoff, land on other boxes, re-register in Redis, <code>SYNC</code> from their last seq, and drain their backlog.</li>
+      <li>Users see a brief "connecting…" and, at worst, a message that arrives as a push notification instead of in-app. <strong>Nothing is lost. Only liveness degrades.</strong></li>
+    </ol>
+
+    <p>
+      That is the payoff for every decision made earlier: persist-before-ack, TTL leases, an inbox that doubles as a failure
+      fallback. Point at that. <em>"The reason a server dying is boring is that I made three choices earlier that were slightly
+      more expensive than the alternatives."</em>
+    </p>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="deep-dive-2">7b. Deep dive: delivery guarantees &amp; ordering</h2>
+
+    <p>
+      The second place the interview goes, and the one where precise vocabulary is worth more than any diagram. Three questions:
+      <strong>does the message arrive?</strong> <strong>does it arrive once?</strong> <strong>does it arrive in the right
+      order?</strong>
+    </p>
+
+    <h3>The ladder: what each tick actually asserts</h3>
+
+    <table>
+      <thead><tr><th>Tick</th><th>Means</th><th>Triggered by</th><th>Travels</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>⏱ <strong>Pending</strong> (grey clock)</td>
+          <td>The client has the message locally. The server has <em>not</em> confirmed anything. Purely a client-side state.</td>
+          <td>Nothing — it's the absence of an ack.</td>
+          <td>Nowhere.</td>
+        </tr>
+        <tr>
+          <td>✓ <strong>Sent</strong></td>
+          <td><strong>Durably persisted on the server.</strong> Not delivered, not seen. Just: it exists now, and it will survive.</td>
+          <td>The Cassandra QUORUM write returning.</td>
+          <td>Server → sender.</td>
+        </tr>
+        <tr>
+          <td>✓✓ <strong>Delivered</strong></td>
+          <td>The bytes reached the recipient's <em>device</em>. Their app has it. Their eyes have not.</td>
+          <td>Recipient's client sends <code>ACK_DELIVERED</code> on receipt.</td>
+          <td>Recipient → their server → registry lookup → sender's server → sender.</td>
+        </tr>
+        <tr>
+          <td>✓✓ <strong>Read</strong> (blue)</td>
+          <td>The recipient opened the conversation and the message was on screen.</td>
+          <td>Recipient's client sends <code>ACK_READ</code> with <code>upToSeq</code>.</td>
+          <td>Same path back.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>
+      The insight to voice: <strong>every rung is an ack travelling backwards through the exact same routing machinery as the
+      original message.</strong> The reverse path needs its own registry lookup (where is the <em>sender</em> now? they may have
+      moved boxes, or gone offline themselves), its own hop, and its own offline handling — if A is offline when B reads the
+      message, the blue tick has to wait and arrive on A's next sync. Your delivery-receipt traffic is therefore roughly the
+      same order of magnitude as your message traffic, and it is subject to all the same failure modes. Draw the arrows both
+      ways.
+    </p>
+
+    <h3>At-least-once + client dedup = "effectively once"</h3>
+
+    <p>
+      You cannot have exactly-once delivery. <a href="05-coordination-consensus.html">Tutorial 05</a> proved it and the proof is
+      worth being able to give in fifteen seconds, because interviewers ask this <em>specifically</em> to see whether you'll
+      claim the impossible:
+    </p>
+
+<pre><code>Server pushes MESSAGE ──▶ Client
+Client receives it, sends ACK ──▶ ✗ ack lost in the network
+
+Now the server has an unacknowledged message. It has exactly two
+options, and there is no third:
+
+  (1) Retry the send  ──▶ client may receive it TWICE  (at-least-once)
+  (2) Don't retry     ──▶ client may receive it ZERO times (at-most-once)
+
+The ack and the delivery cannot be made atomic across a network. That
+is not an engineering limitation you can outspend. It is the Two
+Generals Problem, and it has no solution.
+</code></pre>
+
+    <p>
+      So you pick <strong>at-least-once</strong> — because in chat a duplicate is a UI annoyance and a loss is a broken product —
+      and then you <em>eliminate the duplicate at the edge</em>. Every message carries a globally unique
+      <code>message_id</code> (and, upstream of that, the sender's <code>clientMsgId</code>). The receiving client keeps a set of
+      recently-seen IDs and drops repeats. The <em>user</em> therefore observes exactly-once, even though the network did
+      at-least-once. Two dedup points, and it's worth naming both:
+    </p>
+
+    <ul>
+      <li>
+        <strong>Send-side (server dedups on <code>clientMsgId</code>):</strong> A's client retries a <code>SEND</code> whose ack
+        was lost. The server sees a <code>clientMsgId</code> it has already written and returns the existing
+        <code>messageId</code>/<code>seq</code> rather than inserting a second message. This is a plain
+        <strong>idempotency key</strong> — literally the same mechanism as the payment idempotency key in
+        <a href="13-payments-orders.html">tutorial 13</a> and <a href="06-caching-queues-resilience.html">tutorial 06</a>.
+        Without it, a flaky network turns one message into three bubbles in the <em>permanent history</em>, which is far worse
+        than a transient UI duplicate.
+      </li>
+      <li>
+        <strong>Receive-side (client dedups on <code>message_id</code>):</strong> B's client is re-pushed a message it already
+        has, because its ack was lost or because it re-synced across the boundary. It sees a known <code>message_id</code> and
+        drops it silently.
+      </li>
+    </ul>
+
+    <div class="senior">The exactly-once question is a trap and here is how you walk through it: <em>"I can't give you exactly-once delivery — nobody can; the ack and the delivery can't be made atomic across a network, and that's Two Generals, not a missing feature. What I <em>can</em> give you is <strong>at-least-once delivery plus idempotent handling at both ends</strong>, which the user experiences as exactly-once. Every message has a client-generated ID that the server treats as an idempotency key, and the receiving client dedups on message ID. I deliberately choose at-least-once over at-most-once because in chat a duplicate is a cosmetic bug I can suppress, and a lost message is a broken product I can't."</em> Candidates who say "I'd use exactly-once semantics" get taken apart. Candidates who explain <em>why it's impossible and what they do instead</em> have just demonstrated the single most transferable idea in distributed systems.</div>
+
+    <h3>Ordering — server sequence numbers, and why client clocks are a trap</h3>
+
+    <div class="pitfall">Never, ever order messages by <strong>client timestamp</strong>. Client clocks are wrong: phones drift, users manually change the date, timezone bugs are endemic, and a client can simply <em>lie</em>. Order by client time and a user with a clock set to 2029 pins their messages to the top of every conversation forever — a real bug that has shipped in real products. Client timestamps are <em>display metadata</em>. They are never the sort key. And server wall-clock isn't much better across a fleet: two chat servers' clocks differ by milliseconds, so two messages sent a millisecond apart can be ordered <em>backwards</em>, permanently, in the history.</div>
+
+    <p>
+      The answer is a <strong>server-assigned, per-conversation, monotonically increasing sequence number</strong>. The
+      conversation is one partition (§5), so a single counter — <code>INCR seq:{conversation_id}</code> in Redis — totally orders
+      it. Concretely:
+    </p>
+
+    <ul>
+      <li><strong>The sort key is <code>seq</code>.</strong> Not <code>created_at</code>. Ever.</li>
+      <li>
+        <strong>The client reorders on receipt.</strong> Frames can arrive out of order (different hops, a retry, a sync
+        overlapping a live push). The client holds a small buffer: if it has <code>seq</code> 4470 and 4472, it knows 4471 is in
+        flight and it can either wait briefly or request it. Gaps are <em>detectable</em>, which is itself a feature — a client
+        that notices a hole can heal itself by re-syncing. That is a property you simply do not get from timestamps.
+      </li>
+      <li>
+        <strong><code>seq</code> is also your cursor.</strong> "Give me everything since 4460" is one number, and it's the
+        pagination cursor, the sync watermark, and the read-receipt pointer all at once. One mechanism, four jobs.
+      </li>
+    </ul>
+
+    <p>
+      Now say the thing about <em>global</em> order, because it's a scoping win: you don't need one and you shouldn't build one.
+    </p>
+
+    <div class="senior"><em>"I need ordering <strong>within a conversation</strong>, and that's all — nobody can perceive the relative order of two messages in two different chats, so a global total order would be an expensive guarantee with no user-visible value. Per-conversation ordering is cheap because a conversation is already my partition key: one counter, one partition, totally ordered. A global order would need either a single global sequencer, which is a bottleneck and a single point of failure, or distributed consensus on every message, which is Raft on the hot path at 230k writes a second. I'd be paying enormously for something no user could ever observe. <strong>Notice that the ordering guarantee and the partition key are the same decision</strong> — I got the ordering for free by partitioning by conversation."</em> Declining to build something is often the strongest move available. Say <em>why</em> you declined.</div>
+
+    <div class="note">If you want to go one level deeper — awareness level, one sentence, don't rathole — the theoretically pure answer to "who sent first" between two users is <strong>logical clocks</strong>: Lamport timestamps or vector clocks, which capture causality rather than time. Chat doesn't need them, because the server sees every message and can just impose an order at the point it assigns <code>seq</code>. Where you <em>do</em> need them is when there's no single ordering authority — peer-to-peer, or offline-first collaborative editing, which is precisely why tutorial 23 reaches for CRDTs. Knowing the boundary — "the server is my sequencer, so I don't need vector clocks; when there is no server, you do" — is worth more than being able to define a vector clock.</div>
+
+    <h3>Offline delivery, in one picture</h3>
+
+<pre><code>  A sends ──▶ persist to Cassandra   ← the message is now SAFE.
+                     │                  Everything after this is
+                     │                  about LIVENESS, not durability.
+                     ▼
+            registry: GET conn:u_B
+                     │
+        ┌────────────┴─────────────┐
+        │                          │
+   "server_402"                   nil  (offline — or the server is dead;
+        │                          │        same path, §7a)
+        ▼                          ▼
+   push down B's socket      append to user_inbox[u_B]   (a POINTER)
+        │                          │
+        ▼                          ▼
+   ACK_DELIVERED ──▶ ✓✓      Notification Service ──▶ APNs / FCM
+                                   │                  (→ tutorial 12)
+                                   ▼
+                        ── B reopens the app, hours later ──
+                                   ▼
+                    connect → register → SYNC(sinceSeq = 4460)
+                                   ▼
+                    drain inbox → deliver in seq order → ACK ──▶ ✓✓
+</code></pre>
+
+    <p>
+      The client's <strong>last-seen seq is the whole sync protocol</strong>. It's one number the client persists locally, it
+      survives app kills, and it makes reconnect a pure "catch me up from N" — no server-side session state, no per-client
+      cursor to lose. The client owns its own watermark, which is why a client can crash, be reinstalled, or be replaced by a
+      second device without the server having to remember anything about the conversation it was having.
+    </p>
+
+    <div class="pitfall">Don't put message <em>bodies</em> in the offline inbox. In a 100-person group with 50 offline members, copying the body 50 times means 50× the storage for one message, and now the body exists in 51 places and you have to keep them consistent (deletes, edits, retention). Store <strong>pointers</strong> — <code>(user_id, seq, conversation_id, message_id)</code> — and let the client fetch bodies from the single canonical <code>messages</code> table it's already reading history from. The inbox is a <em>work queue</em>, not a mailbox. This is the same fan-out-index-not-content decision you made in <a href="10-news-feed.html">tutorial 10</a>.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="presence">7c. Presence — the surprisingly expensive feature</h2>
+
+    <p>
+      Presence is a green dot. It is one bit. It is also, on a bad day, <strong>more traffic than your entire messaging
+      system</strong>, and the candidate who realises that unprompted is doing something the other candidates are not.
+    </p>
+
+    <h3>Why the naive design explodes</h3>
+
+<pre><code>Naive: when a user's status changes, tell all their contacts.
+
+  Average contacts per user:      200
+  Users going online/offline:     a phone on a train flaps between
+                                  cellular and no-signal CONSTANTLY —
+                                  a user can generate dozens of
+                                  transitions an hour.
+
+  50M concurrent users × even 1 transition/minute
+      = 833,000 status changes/sec
+      × 200 contacts each
+      = 166,000,000 presence pushes/sec
+
+  Your ACTUAL MESSAGE rate is 230,000/sec.
+  Presence is 700× your core product. For a dot.
+</code></pre>
+
+    <p>
+      This is an <strong>O(n²)</strong> chatter problem: n users each telling n contacts. And it has a nasty tail — a user with
+      50,000 contacts (a Slack workspace member, a public figure) whose phone is flapping on a train generates a
+      <em>presence storm</em> all by themselves, and the storm gets worse exactly when the network is worst, which is exactly
+      when you have the least capacity to absorb it. Everyone's phone is flapping in the same tunnel at the same time.
+    </p>
+
+    <h3>The four fixes, in order of how much they buy you</h3>
+
+    <ol>
+      <li>
+        <strong>Heartbeat + TTL in Redis — don't track "offline" at all.</strong> The client heartbeats every 30 seconds; the
+        server does <code>SET presence:u_B online EX 45</code>. Offline is not an <em>event</em> you handle — it's the
+        <strong>absence of a key</strong>. This is enormous: a user who drops off a cliff, whose phone dies, whose app is
+        force-quit, or whose server explodes all become offline automatically, with no disconnect event, no cleanup job, and no
+        code. The same lease pattern as the connection registry (§7a) — name the repetition, it's a pattern worth having.
+      </li>
+      <li>
+        <strong>Pull, don't push — and only for what's on screen.</strong> The realisation that kills the O(n²): <em>a user is
+        looking at maybe 20 contacts at a time.</em> They have the chat list open, or one conversation. So don't broadcast
+        presence to 200 contacts; let the client <strong>subscribe to the presence of the ~20 people currently rendered</strong>
+        and poll or subscribe for just those. Fan-out collapses from "all contacts of everyone" to "what's visible on screens
+        right now", which is smaller by orders of magnitude — and it's the exact same insight as fan-out-on-read
+        (<a href="10-news-feed.html">tutorial 10</a>): <strong>don't compute what nobody is looking at.</strong>
+      </li>
+      <li>
+        <strong>Debounce and coalesce the flapping.</strong> Don't emit "offline" the instant a heartbeat is missed — the phone
+        is in a tunnel and will be back in eight seconds. The TTL already gives you this for free (45s of grace), and you can
+        coalesce a burst of transitions into at most one update per user per N seconds. A user who flaps ten times a minute
+        should generate at most one presence event a minute. Most of the flap should be invisible.
+      </li>
+      <li>
+        <strong>Downgrade the requirement.</strong> The best fix of all, and the one that requires the most nerve.
+      </li>
+    </ol>
+
+    <div class="senior">This is a superb "cut the requirement" moment and it's worth rehearsing verbatim: <em>"Before I engineer this, I want to challenge the requirement — because <strong>exact real-time presence is the single most expensive feature in this product and users cannot tell the difference</strong>. If I broadcast every status change to every contact, presence traffic is a couple of orders of magnitude larger than my actual message traffic, and I'd be scaling the hard part of my system for a green dot. <strong>'Last seen 5 minutes ago' at one-minute granularity costs a rounding error and nobody has ever complained about it.</strong> So: heartbeat with a TTL in Redis, presence pulled only for the contacts a user is currently looking at, coalesce flapping into at most one update a minute, and accept coarse granularity. If you tell me exact instantaneous presence is a hard product requirement, I'll build it — but I want you to know it's the most expensive thing on the board, and I'd rather spend that budget on message durability."</em> Senior engineers negotiate requirements. Mid-level engineers implement them. This paragraph is the difference, and interviewers are listening for it.</div>
+
+    <div class="note">Real products already made this trade and you can cite it: WhatsApp's "last seen" is deliberately coarse and can be turned off entirely; Slack's presence is best-effort and routinely shows people as active when they've walked away. Nobody files bugs. Meanwhile <em>typing indicators</em> — which generate <strong>more events than messages</strong> — are pure fire-and-forget UDP-grade ephemera: never persisted, never retried, dropped freely under load, and expired by the client after a few seconds if no follow-up arrives. <strong>Ephemeral data gets an ephemeral pipeline.</strong> Never let a green dot anywhere near your durable write path.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="groups">7d. Group chat — fan-out, back again</h2>
+
+    <p>
+      Here is the moment where the course's central lesson pays off. Group chat is <strong>fan-out</strong> — the exact same
+      problem you solved in <a href="10-news-feed.html">tutorial 10</a>, wearing entirely different clothes. Say so out loud.
+      Interviewers are actively listening for whether you recognise a shape you've seen before, because that is what
+      distinguishes someone who has <em>understood</em> distributed systems from someone who has memorised eight of them.
+    </p>
+
+    <h3>Small groups (our scope): fan-out on write</h3>
+
+<pre><code>A sends to group G (100 members):
+
+  1. Persist ONCE to messages[conversation = G, seq = N]   ← one write
+  2. Look up G's participants                              ← Postgres,
+                                                              cached
+  3. For each of the other 99 members:
+       registry: GET conn:u_x
+         online  → hop to their chat server → push
+         offline → append pointer to user_inbox[u_x] → notification
+
+  Cost: 1 durable message write
+      + 99 registry lookups (pipeline them — one Redis round trip)
+      + 99 pushes / inbox appends
+
+  At 100 members this is completely fine. Do this.
+</code></pre>
+
+    <p>
+      Note the crucial economy, and voice it: <strong>the message body is stored once</strong>, in the conversation's partition.
+      What fans out is a <em>pointer</em> and a <em>push</em>, not a copy. Exactly the "fan out the index, not the content"
+      decision from tutorial 10.
+    </p>
+
+    <h3>Large channels: the cost explodes, so you flip</h3>
+
+<pre><code>Same message, 100,000-member channel:
+
+  100,000 registry lookups
+  100,000 pushes
+  100,000 inbox appends for the offline majority
+
+  ONE message = 100,000 units of work. And in a busy channel, at
+  10 messages/sec, that's a MILLION operations per second FROM ONE
+  CONVERSATION — which lands on one partition, on one node.
+
+  This is the CELEBRITY PROBLEM (tutorial 10) exactly. A single
+  entity whose fan-out is so large it destroys the fan-out-on-write
+  model. Same problem. Same fix.
+</code></pre>
+
+    <p>The fix is the one you already know, and you should name it as a callback rather than deriving it from scratch:</p>
+
+    <ul>
+      <li>
+        <strong>Flip to fan-out on read.</strong> Don't push to 100,000 inboxes. Write the message once to the channel's
+        partition and let clients <strong>pull</strong> — a client that has the channel open syncs from its last-seen seq;
+        clients that don't have it open get nothing until they look. The 99% of members who aren't reading the channel right now
+        cost you <em>zero</em>. This is precisely the celebrity-tweet answer: don't fan out to millions of timelines, let readers
+        merge at read time.
+      </li>
+      <li>
+        <strong>Push only to the members currently connected <em>and</em> with the channel open</strong> — a much smaller,
+        already-known set. The server can maintain a lightweight subscription set per channel of "who's actually watching",
+        which is the same insight as the presence fix in §7c: <em>only do work for what someone is looking at.</em>
+      </li>
+      <li>
+        <strong>The hybrid is the real answer, exactly as in tutorial 10.</strong> Fan out on write for small groups and 1:1
+        (fast, simple, the overwhelming majority of traffic); fan out on read above a threshold — say 500 members — where the
+        push cost stops being worth it. One threshold, two strategies, same as the celebrity/normal-user split.
+      </li>
+      <li>
+        <strong>And bucket the hot partition</strong> (§5): a mega-channel's messages must not all land on one Cassandra
+        partition, so key by <code>(conversation_id, time_bucket)</code>.
+      </li>
+    </ul>
+
+    <div class="senior">Say the transfer explicitly — this single paragraph is the most valuable thing you can do in the last five minutes of this round: <em>"This is the <strong>same fan-out decision as a news feed</strong>, and I want to name that because the answer transfers wholesale. Small groups are like normal users — fan out on write, push eagerly, it's cheap. A 100,000-member channel is a <strong>celebrity</strong> — the fan-out cost explodes, so I flip that conversation to fan-out on read and let clients pull. The hybrid — eager push below a threshold, pull above it — is the same hybrid I'd use for Twitter timelines, and for exactly the same reason: <strong>the cost of pushing scales with the audience, and the cost of pulling scales with the readers, so you pick whichever one is smaller for that particular entity.</strong> Group chat isn't a new problem; it's fan-out with a WebSocket bolted on."</em> An interviewer hearing that knows they're talking to someone who has abstracted, not memorised. That's the grade.</div>
+
+    <div class="pitfall">The failure mode people walk straight into: designing group chat as "loop over members and push", stating it as if it's obviously correct, and never asking how big a group can get. Then the interviewer says "what about a 50,000-person Slack channel?" and you have to rebuild your design under pressure. <strong>Pre-empt it.</strong> Ask for the group-size cap in requirements (§2 — you did), design for the cap, and then volunteer the large-channel answer before they ask. Volunteering the limit of your own design is one of the strongest moves available to you in a system design round.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="scaling">8. Scaling &amp; bottlenecks</h2>
+
+    <p>What breaks first, in the order it breaks. Be specific; "add more servers" is not an answer.</p>
+
+    <h3>1. The connection registry becomes a hot spot</h3>
+    <p>
+      Every single message does at least one <code>GET conn:{user}</code>, every ack does another, every heartbeat does an
+      <code>EXPIRE</code>, and every connect/disconnect does a write. At 230k messages/sec plus 1.7M heartbeats/sec, a single
+      Redis instance is a bottleneck and — worse — a <strong>single point of failure for the entire routing layer</strong>. If
+      the registry is down, nobody can find anybody, and the whole system silently degrades to "everyone is offline."
+    </p>
+    <ul>
+      <li><strong>Shard it by user_id</strong> (consistent hashing, <a href="04-partitioning-hashing.html">tutorial 04</a>). The keys are independent — there is no cross-key operation anywhere in the registry — so this shards perfectly. This is the easiest scaling win in the design.</li>
+      <li><strong>Cache the mapping on the chat servers</strong> for a few seconds. A user's server assignment is stable for hours, so the hit rate is enormous and a stale entry costs you one failed hop and a re-lookup.</li>
+      <li><strong>Pipeline the lookups</strong> — a 100-member group needs 99 lookups, but that's one Redis round trip with <code>MGET</code>, not 99.</li>
+      <li><strong>Replicate, and degrade gracefully.</strong> If the registry is unreachable, fall back to "treat everyone as offline": persist the message, write the inbox, fire the push notification. <em>Real-time delivery degrades; durability does not.</em> That's the right failure mode and you should say the words.</li>
+    </ul>
+
+    <h3>2. One server holds a whale — hot connections, not hot data</h3>
+    <p>
+      Connection <em>count</em> balances fine. Connection <em>cost</em> doesn't. A box that happens to host several extremely
+      active users, or the members of a very busy group, does far more work per connection than its neighbours. Load-balance on
+      <strong>observed load</strong> (messages/sec, CPU), not just connection count, and be willing to migrate a connection —
+      send a <code>GOAWAY</code> with a target hint and let the client reconnect elsewhere. The connection is a lease; you're
+      allowed to revoke it.
+    </p>
+
+    <h3>3. Message-store write throughput</h3>
+    <p>
+      230k writes/sec sustained, 600k at peak, forever, growing. Cassandra handles this <em>if you don't create hot
+      partitions</em> — which means the busy-conversation bucketing from §5 isn't optional at scale, it's the thing standing
+      between you and a single node absorbing a mega-channel's entire write load. Also: write at QUORUM, not ALL (ALL means one
+      slow replica stalls every write); use the write path's natural batching; and keep the row small — the body is text, the
+      media is a URL into blob storage, never bytes in the row.
+    </p>
+
+    <h3>4. The reconnect storm (§7a) — the one that actually takes you down</h3>
+    <p>
+      Worth repeating in the bottleneck list because it is the <em>real</em> outage. Any event that disconnects a large
+      population at once — a deploy, an LB failure, a network partition, a mobile carrier blip, an AWS AZ going away — produces a
+      synchronised reconnect. Volume isn't the issue; <strong>shape</strong> is. Full-jitter backoff, server-assigned reconnect
+      windows, accept-rate limits, and fleet headroom. And test it: <strong>if you have never killed 5% of your chat fleet in
+      production on purpose, you do not know whether your reconnect logic works.</strong> Saying that sentence signals operational
+      maturity and costs nothing.
+    </p>
+
+    <h3>5. Geography</h3>
+    <p>
+      A user in Sydney whose socket terminates in Virginia pays 200ms of round-trip on <em>every</em> frame, before you've done
+      any work at all. Terminate connections in <strong>regional edge clusters</strong> close to users; route cross-region
+      messages between regions rather than dragging users across the planet. It also means the registry needs a region
+      dimension: <code>conn:u_B → {region: ap-southeast-2, server: 402}</code>. Mention this even if you don't build it — a
+      thousand-server fleet is not going to sit in one datacentre, and pretending it does is a scale error.
+    </p>
+
+    <div class="note">Notice what is <em>not</em> on this list: bandwidth (§3 — it's tiny), and read QPS on message history (it's a cached, tiny, one-partition query and most reads are served from the client's local database, since every chat client keeps a full local copy of its own history). The bottlenecks in a chat system are all about <strong>connections and coordination</strong>, never about bytes. Being able to say which of the usual suspects <em>don't</em> apply here is as much a signal as naming the ones that do.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="tradeoffs">9. Trade-offs</h2>
+
+    <p>Every real decision on this page, its alternative, and the condition that would flip it. This is the revision table.</p>
+
+    <table>
+      <thead><tr><th>Decision</th><th>Alternative</th><th>Why this way</th><th>I'd flip if…</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>WebSocket</strong> for the message channel</td>
+          <td>SSE + POST; long polling</td>
+          <td>Bidirectional and low-overhead. Chat is genuinely two-way and high-frequency; SSE would need a separate channel for every client→server event (see <a href="02-networking-delivery.html">tutorial 02</a>).</td>
+          <td>The traffic were overwhelmingly server→client (live scores, a stock ticker, notifications) — then SSE is simpler, survives proxies better, and reconnects for free.</td>
+        </tr>
+        <tr>
+          <td><strong>Persist before ack</strong> (and before routing)</td>
+          <td>Route first for latency, persist async</td>
+          <td>"Never lose a message" was the #1 non-functional. It also makes the inter-server hop allowed to be lossy, which simplifies everything downstream.</td>
+          <td>Durability didn't matter — ephemeral chat, live-stream comments, game state. Then push first and persist lazily (or not at all) and enjoy the latency.</td>
+        </tr>
+        <tr>
+          <td><strong>Cassandra</strong> for messages</td>
+          <td>Postgres; MongoDB; Kafka-as-store</td>
+          <td>Write-heavy, append-only, petabyte-scale, single query shape (one partition + range scan). Textbook LSM workload (<a href="03-data-storage.html">tutorial 03</a>).</td>
+          <td>Scale were 1,000× smaller. At a few thousand messages/sec, <strong>Postgres is the right answer</strong> and Cassandra is résumé-driven development. Say this — it's a maturity signal.</td>
+        </tr>
+        <tr>
+          <td><strong>Partition by conversation_id</strong></td>
+          <td>By user_id; by message_id</td>
+          <td>It's how you read, and it makes per-conversation ordering free. The ordering guarantee and the partition key are one decision.</td>
+          <td>Never, really — but bucket by <code>(conversation_id, month)</code> once conversations get big, to cap partition width.</td>
+        </tr>
+        <tr>
+          <td><strong>Redis pub/sub</strong> for the inter-server hop</td>
+          <td>Direct gRPC; Kafka</td>
+          <td>Cheapest and simplest, and it's <em>allowed</em> to be lossy because durability already lives in Cassandra. The hop is a hint, not a guarantee.</td>
+          <td>You hadn't persisted first (then you need Kafka's durability), or the fleet were small enough that a gRPC mesh is trivially manageable and you want the last few milliseconds.</td>
+        </tr>
+        <tr>
+          <td><strong>Registry entries are TTL leases</strong></td>
+          <td>Explicit register/deregister; ZooKeeper ephemeral nodes</td>
+          <td>Dead servers can't run cleanup code. A TTL makes failure cleanup automatic and coordination-free. ZK ephemeral nodes give the same property with stronger consistency — and much more operational weight.</td>
+          <td>You needed strict correctness on the mapping (you don't — a stale entry costs one failed hop and a retry, which you handle anyway).</td>
+        </tr>
+        <tr>
+          <td><strong>At-least-once + client dedup</strong></td>
+          <td>At-most-once; "exactly-once"</td>
+          <td>Exactly-once across a network is impossible. A duplicate is a suppressible UI bug; a loss is a broken product.</td>
+          <td>Duplicates were genuinely worse than losses — e.g. a "place trade" command. Then at-most-once, or a heavyweight idempotent transaction (<a href="13-payments-orders.html">tutorial 13</a>).</td>
+        </tr>
+        <tr>
+          <td><strong>Server-assigned per-conversation seq</strong></td>
+          <td>Client timestamps; global sequencer; vector clocks</td>
+          <td>Client clocks are wrong and clients lie. Global order costs consensus and buys nothing observable. Per-conversation is free given the partition key.</td>
+          <td>There were no central server to sequence — offline-first or P2P — which is when CRDTs/logical clocks earn their keep (tutorial 23).</td>
+        </tr>
+        <tr>
+          <td><strong>Coarse presence</strong> (TTL, view-scoped, coalesced)</td>
+          <td>Exact real-time presence broadcast to all contacts</td>
+          <td>Naive presence is O(n²) and can exceed message traffic by orders of magnitude. Users cannot perceive the difference.</td>
+          <td>Presence <em>is</em> the product (an availability/status board, a live-ops console). Then pay for it, deliberately, and budget for it being your biggest system.</td>
+        </tr>
+        <tr>
+          <td><strong>Fan-out on write</strong> for groups ≤ ~500</td>
+          <td>Fan-out on read for everything</td>
+          <td>Eager push is cheap and gives the lowest latency for the 99% case that is 1:1 and small groups.</td>
+          <td>The group is huge — then flip to pull, exactly as with a celebrity in <a href="10-news-feed.html">tutorial 10</a>. The hybrid is the real production answer.</td>
+        </tr>
+        <tr>
+          <td><strong>Read receipts as a pointer</strong> (<code>last_read_seq</code>)</td>
+          <td>One receipt row per (message, user)</td>
+          <td>O(1) write per read event instead of O(n). All tick states derive from one row per member.</td>
+          <td>You needed per-message read analytics — and note that in a 500-person group you probably just <em>don't offer</em> read receipts at all (§10).</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="followups">10. Follow-ups you should expect</h2>
+
+    <h3>"Add end-to-end encryption. What changes?"</h3>
+
+    <p>
+      The best follow-up on this question, because the interesting answer isn't <em>how</em> you'd do it — it's
+      <strong>what it destroys</strong>. Most candidates say "Signal protocol, done" and miss that E2E encryption quietly
+      deletes several features they just designed.
+    </p>
+
+    <table>
+      <thead><tr><th>What breaks</th><th>Why</th><th>What you actually do</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Server-side search</strong></td>
+          <td>You cannot index text you cannot read. Full stop.</td>
+          <td>Search moves entirely to the <strong>client</strong>, over its local decrypted history. Which means search only covers what that device has, and a fresh install can't search anything. WhatsApp works exactly this way, and users accept it.</td>
+        </tr>
+        <tr>
+          <td><strong>Server-side fan-out to groups</strong></td>
+          <td>You can't re-encrypt a message for 99 recipients if you can't decrypt it. The server is now a dumb relay of opaque blobs.</td>
+          <td><strong>The sender encrypts the message once per recipient</strong> (per-device, actually) and sends N ciphertexts. Fan-out cost moves from the server to the <em>client's uplink</em> — which is precisely why E2E group chats have hard member caps. This is the deep answer and almost nobody gives it.</td>
+        </tr>
+        <tr>
+          <td><strong>Rich push notifications</strong></td>
+          <td>Your notification service can't put the message text in the push, because it can't read it.</td>
+          <td>Send a contentless push ("New message"); the app wakes, fetches the ciphertext, decrypts locally, and rewrites the notification on-device.</td>
+        </tr>
+        <tr>
+          <td><strong>Server-side moderation, spam and abuse detection</strong></td>
+          <td>Same reason.</td>
+          <td>Client-side reporting, metadata-based signals (who messages how many strangers how fast), and you accept you're blind. A real, permanent product cost.</td>
+        </tr>
+        <tr>
+          <td><strong>Multi-device sync</strong></td>
+          <td>A new device has no keys and therefore no history.</td>
+          <td>Key transfer between the user's own devices, or an encrypted backup the user holds the key to. This is genuinely hard and is why "WhatsApp on a new phone" historically lost your history.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="senior"><em>"E2E encryption doesn't just add a crypto layer — it <strong>demotes my server from a participant to a dumb pipe</strong>, and I lose every feature that depended on the server understanding the payload. Search moves to the client. Group fan-out moves to the sender, who now encrypts once per recipient device, which is exactly why encrypted group chats have member limits. Push notifications become contentless. Moderation becomes metadata-only. What <em>doesn't</em> change is everything I spent the last thirty minutes on — routing, the registry, ordering, delivery receipts, presence — because those all operate on <strong>metadata</strong>, and the server still sees all of it. The architecture survives; the feature set doesn't."</em> That final observation — the architecture survives, the features don't — is the answer of someone who has actually thought about it.</div>
+
+    <h3>"How do you handle image and video attachments?"</h3>
+    <p>
+      Media <strong>never touches your chat servers</strong>. They're your scarcest resource — a box holding 50k sockets must not
+      be babysitting a 40MB upload. The flow (same pattern as <a href="03-data-storage.html">tutorial 03</a>'s blob section):
+      client asks the API for a <strong>presigned upload URL</strong> → client uploads <em>directly</em> to S3/blob storage →
+      client sends a chat message whose body is the resulting object key. Recipients get a presigned <em>download</em> URL and
+      pull from the CDN. Your message row stays 200 bytes, your chat servers stay stateless-ish and cheap, and the bytes go
+      client↔blob-store without ever transiting your application tier. Add: server-side thumbnail generation as an async job,
+      and (with E2E) the client encrypts the blob before upload and puts the key in the encrypted message body — so the blob
+      store holds ciphertext it cannot read.
+    </p>
+
+    <h3>"Search over message history?"</h3>
+    <p>
+      Cassandra cannot do this — it's a partition-key store, and "find 'invoice' across all my conversations" is exactly the query
+      shape it's bad at. So you don't ask it to. Stream messages into <strong>Elasticsearch</strong> (via CDC or the same event
+      the notification service consumes), indexed per user, and serve search from there. It's a separate system with a separate
+      index and eventual consistency — a message may be searchable a second or two after it's sent, which nobody minds. And note
+      the honest caveat you already made: <strong>with E2E encryption this component cannot exist</strong>, and search has to be
+      local to the device. Two follow-ups, one connected answer — that connection is the point.
+    </p>
+
+    <h3>"Read receipts in a 500-person group?"</h3>
+    <p>
+      Do the arithmetic out loud, because the arithmetic <em>is</em> the answer. One message read by 500 people = 500 read-state
+      writes, each of which fans out a <code>READ</code> event to up to 500 members = <strong>250,000 pushes for one
+      message</strong>. And what does it buy? A sender who wants to know which of 500 people has read their message, which is a
+      UI nobody can even render usefully.
+    </p>
+    <div class="senior"><em>"For a 500-person group I'd <strong>just not offer read receipts</strong> — that's an O(n) write and an O(n²) fan-out per message for a feature that's unusable at that size. WhatsApp caps detailed read receipts to small groups; Slack doesn't have them at all. If the product insisted, I'd give them an aggregate — 'read by 312' — computed asynchronously from the read_state table and refreshed lazily, never pushed. <strong>The right engineering answer to some features is to not build them</strong>, and being able to say that with a number behind it is more valuable than being able to build it."</em></div>
+
+    <h3>Quick-fire follow-ups</h3>
+    <ul>
+      <li><strong>"Message editing and deletion?"</strong> You designed an <em>append-only immutable</em> store, so an edit is a <em>new</em> message row pointing at the original (a tombstone/revision event), and clients render the latest revision. Don't mutate the original — that would sacrifice the LSM fit and Cassandra's whole reason for being there. "Delete for everyone" is a tombstone event fanned out like any other message; note honestly that you cannot un-ring the bell on a device that already has the plaintext.</li>
+      <li><strong>"Multi-device?"</strong> The registry key becomes a <em>set</em> of (server, device) pairs; every device gets a copy; the read pointer becomes per-user (not per-device) so reading on your phone clears the badge on your laptop; and each device keeps its own last-seen seq for sync.</li>
+      <li><strong>"Rate limiting / spam?"</strong> Token bucket per user on the chat server (<a href="09-rate-limiter.html">tutorial 09</a>). Cheap, local, and it protects the durable write path — which is the thing you actually care about protecting.</li>
+      <li><strong>"Retention?"</strong> Cassandra TTLs on the messages table if the product wants messages to expire (disappearing messages are literally a per-row TTL — a rare case of a product feature that is one line of schema). Otherwise cold-tier old partitions to blob storage and serve deep history from there, slowly.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="qa">Interview Q&amp;A</h2>
+
+    <details class="qa">
+      <summary>Why can't the chat servers be stateless like every other service you've designed?</summary>
+      <div class="answer">
+        <p>
+          Because delivery is <strong>push to a specific socket</strong>, and a socket is a TCP connection terminated on one
+          physical machine. In a stateless service, any box can serve any request, so the load balancer picks one at random and
+          nobody cares. Here, user B's connection is on server #402 and <em>only</em> #402 can write bytes to B. Round-robin
+          doesn't help you — it actively hurts, because 999 times out of 1,000 the box you land on is the wrong one.
+        </p>
+        <p>
+          That single fact generates every hard problem on this page: you need a <strong>registry</strong> to find B's box, an
+          <strong>inter-server hop</strong> to get the message there, a <strong>TTL</strong> so a dead box's entries expire, a
+          <strong>graceful drain</strong> so a deploy doesn't sever 50 million connections at once, and a
+          <strong>reconnect strategy</strong> so the resulting stampede doesn't cascade. State is the whole problem. Say that
+          sentence in the first two minutes.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>How many WebSocket connections can one server hold, and what limits it?</summary>
+      <div class="answer">
+        <p>
+          Give a number <em>with</em> its assumptions — a defended 50k beats an undefended million. Roughly 50,000–100,000 for a
+          real application server. The binding constraint is usually <strong>memory</strong>: kernel send and receive buffers per
+          socket, the TLS session, and your per-connection application state (user ID, session, write queue) — call it ~10 KB
+          each, so 50k connections is ~500 MB before your app has done anything. File descriptors are a limit too, but it's a
+          config line (<code>ulimit</code>), not a real constraint. Ephemeral <em>port</em> exhaustion is a client-side and
+          proxy-side concern, not usually a server-side one, since the server's connections all share one listening port.
+        </p>
+        <p>
+          The C10M benchmarks showing a million connections per box are real but they're a tuned event loop echoing bytes with no
+          TLS, no business logic, no GC. If you quote a big number, expect "what's your memory per connection?" immediately. And
+          the number matters because it's the divisor: <strong>50M concurrent / 50k per box = 1,000 boxes</strong>, and 1,000
+          boxes is why you have a routing problem at all.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Walk me through delivering a message when the recipient is on a different server.</summary>
+      <div class="answer">
+        <p>
+          A → server #17 (A's box). #17 assigns a <code>seq</code> and <strong>persists to Cassandra at QUORUM first</strong> —
+          durability before liveness. It acks A (tick one: "stored"). Then it queries the <strong>connection registry</strong> —
+          <code>GET conn:u_B</code> in Redis — which says <code>server_402</code>. #17 forwards the message to #402 (Redis
+          pub/sub channel per server, or gRPC, or Kafka). #402 finds B's socket in its local in-memory map and writes the frame.
+          B's client sends <code>ACK_DELIVERED</code>, which travels the <strong>whole path in reverse</strong> — including its
+          own registry lookup for A, since A may have moved boxes — and A's second tick appears.
+        </p>
+        <p>
+          If the registry returns nil, B is offline (or B's server is dead — <em>same path</em>): append a pointer to
+          <code>user_inbox[u_B]</code> and fire a push notification. Nothing is lost, because the message was persisted at step
+          two, before any of this routing was attempted.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>You're about to deploy new code to 1,000 chat servers holding 50,000 live sockets each. What happens?</summary>
+      <div class="answer">
+        <p>
+          <strong>The question that separates candidates.</strong> Naively: 50 million connections drop simultaneously, every
+          client reconnects at once, the surviving boxes eat a synchronised flood of TLS handshakes plus registry writes plus
+          backlog syncs, they fall over, <em>their</em> clients reconnect, and you have a cascading outage caused by a routine
+          deploy. Four mechanisms, and you need all four:
+        </p>
+        <ol>
+          <li><strong>Graceful drain, slowly.</strong> A deploying box deregisters from the LB, stops accepting new connections, and sheds its existing ones over <em>minutes</em>, not seconds — sending each client a <code>GOAWAY</code>-style frame telling it to reconnect elsewhere.</li>
+          <li><strong>Exponential backoff with FULL jitter</strong> on the client. Backoff <em>without</em> jitter is useless — it just moves the synchronised stampede to t=1s, then t=2s, in lockstep forever. The randomness <em>is</em> the mechanism.</li>
+          <li><strong>Server-assigned reconnect delay.</strong> Put <code>reconnectAfterMs</code> in the drain frame, spread randomly across a ten-minute window. Now the box <em>schedules its own migration</em>: 50k clients trickling back at ~80/sec, which the fleet absorbs without noticing.</li>
+          <li><strong>Accept-rate limiting</strong> on every box (say 500 new connections/sec, then 503 + Retry-After). Clients lie and networks partition; better to reject 2,000 reconnects politely than to OOM and drop the 50,000 you were already serving.</li>
+        </ol>
+        <p>
+          And note the second-order effect: reconnect is also a <strong>re-sync storm</strong> against the database, because every
+          reconnecting client immediately asks "what did I miss?" The same jitter smears both. <strong>The problem is arrival
+          shape, not arrival volume.</strong>
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>How do you guarantee message ordering?</summary>
+      <div class="answer">
+        <p>
+          <strong>Server-assigned, per-conversation, monotonically increasing sequence numbers.</strong> The conversation is the
+          partition key, so a single counter (<code>INCR seq:{conversation_id}</code> in Redis) totally orders it. That
+          <code>seq</code> is the clustering key in Cassandra, the pagination cursor, the sync watermark, and the read-receipt
+          pointer — one mechanism, four jobs.
+        </p>
+        <p>
+          <strong>Never order by client timestamp.</strong> Phone clocks drift, users change the date, and clients can lie — a
+          user with their clock set to 2029 would pin their messages to the top of every conversation permanently. Client
+          timestamps are display metadata, never the sort key. Server wall-clock isn't safe either: two chat servers' clocks
+          differ by milliseconds, so messages sent a millisecond apart can be ordered backwards, forever.
+        </p>
+        <p>
+          And say why you <em>don't</em> need global ordering: no user can perceive the relative order of two messages in two
+          different conversations, so a global total order would require a single sequencer (bottleneck, SPOF) or consensus on
+          every message (Raft at 230k writes/sec) to buy something nobody can observe. Per-conversation ordering falls out of the
+          partition key for free — <strong>the ordering guarantee and the partition key are the same decision.</strong>
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Can you guarantee exactly-once delivery?</summary>
+      <div class="answer">
+        <p>
+          <strong>No, and neither can anyone else.</strong> When the server pushes a message and the ack is lost in the network,
+          the server has exactly two choices: retry (risking a duplicate — at-least-once) or don't (risking a loss —
+          at-most-once). There is no third option, because the delivery and the ack cannot be made atomic across a network. This
+          is the Two Generals Problem; it isn't an engineering gap you can spend your way out of.
+        </p>
+        <p>
+          So you choose <strong>at-least-once</strong> — a duplicate is a suppressible UI bug, a loss is a broken product — and
+          then you make it <em>effectively</em> once with <strong>idempotency at both ends</strong>: the server dedups on the
+          sender's <code>clientMsgId</code> (so a retried send doesn't create a second permanent message), and the receiving
+          client dedups on <code>message_id</code> (so a re-push isn't rendered twice). The network does at-least-once; the user
+          experiences exactly-once. Note this is the <em>identical</em> mechanism as an idempotency key on a payments API.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Why is presence expensive, and what would you actually build?</summary>
+      <div class="answer">
+        <p>
+          Naive presence is <strong>O(n²)</strong>: every user's status change is broadcast to all their contacts. With 50M
+          concurrent users averaging 200 contacts, and mobile clients that flap on and off constantly (a phone on a train
+          generates dozens of transitions an hour), you get on the order of <em>hundreds of millions of presence pushes per
+          second</em> against an actual message rate of 230k/sec. Presence would be several orders of magnitude larger than your
+          core product. For a green dot.
+        </p>
+        <p>
+          What you build: (1) <strong>heartbeat + TTL in Redis</strong> — <code>SET presence:u online EX 45</code>, so "offline"
+          is the <em>absence of a key</em>, not an event you have to handle; dead phones and dead servers clean themselves up.
+          (2) <strong>Only serve presence for the contacts the user is currently looking at</strong> — ~20 people on screen, not
+          200 contacts; this is fan-out-on-read applied to presence. (3) <strong>Debounce and coalesce</strong> flapping into at
+          most one update per user per minute. (4) <strong>Negotiate the requirement down</strong>: "last seen 5 minutes ago" is
+          nearly free and no user has ever complained. That last one is the real answer, and it's the best "cut the requirement"
+          moment in the whole question.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Why Cassandra for messages rather than Postgres? And when would you not?</summary>
+      <div class="answer">
+        <p>
+          Derive it from the access pattern, never from preference. The workload is: <strong>230k writes/sec, petabytes a year,
+          append-only, never updated, and read by exactly one query shape</strong> — "a slice of one conversation, ordered by
+          sequence." No joins, no cross-row transactions, no ad-hoc analytics. That is the textbook <strong>LSM-tree</strong>
+          workload: writes become sequential appends to a commit log and memtable rather than random B-tree page updates, and the
+          one read you do is a single partition on a single node, scanned contiguously. Compaction pays the cost in the
+          background, off the critical path. Cassandra also gives you consistent hashing, rebalancing, and multi-DC replication
+          out of the box.
+        </p>
+        <p>
+          Keep <strong>Postgres for users, conversations, participants, and read state</strong> — that data is small, relational,
+          low-volume, and you want foreign keys and real transactions on it. Two stores, each matched to an access pattern.
+        </p>
+        <p>
+          <strong>When would you not?</strong> When the scale is 1,000× smaller. At a few thousand messages a second, Postgres
+          handles this comfortably and Cassandra is résumé-driven development that buys you an operational burden and nothing
+          else. Volunteering that unprompted is a maturity signal — it shows the choice was reasoned, not reflexive.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>What happens when a chat server dies?</summary>
+      <div class="answer">
+        <p>
+          Fifty thousand connections sever. Clients notice within seconds (failed heartbeat or socket close). The dead box's
+          registry entries stop being refreshed and <strong>expire within 45 seconds on their own</strong> — no cleanup job, no
+          coordination, nobody paged, because the entries were <em>leases, not facts</em>.
+        </p>
+        <p>
+          In that window, messages destined for those users route at a dead box and the hop fails. The fallback is the
+          <em>same path as an offline user</em>: append to the inbox, fire a push notification. <strong>No message is lost,
+          because messages are persisted before they are routed.</strong> Clients reconnect with jittered backoff, land on other
+          boxes, re-register, <code>SYNC</code> from their last-seen seq, and drain the backlog. Users see a brief
+          "connecting…" and at worst get a message as a push instead of in-app.
+        </p>
+        <p>
+          The point to make: <strong>only liveness degrades, never durability</strong> — and that's a consequence of three
+          slightly-more-expensive choices made earlier (persist-before-ack, TTL leases, an inbox that doubles as a failure
+          fallback). Good failure behaviour is designed in upstream, not bolted on.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>How does group chat change the design? What about a 100,000-member channel?</summary>
+      <div class="answer">
+        <p>
+          It's <strong>fan-out — the same problem as a news feed</strong> (tutorial 10), and you should name that out loud. For
+          small groups (≤ ~500), <strong>fan out on write</strong>: persist the message <em>once</em> to the conversation's
+          partition, then for each member do a registry lookup (pipelined — one Redis round trip, not 99) and either push down
+          their socket or append a <em>pointer</em> to their inbox. Note what fans out is a pointer and a push, never a copy of
+          the body.
+        </p>
+        <p>
+          At 100,000 members, one message becomes 100,000 lookups + 100,000 pushes + 100,000 inbox appends. In a busy channel
+          that's a million ops/sec from a <em>single conversation</em>, landing on a single partition. <strong>That is the
+          celebrity problem, exactly.</strong> Same fix: <strong>flip to fan-out on read</strong> — write once, let clients who
+          actually have the channel open pull from their last-seen seq; the 99% of members not looking at it cost you nothing.
+          Push only to members currently connected <em>and</em> viewing. And bucket the Cassandra partition by
+          <code>(conversation_id, time_bucket)</code> so one mega-channel doesn't melt one node.
+        </p>
+        <p>
+          The hybrid — eager push below a threshold, pull above it — is the same hybrid as the Twitter timeline, for the same
+          reason: <em>pushing costs scale with the audience, pulling costs scale with the readers; pick whichever is smaller for
+          that entity.</em>
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>What does end-to-end encryption break?</summary>
+      <div class="answer">
+        <p>
+          More than people expect, and the interesting answer is the breakage, not the crypto. E2E <strong>demotes your server
+          from a participant to a dumb pipe</strong>:
+        </p>
+        <ul>
+          <li><strong>Server-side search:</strong> gone. You can't index what you can't read. Search moves to the client's local history — so a fresh install can search nothing.</li>
+          <li><strong>Server-side group fan-out:</strong> gone. You can't re-encrypt for 99 recipients without the plaintext. <strong>The sender must encrypt once per recipient device and upload N ciphertexts</strong> — fan-out cost moves to the sender's uplink, which is exactly why encrypted group chats have hard member caps.</li>
+          <li><strong>Rich push notifications:</strong> gone. Send a contentless push; the device wakes, fetches, decrypts, and rewrites the notification locally.</li>
+          <li><strong>Server-side moderation and spam detection:</strong> gone. You're left with metadata signals and user reports.</li>
+          <li><strong>Effortless multi-device history:</strong> gone. A new device has no keys, hence no history, without a key-transfer or user-held encrypted backup.</li>
+        </ul>
+        <p>
+          What <em>survives</em> is the entire architecture — routing, registry, ordering, receipts, presence, offline queues —
+          because all of that operates on <strong>metadata</strong>, which the server still sees. That's the closing line:
+          <em>the architecture survives; the feature set doesn't.</em>
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>How would you handle read receipts in a 500-person group?</summary>
+      <div class="answer">
+        <p>
+          Do the arithmetic, and let the arithmetic be the answer. One message read by 500 people = 500 read-state writes, each
+          fanning out a <code>READ</code> event to up to 500 members = <strong>250,000 pushes for a single message</strong>. And
+          what does the sender get? A list of 500 names, which is not a UI anyone can use.
+        </p>
+        <p>
+          So: <strong>don't offer read receipts at that size.</strong> WhatsApp caps detailed receipts to small groups; Slack has
+          none at all. If the product insists, give an <em>aggregate</em> — "read by 312" — computed asynchronously from the
+          <code>read_state</code> table and fetched lazily, never pushed. <strong>The right engineering answer to some features
+          is to not build them</strong>, and saying that with a number behind it is stronger than building it.
+        </p>
+        <p>
+          Related and worth volunteering: even in small chats, read state is a <strong>pointer</strong>
+          (<code>last_read_seq</code>), not a row per message. A user scrolling past 40 messages generates <em>one</em> upsert,
+          not 40.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Why WebSocket rather than SSE or long polling here — and when would you pick differently?</summary>
+      <div class="answer">
+        <p>
+          Chat is genuinely <strong>bidirectional and high-frequency</strong>: the client sends messages, acks, typing events and
+          heartbeats just as often as it receives them. WebSocket gives you one full-duplex connection with ~2-byte frame
+          overhead. SSE is server→client <em>only</em>, so every client→server event would need a separate HTTP request — you'd
+          end up with a socket <em>and</em> a POST channel, which is strictly worse than just having the socket. Long polling
+          works and is a legitimate fallback for hostile networks, but it burns a request per message and adds latency.
+        </p>
+        <p>
+          <strong>When you'd flip:</strong> if the traffic were overwhelmingly server→client — live sports scores, a stock
+          ticker, notification delivery, a progress feed — <strong>SSE is the better choice</strong>: it's plain HTTP, it sails
+          through proxies and corporate firewalls, and it reconnects automatically with <code>Last-Event-ID</code> built in.
+          Knowing when <em>not</em> to reach for WebSockets is the actual signal here; the transport is the easy part of this
+          question, which is why you should spend thirty seconds on it and move to routing.
+        </p>
+      </div>
+    </details>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="takeaways">What to remember</h2>
+
+    <p><strong>The archetype: real-time push with stateful connections.</strong> Chat, live scores, collaborative editing (tutorial 23), trading dashboards, multiplayer games, driver tracking, any "server pushes to a specific client" system. They all have connections pinned to boxes, a registry, an inter-server hop, presence, reconnect storms, and an ordering story. Learn it once.</p>
+
+    <ul>
+      <li><strong>The spine of the whole page: the server is STATEFUL.</strong> Every other system in this course puts stateless boxes behind a load balancer. Here, user B's socket lives on one box out of a thousand, and to deliver to B you must <em>find that box</em>. Messaging becomes routing. Say this in your first two minutes.</li>
+      <li><strong>The driving number is connections per box.</strong> ~50k WebSocket connections per server (memory, ~10 KB each), 50M concurrent ⇒ <strong>1,000 chat servers</strong>. Derive the routing problem from arithmetic, don't assert it. Bandwidth is a footnote (~46 MB/s); the <em>connections</em> are the problem, not the bytes.</li>
+      <li><strong>Connection registry = Redis, <code>user_id → server_id</code>, with a TTL.</strong> The TTL is the trick: an entry is a <strong>lease, not a fact</strong>, so a dead server's 50k stale entries expire themselves in 45 seconds with no cleanup job and no coordination.</li>
+      <li><strong>Persist before you ack, and persist before you route.</strong> That one ordering cashes in the "never lose a message" requirement — and it's what <em>permits</em> the inter-server hop to be lossy (Redis pub/sub) instead of durable (Kafka). Two components that look independent are not.</li>
+      <li><strong>The failure path and the offline path are the same path.</strong> Registry miss, dead server, phone in a tunnel — all three end in "append to the user's inbox, fire a push notification." You get failure handling free from a feature you had to build anyway.</li>
+      <li><strong>The deploy question.</strong> 1,000 stateful boxes × 50k sockets = a deploy destroys 50M connections. Graceful drain over minutes + <strong>full-jitter</strong> backoff + a server-assigned reconnect window + accept-rate limiting. Backoff without jitter does nothing — it just reschedules the stampede. Remember it's also a <em>re-sync</em> storm against the DB. <strong>The problem is arrival shape, not arrival volume.</strong> Almost nobody has this answer.</li>
+      <li><strong>Delivery: at-least-once + dedup at both ends = effectively-once.</strong> Exactly-once is impossible (Two Generals). Server dedups on <code>clientMsgId</code> (an idempotency key), client dedups on <code>message_id</code>. Pick duplicates over losses, because a duplicate is suppressible and a loss is a broken product.</li>
+      <li><strong>Ordering: server-assigned per-conversation <code>seq</code>.</strong> Never client timestamps — clocks are wrong and clients lie. Global order is expensive and unobservable, so don't build it. <strong>The ordering guarantee and the partition key are the same decision.</strong></li>
+      <li><strong>Cassandra for messages, Postgres for the spine.</strong> Write-heavy, append-only, never-updated, one query shape (partition + range scan) = the canonical <strong>LSM-tree</strong> case. Partition by <code>conversation_id</code> — you partition by what you <em>read</em> by — and bucket it by time once conversations get wide.</li>
+      <li><strong>Presence is O(n²) and it's the best requirement to negotiate down.</strong> Heartbeat TTL (offline = absence of a key), presence only for contacts on screen, coalesce flapping, and be honest that "last seen 5 minutes ago" is cheap and nobody cares. Ephemeral data gets an ephemeral pipeline — never let a green dot near the durable write path.</li>
+      <li><strong>Group chat is fan-out again.</strong> Small groups → fan out on write. Huge channels → the celebrity problem → flip to fan-out on read. Same hybrid, same threshold logic, same reasoning as <a href="10-news-feed.html">tutorial 10</a>. <strong>Say the transfer out loud</strong> — recognising a shape you've seen before is the single thing this whole course is training.</li>
+      <li><strong>E2E encryption demotes your server to a dumb pipe.</strong> It breaks server-side search, server-side group fan-out (the sender must now encrypt per recipient — hence member caps), rich push notifications, and moderation. The architecture survives because routing runs on metadata; the feature set doesn't.</li>
+      <li><strong>Sometimes the answer is "don't build it."</strong> Read receipts in a 500-person group are an O(n) write and an O(n²) fan-out for an unusable UI. Exact presence costs more than the entire messaging system. Naming the feature you'd cut, with a number behind it, is a stronger move than building it.</li>
+    </ul>
+
+    <div class="senior">If you remember one sentence from this page, make it this one: <em>"Chat is the first system I've designed that can't be stateless — and every hard problem in it, from the registry to the deploy story to the reconnect storm, is a direct consequence of that one fact."</em> Open with it, structure the whole 45 minutes around it, and close with it. An interviewer who hears that has already decided you understand the problem; everything after is you confirming it.</div>
+  </section>
+
+  <nav class="page-nav">
+    <a href="10-news-feed.html">← 10 — Design a News Feed</a>
+    <a href="12-notifications-scheduler.html">12 — Design a Notification System &amp; Scheduler →</a>
+  </nav>
+
+</main>
+</body>
+</html>

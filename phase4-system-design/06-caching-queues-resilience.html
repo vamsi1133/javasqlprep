@@ -1,0 +1,1912 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>06 — Caching, Queues, Resilience &amp; Observability | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <div class="breadcrumb"><a href="index.html">← Course Home</a></div>
+    <h1>06 — Caching, Queues, Resilience &amp; Observability</h1>
+    <p>The toolbox. Every case study from here on reaches into this page.</p>
+  </div>
+</header>
+
+<main class="container">
+
+  <section>
+    <h2>Why this matters in the interview</h2>
+    <p>
+      Tutorials 02–05 gave you the substrate: how bytes move, where they're stored, how you split them across machines,
+      how machines agree. This page gives you the <strong>tools you apply on top of that substrate</strong>, and it is the
+      one you will use most. Almost every "how would you make this faster?" answer starts with a cache. Almost every
+      "what if this spikes 10×?" answer involves a queue. Almost every "what happens when that service is down?" answer is
+      a timeout, a retry with jitter, a circuit breaker, and a degraded response. And almost every follow-up chain in a
+      45-minute round ends up at <em>"how would you know this was broken?"</em> — which is observability. These four things
+      are not separate topics; they are the four moves you make after the boxes are drawn, and knowing them cold is what
+      lets you spend the second half of an interview on judgment rather than on remembering vocabulary.
+    </p>
+    <p>
+      There's a sharper reason to take this page seriously. The material here is where <strong>7 YOE is separated from
+      3 YOE</strong> most reliably, because the naive version of every one of these tools is a trap that a mid-level
+      candidate walks straight into. "Add a cache" is mid-level; "add a cache, and here's what happens to my database the
+      moment that hot key expires and ten thousand requests miss simultaneously" is senior. "Retry the request" is
+      mid-level; "retry with exponential backoff <em>and jitter</em>, because without jitter my retries re-synchronize and
+      I've built a DDoS against my own dependency" is senior. "We'll target four nines" is mid-level; "four nines is 52
+      minutes a year, and since my five dependencies multiply, I can't get there without removing a hop" is senior. Every
+      section below is built around one of those upgrades. Learn the upgrade, not just the tool.
+    </p>
+  </section>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ul>
+      <li><a href="#caching">Part 1 — Caching</a> — layers · patterns · invalidation · eviction · stampede, penetration, avalanche · Redis · hit-ratio math</li>
+      <li><a href="#queues">Part 2 — Queues &amp; async</a> — why async · queue vs log · Kafka · delivery semantics · idempotency · DLQs · backpressure &amp; load shedding · rate limiting</li>
+      <li><a href="#resilience">Part 3 — Resilience</a> — timeouts · retry storms &amp; jitter · circuit breakers · bulkheads · degradation · health checks · availability math · multi-region · SPOFs</li>
+      <li><a href="#observability">Part 4 — Observability</a> — metrics vs logs vs traces · why P99, not the average · SLI/SLO/SLA &amp; error budgets</li>
+      <li><a href="#bloom">Part 5 — Bloom filters</a> — the one probabilistic structure that keeps showing up</li>
+      <li><a href="#qa">Interview Q&amp;A</a></li>
+      <li><a href="#takeaways">What to remember</a></li>
+    </ul>
+  </div>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="caching">Part 1 — Caching</h2>
+
+    <p>
+      A cache is a bet: <em>this data will be read many more times than it changes, so I'll pay memory to avoid paying
+      I/O.</em> That's the whole idea, and it's why the first number you should reach for when someone says "make it
+      faster" is the <strong>read:write ratio</strong>. A URL shortener is 100:1 reads to writes — it is essentially a
+      cache with a database attached. A write-heavy metrics ingest pipeline is 1:100 — caching buys you nothing there and
+      suggesting it signals you're pattern-matching instead of thinking.
+    </p>
+
+    <h3>1.1 Where caches live</h3>
+    <p>
+      There is not "a cache" in a system; there are six or seven, stacked, and each one absorbs traffic so the next one
+      down sees less. Draw this layer stack and you've already answered half of "how do you scale reads."
+    </p>
+
+<pre><code>  Browser cache        │ Cache-Control / ETag. Free. Zero network. You own this
+  (private, per user)  │ as a frontend dev — it's the same HTTP semantics.
+         │
+         ▼
+  CDN / edge           │ Static assets, images, sometimes whole HTML pages.
+  (shared, global)     │ Absorbs the enormous majority of bytes. Tutorial 02.
+         │
+         ▼
+  API gateway / proxy  │ Response cache for identical GETs (Varnish, nginx,
+  (shared, regional)   │ CloudFront). Cheap win for public read APIs.
+         │
+         ▼
+  Application, LOCAL   │ In-process map (Caffeine, Guava). Nanoseconds. But
+  (per instance!)      │ each instance has its OWN copy → they disagree.
+         │
+         ▼
+  Distributed cache    │ Redis / Memcached. ~0.5–1 ms over the network.
+  (shared, one truth)  │ Shared by every instance → consistent, evictable.
+         │
+         ▼
+  DB buffer pool       │ Postgres shared_buffers, InnoDB pool. Already caching
+  (inside the DB)      │ your hot pages in RAM — a "DB hit" is often a RAM hit.
+         │
+         ▼
+  Disk
+</code></pre>
+
+    <p>
+      Two things to say out loud about this stack. First, <strong>the cheapest cache is the one closest to the user</strong>
+      — a CDN hit costs you nothing and never touches your infrastructure, so the question "can this be cached at the
+      edge?" always comes before "can this be cached in Redis?" Second, the database is <em>already</em> caching for you.
+      When you say "the DB read costs 5 ms," that's usually a buffer-pool hit, not a disk seek. Adding Redis in front of a
+      Postgres query that already hits shared_buffers buys you maybe 3 ms and buys you an entire new class of consistency
+      bugs. Justify the cache with the read volume you're removing from the DB, not with a vague appeal to latency.
+    </p>
+
+    <div class="pitfall">
+      <strong>Local (in-process) caches are inconsistent across instances, and candidates forget this constantly.</strong>
+      You have 20 application pods. A user updates their profile; the request lands on pod 7, which updates Postgres and
+      evicts its own local copy. Pods 1–6 and 8–20 still serve the stale profile until their TTL expires. The user hits
+      refresh and sees the old name half the time — a "flapping" bug that is miserable to reproduce. Local caches are
+      legitimate (they're the fastest thing you have), but only for data that is either immutable, or where bounded
+      staleness is genuinely acceptable, or where you have a real invalidation broadcast (a Redis pub/sub channel that
+      tells every pod to evict key K). If you propose a local cache in an interview, say the staleness sentence in the
+      same breath — otherwise the interviewer will, and it'll be a correction rather than a point scored.
+    </div>
+
+    <div class="note">
+      You already know this pattern from React. A local in-process cache is component state; a distributed cache is a
+      shared store like Redux or a React Query cache; the CDN is the browser's HTTP cache. And "which pod has the stale
+      copy" is the same class of problem as "which component didn't re-render." The intuition transfers — use it.
+    </div>
+
+    <h3>1.2 Cache patterns</h3>
+
+    <h4>Cache-aside (lazy loading) — the default</h4>
+    <p>
+      The application owns the cache. It checks the cache first; on a miss it reads the database, populates the cache, and
+      returns. On a write it updates the database and <em>invalidates</em> the cache entry. This is what 90% of systems
+      do, and it's the right answer unless you have a specific reason to deviate.
+    </p>
+
+<pre><code><span class="com">// READ path — cache-aside</span>
+<span class="kw">public</span> <span class="typ">Profile</span> getProfile(<span class="typ">long</span> id) {
+  <span class="typ">String</span> key = <span class="str">"profile:"</span> + id;
+  <span class="typ">Profile</span> cached = redis.get(key);
+  <span class="kw">if</span> (cached != <span class="kw">null</span>) <span class="kw">return</span> cached;              <span class="com">// HIT</span>
+
+  <span class="typ">Profile</span> p = profileRepo.findById(id);              <span class="com">// MISS → go to source of truth</span>
+  redis.setex(key, <span class="num">300</span>, p);                          <span class="com">// populate, TTL 5 min</span>
+  <span class="kw">return</span> p;
+}
+
+<span class="com">// WRITE path — write to DB, then INVALIDATE (do not "update" the cache)</span>
+<span class="kw">public</span> <span class="typ">void</span> updateProfile(<span class="typ">Profile</span> p) {
+  profileRepo.save(p);                              <span class="com">// 1. source of truth first</span>
+  redis.del(<span class="str">"profile:"</span> + p.getId());               <span class="com">// 2. delete, don't overwrite</span>
+}
+</code></pre>
+
+    <p>
+      Two deliberate choices in that write path, and interviewers probe both.
+      <strong>DB first, cache second</strong>: if you evict first and the DB write then fails, you've thrown away a valid
+      cache entry for no reason — annoying but harmless. If you write the cache first and the DB write fails, the cache now
+      holds data that does not exist. Always make the durable store the source of truth and let the cache be the thing
+      that's allowed to be wrong.
+      <strong>Delete rather than update</strong>: overwriting the cache on write looks efficient but re-introduces a race —
+      two concurrent writers can interleave (writer A writes DB, writer B writes DB, writer B writes cache, writer A writes
+      cache) and leave the cache holding A's older value permanently, with no TTL-free path back to correctness. Deleting is
+      idempotent and self-healing: the next reader repopulates from the DB, which is by definition current.
+    </p>
+
+    <div class="senior">
+      Say this: <em>"I'll use cache-aside and I'll delete the key on write rather than update it, because delete is
+      idempotent — a concurrent-write race with delete costs me one extra DB read, whereas the same race with update can
+      pin a stale value in the cache indefinitely."</em> That single sentence is worth more than drawing three more boxes.
+      Then note the residual race honestly: even delete-on-write has a window where a reader who missed the cache <em>before</em>
+      the write can write its stale value <em>after</em> the delete. It's rare, it's bounded by the TTL, and the fix
+      (delayed double-delete, or versioned keys) is usually not worth it. Naming a race you're choosing to accept is a
+      strong signal; pretending it doesn't exist is a weak one.
+    </div>
+
+    <h4>The other four patterns</h4>
+    <p>
+      Cache-aside puts the cache logic in your application. The rest push it into the cache layer itself, so your code just
+      reads and writes the cache and something else talks to the database.
+    </p>
+    <ul>
+      <li><strong>Read-through</strong> — the cache itself loads from the DB on a miss. Your code only ever calls
+        <code>cache.get(key)</code>. Same behaviour as cache-aside, cleaner code, but you need a cache library that
+        supports a loader (Caffeine's <code>LoadingCache</code>, or a DAX-style layer). Nice property: the loader can
+        deduplicate concurrent misses for the same key, which is your stampede fix for free.</li>
+      <li><strong>Write-through</strong> — every write goes to the cache, and the cache synchronously writes to the DB
+        before acknowledging. The cache is never stale. The cost is write latency (you pay both hops) and cache pollution
+        (you cache things nobody will read). Pair it with a TTL. Good for read-heavy data that is written rarely and read
+        immediately after being written.</li>
+      <li><strong>Write-behind / write-back</strong> — write to the cache, acknowledge immediately, flush to the DB
+        asynchronously in batches. Fastest writes by a mile, and it lets you coalesce (1,000 increments of a view counter
+        become one DB write). The price is <strong>durability</strong>: if the cache node dies before the flush, those
+        writes are gone. Only acceptable where loss is tolerable — view counts, "last seen" timestamps, analytics
+        counters. Never for money. Say that boundary out loud; it's the trade-off the pattern exists to expose.</li>
+      <li><strong>Refresh-ahead</strong> — proactively refresh a key <em>before</em> it expires, if it's being read
+        frequently. The reader never sees a miss, so you never pay the cold-read latency on hot keys. Costs you refreshes
+        for keys that were about to go cold anyway. This is the polished answer to "how do you avoid the latency spike when
+        a hot key expires?" and it's closely related to the probabilistic-early-expiry stampede fix below.</li>
+    </ul>
+
+    <table>
+      <thead><tr><th>Pattern</th><th>Who talks to the DB</th><th>Consistency</th><th>Use when</th><th>Don't use when</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Cache-aside</strong> (lazy)</td>
+          <td>Your app, on a miss</td>
+          <td>Eventually consistent; bounded by TTL</td>
+          <td>The default. Read-heavy, tolerant of brief staleness. Only cached data is data someone actually asked for.</td>
+          <td>You need read-your-writes on the cached path with zero staleness.</td>
+        </tr>
+        <tr>
+          <td><strong>Read-through</strong></td>
+          <td>The cache library</td>
+          <td>Same as cache-aside</td>
+          <td>You want the miss-dedup (single-flight) for free and cleaner call sites.</td>
+          <td>Your cache has no loader abstraction; you'd be writing it yourself anyway.</td>
+        </tr>
+        <tr>
+          <td><strong>Write-through</strong></td>
+          <td>The cache, synchronously on write</td>
+          <td>Cache never stale</td>
+          <td>Written once, read many times immediately. Config, feature flags, catalogue data.</td>
+          <td>Write-heavy — you pay two hops on every write and cache data nobody reads.</td>
+        </tr>
+        <tr>
+          <td><strong>Write-behind</strong></td>
+          <td>The cache, asynchronously in batches</td>
+          <td>Cache is ahead of the DB — DB is stale</td>
+          <td>High-volume, loss-tolerant writes you can coalesce: counters, likes, view counts, presence.</td>
+          <td><strong>Anything you'd be fired for losing.</strong> Payments, orders, ledgers.</td>
+        </tr>
+        <tr>
+          <td><strong>Refresh-ahead</strong></td>
+          <td>The cache, proactively before expiry</td>
+          <td>Bounded staleness, no miss latency</td>
+          <td>Predictably hot keys where the cold-read is expensive (an expensive aggregate, a rendered feed).</td>
+          <td>Access is unpredictable — you'll refresh keys nobody wants.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>1.3 Invalidation — the actually hard part</h3>
+    <p>
+      Phil Karlton's line — "there are only two hard things in computer science: cache invalidation and naming things" — is
+      a joke that is also completely true. Populating a cache is trivial. Knowing <em>when the thing you cached stopped
+      being true</em> requires knowing every code path that can change it, forever, including the ones written by the team
+      next door and the ones run by a DBA at 2 a.m. That's why the pragmatic industry answer is not "invalidate
+      correctly" — it's "expire quickly enough that being wrong doesn't matter."
+    </p>
+
+    <table>
+      <thead><tr><th>Strategy</th><th>How</th><th>Gets you</th><th>Costs you</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>TTL</strong> (time-to-live)</td>
+          <td><code>SETEX key 300 value</code> — the entry dies on a timer.</td>
+          <td>Dead simple. Self-healing: any bug, any missed invalidation, any DBA writing straight to the table — all of it corrects itself within one TTL. No coordination anywhere.</td>
+          <td><strong>Staleness up to the TTL.</strong> You are explicitly choosing to serve wrong data for up to N seconds. Also causes avalanches if many keys share a TTL (see below).</td>
+        </tr>
+        <tr>
+          <td><strong>Explicit invalidation</strong></td>
+          <td>Every writer deletes the affected keys. Ideally via a change-data-capture stream or the outbox (tutorial 05) rather than hand-written <code>del()</code> calls scattered around the codebase.</td>
+          <td>Freshness measured in milliseconds.</td>
+          <td>You must find <em>every</em> writer, forever. Miss one path and that key is stale until something else evicts it. Fan-out is brutal: which of the 40,000 cached feeds contain this now-deleted tweet?</td>
+        </tr>
+        <tr>
+          <td><strong>Versioned / immutable keys</strong></td>
+          <td>Bake a version into the key: <code>user:42:v7</code>, or <code>profile:42:{updated_at}</code>. A write bumps the version, so readers naturally look up a <em>different</em> key.</td>
+          <td>No invalidation at all — you never delete anything, you just stop asking for the old key. Zero race conditions. This is exactly the content-hashed-filename trick you already use in webpack builds.</td>
+          <td>Old entries linger until eviction (wasting memory), and readers must know the current version — which usually means one small, hot, frequently-read pointer key, or embedding the version in the URL/entity you already fetched.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="senior">
+      The line to say: <em>"I'll default to a TTL and treat it as a correctness budget, not a performance knob. A 60-second
+      TTL is me saying out loud that 60 seconds of staleness is acceptable for this data. Where it isn't — a user reading
+      back their own edit — I'll add explicit invalidation on top, or bypass the cache for read-your-writes on the writing
+      user's own session."</em> The reason this scores is that it reframes TTL as a <em>product</em> decision rather than a
+      technical default, and then handles the one case (read-your-writes) where users actually notice staleness. Users
+      almost never notice that someone else's post is 30 seconds late. They always notice that their own edit vanished.
+    </div>
+
+    <h3>1.4 Eviction policies</h3>
+    <p>
+      A cache is a fixed-size box. When it's full and a new entry arrives, something must go. The policy decides what.
+    </p>
+    <ul>
+      <li><strong>LRU — Least Recently Used.</strong> Evict whatever hasn't been touched for the longest. The default
+        nearly everywhere, because it approximates "what's hot right now" cheaply and adapts fast to changing traffic.
+        Its weakness is a <em>scan</em>: one batch job that reads a million cold rows evicts your entire hot set. (Redis's
+        <code>allkeys-lru</code>. Postgres's buffer pool uses a clock-sweep variant to resist exactly this.)</li>
+      <li><strong>LFU — Least Frequently Used.</strong> Evict whatever's been touched least <em>often</em>. Resists the
+        scan problem — one read of a cold row doesn't beat a key that's been read 10,000 times. Its weakness is the
+        opposite: yesterday's hot key stays resident on stale popularity long after it's gone cold. Real implementations
+        (Redis's <code>allkeys-lfu</code>) age the counters to fix this.</li>
+      <li><strong>FIFO</strong> — evict the oldest inserted, regardless of use. Cheap, dumb, rarely the right choice: it
+        will happily evict your hottest key just because it's been there a while.</li>
+      <li><strong>TTL-based</strong> — entries expire on a timer and eviction is a side effect. Often combined with the
+        above (<code>volatile-lru</code> in Redis: evict by LRU, but only among keys that have a TTL set — so keys you've
+        deliberately marked as permanent survive).</li>
+      <li><strong>Random</strong> — genuinely used in practice (Redis supports it) because it's O(1) with no bookkeeping
+        and, surprisingly, performs within a few percent of LRU on real workloads.</li>
+    </ul>
+
+    <div class="note">
+      <strong>You have already built one of these.</strong> Phase 3, tutorial 06 — LRU Cache (LC 146), the hash map plus
+      doubly-linked list, O(1) get and put. That is not a toy: it's the actual data structure inside Caffeine, inside
+      Redis's approximated LRU (which samples a few keys rather than maintaining a perfect list, because maintaining a
+      perfect list of 100 million keys costs more memory than the cache saves), and inside your OS page cache. If an
+      interviewer pivots from "design a distributed cache" to "OK, code the eviction," you've already written it. Say so:
+      <em>"Internally each node is a hash map plus an intrusive doubly-linked list, giving O(1) get, put and evict — Redis
+      actually approximates this with random sampling to avoid the pointer overhead at scale."</em>
+    </div>
+    <h3>1.5 The three failure modes</h3>
+    <p>
+      Every cache-related outage you will ever read a postmortem about is one of these three. Interviewers know that, which
+      is why "what happens when the cache misses?" is the single most common follow-up after you draw a Redis box. Learn
+      all three by name — naming them is half the credit.
+    </p>
+
+    <h4>(a) Cache stampede / thundering herd</h4>
+    <p>
+      One key is extremely hot — the homepage feed, a celebrity's profile, the current product catalogue. It gets 10,000
+      requests per second, all served from Redis. Its TTL expires. Now, in the same millisecond, 10,000 requests miss the
+      cache, and all 10,000 of them do exactly what your cache-aside code tells them to: go read the database. Your DB,
+      which has been comfortably idle serving ~0 QPS for this key, takes 10,000 concurrent identical queries. It falls
+      over. Requests time out. The clients retry. Now it's 20,000.
+    </p>
+
+<pre><code>  t=0.000  cache: profile:celebrity  TTL expires
+  t=0.001  ┌── req 1 ──┐
+           ├── req 2 ──┤   all MISS,  all query the DB with the
+           ├── ...  ───┤   IDENTICAL query, all recompute the same value
+           └── req 10k ┘
+                 │
+                 ▼
+            [ Postgres ]  ← 10,000 concurrent identical reads. Dies.
+</code></pre>
+
+    <p><strong>The three fixes, in the order you should mention them:</strong></p>
+    <ul>
+      <li><strong>Request coalescing / single-flight.</strong> The first request to miss takes a lock (or registers itself
+        in an in-flight map); every other request for the same key <em>waits on that one</em> instead of issuing its own
+        query. One DB read serves all 10,000. In Java this is Caffeine's <code>LoadingCache</code> (its <code>get(key,
+        loader)</code> guarantees the loader runs once per key), or a <code>ConcurrentHashMap&lt;String,
+        CompletableFuture&lt;V&gt;&gt;</code> you build yourself. Do this per-instance, and if you have many instances, add a
+        distributed lock in Redis (<code>SET lock:K token NX PX 5000</code>) so only one <em>pod</em> rebuilds — the loser
+        pods either wait briefly or serve the stale value.</li>
+      <li><strong>Probabilistic early expiry.</strong> Instead of expiring exactly at T, each reader independently rolls
+        the dice: as you approach expiry, the chance that <em>this particular</em> reader decides to refresh the key rises
+        toward 1. So one unlucky reader refreshes early, while everyone else keeps getting hits from the still-valid entry.
+        The herd never forms, because expiry stops being a single synchronized instant. This is the XFetch algorithm and
+        it's a genuinely impressive thing to name.</li>
+      <li><strong>Never expire hot keys; refresh them out-of-band.</strong> The hottest keys get no TTL at all, and a
+        background job (or the refresh-ahead pattern) recomputes them on a schedule. Reads never miss, so there's no herd
+        to form. The cost is that a bug in your refresher means permanently stale data — so pair it with a long safety TTL.</li>
+    </ul>
+
+    <div class="pitfall">
+      The most common wrong answer is <em>"I'd just increase the TTL."</em> That doesn't fix the stampede, it postpones it
+      — and makes it worse, because a longer TTL means more clients have accumulated on that key by the time it does
+      expire. The stampede isn't caused by expiring too often; it's caused by <strong>everyone missing at the same
+      instant</strong>. Every real fix attacks the simultaneity (dedupe the misses, or desynchronize the expiry), not the
+      frequency.
+    </div>
+
+    <h4>(b) Cache penetration</h4>
+    <p>
+      Requests arrive for keys that <strong>don't exist in the database at all</strong>. <code>GET /user/999999999</code>.
+      The cache misses (correctly — there's nothing to cache), so the request falls through to the DB, which also finds
+      nothing, and returns null. You cache nothing, because there's nothing to cache. The next identical request does the
+      same thing. Your cache is now providing exactly zero protection, and every one of these requests is a full DB query.
+      This is trivially weaponizable: an attacker hammers random non-existent IDs and walks straight past your cache into
+      your database. It also happens innocently — a crawler following dead links, a client with stale IDs.
+    </p>
+    <ul>
+      <li><strong>Cache the negative result.</strong> On a DB miss, write a tombstone: <code>SETEX user:999999999 60
+        "__NULL__"</code>. Now the second request for that key is a cache hit that returns 404 without touching the DB.
+        Use a <em>short</em> TTL — a minute, not an hour — because the key might legitimately be created a second later
+        and you don't want to serve "doesn't exist" for an entity that now does. This is the answer in 95% of interviews:
+        cheap, one line, done.</li>
+      <li><strong>Bloom filter in front of the cache.</strong> Keep a bloom filter of every ID that exists. Before you
+        query anything, ask the filter. If it says "definitely not present," return 404 immediately — no cache lookup, no
+        DB query. If it says "possibly present," proceed normally. This gives you protection against an <em>unbounded</em>
+        keyspace of garbage IDs without storing a tombstone for each one (which an attacker could use to blow up your
+        cache's memory). See Part 5.</li>
+      <li><strong>Validate before you query.</strong> The boring, effective one: if your IDs are 12-digit base62 strings,
+        reject anything that isn't, at the gateway, before it costs you anything. Free, and worth saying.</li>
+    </ul>
+
+    <h4>(c) Cache avalanche</h4>
+    <p>
+      A <em>large fraction of your keys expire at the same moment</em>, and the DB gets hit by a wall of misses across
+      many different keys at once. Note how this differs from a stampede: a stampede is <em>many requests, one key</em>;
+      an avalanche is <em>many keys, all expiring together</em>. The classic cause is self-inflicted and almost comically
+      easy to do: you warmed the cache at deploy time by loading 100,000 entries in a loop, each with
+      <code>SETEX key 3600</code>. One hour later — to the second — all 100,000 expire together.
+      (The other cause is the cache itself going down or being flushed, which dumps 100% of your traffic onto a database
+      that has never in its life seen 100% of your traffic. That's a separate argument for why the DB must be sized to
+      survive a cold cache, and for why you should never <code>FLUSHALL</code> in production.)
+    </p>
+    <ul>
+      <li><strong>Jitter the TTLs.</strong> Never <code>ttl = 3600</code>. Always <code>ttl = 3600 + random(0, 600)</code>.
+        The expiries now smear across a ten-minute window instead of landing on one second, and the DB sees a gentle
+        trickle of misses instead of a wall. This is a one-line fix and it is the answer the interviewer is fishing for.
+        Jitter is a theme on this page — you will meet it again in retries, for exactly the same reason: <strong>anything
+        that makes independent actors act at the same instant is a load spike waiting to happen, and randomness is how you
+        break the synchronization.</strong></li>
+      <li><strong>Stagger the warm-up</strong> so entries don't all start their clocks together in the first place.</li>
+      <li><strong>Survive a cold cache.</strong> Size the DB (and add a rate limiter / load shedder in front of it) so that
+        a total cache loss degrades you rather than killing you. If the honest answer is "if Redis dies, we go down," then
+        Redis is a single point of failure — say so, and either accept it explicitly or replicate it.</li>
+    </ul>
+
+    <table>
+      <thead><tr><th>Failure</th><th>Shape</th><th>Trigger</th><th>Fix</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Stampede</strong> (thundering herd)</td><td>Many requests → one hot key</td><td>A hot key expires</td><td>Single-flight / request coalescing · probabilistic early expiry · lock-on-rebuild · never expire hot keys</td></tr>
+        <tr><td><strong>Penetration</strong></td><td>Requests for keys that don't exist</td><td>Bad or malicious IDs</td><td>Cache the negative (short TTL) · bloom filter · input validation</td></tr>
+        <tr><td><strong>Avalanche</strong></td><td>Many keys expire at once</td><td>Bulk warm-up with identical TTL; or the cache dies</td><td><strong>Jitter the TTLs</strong> · stagger warm-up · size the DB to survive a cold cache</td></tr>
+      </tbody>
+    </table>
+
+    <h3>1.6 Redis specifics worth knowing</h3>
+    <p>
+      You don't need to be a Redis expert. You need to not say anything embarrassing about it, and to know the three or
+      four facts that actually change a design.
+    </p>
+
+    <h4>It is single-threaded (for command execution)</h4>
+    <p>
+      Redis executes commands one at a time on a single thread. This is a <em>feature</em> — every command is atomic with
+      no locking, which is why <code>INCR</code>, <code>SETNX</code> and Lua scripts are trustworthy primitives for
+      counters and locks. But it has a sharp consequence: <strong>one slow command blocks every other client.</strong>
+      Run <code>KEYS *</code> against a 50-million-key instance in production and you have stalled your entire cache for
+      several seconds, which means you've stalled every service that depends on it. Same for a large <code>SMEMBERS</code>,
+      a big <code>FLUSHALL</code>, or an unbounded <code>LRANGE</code>. Use <code>SCAN</code> (cursor-based, incremental)
+      instead of <code>KEYS</code>. Knowing this is a small thing that reads as real operational experience.
+    </p>
+
+    <div class="pitfall">
+      <code>KEYS *</code> in production is a genuine, career-shaping outage. It is O(n) over the entire keyspace, on the
+      single thread that serves everyone. If an interviewer asks you how you'd find all keys matching a pattern, the answer
+      is <em>"<code>SCAN</code> with a cursor, in batches — never <code>KEYS</code>, because Redis is single-threaded and
+      <code>KEYS</code> would block every other client for the duration."</em> Also: don't design a system that needs to
+      enumerate the keyspace. If you need to find keys by a property, maintain a secondary index (a set) yourself.
+    </div>
+
+    <h4>Data structures beyond strings</h4>
+    <p>
+      Candidates use Redis as a big <code>Map&lt;String,String&gt;</code> and miss that its data structures <em>are</em> the
+      answer to several classic design questions:
+    </p>
+    <table>
+      <thead><tr><th>Structure</th><th>Key commands</th><th>What it solves in an interview</th></tr></thead>
+      <tbody>
+        <tr><td><strong>String</strong></td><td><code>GET/SETEX/INCR</code></td><td>Plain cache entries; atomic counters (<code>INCR</code> is your fixed-window rate limiter).</td></tr>
+        <tr><td><strong>Hash</strong></td><td><code>HSET/HGET/HGETALL</code></td><td>An object with fields you update individually — a user profile, a session. Avoids read-modify-write of a whole serialized blob.</td></tr>
+        <tr><td><strong>Sorted set (ZSET)</strong></td><td><code>ZADD/ZRANGE/ZREVRANGE/ZREMRANGEBYSCORE</code></td><td><strong>The MVP.</strong> Leaderboards (score = points). <strong>Sliding-window rate limiting</strong> (score = timestamp; drop everything older than the window with <code>ZREMRANGEBYSCORE</code>, then <code>ZCARD</code> to count). Delayed jobs / a scheduler (score = run-at time; poll for score ≤ now). Feed pagination by score.</td></tr>
+        <tr><td><strong>Set</strong></td><td><code>SADD/SISMEMBER</code></td><td>Dedup, membership, "has this user already voted?"</td></tr>
+        <tr><td><strong>List</strong></td><td><code>LPUSH/BRPOP</code></td><td>A poor-man's queue. Fine for simple work queues; not a Kafka replacement (no consumer groups, no replay).</td></tr>
+        <tr><td><strong>HyperLogLog</strong></td><td><code>PFADD/PFCOUNT</code></td><td>Approximate unique counts (unique visitors) in ~12 KB regardless of cardinality, ~0.8% error. Tutorial 18.</td></tr>
+      </tbody>
+    </table>
+    <p>
+      The sorted set is the one to remember. "Design a leaderboard," "design a rate limiter," "design a delayed job
+      scheduler" — three different interview questions, one Redis structure, and reaching for it directly makes you look
+      like you've built these things rather than read about them.
+    </p>
+
+    <h4>Persistence: RDB vs AOF</h4>
+    <ul>
+      <li><strong>RDB</strong> — periodic point-in-time snapshots of the whole dataset, forked to disk. Compact, fast to
+        restore, cheap on the running process. You lose everything since the last snapshot (minutes).</li>
+      <li><strong>AOF</strong> (append-only file) — logs every write command; replay the log to rebuild. Configurable
+        fsync (every write = safest and slowest; every second = the sane default). Much smaller loss window, larger files,
+        slower restart.</li>
+      <li>Production usually runs <strong>both</strong>: AOF for durability, RDB for fast restores and backups.</li>
+    </ul>
+    <p>
+      The judgment point: <strong>if you're using Redis as a cache, you may not want persistence at all</strong> — a cache
+      is supposed to be losable, and an empty cache after a restart is a correctness non-event (just a performance one). If
+      you're using Redis as a <em>database</em> (a session store, a distributed lock, a job queue), then persistence,
+      replication and failover suddenly matter a great deal, and you should say so explicitly rather than hand-waving
+      "Redis" as though it were free durability. Note that Redis replication is asynchronous, so a failover can lose
+      acknowledged writes — which is exactly why tutorial 05 warns you off Redis as a distributed lock for anything where
+      correctness depends on mutual exclusion.
+    </p>
+
+    <h4>Redis vs Memcached</h4>
+    <table>
+      <thead><tr><th></th><th>Redis</th><th>Memcached</th></tr></thead>
+      <tbody>
+        <tr><td>Data model</td><td>Strings, hashes, lists, sets, sorted sets, streams, HLL, geo</td><td>Opaque strings only</td></tr>
+        <tr><td>Persistence</td><td>RDB + AOF</td><td>None. Purely volatile.</td></tr>
+        <tr><td>Replication / HA</td><td>Replicas, Sentinel, Cluster mode</td><td>None built in — the client shards</td></tr>
+        <tr><td>Threading</td><td>Single-threaded command execution (multi-threaded I/O since 6.0)</td><td>Genuinely multi-threaded — scales better on a single big box for pure get/set</td></tr>
+        <tr><td>Extras</td><td>Pub/sub, Lua scripting, transactions, TTL per key, streams</td><td>TTL per key. That's it.</td></tr>
+        <tr><td>Pick it when</td><td><strong>Default.</strong> You want data structures, atomic ops, persistence or pub/sub.</td><td>You want a dead-simple, multi-threaded, purely volatile LRU string cache and nothing more.</td></tr>
+      </tbody>
+    </table>
+    <p>
+      Honest framing for the interview: <em>"Redis, unless the only thing I need is a volatile string cache and I care
+      about squeezing multi-core throughput out of one box — then Memcached is simpler and slightly faster. In practice I'd
+      choose Redis and move on, because the data structures pay for themselves the first time I need a leaderboard or a
+      rate limiter."</em> Don't burn interview minutes on this comparison; know it, state it in one sentence, move.
+    </p>
+
+    <h3>1.7 Hit-ratio math — the reframing that scores</h3>
+    <p>
+      Here is the most under-appreciated piece of arithmetic in caching, and it's the reason "let's improve the cache hit
+      rate from 90% to 99%" is a project worth a quarter of engineering time rather than a rounding error.
+    </p>
+    <p>
+      Take 10,000 requests per second against a cache. What reaches the database is the <em>miss</em> traffic, so what
+      matters is the <strong>miss rate</strong> — and going from a 90% to a 99% hit rate does not improve things by 9%.
+      It cuts the miss rate from 10% to 1%: <strong>a 10× reduction in database load.</strong>
+    </p>
+
+    <table>
+      <thead><tr><th>Hit rate</th><th>Miss rate</th><th>DB QPS (of 10,000)</th><th>Relative DB load</th></tr></thead>
+      <tbody>
+        <tr><td>0%</td><td>100%</td><td>10,000</td><td>1×</td></tr>
+        <tr><td>50%</td><td>50%</td><td>5,000</td><td>2× better</td></tr>
+        <tr><td>90%</td><td>10%</td><td>1,000</td><td>10× better</td></tr>
+        <tr><td>95%</td><td>5%</td><td>500</td><td>20× better</td></tr>
+        <tr><td>99%</td><td>1%</td><td>100</td><td>100× better</td></tr>
+        <tr><td>99.9%</td><td>0.1%</td><td>10</td><td>1000× better</td></tr>
+      </tbody>
+    </table>
+
+    <p>
+      Every extra nine of hit rate is another 10× off your database. That's why a hot-key cache in front of a URL shortener
+      turns a database problem into a non-problem, and it's why the CDN — which might hit 99%+ on static assets — is doing
+      more for your infrastructure than any other single component.
+    </p>
+    <p>
+      The same arithmetic works on <strong>average latency</strong>, and it's worth doing out loud. Cache hit = 1 ms,
+      cache miss = 50 ms (network + DB + deserialize):
+    </p>
+<pre><code>  90% hit:  0.90 × 1ms  +  0.10 × 50ms  =  0.9 + 5.0  =  5.9 ms average
+  99% hit:  0.99 × 1ms  +  0.01 × 50ms  =  0.99 + 0.5 =  1.5 ms average
+
+  → the misses dominate the average even when they're rare.
+    At a 90% hit rate, 85% of your average latency is spent in the 10% of
+    requests that miss.
+</code></pre>
+
+    <div class="senior">
+      Say it like this: <em>"Cache hit rate is the number I'd instrument first, because it's non-linear — going from 90%
+      to 99% doesn't shave 9% off the database, it divides database load by ten. And it works the other way too: a hit rate
+      that quietly drops from 99% to 90% is a <strong>10× traffic spike</strong> to my database that nobody provisioned
+      for. That's why I alarm on hit rate, not just on DB CPU — by the time the DB is hot, I'm already in an incident."</em>
+      That last clause — hit rate as a <em>leading</em> indicator — is the senior half of the point. Anyone can say caching
+      is good. Saying that a degrading hit ratio is a load multiplier aimed at your database, and that you'd page on it, is
+      the thing a 3-YOE candidate doesn't say.
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="queues">Part 2 — Queues &amp; async</h2>
+
+    <h3>2.1 The one question that decides everything</h3>
+    <p>
+      When a user uploads a video, what has to happen before you can return <code>200 OK</code>? Store the bytes and
+      record that the upload exists — that's it. Transcoding it into five resolutions, generating thumbnails, running
+      content moderation, notifying their 40,000 subscribers, updating the recommendation index: <em>none of that has to
+      happen before the response.</em> So it doesn't. It goes on a queue, and the HTTP request returns in 200 ms instead
+      of four minutes.
+    </p>
+    <div class="senior">
+      This is the single most reusable move in system design, and it's a question, not a pattern:
+      <strong><em>"Does this need to happen before I respond to the user?"</em></strong> If yes, it's on the critical path
+      — keep it synchronous and make it fast. If no, it goes on a queue. Ask this out loud, per step, while you walk the
+      write path in any case study, and you will naturally arrive at the architecture the interviewer was hoping for. It's
+      how you get from "the API does eight things and takes four seconds" to "the API does two things and takes 200 ms,
+      and six workers do the rest."
+    </div>
+
+    <p>Once you've made that split, the queue is doing four distinct jobs — and you should be able to name which one you
+      care about, because it changes what you build:</p>
+    <ul>
+      <li><strong>Decoupling.</strong> The producer doesn't know or care who consumes. You can add a new consumer (say,
+        a fraud-scoring service reading the same order events) without touching the producer. This is the architectural
+        payoff, and the one that survives longest.</li>
+      <li><strong>Buffering / load-leveling.</strong> Traffic is spiky; your workers are not. A queue absorbs a 10× spike
+        and lets consumers drain it at their own steady rate. The queue depth grows, latency grows, but nothing
+        <em>fails</em>. Without the queue, that spike hits your database directly and something falls over. This is the
+        argument to make on any "what happens on Black Friday?" question.</li>
+      <li><strong>Retries &amp; durability.</strong> If a worker crashes mid-job, the message wasn't acknowledged, so it
+        comes back and another worker picks it up. In a synchronous call, a crash means the work is simply lost — you'd
+        have to build the retry infrastructure yourself, badly.</li>
+      <li><strong>Smoothing over slow or flaky third parties.</strong> The email provider is down for 20 minutes. If
+        sending the welcome email is inline in your signup handler, signup is down for 20 minutes. If it's on a queue,
+        nothing is down; the messages simply sit there and get delivered when the provider comes back.</li>
+    </ul>
+
+    <div class="pitfall">
+      Async is not free, and saying "and we'll queue it" without naming the cost is a tell. You have just bought:
+      <strong>eventual consistency</strong> (the user sees "processing…" instead of the finished thing — the UI must now
+      handle a state that didn't previously exist), <strong>the need for idempotent consumers</strong> (because delivery is
+      at-least-once), <strong>a new failure surface</strong> (what if the queue itself is full, or down?), <strong>harder
+      debugging</strong> (the stack trace no longer spans the whole operation — this is why you need distributed tracing,
+      Part 4), and <strong>an operational metric you must now watch</strong> (consumer lag). Say the trade-off in the same
+      breath as the proposal: <em>"I'll move transcoding to a queue — which means the client polls or gets a webhook when
+      it's ready, and the consumer has to be idempotent because I'll get duplicate deliveries."</em>
+    </div>
+
+    <h3>2.2 Message queue vs log — the distinction candidates get wrong</h3>
+    <p>
+      Candidates say "Kafka" reflexively for anything asynchronous. Half the time SQS or RabbitMQ is the better answer,
+      and the interviewer is waiting to see whether you know <em>why</em> you said Kafka. The difference is not about
+      throughput or fashion; it's about <strong>what happens to a message after it's consumed</strong>.
+    </p>
+
+<pre><code>  MESSAGE QUEUE (RabbitMQ, SQS, ActiveMQ) — a to-do list
+  ─────────────────────────────────────────────────────
+     producer ──▶ [ m5 m4 m3 m2 m1 ]──▶ consumer A  (takes m1, acks, m1 is GONE)
+                       queue        └──▶ consumer B  (takes m2, acks, m2 is GONE)
+                                    └──▶ consumer C  (takes m3 …)
+     Competing consumers. Each message goes to exactly ONE of them.
+     Ack ⇒ delete. The queue drains. It is a work-distribution device.
+
+
+  LOG (Kafka, Kinesis, Pulsar) — an append-only tape everyone reads
+  ────────────────────────────────────────────────────────────────
+     producer ──▶ [ m1 m2 m3 m4 m5 m6 m7 … ]   ← messages STAY (retention: 7d)
+                    ▲           ▲        ▲
+                    │           │        │
+        billing-group offset=1  │        │   ← each consumer GROUP has its own
+        search-group   offset=4 ┘        │      independent read position
+        analytics-group offset=7 ────────┘
+     Reading does not remove. Groups don't interfere. Rewind = replay.
+     It is a durable, ordered, re-readable event stream.
+</code></pre>
+
+    <p>
+      That picture contains the entire distinction. In a queue, consuming <strong>destroys</strong>; the queue is a
+      buffer of <em>work to be done</em>, and once it's done, it's done. In a log, consuming is just <strong>moving a
+      bookmark</strong>; the log is a record of <em>things that happened</em>, and it doesn't care who has read it or how
+      many times. That's why a log gives you replay — the single most valuable property Kafka has, and the one that
+      justifies its operational weight. Ship a bug in your analytics consumer? Fix it, reset the offset to yesterday,
+      reprocess. With SQS, those messages were deleted the moment they were acked; they're gone forever.
+    </p>
+
+    <table>
+      <thead><tr><th></th><th>Message queue (RabbitMQ, SQS)</th><th>Log (Kafka, Kinesis)</th></tr></thead>
+      <tbody>
+        <tr><td>Mental model</td><td>A to-do list. Work to be distributed.</td><td>A tape. Events that happened.</td></tr>
+        <tr><td>After consumption</td><td>Message is deleted on ack</td><td>Message stays until retention expires (e.g. 7 days)</td></tr>
+        <tr><td>Consumer position</td><td>The broker tracks it (in-flight / ack)</td><td>The <em>consumer</em> tracks it (an offset it commits)</td></tr>
+        <tr><td>Replay</td><td>No. Once acked, it's gone.</td><td><strong>Yes — reset the offset and reprocess.</strong> The killer feature.</td></tr>
+        <tr><td>Multiple independent readers</td><td>Needs fan-out to multiple queues (an exchange, or SNS→SQS)</td><td>Native: N consumer groups each read the whole topic independently</td></tr>
+        <tr><td>Ordering</td><td>Roughly FIFO; broken by competing consumers and redeliveries. (SQS FIFO queues exist, at much lower throughput.)</td><td>Strict order <strong>within a partition</strong>. No global order.</td></tr>
+        <tr><td>Throughput</td><td>High (tens of thousands/s)</td><td>Very high (millions/s) — it's just sequential disk writes</td></tr>
+        <tr><td>Per-message features</td><td>Rich: priorities, delays, per-message TTL, complex routing (RabbitMQ exchanges), visibility timeouts</td><td>Deliberately poor. Kafka does not do per-message priority or per-message delay. Don't pretend it does.</td></tr>
+        <tr><td>Operational cost</td><td>Low (SQS is fully managed and effectively free of ops)</td><td>Real. Brokers, partitions, ZooKeeper/KRaft, rebalancing, lag monitoring.</td></tr>
+        <tr><td><strong>Reach for it when</strong></td><td>Task distribution: send this email, resize this image, charge this card. One job, one worker, then forget it.</td><td>Event streaming: many consumers care about the same events; you need replay, ordering per key, or an event-sourced/CDC pipeline; volume is huge.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="senior">
+      The line that separates you from the reflexive Kafka answer: <em>"For 'send the welcome email', I'd use SQS or
+      RabbitMQ — it's one task, one worker, delete on completion, and I get retries and a DLQ for free with zero
+      operational overhead. I'd reach for Kafka when the event has <strong>more than one interested consumer</strong>, or
+      when I need <strong>replay</strong> — for example, order events feeding billing, search indexing, and analytics
+      independently. Kafka is a commitment; I want a reason for it."</em> Then, if the interviewer pushes, admit the honest
+      middle: most companies that have Kafka use it for both, because running one system is cheaper than running two.
+    </div>
+
+    <h3>2.3 Kafka concepts that actually come up</h3>
+    <ul>
+      <li><strong>Topic</strong> — a named stream of events. <code>orders</code>, <code>clicks</code>, <code>user-events</code>.</li>
+      <li><strong>Partition</strong> — the unit of parallelism <em>and</em> the unit of ordering. A topic is split into N
+        partitions, each an independent append-only log living on a broker. A message's key is hashed to pick its
+        partition. <strong>Partitions are why Kafka scales</strong> — throughput is (partitions × per-partition
+        throughput) — and they're also the source of the single most-missed fact below.</li>
+      <li><strong>Consumer group</strong> — a set of consumers that share the work of a topic. Kafka assigns each partition
+        to exactly one consumer in the group. Consequence: <strong>your maximum consumer parallelism is your partition
+        count.</strong> 6 partitions means at most 6 useful consumers; a 7th sits idle. Add consumers beyond that and
+        nothing gets faster — you must add partitions. Different <em>groups</em> are fully independent and each sees every
+        message.</li>
+      <li><strong>Offset</strong> — the consumer's bookmark: "I have processed up to message 4,182 in partition 3."
+        Committed back to Kafka. <em>When</em> you commit it is what determines your delivery semantics (below).</li>
+      <li><strong>Retention</strong> — how long messages live regardless of consumption: time-based (7 days) or size-based,
+        or compacted (keep only the latest message per key — which turns a topic into a durable changelog / materialized
+        table, and is how CDC pipelines work).</li>
+      <li><strong>Replay</strong> — reset a group's offsets backwards and reprocess history. Backfilling a new service,
+        rebuilding a search index, recovering from a consumer bug. This is the capability you're buying.</li>
+      <li><strong>Replication</strong> — each partition has a leader and followers on other brokers; writes go to the
+        leader, and <code>acks=all</code> waits for the in-sync replicas. Same quorum reasoning as tutorial 05.</li>
+    </ul>
+
+    <div class="pitfall">
+      <strong>Ordering in Kafka is per-partition ONLY.</strong> There is no global ordering across a topic, and there
+      cannot be — that would require a single serialized log, which is precisely the bottleneck partitions exist to
+      remove. Candidates say "Kafka guarantees ordering" and get taken apart on the follow-up.<br><br>
+      What this means in practice: if the ordering of events <em>for a given entity</em> matters — and it almost always
+      does; you cannot process <code>order:123 shipped</code> before <code>order:123 created</code> — then you must
+      <strong>key the message by that entity</strong>. <code>producer.send(topic, orderId, event)</code> hashes
+      <code>orderId</code> to a partition, so <em>all events for order 123 land in the same partition and are therefore
+      consumed in order by one consumer</em>. Events for different orders may be interleaved arbitrarily, and you don't
+      care. Say the whole thing: <em>"I'll partition by order ID, which gives me strict ordering per order — which is the
+      only ordering I actually need — while still parallelizing across orders."</em> That is the correct, complete,
+      senior answer, and it's also a nice echo of the sharding-key discussion in tutorial 04: <strong>the partition key is
+      a design decision, and it simultaneously buys you ordering and exposes you to hot partitions.</strong> Partition by
+      <code>country</code> and one country will melt one broker.
+    </div>
+
+    <h3>2.4 Delivery semantics</h3>
+    <p>Three options, and only one of them is real.</p>
+    <table>
+      <thead><tr><th>Semantic</th><th>How you get it</th><th>Failure mode</th><th>Verdict</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>At-most-once</strong></td>
+          <td>Commit the offset / ack <em>before</em> processing.</td>
+          <td>Crash after the ack, before the work → the message is <strong>lost</strong>, silently.</td>
+          <td>Only for data where loss is genuinely fine: metrics samples, debug logs, presence pings.</td>
+        </tr>
+        <tr>
+          <td><strong>At-least-once</strong></td>
+          <td>Commit the offset / ack <em>after</em> the work is done.</td>
+          <td>Crash after the work, before the ack → the message is redelivered → the work happens <strong>twice</strong>.</td>
+          <td><strong>The default, and what you should design for.</strong></td>
+        </tr>
+        <tr>
+          <td><strong>Exactly-once</strong></td>
+          <td>Kafka offers transactional producers + read-process-write transactions, which give it <em>within Kafka</em>.</td>
+          <td>The moment your side effect leaves Kafka — charging a card, sending an email, writing to Postgres — the atomicity is gone. You cannot make "send an email" and "commit an offset" atomic.</td>
+          <td><strong>A myth at the boundary.</strong> Don't claim it.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="senior">
+      This is the same conclusion tutorial 05 reached from the transactions side, and it is worth being able to state in
+      one breath because it comes up in <em>every</em> async design: <em>"Exactly-once delivery doesn't exist across a
+      network — you can't atomically perform a side effect and record that you performed it. What exists is
+      <strong>at-least-once delivery plus an idempotent consumer</strong>, which is observationally equivalent to
+      exactly-once and is what everyone actually builds. So my consumers take an idempotency key — the message ID, or a
+      natural key like the order ID — and I record processed keys in the same transaction as the side effect. A duplicate
+      delivery hits a unique-constraint violation, and I ack it and move on."</em>
+    </div>
+
+<pre><code><span class="ann">@Transactional</span>                            <span class="com">// side effect + dedup record commit TOGETHER</span>
+<span class="kw">public</span> <span class="typ">void</span> handle(<span class="typ">OrderEvent</span> e) {
+  <span class="kw">try</span> {
+    processedRepo.insert(e.getMessageId());  <span class="com">// UNIQUE PK → duplicate throws</span>
+  } <span class="kw">catch</span> (<span class="typ">DuplicateKeyException</span> dup) {
+    log.info(<span class="str">"already processed {} — ack and skip"</span>, e.getMessageId());
+    <span class="kw">return</span>;                                <span class="com">// idempotent: second delivery is a no-op</span>
+  }
+  inventory.reserve(e.getSku(), e.getQty()); <span class="com">// the real work, same tx</span>
+}
+</code></pre>
+    <p>
+      The reason this works is that the dedup record and the side effect are in <strong>one local database
+      transaction</strong> — so they either both happen or neither does. You've replaced an impossible distributed
+      guarantee with a possible local one, which is the general shape of every correct answer in this space (it's the same
+      trick as the outbox pattern in tutorial 05, run in reverse). Where the side effect is genuinely external and
+      non-transactional — charging a card — you push the idempotency key <em>to the third party</em>: Stripe accepts an
+      <code>Idempotency-Key</code> header for exactly this reason. Tutorial 13 does this properly.
+    </p>
+
+    <h3>2.5 Dead-letter queues, poison messages, and consumer lag</h3>
+    <p>
+      Now the operational reality, which is where the interesting follow-ups live.
+    </p>
+    <ul>
+      <li><strong>Poison message.</strong> One message that <em>always</em> fails — malformed JSON, a null field your
+        parser doesn't handle, a reference to a deleted user. At-least-once means it gets redelivered. It fails again.
+        Forever. In a queue with strict ordering, it now <strong>blocks the entire partition behind it</strong> — a single
+        bad message can halt a whole stream, and this is a real, common outage. Interviewers love asking "what if a message
+        can't be processed?" precisely because the naive retry loop answer is an infinite loop.</li>
+      <li><strong>Dead-letter queue (DLQ).</strong> The fix: after N failed attempts (3–5), stop retrying and move the
+        message to a separate queue. The main queue keeps flowing; the bad message is preserved with its failure context
+        for a human to look at. SQS does this natively (<code>maxReceiveCount</code> → redrive policy); with Kafka you
+        implement it yourself by producing to a <code>orders.DLT</code> topic (Spring Kafka does this for you). Then:
+        <strong>alarm on DLQ depth &gt; 0.</strong> A DLQ nobody watches is just a place where data goes to die, and
+        saying "and I'd alert on it, with a redrive path once the bug is fixed" is what makes the answer complete.</li>
+      <li><strong>Retry with backoff, off the main queue.</strong> Don't retry a failing message in a tight loop on the
+        main consumer — you'll starve the good messages. Standard structure: main topic → retry topic (with a delay) →
+        DLQ. This keeps transient failures (a dependency being briefly down) from behaving like permanent ones.</li>
+      <li><strong>Consumer lag.</strong> <em>The</em> health metric for any async system: how many messages behind the head
+        of the log is this consumer group? Equivalently, "if I stopped producing right now, how long until the consumer
+        catches up?" Lag that is flat and small = healthy. Lag that is <strong>growing</strong> = your consumers are
+        permanently slower than your producers, and nothing about that is self-correcting: you will fall further behind
+        forever until the retention window drops messages you never read. When an interviewer asks "how do you know the
+        pipeline is healthy?", the answer is <strong>lag, and its derivative</strong>. Fixes: add consumers (up to the
+        partition count — remember 2.3), add partitions, make the consumer faster (batch its DB writes), or shed load.</li>
+    </ul>
+
+    <h3>2.6 Backpressure and load shedding</h3>
+    <p>
+      Producers outpace consumers. Queue depth grows without bound. Something must give — the only question is
+      <strong>whether you choose what gives, or whether the system chooses for you</strong> (and the system always chooses
+      the worst option: an OOM, a full disk, a broker refusing all writes, a total outage).
+    </p>
+    <p>The four levers, in the order you'd apply them:</p>
+    <ol>
+      <li><strong>Buffer</strong> — that's what the queue is. It absorbs <em>spikes</em>. It does not absorb a
+        <em>sustained</em> overload; it only converts it into growing latency and eventual collapse. State this
+        distinction: a queue is a shock absorber, not a capacity increase.</li>
+      <li><strong>Scale the consumers</strong> — autoscale the worker pool on queue depth or lag (this is the single most
+        natural autoscaling signal there is, and much better than CPU). Bounded by partition count in Kafka, and
+        ultimately bounded by whatever the consumers write to — scaling 100 workers into a database that can take 500 QPS
+        just moves the failure downstream.</li>
+      <li><strong>Throttle the producer</strong> — apply backpressure upstream: a bounded queue that blocks (or fails)
+        writes when full, TCP-style flow control, HTTP <code>429 Too Many Requests</code> with a <code>Retry-After</code>
+        header. This is the honest option: it pushes the problem to the party that can actually reduce load.</li>
+      <li><strong>Shed load</strong> — deliberately drop work. Yes, really.</li>
+    </ol>
+
+    <div class="senior">
+      <strong>Load shedding as a design choice.</strong> Say this: <em>"When I'm past capacity, I'd rather serve 80% of
+      users correctly and reject 20% fast with a 429 than serve 100% of users a 30-second timeout and then fall over —
+      because a queue of doomed requests is pure waste. So I'd shed load at the edge, and I'd shed it by priority: drop
+      analytics events before I drop checkouts."</em><br><br>
+      Two ideas in there and both are senior signals. <strong>Fail fast beats fail slow</strong> — a request that will time
+      out anyway should be rejected <em>now</em>, while rejecting it is still cheap, rather than after it has consumed a
+      thread, a connection, and 30 seconds of a downstream service's attention. And <strong>not all traffic is equal</strong>
+      — having explicit request priorities means overload degrades your product gracefully instead of uniformly. The
+      related move is dropping requests whose deadline has already passed: if a message has been sitting in the queue for
+      longer than the client's timeout, processing it is pure waste — the client is gone. Discard it and move on.
+    </div>
+
+    <h3>2.7 Rate limiting (in brief — tutorial 09 does it properly)</h3>
+    <p>
+      Rate limiting is backpressure with a contract. It's how you stop one noisy client from consuming capacity that
+      belongs to everyone else, and it's the first defence in front of any public API. The 60-second version you need
+      here, so you can name it in any design:
+    </p>
+    <ul>
+      <li><strong>Token bucket</strong> — a bucket holds up to B tokens, refilled at R per second; each request takes one.
+        Allows short <em>bursts</em> (up to B) while bounding the sustained rate at R. The default answer, and the one
+        most APIs actually use, because bursts are usually fine and bursty traffic is normal.</li>
+      <li><strong>Leaky bucket</strong> — requests drain at a constant rate. Perfectly smooth output, no bursts allowed.
+        Use when the thing downstream genuinely can't handle bursts.</li>
+      <li><strong>Fixed window</strong> — a counter per minute (<code>INCR</code> on a Redis key that expires). Trivially
+        cheap; has the boundary flaw (100 requests at 11:59:59 and 100 more at 12:00:00 = 200 in one second, all
+        "allowed").</li>
+      <li><strong>Sliding window</strong> — a Redis sorted set of request timestamps per user; drop entries older than the
+        window, count what's left. Accurate, no boundary flaw, more memory. There's also a sliding-window <em>counter</em>
+        that interpolates between two fixed windows — nearly as accurate, far cheaper.</li>
+      <li><strong>Where it lives</strong> — the API gateway, so bad traffic dies before it costs you anything. State is in
+        Redis so all gateway instances share one counter (a per-instance limit of R across 10 instances is really a limit
+        of 10R — a classic bug). And when Redis is down: <strong>fail open</strong> (allow traffic, protect availability)
+        or <strong>fail closed</strong> (reject, protect the backend)? That's a real judgment call and interviewers push
+        on it — for a public API, usually fail open with a local per-instance fallback limit.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="resilience">Part 3 — Resilience</h2>
+
+    <p>
+      At one machine, failure is an exception. At a thousand machines, failure is a <strong>Tuesday</strong>. If a server
+      has a 3-year mean time between failures and you run 10,000 of them, you're losing roughly ten a day — plus disks,
+      plus a network partition somewhere, plus a bad deploy, plus a dependency that got slow rather than dead (which is
+      worse). The senior mindset isn't "how do I prevent failure"; it's <strong>"failures are constant and I design so
+      that they're boring."</strong> Everything below is a technique for converting an unbounded, contagious failure into a
+      bounded, local, uninteresting one.
+    </p>
+
+    <h3>3.1 Timeouts — the one everybody skips</h3>
+    <p>
+      Set a timeout on <strong>every</strong> outbound call. Every HTTP client, every DB query, every Redis command, every
+      lock acquisition. The default in most libraries is <em>infinite</em>, and an unbounded wait is how a single slow
+      dependency takes down a system that wasn't even broken.
+    </p>
+    <p>Walk the cascade, because this is the mechanism and it's worth being able to narrate:</p>
+<pre><code>  Service B gets slow (not down — SLOW. 30s per request instead of 50ms).
+
+  1. Service A calls B with no timeout. Each request holds a thread.
+  2. A's thread pool (say 200 threads) fills with requests waiting on B.
+  3. A now has zero threads to serve ANY request — including its
+     /healthz, and including endpoints that never touch B at all.
+  4. A is now "down". A's callers, waiting on A with no timeout, fill
+     THEIR pools.
+  5. The whole graph is down because one leaf got slow.
+
+  This is a cascading failure. The fix in step 1 is one line of config.
+</code></pre>
+    <p>
+      Note the crucial detail: <strong>B never failed.</strong> It got slow. A dependency that is <em>down</em> is easy —
+      you get a connection-refused in a millisecond and can handle it. A dependency that is <em>slow</em> is what kills
+      you, because slowness is indistinguishable from work in progress, and every waiting caller is holding a finite
+      resource (a thread, a connection, a socket, memory) while it waits. <strong>A timeout is what converts "slow" into
+      "failed", and "failed" is a thing your code can handle.</strong>
+    </p>
+    <p>
+      How to pick one: not from a hat. Start from your P99 latency for that call and add headroom — if the dependency's
+      P99 is 200 ms, a 1-second timeout is generous; a 30-second timeout is not a timeout, it's a fiction. Then check that
+      your timeouts <em>nest</em>: if your own SLA is 2 seconds and you make three sequential calls with 1-second timeouts
+      each, you can blow your own budget while every individual call is "within timeout." The clean version of this is a
+      <strong>deadline propagated through the call graph</strong> (gRPC does this natively): the entry point stamps
+      "this request dies at T+2s", every hop passes the remaining budget down, and a service that receives a request with
+      50 ms left doesn't even bother starting work it can't finish.
+    </p>
+
+    <div class="senior">
+      Say: <em>"Every network call gets a timeout derived from the dependency's P99, and ideally a deadline propagated
+      from the edge so the whole request has one budget rather than each hop having its own. The failure I'm defending
+      against isn't a dependency being down — that's easy — it's a dependency being <strong>slow</strong>, because a slow
+      dependency silently consumes my thread pool and takes down endpoints that never called it."</em> That last sentence
+      is the one that lands.
+    </div>
+
+    <h3>3.2 Retries — and why naive retries make outages worse</h3>
+    <p>
+      A retry is the right instinct: networks drop packets, leaders fail over, a pod gets rescheduled mid-request. Most
+      failures are transient, and retrying converts a user-visible error into an invisible 50 ms delay. But the naive
+      implementation — <code>catch (e) { retry(); }</code>, immediately, three times — is <strong>an amplifier</strong>, and
+      under exactly the conditions where you can least afford it.
+    </p>
+    <p>
+      Here's the mechanism. Your dependency is overloaded and starts failing 20% of requests. Every client retries 3 times.
+      Your dependency's load just went from 100% to <strong>up to 300%</strong> — precisely at the moment it was already
+      struggling. It now fails 60% of requests. More retries. It fails everything. <strong>The retries, not the original
+      fault, are what turn a degradation into an outage.</strong> This is a retry storm, and it is one of the most common
+      root causes in real postmortems. AWS has published on it; so has Google. It's not theoretical.
+    </p>
+
+    <div class="pitfall">
+      <strong>Retries are load multiplication applied to a system that is already failing.</strong> Three rules, and you
+      should be able to state all three:
+      <ol>
+        <li><strong>Only retry what is retryable.</strong> A 500, a timeout, a connection reset — retry. A <code>400</code>,
+          a <code>401</code>, a <code>404</code>, a validation error — <em>never</em>. Retrying a deterministic failure just
+          burns capacity to fail again, more expensively. A <code>429</code> means retry, but only after
+          <code>Retry-After</code>.</li>
+        <li><strong>Only retry idempotent operations</strong> — or make them idempotent with an idempotency key (2.4).
+          Retrying <code>POST /charge</code> after a timeout, where you genuinely do not know whether the charge went
+          through, is how customers get billed twice.</li>
+        <li><strong>Cap the total.</strong> Two or three attempts, and a global budget: something like a
+          <em>retry budget</em>, where a client refuses to let retries exceed ~10% of its total request volume. If more
+          than 10% of your calls are failing, the dependency is down, and retrying is not going to fix that — you're just
+          kicking it while it's down.</li>
+      </ol>
+    </div>
+
+    <h4>Exponential backoff + jitter</h4>
+    <p>
+      Exponential backoff: wait 100 ms, then 200, then 400, then 800. This gives the struggling dependency <em>increasing
+      room to breathe</em> instead of a machine-gun of immediate retries. Necessary, and everyone knows it.
+    </p>
+    <p>
+      <strong>Jitter</strong> is the part candidates omit, and it is the part that matters. Consider what happens with pure
+      exponential backoff during an incident:
+    </p>
+<pre><code>  A dependency blips at t=0. 10,000 clients all fail at once.
+
+  WITHOUT jitter (backoff = 100ms, 200ms, 400ms):
+    t=100ms  →  all 10,000 retry SIMULTANEOUSLY  → dependency dies again
+    t=300ms  →  all 10,000 retry SIMULTANEOUSLY  → dies again
+    t=700ms  →  all 10,000 retry SIMULTANEOUSLY  → dies again
+    The backoff spread them out in TIME but kept them PERFECTLY IN PHASE.
+    You have built a synchronized DDoS with a metronome.
+
+  WITH jitter (sleep = random(0, 100ms), then random(0, 200ms), …):
+    retries smear across the window → the dependency sees a smooth trickle
+    → it recovers → the herd dissolves naturally.
+</code></pre>
+    <p>
+      The failure event <em>synchronized</em> your clients — they all failed on the same millisecond, so they all start
+      their backoff clocks on the same millisecond, so a <em>deterministic</em> backoff keeps them locked in phase forever.
+      Exponential backoff without jitter doesn't break the herd; it just reschedules it. <strong>Randomness is the only
+      thing that breaks synchronization</strong>, and that is precisely the same insight as jittering cache TTLs to prevent
+      an avalanche (1.5c). The two are the same idea wearing different clothes, and noticing that out loud is a nice
+      moment.
+    </p>
+<pre><code><span class="com">// "Full jitter" — AWS's recommendation, and the one to name.</span>
+<span class="com">// sleep = random(0, min(cap, base * 2^attempt))</span>
+<span class="kw">long</span> backoff = Math.min(cap, base * (<span class="num">1L</span> &lt;&lt; attempt));
+<span class="kw">long</span> sleep   = ThreadLocalRandom.current().nextLong(<span class="num">0</span>, backoff + <span class="num">1</span>);
+Thread.sleep(sleep);
+<span class="com">// Note: random(0, backoff) — NOT backoff + random(0, small). Full jitter</span>
+<span class="com">// spreads retries across the WHOLE window, and measurably beats the</span>
+<span class="com">// "backoff plus a little noise" version people usually write.</span>
+</code></pre>
+
+    <h3>3.3 Circuit breakers</h3>
+    <p>
+      Backoff slows retries down. A circuit breaker asks the better question: <strong>if the dependency has been failing
+      for the last 30 seconds, why am I calling it at all?</strong> Every doomed call costs you a thread, a connection,
+      and your user's patience, and it costs the struggling dependency work it can't do. So: stop calling. Fail
+      immediately, locally, in microseconds.
+    </p>
+
+<pre><code>                 failure rate &gt; threshold
+                (e.g. &gt;50% of last 20 calls)
+      ┌────────┐ ─────────────────────────────▶ ┌────────┐
+      │ CLOSED │                                │  OPEN  │
+      │        │ ◀───────────────────────────── │        │
+      └────────┘        trial call OK           └────────┘
+        │  ▲                                       │
+        │  │                                       │ after a cooldown
+        │  │      trial call FAILS                 │ (e.g. 30s)
+        │  │  ┌──────────────────────────────┐     │
+        │  └──│         HALF-OPEN            │◀────┘
+        │     │  let ONE (or a few) requests │
+        │     │  through as a probe          │
+        │     └──────────────────────────────┘
+        │
+   normal traffic                     OPEN = all calls fail INSTANTLY.
+   flows through                      No thread held. No network hop.
+                                      Fallback runs immediately.
+</code></pre>
+
+    <ul>
+      <li><strong>CLOSED</strong> — normal. Calls flow. The breaker counts failures in a rolling window.</li>
+      <li><strong>OPEN</strong> — the failure rate crossed the threshold. <em>All</em> calls fail immediately without
+        touching the network. This is the whole point: you <strong>fail fast</strong> instead of failing slow, you stop
+        consuming your own resources on calls that won't succeed, and you stop hammering a dependency that needs a moment
+        to recover. Your fallback (cached value, default, degraded response) runs in microseconds.</li>
+      <li><strong>HALF-OPEN</strong> — after a cooldown, let a small number of trial requests through. If they succeed,
+        close the breaker and resume normal traffic. If they fail, go back to OPEN and wait again. This is what makes
+        recovery automatic and, crucially, <em>gentle</em>: without a half-open state you'd either stay open forever or
+        slam the recovering dependency with the full herd the instant the timer expired.</li>
+    </ul>
+
+    <div class="note">
+      You've likely met this already: <strong>Resilience4j</strong> in Spring Boot (which replaced Hystrix), where it's
+      literally <code>@CircuitBreaker(name = "inventory", fallbackMethod = "cachedInventory")</code>, and Istio/Envoy do it
+      at the service-mesh layer without any application code at all. Service meshes are worth one sentence of awareness:
+      <em>"timeouts, retries with jitter, and circuit breaking can be pushed into the sidecar so every service gets them
+      uniformly, rather than depending on each team's HTTP client config."</em> If you've configured Resilience4j at work,
+      <strong>say so</strong> — concrete experience with the state machine is worth more than reciting it.
+    </div>
+
+    <p>
+      Two tuning points that show you've actually used one. First, the threshold must be a <em>rate over a window with a
+      minimum call count</em> — "50% failures over the last 20 calls" — not an absolute count, or a single failure during
+      a quiet period trips your breaker. Second, a breaker <strong>needs a fallback to be worth anything</strong>. Opening
+      the circuit and then returning a 500 has protected your dependency but not your user. Which brings us to:
+    </p>
+
+    <h3>3.4 Bulkheads and graceful degradation</h3>
+
+    <h4>Bulkheads</h4>
+    <p>
+      Named after ship compartments: a hull breach floods one compartment, not the whole ship. In software, you
+      <strong>partition your resources so one dependency can't consume all of them</strong>. If service A calls the
+      recommendation service and the payment service from the same 200-thread pool, then a slow recommendation service
+      eats all 200 threads and payments go down too — even though payments is perfectly healthy. Give each dependency its
+      own bounded pool (20 threads for recommendations, 50 for payments) and the recommendation failure is
+      <em>contained</em>: it exhausts its 20 threads and stops, and payments never notices.
+    </p>
+    <p>
+      The same idea scales up. Separate connection pools per dependency. Separate thread pools. Separate service instances
+      per tenant class (a "cell" architecture — a bad actor in cell 3 can only ever take down cell 3). AWS calls this
+      cellular architecture; the shard-per-customer version is exactly the same instinct as tutorial 04's partitioning,
+      applied to blast radius instead of to data volume. <strong>Bulkheads are about limiting blast radius; circuit
+      breakers are about not making things worse.</strong> They compose.
+    </p>
+
+    <h4>Graceful degradation</h4>
+    <p>
+      When a dependency is gone, the choice is not <em>"correct response or 500."</em> It's <em>"what is the best response
+      I can still produce?"</em> Almost always, something useful is available:
+    </p>
+    <ul>
+      <li><strong>Serve stale.</strong> The cached value expired 10 minutes ago and the DB is unreachable — serve it
+        anyway, and label it if you can. Stale data beats no data for almost everything that isn't money. This is the
+        "stale-while-revalidate" / "stale-if-error" idea you already know from HTTP <code>Cache-Control</code>; it applies
+        just as well server-side, and it means <strong>you should not evict on expiry, you should mark
+        expired</strong> — keeping the stale value around gives you something to fall back to.</li>
+      <li><strong>Hide the non-critical widget.</strong> The recommendation service is down; render the product page
+        without the "you might also like" carousel. The user buys the thing. Nobody files a ticket. Compare that with the
+        alternative: the whole page 500s because a carousel failed. As a frontend engineer this should be visceral — it's
+        an error boundary around a component, and the same principle applies to whole services.</li>
+      <li><strong>Fall back to a default.</strong> Personalization down → serve the generic ranking. Pricing service down →
+        serve the last known price (and accept the risk, or block checkout specifically). Fraud scoring down → decide
+        deliberately whether you fail open (approve, take the risk) or fail closed (decline, lose the sale). That decision
+        is a <em>business</em> decision, and saying so is a senior move.</li>
+      <li><strong>Shed the expensive feature.</strong> Under load, turn off the recommendation ranking, the live-updating
+        counter, the animation. A feature flag that lets you drop functionality to preserve the core path is an
+        availability tool.</li>
+    </ul>
+
+    <div class="senior">
+      The sentence: <em>"A degraded response beats a 500. I'd rather serve a product page with a stale price and no
+      recommendations than fail the page, because the user's actual goal — buying the thing — still works. So for every
+      dependency in this design I'd name what happens when it's down: the recommendation service is <strong>optional</strong>
+      (hide the widget), the cache is <strong>optional</strong> (slower, still correct), the payment service is
+      <strong>required</strong> (there's no degraded checkout, so it needs redundancy instead of a fallback)."</em><br><br>
+      Doing that classification out loud — walking your own diagram and marking each dependency
+      <strong>required vs optional</strong> — is one of the highest-value 30 seconds you can spend in a system design
+      round. It proves you think in terms of user outcomes rather than uptime for its own sake, and it naturally produces
+      your fallback strategy for free.
+    </div>
+
+    <h3>3.5 Health checks: liveness vs readiness</h3>
+    <p>
+      Two different questions, and conflating them causes real outages. You've seen both in Kubernetes.
+    </p>
+    <table>
+      <thead><tr><th></th><th>Liveness</th><th>Readiness</th></tr></thead>
+      <tbody>
+        <tr><td>Asks</td><td>"Am I alive, or wedged?"</td><td>"Should I receive traffic right now?"</td></tr>
+        <tr><td>On failure</td><td>Kubernetes <strong>kills and restarts</strong> the container.</td><td>Kubernetes <strong>removes the pod from the load-balancer</strong>. It keeps running.</td></tr>
+        <tr><td>Should check</td><td>Only the process itself — can the event loop respond at all? Deliberately shallow.</td><td>Can I actually serve? Am I warmed up, are my caches primed, is my DB pool connected?</td></tr>
+        <tr><td>Used at</td><td>Startup and continuously; catches deadlocks and wedged processes.</td><td>Startup (don't send traffic until warm) and during a temporary local problem.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="pitfall">
+      <strong>Never check your dependencies in the liveness probe.</strong> The classic self-inflicted outage: your
+      liveness endpoint runs <code>SELECT 1</code> against Postgres. Postgres has a 30-second blip. Every liveness probe
+      in the fleet fails simultaneously, so Kubernetes kills <em>every pod at once</em>, and now you have a full-fleet
+      cold start, empty caches, and a thundering herd against a database that was just about to recover. You have
+      converted a 30-second database blip into a 10-minute total outage, using a health check.<br><br>
+      The rule: liveness = "is my process wedged?" (if the answer is no, restarting it cannot possibly help — so don't).
+      Readiness = "can I serve?" and <em>may</em> consider dependencies — but even then, be careful, because if every pod
+      goes un-ready at once, the load balancer has no pods left and you're down anyway. Many teams deliberately make
+      readiness dependency-free too, and handle dependency failure with circuit breakers and degradation instead of by
+      removing themselves from service. Being able to explain <em>why</em> a naive health check is dangerous is a strong
+      operational signal.
+    </div>
+
+    <h3>3.6 Availability math</h3>
+    <p>
+      When someone says "we need four nines," do they know what they just committed to? Know these cold — they're free
+      points, and they let you push back on a requirement instead of nodding at it.
+    </p>
+    <table>
+      <thead><tr><th>Availability</th><th>Downtime / year</th><th>Downtime / month</th><th>Downtime / week</th><th>Reality check</th></tr></thead>
+      <tbody>
+        <tr><td>99% ("two nines")</td><td>3.65 days</td><td>7.2 hours</td><td>1.7 hours</td><td>An internal tool.</td></tr>
+        <tr><td>99.9% ("three nines")</td><td><strong>8.77 hours</strong></td><td>43.8 minutes</td><td>10.1 minutes</td><td>A normal SaaS SLA. Achievable with one region, done well.</td></tr>
+        <tr><td>99.95%</td><td>4.38 hours</td><td>21.9 minutes</td><td>5 minutes</td><td>The common paid-tier SLA.</td></tr>
+        <tr><td>99.99% ("four nines")</td><td><strong>52.6 minutes</strong></td><td>4.4 minutes</td><td>1 minute</td><td>Serious money. Multi-AZ, automated failover, no manual steps — a human cannot even <em>wake up</em> in 4 minutes, so every recovery must be automatic.</td></tr>
+        <tr><td>99.999% ("five nines")</td><td><strong>5.26 minutes</strong></td><td>26 seconds</td><td>6 seconds</td><td>Telco / exchange territory. A single bad deploy blows your entire year's budget. Most claims of this are marketing.</td></tr>
+      </tbody>
+    </table>
+
+    <h4>Dependencies multiply — the honest argument against gratuitous microservices</h4>
+    <p>
+      If your request path traverses five services <em>in series</em>, and each is independently 99.9% available, your
+      availability is not 99.9%. It's the <strong>product</strong>:
+    </p>
+<pre><code>  0.999 ^ 5  =  0.995   →  99.5%   =  ~43.8 hours of downtime a year.
+
+  Five "three nines" services in series  ≈  one "two-and-a-half nines" system.
+  Every hop you add makes the whole thing LESS available, always.
+  Add the database, the cache, the gateway, the queue: it gets worse.
+</code></pre>
+    <p>
+      This is arithmetic, not opinion, and it is the strongest technical argument against splitting a system into services
+      for reasons of fashion. Each synchronous hop is a multiplication by a number less than one. It's also a precise
+      argument <em>for</em> async: a service you call over a <strong>queue</strong> is not in your availability product,
+      because if it's down, the message waits and your request still succeeds. <strong>Making a dependency asynchronous
+      removes it from your availability equation entirely.</strong> That is a genuinely excellent thing to say and very few
+      candidates say it.
+    </p>
+
+    <h4>Redundancy adds nines</h4>
+    <p>
+      Components in <em>series</em> multiply availability down; components in <em>parallel</em> multiply
+      <em>unavailability</em> down, which is what buys nines back. If one instance is 99% available (1% unavailable), then
+      two independent instances behind a load balancer are unavailable only when <em>both</em> are down:
+    </p>
+<pre><code>  1 instance:   99%     unavailable 1%     ( 0.01     )
+  2 instances:  99.99%  unavailable 0.01%  ( 0.01^2   )
+  3 instances:  99.9999% …               ( 0.01^3   )
+
+  Serial   → multiply availabilities   → you LOSE nines with every hop.
+  Parallel → multiply unavailabilities → you GAIN nines with every replica.
+</code></pre>
+    <p>
+      The catch, and you must name it: this assumes the failures are <strong>independent</strong>. They usually aren't.
+      Three replicas in the same rack share a switch; three AZs in one region share a control plane; every replica shares
+      your bad deploy, your expired TLS certificate, your bug, and your config push. <strong>Correlated failure is why the
+      math is always optimistic</strong>, and it's the entire reason people spread across AZs and regions in the first
+      place — you're not adding replicas, you're buying <em>independence</em>. Add that caveat unprompted and you've
+      demonstrated you understand what the formula is actually modelling.
+    </p>
+
+    <div class="senior">
+      Use the math to interrogate the requirement: <em>"Before I commit to four nines, that's 52 minutes a year — which
+      means no manual recovery step anywhere, because nobody can even get paged and log in inside a 4-minute monthly
+      budget. And with five services in the request path at three nines each, I'm mathematically capped at 99.5% no matter
+      how good each service is. So if we truly need four nines, the design conversation is about <strong>removing
+      synchronous hops</strong> — collapsing services, or moving them behind a queue — and about <strong>redundancy with
+      independent failure domains</strong>. Which is a much more expensive system. Is 99.9% enough?"</em> Interviewers love
+      this because it's a candidate using arithmetic to <em>challenge a requirement</em> rather than blindly implementing
+      it. That is what a staff engineer does.
+    </div>
+
+    <h3>3.7 Multi-region</h3>
+    <p>
+      One region is one failure domain. Regions do go down (and, more often, one region's <em>control plane</em> goes
+      down, which is worse because you can't even fail over). Multi-region is how you survive that — and it is where the
+      cost, in dollars and in consistency, gets real.
+    </p>
+    <table>
+      <thead><tr><th></th><th>Active–passive (warm standby)</th><th>Active–active</th></tr></thead>
+      <tbody>
+        <tr><td>How</td><td>All traffic to region A. Region B has a running replica of everything, receiving async replication, serving nothing.</td><td>Both regions serve traffic, routed by latency/geo DNS. Both accept writes.</td></tr>
+        <tr><td>Failover</td><td>Repoint DNS / global LB to B, promote B's database to primary. Minutes, and there is always a manual "are we sure?" step in practice.</td><td>Nothing to fail over — drain the dead region from the LB and B absorbs the load.</td></tr>
+        <tr><td>Cost</td><td>2× infrastructure, half of it idle (or serving read-only traffic).</td><td>2× infrastructure, all of it working. Better economics, far worse complexity.</td></tr>
+        <tr><td>Hard part</td><td>Failover is <em>rarely tested</em> and therefore rarely works. Replication lag = data loss on failover.</td><td><strong>Writes in two places.</strong> Cross-region write conflicts. This is the whole problem.</td></tr>
+        <tr><td>Use when</td><td>Most systems. It's the honest default and it gets you your DR story.</td><td>You need global low-latency writes, or you can't afford any failover window.</td></tr>
+      </tbody>
+    </table>
+
+    <p><strong>RTO and RPO</strong> — the two numbers a fintech or enterprise interviewer will absolutely ask for by name:</p>
+    <ul>
+      <li><strong>RTO — Recovery Time Objective.</strong> How long may we be down? "We must be back within 15 minutes."
+        This drives your failover automation.</li>
+      <li><strong>RPO — Recovery Point Objective.</strong> How much data may we lose? "At most 5 minutes of writes." This
+        drives your replication strategy. <strong>RPO = 0 requires synchronous replication</strong>, which means every
+        write pays a cross-region round trip (~70 ms US-East to US-West, ~150 ms transatlantic) and your write throughput
+        collapses. RPO = "a few seconds" allows async replication, which is fast — and means a hard failover loses whatever
+        was in flight.</li>
+    </ul>
+    <p>
+      <strong>The hard part is always the data.</strong> Stateless app servers in five regions is a Terraform exercise. The
+      database is where physics bills you. Options, and each has a real cost:
+    </p>
+    <ul>
+      <li><strong>Single-primary, async cross-region read replicas.</strong> Simple, common, correct. All writes cross the
+        ocean to the primary (slow writes for distant users); reads are local and stale by the replication lag. This is
+        the right answer for most systems and you should say it first.</li>
+      <li><strong>Partition by geography.</strong> EU users' data lives in the EU and is written there; US users' in the
+        US. Each region is the primary for <em>its own</em> users, so there are no write conflicts — you've turned a
+        distributed-consistency problem into a routing problem. It's also frequently mandatory anyway (GDPR, data
+        residency). Breaks down for genuinely global data (a shared product catalogue, a global leaderboard) which you
+        handle separately, usually as a replicated read-only dataset.</li>
+      <li><strong>Multi-primary with conflict resolution</strong> — both regions accept writes for the same data, and you
+        resolve conflicts with last-write-wins (lossy, and clock-dependent — see tutorial 05), vector clocks (Dynamo), or
+        CRDTs (conflict-free by construction, but they constrain what operations you can express). <strong>Only viable
+        where a lost or merged write is acceptable</strong> — shopping carts, presence, collaborative documents.
+        <em>Never</em> for a ledger.</li>
+      <li><strong>Spanner / CockroachDB / consensus-based</strong> — synchronous global consensus, strong consistency
+        across regions, at the cost of write latency bounded by the speed of light between your regions. Real, and worth
+        naming at awareness level.</li>
+    </ul>
+
+    <div class="senior">
+      The honest summary: <em>"Multi-region for the stateless tier is easy; multi-region for state is the whole problem.
+      Active–active means accepting writes in two places, and there is no free way to reconcile that — I either partition
+      the data by region so there are no conflicts, accept a conflict-resolution strategy that can lose writes, or pay
+      cross-region consensus latency on every write. For this system I'd start active–passive with async replication, an
+      RPO of a few seconds and an RTO of minutes, and I'd say plainly that the failover must be practised regularly,
+      because an untested failover is a failover that does not work."</em> That last clause is real-operations wisdom and it
+      is rare to hear it in an interview.
+    </div>
+
+    <h3>3.8 Find the single points of failure</h3>
+    <p>
+      A SPOF is any component whose death takes the system with it. The discipline is simple and mechanical, and you should
+      run it on your own diagram, out loud, near the end of any design round — before the interviewer does it for you.
+      <strong>Point at each box and ask: "if this dies right now, what happens?"</strong>
+    </p>
+    <p>The usual suspects, in the order they're usually missed:</p>
+    <ul>
+      <li>The load balancer itself (who load-balances the load balancer? → redundant LBs, DNS failover, anycast).</li>
+      <li>The <strong>single database primary</strong> — the most common real SPOF. Replicas help reads; you need a
+        promotion path for writes, and promotion is usually the least-tested code you own.</li>
+      <li>The cache, if a cold cache means the DB dies (1.5c). If "Redis goes down" ⇒ "we go down", Redis is a SPOF,
+        regardless of how you drew the arrow.</li>
+      <li>The message broker.</li>
+      <li>The auth / session service — everything depends on it, and it's usually drawn as one small box on the side.</li>
+      <li>Shared infrastructure that isn't on your diagram at all: DNS, the service registry, the config service, the
+        secrets manager, the certificate authority. <em>Every</em> expired-certificate outage was a SPOF nobody drew.</li>
+      <li><strong>The deploy pipeline and the humans.</strong> A bad config push hits all your beautifully independent
+        replicas at once, which is why staged/canary rollouts are an <em>availability</em> feature, not a process nicety.</li>
+    </ul>
+
+    <div class="exercise">
+      <h4>Exercise — hunt the SPOFs</h4>
+      <p>Take this perfectly ordinary architecture. Find every single point of failure, then say what you'd do about
+        each one. Do it before you open the answer — this is exactly the drill an interviewer runs on your diagram, and
+        five minutes here is worth an hour of reading.</p>
+<pre><code>  Users ──▶ DNS ──▶ [ Load Balancer ] ──▶ [ API pods ×6 ]
+                                              │  │  │
+                          ┌───────────────────┘  │  └────────────┐
+                          ▼                      ▼               ▼
+                  [ Redis (1 node) ]   [ Postgres primary ]  [ RabbitMQ ]
+                                              │                  │
+                                              ▼                  ▼
+                                       [ read replica ]    [ worker ×3 ]
+                                                                 │
+                                                                 ▼
+                                                       [ Stripe / 3rd party ]
+</code></pre>
+      <details>
+        <summary>Answer</summary>
+        <ul>
+          <li><strong>Redis (1 node)</strong> — a SPOF <em>if</em> the DB can't survive the resulting cold-cache traffic.
+            Fix: Redis with replicas + Sentinel/Cluster, <em>and</em> make the app degrade to direct DB reads with a
+            request-coalescing single-flight and a load shedder so a cache loss is slow rather than fatal. Test it by
+            actually killing Redis in staging.</li>
+          <li><strong>Postgres primary</strong> — the big one. Reads survive (replica), writes do not. Fix: automated
+            failover (Patroni, RDS Multi-AZ) with a promotion path, and know your RPO — async replication means the
+            promoted replica is missing the last few in-flight transactions. Say that out loud.</li>
+          <li><strong>The load balancer</strong> — redundant LB nodes; a managed LB (ALB/NLB) is already multi-AZ. Don't
+            just draw one box and move on.</li>
+          <li><strong>RabbitMQ</strong> — a single broker is a SPOF for all async work. Cluster it with mirrored/quorum
+            queues, or use a managed queue.</li>
+          <li><strong>Stripe / the third party</strong> — you don't control it, so you cannot make it redundant. This is
+            what queues, retries with backoff+jitter, a circuit breaker, and a DLQ are <em>for</em>: the payment isn't
+            lost, it's pending, and it completes when Stripe returns. Degradation, not failure.</li>
+          <li><strong>DNS</strong> — low TTLs, a second DNS provider if you're serious. The 2016 Dyn outage took down half
+            the internet's front door.</li>
+          <li><strong>Everything in one AZ</strong> — if all six pods, the DB and Redis are in a single availability zone,
+            you have <em>one</em> SPOF that dwarfs all the others, and no amount of ×6 fixes it. <strong>Redundancy without
+            independence is not redundancy.</strong> Spread across at least two AZs before you optimize anything else.</li>
+          <li><strong>Not on the diagram</strong> — the config service, secrets, the container registry (can you even
+            <em>start</em> a pod if it's down?), the certificate expiry, and the deploy pipeline that can push a bad
+            config to all six pods in ten seconds.</li>
+        </ul>
+      </details>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="observability">Part 4 — Observability</h2>
+
+    <p>
+      Every design you present will get the question <em>"how would you know if this was broken?"</em> — and at 7 YOE, a
+      shrug there undoes a good design. Observability is short in this tutorial because the depth expected is shallow, but
+      the P99 section below is a genuine senior probe and worth more than the rest of this part combined.
+    </p>
+
+    <h3>4.1 Metrics vs logs vs traces</h3>
+    <p>The three pillars answer three different questions. Knowing which tool answers which question is the whole point.</p>
+    <table>
+      <thead><tr><th></th><th>Metrics</th><th>Logs</th><th>Traces</th></tr></thead>
+      <tbody>
+        <tr><td>What it is</td><td>Numbers over time, aggregated. Counters, gauges, histograms.</td><td>Discrete, timestamped events with context. Ideally structured (JSON), not prose.</td><td>The path of <em>one request</em> across every service it touched, with timing per hop.</td></tr>
+        <tr><td>Answers</td><td><strong>"Is something wrong, and when did it start?"</strong> Error rate, P99 latency, queue depth, cache hit rate, CPU.</td><td><strong>"What exactly happened to this one request?"</strong> The stack trace, the parameters, the reason.</td><td><strong>"Where did the time go?"</strong> / "Which of my 12 services is the slow one?"</td></tr>
+        <tr><td>Cost / cardinality</td><td>Cheap, tiny, retained for a year. But <strong>high-cardinality labels kill you</strong> — never tag a metric with user ID; you'll create millions of time series and take down your metrics backend.</td><td>Expensive at volume. Sample aggressively; keep all errors, sample the successes.</td><td>Expensive. Sample (1%), but always keep traces of slow or failed requests (tail-based sampling).</td></tr>
+        <tr><td>You use it</td><td>To <em>detect</em> and to alert.</td><td>To <em>diagnose</em> the specific case.</td><td>To <em>localize</em> the problem to a service.</td></tr>
+      </tbody>
+    </table>
+    <p>
+      The workflow that ties them together, and the sentence to say: <em>"Metrics tell me something is wrong and page me.
+      Traces tell me which service is responsible. Logs tell me why."</em> Detect → localize → diagnose. If you can only
+      have one, take metrics — you can't fix what you don't know is broken.
+    </p>
+
+    <h3>4.2 Distributed tracing, and why it exists</h3>
+    <p>
+      In a monolith, a stack trace is your trace: one process, one thread, one exception, and you can see the whole
+      operation. The moment a single user action fans out across a gateway, an auth service, an orders service, an
+      inventory service and a queue, <strong>no single machine has seen the whole request</strong> — and "checkout is slow"
+      becomes unanswerable. You're left grepping five log files with no way to line up which lines belong to the same user
+      action.
+    </p>
+    <p>
+      Tracing fixes that with one idea: generate a <strong>trace ID</strong> at the edge, and propagate it through every
+      hop (an HTTP header — <code>traceparent</code>, per the W3C spec — and through your Kafka message headers, which
+      people forget, so traces mysteriously stop at the queue boundary). Each unit of work is a <strong>span</strong> with
+      a start, an end, and a parent span. Ship the spans to a collector (Jaeger, Zipkin, Honeycomb, Datadog), and it
+      reassembles the tree:
+    </p>
+<pre><code>  trace 7f3a…  POST /checkout                                    842 ms
+  ├─ gateway: auth                                                 12 ms
+  ├─ orders-svc: createOrder                                      810 ms   ◀── here
+  │   ├─ postgres: INSERT orders                                    8 ms
+  │   ├─ inventory-svc: reserve                                   640 ms   ◀── no, HERE
+  │   │   ├─ redis: GET stock:sku-99                                1 ms
+  │   │   └─ postgres: SELECT … FOR UPDATE                        635 ms   ◀── actually here.
+  │   │                                                                        lock contention.
+  │   └─ kafka: publish OrderCreated                               14 ms
+  └─ response serialization                                         6 ms
+</code></pre>
+    <p>
+      That waterfall answered in five seconds a question that would have taken a day with logs. It is also the answer to
+      "how would you debug this?" for literally any microservice design: <em>"I'd propagate a trace ID from the edge
+      through every service and every queue message, so I can see the full waterfall for one slow request and find which
+      hop owns the latency."</em> Rule of thumb worth stating: <strong>past three services, tracing stops being nice to
+      have.</strong>
+    </p>
+    <div class="note">
+      Put the trace ID in your error responses and your logs. When a user reports a problem and gives you the trace ID
+      from the error page, you go straight from the complaint to the exact waterfall. It's a two-line change and it makes
+      support a completely different job. <strong>OpenTelemetry</strong> is the vendor-neutral standard for all of this
+      (instrumentation + propagation + export) and is the right thing to name if asked what you'd use.
+    </div>
+
+    <h3>4.3 Why you quote P99, not the average</h3>
+    <p>
+      This is a favourite senior probe and it has a satisfyingly exact answer. <strong>Averages hide the users who are
+      suffering.</strong> Consider 100 requests: 99 take 10 ms, one takes 5,000 ms.
+    </p>
+<pre><code>  average  = (99 × 10ms + 1 × 5000ms) / 100  =  59.9 ms   "looks fine!"
+  P50      = 10 ms
+  P99      = 10 ms
+  P100/max = 5000 ms                                       ← the user who left
+
+  Now the version that actually happens: 5% of requests take 3 seconds.
+  average  = (0.95 × 10) + (0.05 × 3000)  =  159 ms        "hmm, a bit slow"
+  P95      = 3000 ms                                       ← 1 in 20 users is
+                                                              staring at a spinner
+</code></pre>
+    <p>
+      An average is a single number pretending to describe a distribution, and latency distributions are savagely
+      long-tailed — a few percent of requests are 100× the median because they hit a cold cache, a GC pause, a lock, a
+      replica that was rebuilding, a noisy neighbour. Those are <em>real users</em>, they are having a bad time, and the
+      average is designed to make them invisible. <strong>Percentiles are how you count people rather than requests:</strong>
+      "P99 = 800 ms" means one in a hundred requests is worse than 800 ms, and you can decide whether you're okay with
+      that. It's also why you should never <em>average</em> percentiles across hosts (the average of two P99s is not a
+      P99 — you need to merge the histograms).
+    </p>
+
+    <div class="senior">
+      Now the part that makes it a <em>system design</em> point rather than a statistics point, and the reason interviewers
+      keep asking it. <strong>At scale, tail latency becomes the common case.</strong> If rendering one page fans out to
+      100 backend calls, and each call independently has a 1% chance of being slower than its P99, then the probability
+      that <em>at least one</em> of them is slow is:
+      <br><br>
+      <code>1 − (0.99)^100 ≈ 63%</code>
+      <br><br>
+      <strong>Roughly two-thirds of your page loads will contain somebody's P99.</strong> The tail isn't a rare edge case
+      that affects 1% of users — with fan-out, it is what the <em>median</em> user experiences, because a request is only
+      as fast as its slowest dependency. That's why Google's "The Tail at Scale" paper exists, and why the mitigations are
+      architectural rather than statistical: <strong>hedged requests</strong> (send a duplicate to a second replica if the
+      first hasn't answered by its P95, take whichever returns first), reducing fan-out, prioritizing latency-critical
+      work, and setting timeouts that turn a slow response into a fast degraded one. Say: <em>"I'd track P99, not the
+      average, because the average hides the tail — and with this fan-out, the tail is what most users actually hit."</em>
+    </div>
+
+    <h3>4.4 SLI, SLO, SLA, and error budgets</h3>
+    <p>
+      Three words that get used interchangeably and aren't. An <strong>SLI</strong> (indicator) is the measurement:
+      "the proportion of requests served in under 300 ms" — 99.2% this week. An <strong>SLO</strong> (objective) is your
+      internal target for that SLI: "99% of requests under 300 ms, measured over a rolling 28 days." An <strong>SLA</strong>
+      (agreement) is the SLO written into a contract with money attached — you refund customers when you miss it — which
+      is why the SLA is always <em>looser</em> than the SLO: you want to be alerting and fixing well before you're paying.
+      SLI = what you measure, SLO = what you promise yourself, SLA = what you promise your customers (and pay for).
+    </p>
+    <p>
+      An <strong>error budget</strong> is the inverse of the SLO and is the most useful idea of the four. If your SLO is
+      99.9%, then 0.1% of requests are <em>allowed</em> to fail — over 28 days that's about 40 minutes of downtime, and
+      that budget is a <em>resource you are meant to spend</em>. Under budget? Ship faster, take risks, run a chaos
+      experiment; unused reliability is wasted engineering. Blown the budget? Feature work stops and reliability work
+      starts, automatically, without a political argument. It converts "should we ship or stabilize?" from an opinion into
+      arithmetic, and it's the reason 100% availability is an <em>anti-goal</em>: it costs infinitely more than 99.9% and
+      the difference is invisible to a user whose own wifi is less reliable than that.
+    </p>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="bloom">Part 5 — Bloom filters</h2>
+
+    <p>
+      One probabilistic data structure earns a section of its own, because it shows up in three separate places in this
+      course and candidates who can't explain it lose easy points.
+    </p>
+
+    <h3>5.1 What it is</h3>
+    <p>
+      A bloom filter answers exactly one question — <strong>"have I seen X before?"</strong> — using a tiny, fixed amount
+      of memory that <em>does not grow with the size of the elements</em>, at the price of being occasionally wrong in one
+      specific, controlled direction.
+    </p>
+    <p>
+      It's a bit array of m bits (all zero initially) and k independent hash functions. To <strong>add</strong> x: hash it
+      k ways, set those k bits to 1. To <strong>test</strong> x: hash it k ways and look at those k bits. If <em>any</em>
+      is 0, x was definitely never added. If <em>all</em> are 1 — well, either you added x, or you added other things that
+      happened to set all of x's bits between them.
+    </p>
+<pre><code>  m = 16 bits, k = 3 hashes
+
+  add("apple")   → h1=2, h2=7, h3=11   → set bits 2, 7, 11
+  add("banana")  → h1=4, h2=7, h3=14   → set bits 4, 7, 14   (bit 7 shared — fine)
+
+  index:  0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15
+  bits:  [0][0][1][0][1][0][0][1][0][0][0][1][0][0][1][0]
+
+  test("cherry") → h=3,9,15  → bit 3 is 0  ⇒ DEFINITELY NOT PRESENT ✓
+  test("apple")  → h=2,7,11  → all 1       ⇒ "probably present"
+  test("durian") → h=2,4,14  → all 1       ⇒ "probably present"  ← FALSE POSITIVE!
+                                              (never added; bits set by apple+banana)
+</code></pre>
+
+    <p><strong>The contract, and you must state it in exactly this shape:</strong></p>
+    <ul>
+      <li><strong>No false negatives.</strong> If it says "not present," it is <em>definitely</em> not present. This is a
+        hard guarantee, and it's the one you build on.</li>
+      <li><strong>Possible false positives.</strong> If it says "present," it is <em>probably</em> present — you must go
+        check the real store to be sure. The false-positive rate is tunable: more bits and more hashes = fewer false
+        positives. Roughly <strong>10 bits per element buys you ~1%</strong>; ~14 bits buys ~0.1%.</li>
+      <li><strong>You cannot delete</strong> (clearing a bit might unset a bit another element depends on, which would
+        create a false <em>negative</em> and destroy the one guarantee you have). The workaround is a <em>counting</em>
+        bloom filter — counters instead of bits — at ~4× the memory. Or you periodically rebuild.</li>
+      <li><strong>You cannot enumerate</strong> what's in it, and you can't get the value back out. It is membership only.</li>
+    </ul>
+    <p>
+      The reason to care is the memory. Tracking 1 billion URLs in a <code>HashSet&lt;String&gt;</code> costs you well over
+      100 GB. A bloom filter with a 1% false-positive rate costs about <strong>1.2 GB</strong> — it fits in RAM on one
+      machine, and the size depends only on the <em>count</em> of elements, not their length. That's a 100× reduction, and
+      it is the entire reason the structure exists.
+    </p>
+
+    <h3>5.2 The three places it actually shows up in your interviews</h3>
+    <ol>
+      <li><strong>Cache penetration</strong> (Part 1.5b). Keep a bloom filter of every ID that exists. Before you touch
+        the cache or the DB, ask the filter. "Definitely not present" → return 404 for free, and an attacker hammering
+        random non-existent IDs can never reach your database. A false positive just means you do the normal lookup and
+        find nothing — the cost of being wrong is one wasted query, which is exactly the situation you were in anyway.
+        <strong>Notice why the asymmetry works:</strong> the guarantee you need (never wrongly reject a real key) is
+        precisely the guarantee the filter gives you. That's not luck — it's why you must always check that the direction
+        of the error is the harmless one.</li>
+      <li><strong>Web crawler URL dedup</strong> (tutorial 17). "Have I already crawled this URL?" — across billions of
+        URLs, on every link you extract from every page. A false positive means you skip a page you've never crawled;
+        with a 1% rate you miss ~1% of the web, and for a crawler that is a completely acceptable trade for fitting the
+        seen-set in RAM instead of paying a database round trip per link.</li>
+      <li><strong>LSM-tree reads</strong> (tutorial 03). An LSM read has to check many immutable SSTables on disk for the
+        key, and most of them don't have it. Every SSTable carries a bloom filter of its keys, so the engine can skip —
+        with no disk I/O at all — every file that definitely doesn't contain the key. This is <em>the</em> reason
+        Cassandra/RocksDB/LevelDB point reads aren't catastrophically slow, and connecting that back to the storage-engine
+        tutorial is a lovely thing to do in an interview.</li>
+    </ol>
+    <p>
+      The unifying pattern across all three: <strong>a cheap, in-memory, always-right-when-it-says-no filter in front of an
+      expensive, definitely-right lookup.</strong> If you can articulate that shape, you can invent the application on the
+      spot for whatever system you're given.
+    </p>
+    <div class="note">
+      Cousins worth naming in one line each, purely at awareness level: <strong>Counting bloom filter</strong> (supports
+      deletes). <strong>Cuckoo filter</strong> (supports deletes, similar space, better lookup locality). <strong>HyperLogLog</strong>
+      (approximate <em>cardinality</em> — "how many unique visitors?" in ~12 KB, not membership). <strong>Count-min
+      sketch</strong> (approximate <em>frequency</em> — "how many times have I seen this?", used for heavy-hitter /
+      hot-key detection). Tutorial 18 puts the last two to work.
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="qa">Interview Q&amp;A</h2>
+    <p>Answer each out loud before you open it. The gap between what you said and what's written is your study list.</p>
+
+    <details class="qa">
+      <summary>1. Walk me through cache-aside. Why delete the key on write instead of updating it?</summary>
+      <div class="answer">
+        <p><strong>Read:</strong> check the cache; on a hit, return; on a miss, read the database, populate the cache with a
+        TTL, return. <strong>Write:</strong> write the database first (it's the source of truth — if the DB write fails, I
+        want the cache untouched rather than holding a value that doesn't exist), then <em>delete</em> the key.</p>
+        <p><strong>Delete, not update, for two reasons.</strong> First, delete is idempotent and self-healing: whatever
+        interleaving happens, the worst outcome is an extra DB read on the next request, and the value that lands in the
+        cache is by definition the current one. With an update, two concurrent writers can interleave — A writes DB, B
+        writes DB, B writes cache, A writes cache — and now the cache permanently holds A's older value with no path back
+        to correctness except the TTL. Second, updating caches data that may never be read, which wastes memory.</p>
+        <p>I'd also name the residual race honestly: a reader that missed the cache <em>before</em> the write can still
+        write its stale value <em>after</em> the delete. It's a narrow window, it's bounded by the TTL, and I'd only fix it
+        (delayed double-delete, or versioned keys) if the data justified it.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>2. A single hot key expires and 10,000 requests hit the database simultaneously. What is this called and how do you fix it?</summary>
+      <div class="answer">
+        <p>That's a <strong>cache stampede</strong> (thundering herd). Three fixes, and the first is the one I'd reach for:</p>
+        <ul>
+          <li><strong>Request coalescing / single-flight</strong> — the first miss takes a lock and rebuilds; every other
+          request for the same key waits on that one result instead of issuing its own query. One DB read serves all
+          10,000. Caffeine's <code>LoadingCache</code> does this per-process; across pods I'd use a Redis lock
+          (<code>SET lock:K token NX PX 5000</code>) so only one pod rebuilds and the rest briefly serve stale or wait.</li>
+          <li><strong>Probabilistic early expiry (XFetch)</strong> — each reader independently rolls the dice as expiry
+          approaches, so one lucky reader refreshes early while everyone else still hits. The herd never forms because
+          expiry stops being a synchronized instant.</li>
+          <li><strong>Never expire the hottest keys</strong> — refresh them out-of-band on a schedule (refresh-ahead), so
+          reads never miss.</li>
+        </ul>
+        <p>What I would <em>not</em> do is just raise the TTL. That postpones the stampede and makes it bigger. The bug is
+        the <em>simultaneity</em> of the misses, not their frequency.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>3. Distinguish cache stampede, penetration and avalanche.</summary>
+      <div class="answer">
+        <ul>
+          <li><strong>Stampede:</strong> many requests, <em>one</em> key. A hot key expires and everyone misses at once.
+          Fix: single-flight, probabilistic early expiry, don't expire hot keys.</li>
+          <li><strong>Penetration:</strong> requests for keys that <em>don't exist</em>, so the cache can never help and
+          every request reaches the DB. Weaponizable — an attacker requests random IDs. Fix: cache the negative result
+          with a short TTL, or a bloom filter of existing IDs, plus input validation.</li>
+          <li><strong>Avalanche:</strong> <em>many</em> keys expire at the same moment — classically because you warmed
+          them all in a loop with an identical TTL — and the DB gets a wall of misses. Fix: <strong>jitter the
+          TTLs</strong>. Also covers the "the cache died and 100% of traffic hit a DB sized for 5%" case, which is why the
+          DB must be able to survive a cold cache.</li>
+        </ul>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>4. Your cache hit rate is 90%. Is going to 99% worth engineering time?</summary>
+      <div class="answer">
+        <p>Yes, and the reason is that hit rate is <strong>non-linear in the thing you care about</strong>. What reaches
+        the database is the miss traffic. 90% → 99% takes the miss rate from 10% to 1%: that's a <strong>10× reduction in
+        database load</strong>, not a 9% improvement. At 10,000 QPS it's the difference between 1,000 DB QPS and 100.</p>
+        <p>It cuts average latency too, because misses dominate it: at a 1 ms hit and 50 ms miss, a 90% hit rate averages
+        5.9 ms and a 99% hit rate averages 1.5 ms — 85% of the average at 90% hit rate is spent in the 10% that miss.</p>
+        <p>And the inverse is the operational point: a hit rate quietly sliding from 99% to 90% is a <strong>10× traffic
+        spike aimed at my database</strong> that nobody provisioned for. So I alarm on hit rate as a leading indicator,
+        rather than waiting for DB CPU — by the time the DB is hot, I'm already in an incident.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>5. Kafka or SQS/RabbitMQ? Justify it.</summary>
+      <div class="answer">
+        <p>The question is what happens to a message after it's consumed. <strong>A queue deletes on ack</strong> — it's a
+        to-do list, a work-distribution device, competing consumers, each message handled once. <strong>A log keeps the
+        message</strong> — consumers just move an offset, so multiple independent consumer groups each read everything,
+        and you can <strong>replay</strong> by resetting offsets.</p>
+        <p>So: <strong>SQS/RabbitMQ</strong> for task distribution — send this email, resize this image, charge this card.
+        One job, one worker, delete when done, and I get retries and a DLQ with essentially zero operational cost.
+        <strong>Kafka</strong> when the event has more than one interested consumer (order events feeding billing, search
+        indexing and analytics independently), when I need replay (backfilling a new service, rebuilding an index after a
+        consumer bug), or at very high volume. Kafka is real operational weight — brokers, partitions, rebalancing, lag
+        monitoring — so I want a reason for it, not a reflex.</p>
+        <p>Also worth saying: RabbitMQ gives me things Kafka deliberately doesn't — per-message priority, per-message
+        delay, rich routing. If I need those, Kafka is the wrong tool no matter how fashionable it is.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>6. Does Kafka guarantee message ordering?</summary>
+      <div class="answer">
+        <p><strong>Only within a partition.</strong> There is no global ordering across a topic and there cannot be —
+        that would require one serialized log, which is exactly the bottleneck partitions exist to remove.</p>
+        <p>In practice that's fine, because I almost never need global ordering; I need ordering <em>per entity</em>. I
+        can't process <code>order:123 shipped</code> before <code>order:123 created</code>, but I don't care how order 123
+        interleaves with order 456. So I <strong>key the message by the entity</strong> — <code>send(topic, orderId,
+        event)</code> — which hashes the order ID to a partition, so all events for that order land in one partition and are
+        consumed in order by one consumer, while different orders parallelize freely.</p>
+        <p>The cost of that decision, which I'd name: the partition key can create <strong>hot partitions</strong>. Key by
+        country and one country melts one broker. And ordering-per-partition means a poison message can block everything
+        behind it in that partition — which is what the DLQ is for.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>7. Can you guarantee exactly-once processing?</summary>
+      <div class="answer">
+        <p>No — not across a network boundary, and I'd say so plainly. You cannot atomically perform a side effect
+        (charge a card, send an email) and record that you performed it; there is always a window where one has happened
+        and the other hasn't. Kafka's "exactly-once semantics" is real but only <em>within Kafka</em> (read-process-write
+        transactions); the guarantee evaporates the moment the effect leaves Kafka.</p>
+        <p>What exists — and what everybody actually builds — is <strong>at-least-once delivery plus an idempotent
+        consumer</strong>, which is observationally equivalent to exactly-once. Concretely: every message carries an
+        idempotency key (its message ID, or a natural key like the order ID); the consumer inserts that key into a
+        <code>processed_messages</code> table <em>in the same local transaction as the side effect</em>. A duplicate
+        delivery hits the unique constraint, the consumer acks it and moves on. I've replaced an impossible distributed
+        guarantee with a possible local one. Where the side effect is genuinely external, I push the idempotency key to the
+        third party — which is exactly why Stripe has an <code>Idempotency-Key</code> header.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>8. Why do retries make outages worse, and what does jitter fix that backoff doesn't?</summary>
+      <div class="answer">
+        <p><strong>Retries are load multiplication applied to a system that is already failing.</strong> A dependency starts
+        failing 20% of requests under load; every client retries 3×; the dependency's load triples at exactly the moment it
+        was struggling; now it fails 60%; more retries; total outage. The retries, not the original fault, cause the
+        outage. That's a retry storm.</p>
+        <p>So: only retry retryable errors (5xx, timeouts — never a 400 or 404, which will just fail again), only retry
+        idempotent operations, cap attempts at 2–3, and ideally enforce a <em>retry budget</em> (retries may not exceed
+        ~10% of my request volume — if more than that is failing, the dependency is down and retrying won't help).</p>
+        <p><strong>Backoff spreads retries out in time; jitter breaks their synchronization.</strong> If 10,000 clients all
+        fail at t=0, they all start their backoff clocks at t=0, so with a deterministic 100/200/400 ms backoff they all
+        retry at t=100, t=300, t=700 — <em>simultaneously, forever</em>. Backoff without jitter is a synchronized DDoS with
+        a metronome. Full jitter — <code>sleep = random(0, min(cap, base·2^attempt))</code> — smears the retries across the
+        window so the dependency sees a trickle and recovers. It's exactly the same insight as jittering cache TTLs:
+        randomness is the only thing that breaks a synchronized herd.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>9. Explain the circuit breaker state machine and why half-open exists.</summary>
+      <div class="answer">
+        <p><strong>Closed</strong> — normal; calls pass through and the breaker tracks the failure rate over a rolling
+        window (e.g. &gt;50% of the last 20 calls, with a minimum call count so a single failure in a quiet period doesn't
+        trip it). <strong>Open</strong> — every call fails immediately, locally, without touching the network. That's the
+        point: I stop consuming my own threads and connections on calls that won't succeed, I <em>fail fast</em> so my
+        fallback runs in microseconds instead of after a 30-second timeout, and I stop hammering a dependency that needs
+        breathing room. <strong>Half-open</strong> — after a cooldown, let a few probe requests through: if they succeed,
+        close; if they fail, re-open and wait longer.</p>
+        <p><strong>Half-open exists because recovery must be gentle.</strong> Without it I'd either stay open forever (no
+        automatic recovery) or slam the recovering dependency with the entire held-back herd the instant the timer expired
+        — which would immediately knock it over again. Half-open is a controlled probe.</p>
+        <p>I've used Resilience4j in Spring Boot for this (<code>@CircuitBreaker</code> with a fallback method); it can also
+        live in the service mesh sidecar (Envoy/Istio) so every service gets it uniformly. And the breaker is only worth
+        anything <strong>if the fallback is</strong> — opening the circuit and returning a 500 protects the dependency but
+        not the user.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>10. What does 99.99% availability actually cost, and what happens to it when I have five services?</summary>
+      <div class="answer">
+        <p>99.99% is <strong>52 minutes of downtime per year — about 4 minutes a month.</strong> Nobody can get paged, wake
+        up, log in and diagnose in 4 minutes, so every recovery path must be fully automated: multi-AZ, automatic failover,
+        no manual step anywhere. (99.9% is 8.8 hours a year, which one well-run region can do.)</p>
+        <p>And <strong>dependencies multiply.</strong> Five services in series at 99.9% each gives 0.999⁵ ≈ <strong>99.5%
+        — about 44 hours a year</strong>, before I've even counted the database, cache and gateway. Every synchronous hop
+        multiplies my availability by a number less than one. That is the honest technical argument against splitting a
+        system into services for fashion, and it's also a strong argument for <em>async</em>: a dependency I call over a
+        queue is <strong>not in my availability product at all</strong>, because if it's down the message just waits and my
+        request still succeeds.</p>
+        <p>Redundancy buys nines back — parallel components multiply <em>un</em>availability, so two 99% instances give
+        99.99% — but only if the failures are <strong>independent</strong>, which they usually aren't: same rack, same AZ,
+        same bad deploy, same expired certificate. Correlated failure is why the formula always flatters you, and why you
+        pay for independent failure domains rather than just more replicas.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>11. Why quote P99 rather than the average latency?</summary>
+      <div class="answer">
+        <p><strong>Averages hide the users who are suffering.</strong> If 95% of requests take 10 ms and 5% take 3 seconds,
+        the average is 159 ms — which sounds fine — while one in twenty users is staring at a spinner. Latency
+        distributions are long-tailed (cold caches, GC pauses, lock contention, noisy neighbours), and an average is a
+        single number pretending to describe a distribution designed to hide exactly those users. Percentiles count
+        <em>people</em>, not requests.</p>
+        <p>The system-design half of the answer: <strong>at scale, the tail becomes the common case.</strong> If one page
+        load fans out to 100 backend calls, the chance that at least one is slower than its P99 is 1 − 0.99¹⁰⁰ ≈
+        <strong>63%</strong>. Roughly two in three page loads contain <em>somebody's</em> P99, because a request is only as
+        fast as its slowest dependency. That's Google's "Tail at Scale". The mitigations are architectural: reduce fan-out,
+        hedged requests (fire a duplicate at a second replica if the first hasn't answered by P95 and take the first
+        response), and timeouts that convert a slow response into a fast degraded one.</p>
+        <p>Also: never average percentiles across hosts — the mean of two P99s isn't a P99. Merge the histograms.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>12. What's a bloom filter, and where would you actually use one?</summary>
+      <div class="answer">
+        <p>A bit array plus k hash functions that answers "have I seen X?" in tiny, fixed memory. Adding sets k bits;
+        testing checks those k bits. The contract is asymmetric: <strong>no false negatives — if it says "no", it's
+        definitely absent — but possible false positives</strong>, so a "yes" means "probably; go check the real store."
+        You can't delete from a plain one (that would create a false negative) and you can't enumerate it. Cost is roughly
+        10 bits per element for a ~1% false-positive rate — a billion URLs fit in ~1.2 GB instead of 100+ GB for a hash
+        set.</p>
+        <p>Three uses that come up in these interviews: <strong>cache penetration</strong> (a filter of all IDs that exist,
+        so requests for garbage IDs get a free 404 and never reach the DB — and note the error direction is harmless: a
+        false positive just costs one normal lookup, while a false negative would be fatal, and the filter guarantees those
+        can't happen); <strong>web-crawler URL dedup</strong> ("have I crawled this?" across billions of URLs, where a 1%
+        false-positive rate means skipping ~1% of pages, which is a fine trade for keeping the seen-set in RAM); and
+        <strong>LSM-tree reads</strong> (each SSTable carries a filter of its keys, so a read skips files that definitely
+        don't contain the key without any disk I/O — it's why Cassandra/RocksDB point reads are fast).</p>
+        <p>The general shape: a cheap in-memory filter that is always right when it says "no", sitting in front of an
+        expensive lookup that is always right.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>13. Producers are outpacing consumers and the queue is growing. What do you do?</summary>
+      <div class="answer">
+        <p>First, name the metric: <strong>consumer lag, and its derivative.</strong> Flat lag is healthy; <em>growing</em>
+        lag is not self-correcting — I will fall further behind forever until retention drops messages I never read.</p>
+        <p>Then the four levers, in order: <strong>buffer</strong> (the queue absorbs a spike, but it does <em>not</em>
+        absorb a sustained overload — it just converts it into growing latency and eventual collapse; a queue is a shock
+        absorber, not extra capacity); <strong>scale consumers</strong> (autoscale on lag, which is a far better signal
+        than CPU — but I'm capped by the partition count in Kafka, and ultimately by whatever the consumers write to);
+        <strong>throttle the producer</strong> (bounded queues, HTTP 429 with <code>Retry-After</code> — push the problem
+        to the party who can reduce load); and <strong>shed load</strong>.</p>
+        <p>I'd say load shedding is a legitimate design choice, not an admission of defeat: <em>I'd rather serve 80% of
+        users correctly and reject 20% fast than serve 100% a 30-second timeout and then fall over.</em> Shed by priority —
+        drop analytics before checkouts — and discard any message whose deadline has already passed, since the client that
+        was waiting for it is already gone and processing it is pure waste.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>14. What's the difference between a liveness and a readiness probe, and what's the classic mistake?</summary>
+      <div class="answer">
+        <p><strong>Liveness</strong> asks "is my process wedged?" — failing it means Kubernetes <em>kills and restarts</em>
+        the container. <strong>Readiness</strong> asks "should I get traffic right now?" — failing it means the pod is
+        pulled out of the load balancer but keeps running (used for warm-up, or a temporary local problem).</p>
+        <p><strong>The classic mistake is checking dependencies in the liveness probe.</strong> Your liveness endpoint runs
+        <code>SELECT 1</code>; Postgres has a 30-second blip; every liveness probe in the fleet fails at the same moment;
+        Kubernetes kills <em>every pod simultaneously</em>; you get a full-fleet cold start with empty caches thundering at
+        a database that was just about to recover. You've turned a 30-second blip into a 10-minute outage using a health
+        check.</p>
+        <p>The rule: if restarting the process cannot fix the problem, don't fail liveness on it. Keep liveness shallow.
+        Handle dependency failure with circuit breakers and graceful degradation instead of by removing yourself from
+        service — because if every pod goes un-ready at once, the load balancer has no pods left and you're down anyway.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>15. Your recommendation service is down. What does the product page do?</summary>
+      <div class="answer">
+        <p>It renders — without the "you might also like" carousel. <strong>A degraded response beats a 500.</strong> The
+        user's actual goal is buying the thing, and that still works.</p>
+        <p>Mechanically: the call to the recommendation service has a tight timeout (from its P99), sits behind a circuit
+        breaker so I'm not paying that timeout on every request once it's clearly down, and has its own bounded thread pool
+        (a <strong>bulkhead</strong>) so it cannot exhaust the threads that checkout needs. Its fallback is "return an empty
+        list", and the UI hides the section — which as a frontend engineer is just an error boundary around a component,
+        one level up.</p>
+        <p>The generalizable move, and the one I'd do out loud on my own diagram: <strong>walk every dependency and mark it
+        required or optional.</strong> Recommendations: optional (hide it). Cache: optional (slower, still correct). Search:
+        optional (fall back to a category browse). Payments: <em>required</em> — there is no degraded checkout, so it gets
+        redundancy rather than a fallback. That classification produces the fallback strategy for free and shows I'm
+        thinking about user outcomes rather than uptime for its own sake.</p>
+      </div>
+    </details>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="takeaways">What to remember</h2>
+
+    <h3>Caching</h3>
+    <ul>
+      <li>The layers: browser → CDN → gateway → local (in-process) → distributed (Redis) → DB buffer pool. <strong>The
+        cheapest cache is the one closest to the user.</strong> Local caches are the fastest and the most dangerous —
+        every instance has its own copy, so they disagree.</li>
+      <li><strong>Cache-aside is the default.</strong> DB first, then <em>delete</em> the key (delete is idempotent;
+        update can pin a stale value forever). Write-through = never stale, slower writes. Write-behind = fastest writes,
+        <strong>can lose data — never for money</strong>. Refresh-ahead = no miss latency on hot keys.</li>
+      <li><strong>TTL is a correctness budget, not a performance knob.</strong> A 60-second TTL is you saying 60 seconds
+        of staleness is acceptable. Add explicit invalidation only where it isn't — usually read-your-writes.</li>
+      <li>The three failure modes: <strong>stampede</strong> (many requests, one hot key → single-flight, probabilistic
+        early expiry); <strong>penetration</strong> (keys that don't exist → cache the negative, or a bloom filter);
+        <strong>avalanche</strong> (many keys expire together → <strong>jitter the TTLs</strong>).</li>
+      <li>Redis is <strong>single-threaded</strong> — never <code>KEYS *</code>, use <code>SCAN</code>. The
+        <strong>sorted set</strong> is the MVP: leaderboards, sliding-window rate limiting, delayed jobs. RDB vs AOF; and
+        a cache may not need persistence at all.</li>
+      <li><strong>90% → 99% hit rate = 10× less DB load</strong>, not 9%. And a hit rate falling from 99% to 90% is a 10×
+        spike aimed at your database. Alarm on it.</li>
+    </ul>
+
+    <h3>Queues</h3>
+    <ul>
+      <li>The question that generates the architecture: <strong>"does this need to happen before I respond to the
+        user?"</strong> If no, queue it. Async buys decoupling, load-leveling, retries, and immunity to slow third
+        parties; it costs eventual consistency, idempotency work, and harder debugging.</li>
+      <li><strong>Queue = to-do list</strong> (delete on ack, competing consumers, one job one worker).
+        <strong>Log = tape</strong> (offsets, retention, <strong>replay</strong>, N independent consumer groups). Choose
+        Kafka for multiple consumers or replay; SQS/RabbitMQ for task distribution — and don't say "Kafka" reflexively.</li>
+      <li><strong>Kafka ordering is per-partition only.</strong> Key by entity (order ID) to get the only ordering you
+        actually need, and know it exposes you to hot partitions.</li>
+      <li><strong>Exactly-once doesn't exist across a boundary. At-least-once + an idempotent consumer does</strong> —
+        dedup key written in the same local transaction as the side effect.</li>
+      <li>Poison messages block partitions → <strong>DLQ after N attempts, and alarm on DLQ depth</strong>. Consumer
+        <strong>lag</strong> (and whether it's growing) is the health metric for any async system.</li>
+      <li>Backpressure: buffer → scale consumers → throttle the producer → <strong>shed load</strong>. Fail fast beats
+        fail slow; shed by priority; drop work whose deadline has passed.</li>
+    </ul>
+
+    <h3>Resilience</h3>
+    <ul>
+      <li><strong>Timeout everything.</strong> The killer isn't a dependency that's down — it's one that's <em>slow</em>,
+        silently eating your thread pool and taking down endpoints that never called it. Derive timeouts from the
+        dependency's P99; propagate a deadline from the edge.</li>
+      <li><strong>Naive retries turn a degradation into an outage.</strong> Only retryable errors, only idempotent
+        operations, cap attempts, keep a retry budget. <strong>Exponential backoff + full jitter</strong> — backoff
+        spreads retries in time, <em>jitter breaks the synchronization</em>, and without it the herd just re-collides.</li>
+      <li><strong>Circuit breaker</strong>: closed → open (fail fast, protect yourself and the dependency) → half-open
+        (gentle probe) → closed. Resilience4j / Envoy. A breaker without a fallback protects the dependency, not the user.</li>
+      <li><strong>Bulkheads</strong> limit blast radius (separate pools per dependency). <strong>Graceful degradation</strong>
+        beats failure: serve stale, hide the optional widget, fall back to a default. Walk your diagram and mark every
+        dependency <strong>required or optional</strong>.</li>
+      <li><strong>Liveness ≠ readiness.</strong> Never check dependencies in a liveness probe or you'll restart your
+        entire fleet during a database blip.</li>
+      <li><strong>Availability math:</strong> 99.9% = 8.8 h/yr; 99.99% = <strong>52 min/yr</strong> (so recovery must be
+        automated — no human is that fast). <strong>Serial dependencies multiply</strong>: five 99.9% services ≈ 99.5%.
+        Parallel redundancy adds nines, <em>but only if failures are independent</em> — and they usually aren't. A
+        dependency behind a queue leaves your availability equation entirely.</li>
+      <li><strong>Multi-region:</strong> active-passive (simple, untested failover, RPO &gt; 0) vs active-active (writes in
+        two places — the whole problem). Know <strong>RTO</strong> (how long down) and <strong>RPO</strong> (how much data
+        lost); RPO = 0 means synchronous cross-region replication and slow writes. Partition data by geography to dodge
+        write conflicts entirely.</li>
+    </ul>
+
+    <h3>Observability &amp; bloom filters</h3>
+    <ul>
+      <li><strong>Metrics detect. Traces localize. Logs diagnose.</strong> Propagate a trace ID from the edge through every
+        service <em>and every queue message</em>; past three services, tracing is mandatory.</li>
+      <li><strong>P99, not the average</strong> — averages hide the suffering users. And with a fan-out of 100, ~63% of
+        page loads contain somebody's P99, so the tail <em>is</em> the median experience. Mitigate architecturally: less
+        fan-out, hedged requests, tight timeouts.</li>
+      <li>SLI = measured, SLO = your target, SLA = the contract with money attached. The <strong>error budget</strong> is
+        the inverse of the SLO and is a resource to <em>spend</em>: under budget, ship; over budget, stop and fix.</li>
+      <li><strong>Bloom filter: no false negatives, possible false positives.</strong> ~10 bits/element for ~1% error.
+        Cache penetration, crawler URL dedup, LSM-tree SSTable skipping. Always check that the error direction is the
+        harmless one.</li>
+    </ul>
+
+    <div class="senior">
+      The through-line of this whole page, and the sentence that ties it together in an interview: <strong>every tool here
+      is a way of converting an unbounded failure into a bounded one.</strong> A cache bounds database load. A queue bounds
+      the spike your workers see. A timeout bounds how long a slow dependency can hold your resources. A circuit breaker
+      bounds how long you'll keep making a mistake. A bulkhead bounds the blast radius. Load shedding bounds the damage
+      when you're past capacity. If you can't say what a component <em>bounds</em>, you haven't finished designing it —
+      and saying that out loud, once, near the end of a design round, is worth more than another box on the whiteboard.
+    </div>
+  </section>
+
+  <nav class="page-nav">
+    <a href="05-coordination-consensus.html">← 05 — Coordination, Consensus &amp; Distributed Transactions</a>
+    <a href="07-url-shortener.html">07 — Design a URL Shortener →</a>
+  </nav>
+
+</main>
+</body>
+</html>

@@ -1,0 +1,1214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 — Data &amp; Storage Engines | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <div class="breadcrumb"><a href="index.html">← Course Home</a></div>
+    <h1>03 — Data &amp; Storage Engines</h1>
+    <p>The database choice is the decision every system design interview turns on. Learn to derive it, not guess it.</p>
+  </div>
+</header>
+
+<main class="container">
+
+  <section>
+    <h2>Why this matters in the interview</h2>
+    <p>
+      Every distributed design round funnels into one moment: <em>"what database would you use?"</em> It is the highest-signal
+      question in the loop because your answer reveals, in about ninety seconds, whether you understand storage or whether you
+      have memorized a list of product names. The failure mode is famous and fatal: <strong>"I'd use NoSQL because it scales."</strong>
+      That sentence tells the interviewer you don't know what NoSQL is, don't know that Postgres runs some of the largest OLTP
+      workloads on earth, and — worst — that you pick technology by reputation rather than by requirement. At 3 YOE that's a
+      shrug. At 7 YOE it's a downlevel or a no-hire, because the entire grading rubric at your level is <em>judgment under
+      trade-offs</em>, and the data store is where the biggest trade-offs live.
+    </p>
+    <p>
+      The good news is you're not starting cold. You just spent a phase inside Postgres — B-tree indexes, <code>EXPLAIN</code>
+      plans, transactions, MVCC, JSONB. That's the deepest storage knowledge most candidates in a system design round have, and
+      most of them can't articulate it. This page extends it outward: what a <em>different</em> storage engine (LSM-tree) does
+      differently and why that makes Cassandra fast at writes; what happens to all that ACID machinery when the data no longer
+      fits on one box; what replication actually costs you; and the precise vocabulary — read-your-writes, monotonic reads,
+      PACELC — that interviewers listen for. When you're done, "what database?" stops being a guessing game and becomes a
+      derivation: <strong>state the access patterns, then name the store that serves them.</strong> That is the whole move,
+      and this page is where you learn to make it.
+    </p>
+  </section>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ul>
+      <li><a href="#justify">1. How to actually justify a database choice</a> — the script</li>
+      <li><a href="#taxonomy">2. The store taxonomy</a> — workload → store, with real examples</li>
+      <li><a href="#sqlnosql">3. SQL vs NoSQL, done properly</a> ★</li>
+      <li><a href="#engines">4. Storage engines: B-tree vs LSM-tree</a> ★ — <em>why</em> Cassandra beats Postgres at writes</li>
+      <li><a href="#indexing">5. Indexing, in the system-design frame</a></li>
+      <li><a href="#acid">6. ACID &amp; isolation levels</a></li>
+      <li><a href="#replication">7. Replication &amp; read replicas</a></li>
+      <li><a href="#cap">8. CAP and PACELC</a> — and why CAP is over-invoked</li>
+      <li><a href="#consistency">9. Consistency models</a> ★</li>
+      <li><a href="#blob">10. Blob / object storage</a></li>
+      <li><a href="#qa">Interview Q&amp;A</a></li>
+      <li><a href="#takeaways">What to remember</a></li>
+    </ul>
+  </div>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="justify">1. How to actually justify a database choice</h2>
+
+    <p>
+      A database is not a general-purpose thing you "have." It is a machine that makes a specific set of queries cheap by making
+      other queries expensive. Postgres makes arbitrary joins and multi-row transactions cheap by keeping everything on one
+      machine's authoritative copy. DynamoDB makes "fetch the item with this key, at any scale, in single-digit milliseconds"
+      cheap by refusing to join and by forcing you to declare your access pattern up front. Neither is better. They are
+      <em>different bets about what you'll ask for.</em>
+    </p>
+
+    <p>
+      So the choice can't be made from the product name inwards. It has to be made from the queries outwards. The order is fixed:
+    </p>
+
+<pre><code>  1. What are the ENTITIES?          users, videos, comments, seats, payments
+  2. What are the ACCESS PATTERNS?   "get video by id"        — 500k/s
+                                     "list a user's uploads"  — 200/s
+                                     "search video titles"    — 5k/s
+  3. What's the READ:WRITE ratio?    100:1 read-heavy → cache + replicas matter
+  4. What's the SHAPE of the data?   fixed cols? nested docs? time series? blobs?
+  5. What CONSISTENCY does each
+     pattern actually need?          seat booking: strong. like count: eventual.
+  6. THEN name the store — and say
+     which access pattern forced it.
+</code></pre>
+
+    <p>
+      Notice step 6 is the last step, and notice it comes with a justification attached. The sentence you say out loud has a fixed
+      grammar: <strong>"Because the dominant access pattern is X, and it needs Y, I'll use Z — and I'm accepting that this makes
+      W harder."</strong> The clause at the end is the senior clause. Candidates who name a database and stop get a follow-up.
+      Candidates who name the database <em>and its cost</em> get a nod and move on.
+    </p>
+
+    <div class="senior">The script, verbatim, for the moment the interviewer asks "what database?":
+      <em>"Let me look at the access patterns first. 95% of my traffic is 'read one item by primary key' at very high volume, and
+      the writes are append-only with no cross-entity invariants. That's a key-value workload, not a relational one — so I'd put
+      the hot path in DynamoDB or Cassandra. I'm giving up ad-hoc queries and joins, which means any new access pattern needs a
+      new index or a new table, and I'd have to backfill. If the product needed flexible reporting on this data I'd flip to
+      Postgres and shard later."</em> That's fifteen seconds and it contains a requirement, a decision, a cost, and a
+      falsification condition. That is what "senior" sounds like.</div>
+
+    <div class="pitfall">The two rejected answers, in order of frequency.
+      <strong>(1) "NoSQL, because it scales."</strong> Scales <em>what</em>? Postgres on one large instance handles tens of
+      thousands of writes per second and terabytes of data. If your estimate is 500 writes/s, you have no scaling problem and
+      inventing one is a red flag. <strong>(2) Naming a product with no requirement attached</strong> — "I'll use Cassandra" as
+      the opening move, before any numbers exist. Always earn the store from a number you computed.</div>
+
+    <div class="note">The honest default, and it's a strong one: <strong>start with Postgres.</strong> It does relational, it does
+      JSONB documents, it does full-text search, it does time-series adequately, it does geospatial via PostGIS. It is one system
+      you can operate and reason about. The interviewer will not punish "Postgres, and here's the number at which I'd have to
+      move off it" — they punish "MongoDB" with no reason. Introducing a second data store is a real operational cost (backups,
+      monitoring, on-call, another consistency model in your head); make the design pay for it.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="taxonomy">2. The store taxonomy — workload → store</h2>
+
+    <p>
+      There are only about eight shapes of storage. Learn the shape, not the vendor. Vendors change; the shape a workload wants
+      does not.
+    </p>
+
+    <table>
+      <thead><tr><th>Store type</th><th>The access pattern it makes cheap</th><th>What it can't do</th><th>Real example</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Key-value</strong><br><span class="tier tier-1">CORE</span></td>
+          <td><code>GET(key)</code> / <code>PUT(key, blob)</code> at enormous scale, predictable single-digit-ms latency. Partitions trivially — the key <em>is</em> the shard key.</td>
+          <td>Any query that isn't "by key." No joins, no scans, no ad-hoc filtering.</td>
+          <td>Redis (cache, sessions, rate-limit counters) · DynamoDB (URL shortener: <code>shortcode → longUrl</code>)</td>
+        </tr>
+        <tr>
+          <td><strong>Wide-column</strong><br><span class="tier tier-1">CORE</span></td>
+          <td>Huge write volume; queries of the form "give me a <em>range</em> of rows within one partition key," e.g. "the last 50 messages in chat 42." Rows are stored sorted by clustering key inside a partition.</td>
+          <td>Joins, ad-hoc queries, strong multi-row transactions. Query patterns must be known before you design the table.</td>
+          <td>Cassandra / ScyllaDB / HBase — chat message history, time-ordered event logs, IoT telemetry</td>
+        </tr>
+        <tr>
+          <td><strong>Document</strong><br><span class="tier tier-2">COMMON</span></td>
+          <td>Fetch/store a whole nested object by id, where the object is the natural unit of read and write. Flexible per-document fields.</td>
+          <td>Cross-document joins and transactions are weak or awkward. Denormalized data drifts out of sync.</td>
+          <td>MongoDB · a product catalog where every category has different attributes. Also: <strong>Postgres JSONB</strong>, which gives you most of this <em>inside</em> a relational DB.</td>
+        </tr>
+        <tr>
+          <td><strong>Relational</strong><br><span class="tier tier-1">CORE</span></td>
+          <td>Arbitrary queries you didn't anticipate; joins across entities; multi-row ACID transactions; constraints that make invalid states unrepresentable (<code>UNIQUE</code>, <code>FOREIGN KEY</code>, <code>CHECK</code>).</td>
+          <td>Horizontal scaling of <em>writes</em> takes real work (sharding, and then you lose cross-shard joins and transactions anyway).</td>
+          <td>Postgres / MySQL — payments, orders, ledgers, inventory, anything where correctness beats throughput</td>
+        </tr>
+        <tr>
+          <td><strong>Graph</strong><br><span class="tier tier-3">AWARENESS</span></td>
+          <td>Multi-hop traversal: "friends of friends of friends," shortest path, recommendation walks. Each hop is a pointer chase, not a join.</td>
+          <td>Everything else. Also hard to shard — the whole point is that edges cross partitions.</td>
+          <td>Neo4j · fraud rings, social graph traversal. <em>Rarely the right answer in an interview</em> — most "social graph" questions are served fine by an adjacency table + fan-out.</td>
+        </tr>
+        <tr>
+          <td><strong>Time-series</strong><br><span class="tier tier-2">COMMON</span></td>
+          <td>Append-only writes stamped with time; queries are always "aggregate this metric over this window." Aggressive time-based compression, automatic downsampling and retention.</td>
+          <td>Updates, deletes, joins, point lookups of individual records by a non-time key.</td>
+          <td>InfluxDB · TimescaleDB · Prometheus — metrics, ad-click aggregation (see <a href="18-streaming-aggregation.html">18</a>)</td>
+        </tr>
+        <tr>
+          <td><strong>Blob / object</strong><br><span class="tier tier-1">CORE</span></td>
+          <td>Store an arbitrarily large immutable byte-stream cheaply and durably; serve it via HTTP, ideally through a CDN.</td>
+          <td>Query it. It has no idea what's inside the bytes. Listing is slow, and there are no transactions.</td>
+          <td>S3 / GCS / Azure Blob — video files, images, user uploads, backups, data-lake parquet</td>
+        </tr>
+        <tr>
+          <td><strong>Search index</strong><br><span class="tier tier-2">COMMON</span></td>
+          <td>Full-text relevance ranking, fuzzy match, faceting, typo tolerance. Inverted index: term → list of documents.</td>
+          <td>Be your source of truth. It's a derived, eventually-consistent projection you rebuild from the primary DB.</td>
+          <td>Elasticsearch / OpenSearch · Postgres <code>tsvector</code> for smaller scale — product search, log search (see <a href="17-web-crawler-search.html">17</a>)</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="senior">The line that earns points about the search row above: <em>"Elasticsearch is a derived index, not a system
+      of record. The write path goes to Postgres, and a CDC stream or an outbox worker projects into Elasticsearch. If Elasticsearch
+      loses data I rebuild it; if Postgres loses data I've lost the business."</em> Candidates who make Elasticsearch the primary
+      store get taken apart on durability.</div>
+
+    <p>
+      <strong>Polyglot persistence is normal and you should say so — carefully.</strong> A real system uses several of these at
+      once: Postgres for orders, Redis for sessions, S3 for uploads, Elasticsearch for search, Kafka for the event log. That's not
+      indecision, it's fitting the store to the pattern. But every additional store is operational cost, so justify each one with
+      the pattern it exists to serve, and say the sentence: <em>"I'd rather run one Postgres than four stores, so each extra store
+      here is earning its keep by serving a pattern Postgres genuinely can't."</em>
+    </p>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="sqlnosql">3. SQL vs NoSQL, done properly</h2>
+
+    <p>
+      This is the most-asked trade-off in the entire interview and it is almost always answered with folklore. Kill the folklore
+      first, then learn the honest framing.
+    </p>
+
+    <h3>3a. The myths, and what's actually true</h3>
+
+    <table>
+      <thead><tr><th>The myth</th><th>The truth</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><em>"SQL doesn't scale."</em></td>
+          <td><strong>It scales vertically an absurdly long way</strong> — a modern instance with 128 cores and 1 TB of RAM will
+            serve tens of thousands of writes/s and tens of thousands of QPS on reads with replicas, holding multiple terabytes.
+            Most companies never outgrow it. It scales <em>horizontally</em> too, with effort: read replicas are nearly free;
+            write sharding (Vitess for MySQL, Citus for Postgres, or app-level sharding) works but costs you cross-shard joins
+            and cross-shard transactions. The truthful statement is <strong>"relational databases are harder to shard,"</strong>
+            not "they don't scale."</td>
+        </tr>
+        <tr>
+          <td><em>"NoSQL is schemaless."</em></td>
+          <td><strong>There is always a schema. The only question is where it lives.</strong> In Postgres it lives in the database,
+            is enforced on every write, and one <code>ALTER TABLE</code> migrates every row. In MongoDB/Dynamo it lives in your
+            <em>application code</em>, is enforced nowhere, and a "migration" means your code must handle v1 and v2 documents
+            simultaneously, forever, or you write a backfill job. Schemaless writes are fast because you deferred the cost to
+            read time. Say this out loud — it's an instant credibility marker.</td>
+        </tr>
+        <tr>
+          <td><em>"NoSQL has no transactions."</em></td>
+          <td>Outdated. DynamoDB has <code>TransactWriteItems</code>, MongoDB has multi-document transactions. But they're
+            <strong>limited and expensive</strong> (item-count caps, cross-partition cost, higher latency) and using them heavily
+            is a signal you picked the wrong store. Single-item atomicity, however, is guaranteed everywhere — build on that.</td>
+        </tr>
+        <tr>
+          <td><em>"NoSQL is faster."</em></td>
+          <td>Faster at <em>the pattern it was built for</em>, at scales where a single relational node would fall over. A primary-key
+            lookup in Postgres with a warm cache is also sub-millisecond. What NoSQL really buys you is <strong>predictable latency
+            at horizontal scale</strong>: p99 stays flat as you add nodes, because the query can't fan out or join.</td>
+        </tr>
+        <tr>
+          <td><em>"NoSQL means eventual consistency."</em></td>
+          <td>Not inherently. DynamoDB offers strongly consistent reads (at 2× the read cost and higher latency). Cassandra's
+            consistency is <em>tunable</em> per query via quorums (see <a href="05-coordination-consensus.html">05</a>). And
+            conversely: a Postgres read replica gives you eventual consistency too. Consistency is a property of the read path
+            and the replication config, not of the letters "SQL."</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>3b. The honest framing</h3>
+
+    <p>
+      <strong>Relational gives you joins, transactions, constraints, and the freedom to ask questions you didn't anticipate — at
+      the cost of harder horizontal write-scaling. NoSQL gives you horizontal scale and predictable latency — at the cost of
+      denormalization, duplicated data you must keep in sync yourself, and query rigidity: you must know your access patterns
+      before you design the table, and adding a new one later is a migration.</strong>
+    </p>
+
+    <table>
+      <thead><tr><th>Dimension</th><th>Relational (Postgres / MySQL)</th><th>NoSQL (Dynamo / Cassandra / Mongo)</th></tr></thead>
+      <tbody>
+        <tr><td>Data model</td><td>Normalized tables; one fact stored once</td><td>Denormalized; the same fact duplicated into every table that must answer a query</td></tr>
+        <tr><td>Query flexibility</td><td>Ad-hoc SQL; new questions need no schema change</td><td>Only the patterns you designed for; a new pattern = new table/GSI + backfill</td></tr>
+        <tr><td>Joins</td><td>Yes, in the engine</td><td>No — you join in the application, or you pre-joined at write time</td></tr>
+        <tr><td>Transactions</td><td>Full multi-row ACID; constraints enforce invariants</td><td>Single-item atomic; multi-item is limited, costly, sometimes absent</td></tr>
+        <tr><td>Schema enforcement</td><td>In the DB, on every write</td><td>In your application code (or nowhere)</td></tr>
+        <tr><td>Scaling writes</td><td>Vertical first; sharding is real work and you lose cross-shard joins/txns</td><td>Add nodes. Linear, by design. This is the whole product.</td></tr>
+        <tr><td>Scaling reads</td><td>Read replicas — cheap, but introduce replication lag</td><td>Add nodes / replicas; tunable consistency</td></tr>
+        <tr><td>Latency profile</td><td>Excellent, but degrades as data outgrows RAM and as joins get complex</td><td>Flat and predictable — p99 barely moves with data volume</td></tr>
+        <tr><td>Consistency default</td><td>Strong on the leader; eventual on replicas</td><td>Usually eventual/tunable; strong available at a price</td></tr>
+        <tr><td>Best for</td><td>Money, inventory, orders, anything with invariants; unknown future queries; &lt; ~10 TB and &lt; ~10k writes/s</td><td>Massive uniform read/write on a known key; feeds, messages, telemetry, sessions, caches</td></tr>
+        <tr><td>The tell it's wrong</td><td>You're sharding, and every query is now a scatter-gather across shards</td><td>You keep needing joins, or you keep discovering new query patterns</td></tr>
+      </tbody>
+    </table>
+
+    <div class="senior">The formulation that ends the debate in one breath: <em>"The real trade isn't SQL vs NoSQL, it's</em> flexible
+      queries <em>vs</em> horizontal write scale<em>. Relational buys me the ability to ask questions I haven't thought of yet, and
+      I pay for it with a sharding problem later. NoSQL buys me linear write scale, and I pay for it by having to know every
+      question up front. For this system the access patterns are fixed and the write volume is the constraint — so I'll take the
+      NoSQL trade."</em> Interviewers are listening for exactly that reframing.</div>
+
+    <div class="note"><strong>NewSQL exists and is worth one sentence.</strong> Spanner, CockroachDB, YugabyteDB, TiDB: relational
+      semantics — SQL, joins, real ACID transactions — over an automatically-sharded, replicated cluster. The cost is write latency
+      (a distributed commit requires cross-node consensus; Spanner leans on GPS/atomic-clock hardware to bound clock skew) and
+      operational complexity. Naming it as an option — <em>"if I truly needed cross-shard transactions at scale I'd look at
+      CockroachDB rather than building 2PC myself"</em> — is a strong awareness-level signal. Don't pretend to deep expertise.</div>
+
+    <div class="pitfall">Don't choose NoSQL for a system with money or inventory in it. Payments (<a href="13-payments-orders.html">13</a>)
+      and ticket booking (<a href="14-ticket-booking.html">14</a>) are the two case studies where the correct answer is
+      <em>relational</em>, loudly, because you need a transaction and a uniqueness constraint to prevent double-spend and
+      overselling. Candidates who reflexively reach for Cassandra there are re-implementing ACID badly in application code, and the
+      interviewer will make them prove it can't oversell. It can.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="engines">4. Storage engines: B-tree vs LSM-tree</h2>
+
+    <p>
+      This is the section that makes you sound senior, because almost nobody in a system design loop can explain <em>why</em> one
+      database is faster at writes than another. They just know it is. You're going to know the mechanism, and the mechanism is
+      the answer to a question interviewers love to push into.
+    </p>
+
+    <p>
+      Underneath every database is a <strong>storage engine</strong>: the code that decides how bytes hit disk and how they're
+      found again. There are essentially two families, and the choice of family determines the database's entire performance
+      personality.
+    </p>
+
+    <h3>4a. B-tree — update in place (Postgres, MySQL/InnoDB, most relational)</h3>
+
+    <p>
+      You know this one from Phase 1. The index is a balanced tree of fixed-size pages (8 KB in Postgres). Every lookup walks the
+      tree from root to leaf — typically 3–4 page reads for even a very large table, because the fan-out is enormous. A write
+      finds the correct leaf page and <strong>modifies it in place</strong>, which means a random write to a specific location on
+      disk. To survive a crash mid-page-write, the change is first appended to the write-ahead log (WAL); the page itself is
+      flushed later.
+    </p>
+
+<pre><code>  B-tree write:  find leaf page  ──▶  modify page in place  ──▶  fsync WAL
+                 (random read)        (random write)
+                 ~3-4 page reads      1 page write + WAL append
+</code></pre>
+
+    <ul>
+      <li><strong>Reads are excellent and predictable.</strong> One key lives in exactly one place. A point lookup is O(log n) page
+        reads, full stop. Range scans are fast because leaf pages are linked in sorted order.</li>
+      <li><strong>Writes are the weak spot.</strong> Every write is a random I/O against a specific page, plus a WAL append. Under
+        heavy write load, you're issuing random writes across the whole disk. On spinning disks that was murder; on SSDs it's fine
+        but not free, and you still pay <em>write amplification</em> — writing an 8 KB page to change 100 bytes, and writing it
+        twice (WAL + heap).</li>
+      <li><strong>Concurrency needs locks or MVCC.</strong> Two writers touching the same page must be serialized. Postgres's answer
+        is MVCC — you already know this: an <code>UPDATE</code> writes a new row version and leaves the old one for readers,
+        which is why <code>VACUUM</code> exists.</li>
+    </ul>
+
+    <h3>4b. LSM-tree — never update, only append (Cassandra, RocksDB, LevelDB, DynamoDB, HBase, ScyllaDB)</h3>
+
+    <p>
+      The LSM-tree (Log-Structured Merge-tree) starts from a different premise: <strong>random writes are the expensive thing, so
+      never do one.</strong> Everything is an append. Here is the write path — this is the diagram to be able to draw on a
+      whiteboard:
+    </p>
+
+<pre><code>  WRITE(key, value)
+      │
+      ├──▶ 1. Append to COMMIT LOG on disk        (sequential write — durability)
+      │
+      └──▶ 2. Insert into MEMTABLE in RAM         (sorted structure, e.g. skiplist)
+                     │
+                     │  memtable full (~64 MB)?
+                     ▼
+              3. FLUSH to disk as a new SSTABLE
+                 (Sorted String Table: immutable, sorted by key,
+                  written once, sequentially, never modified again)
+
+  Disk over time:   [SST-1] [SST-2] [SST-3] [SST-4] ...  (newest last)
+                       │       │       │       │
+                       └───────┴───┬───┴───────┘
+                                   ▼
+              4. COMPACTION (background): merge SSTables,
+                 keep newest value per key, drop tombstones,
+                 write out fewer/larger SSTables.
+</code></pre>
+
+    <p>Read that again and notice what's <em>missing</em>: there is no "find the old value and overwrite it." An update is just a
+      new append with a newer timestamp. A <strong>delete is also an append</strong> — a marker called a <em>tombstone</em> saying
+      "this key is gone as of time T." Nothing on disk is ever modified. That's why the write is fast: it's a sequential log append
+      plus an in-memory insert. No seek, no read-before-write, no page to hunt down.</p>
+
+    <p>Now the read path, which is where you pay:</p>
+
+<pre><code>  READ(key)
+      │
+      ├─▶ memtable?  (RAM)                      hit → return
+      │
+      ├─▶ SST-4?  bloom filter says maybe → binary-search index → hit → return
+      ├─▶ SST-3?  bloom filter says NO   → skip entirely  (cheap!)
+      ├─▶ SST-2?  bloom filter says NO   → skip
+      └─▶ SST-1?  ... newest-to-oldest until found, else key doesn't exist
+</code></pre>
+
+    <ul>
+      <li><strong>Read amplification.</strong> A key could be in the memtable or in any SSTable, so a read may have to check
+        several files. The fix is a <strong>bloom filter</strong> per SSTable — a tiny probabilistic bitmap that answers "is this
+        key definitely <em>not</em> here?" with no false negatives. It eliminates almost all the useless file reads. (Bloom
+        filters get their own treatment in <a href="06-caching-queues-resilience.html">06</a>; this is where they earn their keep.)</li>
+      <li><strong>Compaction is the tax.</strong> Merging SSTables in the background consumes disk I/O and CPU, and a big compaction
+        can cause a latency spike — the notorious <em>compaction pause</em>, visible as p99 blowouts in Cassandra. It also causes
+        <strong>space amplification</strong>: before compaction, you're storing several versions of the same key.</li>
+      <li><strong>Range scans</strong> are decent (SSTables are sorted) but need a merge across files.</li>
+      <li><strong>Tombstones are a real operational hazard.</strong> Deleted data isn't gone until compaction runs; a workload that
+        deletes heavily builds up tombstones that must still be read and merged. "Cassandra is bad at queues" is entirely this.</li>
+    </ul>
+
+    <h3>4c. The comparison table</h3>
+
+    <table>
+      <thead><tr><th></th><th>B-tree</th><th>LSM-tree</th></tr></thead>
+      <tbody>
+        <tr><td>Write path</td><td>Find page → update <strong>in place</strong> (random I/O) + WAL</td><td><strong>Append</strong> to log + insert into in-memory memtable. Sequential only.</td></tr>
+        <tr><td>Write throughput</td><td>Good. Bounded by random I/O and page writes.</td><td><strong>Excellent.</strong> Bounded by sequential disk bandwidth.</td></tr>
+        <tr><td>Read path</td><td>3–4 page reads, deterministic. One key, one place.</td><td>Check memtable + N SSTables (bloom filters prune most). Variable.</td></tr>
+        <tr><td>Read performance</td><td><strong>Better and more predictable.</strong></td><td>Good with bloom filters; worse tail latency.</td></tr>
+        <tr><td>Write amplification</td><td>Moderate (page + WAL; ~2×)</td><td>Higher over time — compaction rewrites the same data repeatedly (10–30× is common)</td></tr>
+        <tr><td>Space amplification</td><td>Low; some fragmentation (hence <code>VACUUM</code>)</td><td>Higher — stale versions and tombstones live until compacted</td></tr>
+        <tr><td>Latency profile</td><td>Smooth</td><td>Smooth <em>except</em> compaction spikes → worse p99</td></tr>
+        <tr><td>Transactions</td><td>Natural — pages are the unit of locking; MVCC on top</td><td>Hard. Most LSM stores offer single-key atomicity only.</td></tr>
+        <tr><td>Used by</td><td>Postgres, MySQL/InnoDB, Oracle, SQL Server, SQLite, MongoDB(WiredTiger, hybrid)</td><td>Cassandra, ScyllaDB, HBase, RocksDB, LevelDB, DynamoDB, InfluxDB, Kafka's index</td></tr>
+        <tr><td>Pick it when</td><td>Read-heavy or balanced; you need transactions and range queries; correctness first</td><td><strong>Write-heavy</strong>; ingest-dominated; append-only event/log/telemetry data</td></tr>
+      </tbody>
+    </table>
+
+    <div class="senior"><strong>The payoff sentence. Memorize it.</strong> <em>"This is</em> why <em>you'd pick Cassandra over
+      Postgres for a write-heavy workload — it's not magic, it's the write path. Postgres's B-tree does a random in-place page
+      update per write; Cassandra's LSM-tree appends to a commit log and an in-memory memtable and flushes sorted files
+      sequentially, so writes never seek. I'm paying for it with read amplification, compaction I/O, and worse p99 during
+      compaction."</em> Say that in an interview and the storage line of questioning is over — you've demonstrated you understand
+      the engine, not the marketing.</div>
+
+    <div class="note"><strong>Where you've already met an LSM-tree:</strong> Kafka is essentially an append-only log with sorted
+      index files, and RocksDB (an LSM engine) sits underneath an enormous amount of infrastructure you use indirectly — it's the
+      storage layer inside Kafka Streams, Flink state, CockroachDB, and TiKV. When someone says "our metrics DB fell over during
+      compaction," this section is what they mean.</div>
+
+    <div class="pitfall">Don't overclaim. You are <em>not</em> expected to explain leveled vs size-tiered compaction strategies
+      unless you're interviewing for a storage team. Knowing (a) memtable → SSTable → compaction, (b) writes are sequential appends,
+      (c) reads check multiple files and use bloom filters, (d) compaction causes p99 spikes, is the complete 7-YOE answer. If they
+      push further than that, "I know the compaction strategy is tunable — size-tiered favours write throughput, leveled favours
+      read latency and space — but I haven't tuned it in production" is a perfectly strong place to stop.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="indexing">5. Indexing, in the system-design frame</h2>
+
+    <p>
+      You know indexes from Phase 1: an index is a secondary sorted structure that turns a full table scan into a tree walk. You
+      know <code>EXPLAIN</code>, you know a composite index <code>(a, b, c)</code> serves predicates on <code>a</code>,
+      <code>(a,b)</code>, and <code>(a,b,c)</code> but not on <code>b</code> alone (the left-prefix rule), you know a B-tree index
+      can't serve <code>LIKE '%foo'</code>. That's the mechanics, and it's enough. Here's the part that matters in a
+      <em>system design</em> round, which is a different set of facts.
+    </p>
+
+    <h3>5a. Every index is a copy of your data</h3>
+
+    <p>
+      An index is not free metadata. It is a second physical structure holding the indexed columns plus a pointer to the row, kept
+      permanently in sync. Which means:
+    </p>
+
+    <ul>
+      <li><strong>Indexes make reads fast and writes slow.</strong> Every <code>INSERT</code>/<code>UPDATE</code>/<code>DELETE</code>
+        must update <em>every</em> index on the table, transactionally. Five indexes means a single-row insert is six B-tree writes.
+        On a write-heavy table this is the difference between a healthy database and a smoking one.</li>
+      <li><strong>Indexes cost RAM.</strong> The whole performance model of a B-tree database is "the upper levels of the index live
+        in the buffer cache." Add enough indexes and you evict your hot data to make room for index pages that are rarely used.</li>
+      <li><strong>Indexes cost disk and backup time.</strong> On a wide table with many indexes, the indexes can exceed the size of
+        the table itself.</li>
+    </ul>
+
+    <p>The system-design sentence: <em>"I'll index the columns the access patterns actually filter on, and I'll say out loud that
+      this is a write-path tax — on a table taking 20k inserts/second I'd keep the index count minimal and push secondary lookups
+      to a derived store instead."</em></p>
+
+    <h3>5b. Covering indexes</h3>
+
+    <p>
+      Normally an index lookup gives you a pointer, and the database must then go fetch the actual row from the heap — a second
+      random I/O per row. A <strong>covering index</strong> contains every column the query needs, so the engine answers entirely
+      from the index and never touches the table. In Postgres:
+    </p>
+
+<pre><code><span class="com">-- Query: SELECT status, total FROM orders WHERE user_id = ? ORDER BY created_at DESC;</span>
+
+<span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_orders_user <span class="kw">ON</span> orders (user_id, created_at <span class="kw">DESC</span>)
+       <span class="kw">INCLUDE</span> (status, total);        <span class="com">-- payload cols: not searchable, but returned</span>
+
+<span class="com">-- EXPLAIN now shows "Index Only Scan" instead of "Index Scan + Heap Fetch".</span>
+<span class="com">-- Cost: the index is bigger, so writes and RAM pressure go up. Always a trade.</span>
+</code></pre>
+
+    <p>
+      This is worth a sentence in an interview because it's the concrete answer to "how would you make this hot read faster without
+      adding a cache?" — <em>"make the index cover the query so it never touches the heap."</em> In DynamoDB the equivalent is
+      <strong>projecting</strong> attributes into a GSI: same idea, same trade (a projected GSI is a second full copy of those
+      attributes, and you pay write capacity for it on every write).
+    </p>
+
+    <h3>5c. Why you can't index your way out of a sharding problem</h3>
+
+    <p>
+      This is the point of the whole section, and it's the transition into <a href="04-partitioning-hashing.html">04</a>.
+    </p>
+
+    <p>
+      An index solves a <strong>search</strong> problem: "this data is on this machine, find the right rows fast." It does nothing
+      whatsoever for a <strong>capacity</strong> problem: "this data no longer fits on this machine," or "this machine cannot absorb
+      this many writes per second." Indexes don't add CPU, don't add RAM, don't add disk, and — crucially — they <em>make writes
+      worse</em>, so if your bottleneck is write throughput, adding an index moves you in the wrong direction.
+    </p>
+
+    <table>
+      <thead><tr><th>Symptom</th><th>Actual bottleneck</th><th>The fix</th></tr></thead>
+      <tbody>
+        <tr><td>One query is slow, table scan in <code>EXPLAIN</code></td><td>Missing index</td><td>Index it. Cheap, correct.</td></tr>
+        <tr><td>Reads are slow across the board, CPU pinned on the primary</td><td>Read capacity</td><td>Cache (Redis) + read replicas</td></tr>
+        <tr><td>Writes are slow, disk I/O saturated, replication lag climbing</td><td>Write capacity on one node</td><td><strong>Shard.</strong> Or move the write-heavy table to an LSM store. An index makes this <em>worse</em>.</td></tr>
+        <tr><td>Dataset exceeds the biggest instance you can buy</td><td>Storage capacity</td><td><strong>Shard.</strong> Or tier cold data to S3.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="senior"><em>"Indexing is a search-cost fix, not a capacity fix. If the primary is saturated on writes, another index
+      makes it worse — every insert now maintains one more B-tree. At that point the answer is partitioning, or an engine whose
+      write path is cheaper. That's the next conversation."</em> Delivering this cleanly is one of the fastest ways to show you can
+      tell classes of problem apart, which is exactly what 7-YOE grading rewards.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="acid">6. ACID &amp; isolation levels</h2>
+
+    <p>
+      ACID is four promises: <strong>Atomicity</strong> (all of the transaction or none of it), <strong>Consistency</strong> (the
+      DB's own constraints hold before and after — note this is <em>not</em> the "consistency" in CAP, a genuinely unfortunate
+      naming collision worth pointing out in an interview), <strong>Isolation</strong> (concurrent transactions don't see each
+      other's mess), and <strong>Durability</strong> (once committed, it survives a crash — this is what the WAL and its
+      <code>fsync</code> buy you).
+    </p>
+
+    <p>
+      In practice, the only letter with real dials on it is <strong>I</strong>. Isolation is expensive, so databases let you buy
+      less of it. The levels are defined by which <em>anomalies</em> they still permit:
+    </p>
+
+    <table>
+      <thead><tr><th>Anomaly</th><th>What actually happens</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Dirty read</strong></td><td>You read a row another transaction wrote but hasn't committed. It then rolls back — you acted on data that never existed.</td></tr>
+        <tr><td><strong>Non-repeatable read</strong></td><td>You read a row twice inside one transaction and get two different values, because someone committed an update in between.</td></tr>
+        <tr><td><strong>Phantom read</strong></td><td>You run the same <code>WHERE</code> query twice and the second run returns <em>extra rows</em>, because someone inserted rows matching your predicate.</td></tr>
+        <tr><td><strong>Lost update</strong></td><td>Two transactions read the same value, both compute a new one, both write. One update silently vanishes. (Classic: "increment the seat count.")</td></tr>
+        <tr><td><strong>Write skew</strong></td><td>The subtle one. Two transactions each read a set of rows, each check an invariant that <em>currently holds</em>, and each write a <em>different</em> row. Individually legal, together they break the invariant. (Two doctors each check "someone else is on call," each go off call.) <strong>Only Serializable prevents this.</strong></td></tr>
+      </tbody>
+    </table>
+
+    <table>
+      <thead><tr><th>Isolation level</th><th>Dirty read</th><th>Non-repeatable read</th><th>Phantom</th><th>Write skew</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Read Uncommitted</strong></td><td>Possible</td><td>Possible</td><td>Possible</td><td>Possible</td><td>Effectively useless. Postgres doesn't even implement it (it silently gives you Read Committed).</td></tr>
+        <tr><td><strong>Read Committed</strong></td><td>No</td><td>Possible</td><td>Possible</td><td>Possible</td><td><strong>Postgres and Oracle default.</strong> Each <em>statement</em> sees a fresh snapshot. Fine for 95% of application code.</td></tr>
+        <tr><td><strong>Repeatable Read</strong></td><td>No</td><td>No</td><td>Possible in the standard; <strong>prevented in Postgres</strong></td><td>Possible</td><td><strong>MySQL/InnoDB default.</strong> The whole <em>transaction</em> sees one snapshot. Postgres implements this as true snapshot isolation, so phantoms are gone — but write skew remains.</td></tr>
+        <tr><td><strong>Serializable</strong></td><td>No</td><td>No</td><td>No</td><td>No</td><td>The result is <em>as if</em> transactions ran one at a time. Postgres uses SSI (optimistic): it lets them run and aborts one with a serialization failure — <strong>so your code must be prepared to retry.</strong> Costs throughput.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>6a. Optimistic vs pessimistic concurrency</h3>
+
+    <p>Two ways to stop two people from grabbing the same row. You must be able to name both and pick one with a reason.</p>
+
+    <table>
+      <thead><tr><th></th><th>Pessimistic</th><th>Optimistic</th></tr></thead>
+      <tbody>
+        <tr><td>Idea</td><td>Assume conflict. <strong>Lock first</strong>, then work. <code>SELECT … FOR UPDATE</code>.</td><td>Assume no conflict. Work, then <strong>verify nothing changed</strong> at write time (a version column or a <code>WHERE version = ?</code> guard).</td></tr>
+        <tr><td>Cost</td><td>Other writers <em>block</em>. Throughput collapses under contention; risk of deadlock; a long transaction holding a lock is an outage.</td><td>Other writers proceed. But on conflict the loser's work is <strong>wasted</strong> and must retry — under high contention you can livelock on retries.</td></tr>
+        <tr><td>Use when</td><td>Contention is <strong>high</strong> and conflicts are the norm — the last 10 seats of a hot concert.</td><td>Contention is <strong>low</strong> — editing your own profile, updating a document nobody else is touching.</td></tr>
+      </tbody>
+    </table>
+
+<pre><code><span class="com">-- Pessimistic: nobody else can touch this seat until I commit.</span>
+<span class="kw">BEGIN</span>;
+<span class="kw">SELECT</span> status <span class="kw">FROM</span> seats <span class="kw">WHERE</span> id = <span class="num">42</span> <span class="kw">FOR</span> <span class="kw">UPDATE</span>;   <span class="com">-- row lock held till COMMIT</span>
+<span class="kw">UPDATE</span> seats <span class="kw">SET</span> status = <span class="str">'HELD'</span>, held_by = <span class="num">7</span> <span class="kw">WHERE</span> id = <span class="num">42</span>;
+<span class="kw">COMMIT</span>;
+
+<span class="com">-- Optimistic: no lock. The WHERE clause IS the check.</span>
+<span class="com">-- Returns 0 rows updated if someone beat me to it -&gt; I retry or fail the request.</span>
+<span class="kw">UPDATE</span> seats <span class="kw">SET</span> status = <span class="str">'HELD'</span>, held_by = <span class="num">7</span>, version = version + <span class="num">1</span>
+ <span class="kw">WHERE</span> id = <span class="num">42</span> <span class="kw">AND</span> status = <span class="str">'FREE'</span> <span class="kw">AND</span> version = <span class="num">3</span>;
+</code></pre>
+
+    <div class="senior">The clause that separates you from every candidate who just says "I'd use a transaction": <em>"A uniqueness
+      constraint or a conditional UPDATE is a stronger guarantee than any application-level check, because the database enforces
+      it under concurrency and my <code>if</code> statement doesn't. I'd make the invariant impossible to violate at the schema
+      level and let the write fail, rather than trying to be careful in code."</em> That single idea prevents overselling,
+      double-charging, and duplicate accounts, and it is the correct answer to a startling number of interview follow-ups.</div>
+
+    <div class="note"><strong>Forward reference — this becomes the entire problem in <a href="14-ticket-booking.html">14 — Ticket
+      Booking</a>.</strong> Ten thousand people hit "buy" on the last seat at the same millisecond. Read Committed and a naive
+      "check then write" oversells the seat. Pessimistic locking is correct but serializes the flash sale and tanks throughput.
+      Optimistic concurrency is fast but 9,999 people get a retry storm. The interview is <em>entirely</em> about which of these
+      you pick and why. Everything on this page is setup for that page.</div>
+
+    <div class="pitfall">Don't say "I'd use Serializable" as a reflex. It's correct and it's also a throughput cliff — and in
+      Postgres it makes transactions <em>abort</em> under contention, so if your application code doesn't retry on SQLSTATE 40001,
+      you've just turned a race condition into a 500. If you claim Serializable, be ready to say "and my write path has a bounded
+      retry with jitter around it."</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="replication">7. Replication &amp; read replicas</h2>
+
+    <p>
+      Replication exists for three different reasons and candidates routinely conflate them: <strong>durability</strong> (a node
+      dies, the data doesn't), <strong>availability</strong> (a node dies, the service doesn't), and <strong>read scale</strong>
+      (spread reads across copies). Only the third one helps with load — and it's the one that introduces the bug in 7b.
+    </p>
+
+    <h3>7a. Leader–follower (single-leader)</h3>
+
+    <p>The default everywhere: Postgres streaming replication, MySQL replication, MongoDB replica sets, Redis replicas.</p>
+
+<pre><code>                       ┌──────────────┐
+   writes ────────────▶│    LEADER    │  (the only node that accepts writes)
+                       └──────┬───────┘
+                              │  WAL / binlog stream (the replication log)
+                 ┌────────────┼────────────┐
+                 ▼            ▼            ▼
+           ┌──────────┐ ┌──────────┐ ┌──────────┐
+   reads ─▶│ FOLLOWER │ │ FOLLOWER │ │ FOLLOWER │   ← may be MILLISECONDS
+           └──────────┘ └──────────┘ └──────────┘     to SECONDS behind
+</code></pre>
+
+    <p>
+      All writes go to the leader. The leader ships its write-ahead log to the followers, which replay it. Reads can be served by
+      any node. <strong>There are no write conflicts, ever</strong> — that's the entire appeal of single-leader, and it's why it's
+      the default. If the leader dies, you promote a follower (failover), which is where the operational pain lives: detecting the
+      failure, choosing a new leader without split-brain, and accepting that any writes the old leader had accepted but not yet
+      replicated are <em>lost</em>.
+    </p>
+
+    <table>
+      <thead><tr><th>Replication mode</th><th>Leader waits for…</th><th>Durability</th><th>Latency</th><th>Reality</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Asynchronous</strong></td><td>Nothing. Acks the client immediately, ships the log later.</td><td>Weakest — a leader crash loses recently-acked writes</td><td><strong>Best</strong></td><td>The common default. Fine for most workloads; unacceptable for money.</td></tr>
+        <tr><td><strong>Synchronous</strong></td><td><em>All</em> replicas to confirm</td><td>Strongest</td><td>Worst — and one slow replica stalls every write</td><td>Almost nobody does full sync; a single sick node takes the cluster down.</td></tr>
+        <tr><td><strong>Semi-synchronous</strong></td><td><em>One</em> (or a quorum of) replicas to confirm</td><td>Strong enough — a committed write exists on ≥ 2 machines</td><td>Middle — one extra network round trip</td><td><strong>The practical answer.</strong> Postgres <code>synchronous_commit</code> with <code>ANY 1</code>. Say this one.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="senior"><em>"I'd run semi-synchronous replication: the leader waits for one replica to acknowledge before it acks
+      the client. That guarantees a committed write exists on two machines, so a leader failure doesn't lose it, and it costs me
+      one network round trip on the write path instead of stalling on the slowest replica. For the ledger table specifically I
+      would not run fully async — losing an acknowledged payment is not a trade I'd make to save 2ms."</em></div>
+
+    <h3>7b. Replication lag, and the bug you have already shipped</h3>
+
+    <p>
+      A follower is <em>behind</em>. Usually by single-digit milliseconds; under a heavy write burst or a long-running query on the
+      replica, by seconds or minutes. And if you write to the leader and then read from a follower, you get this:
+    </p>
+
+<pre><code>  t=0ms   POST /comments        ──▶ LEADER    (write committed) ✓
+  t=5ms   201 Created           ◀──
+  t=8ms   GET /post/123/comments ──▶ FOLLOWER  (hasn't replayed the write yet)
+  t=12ms  200 OK  → [ ]         ◀──            THE USER'S OWN COMMENT IS GONE
+</code></pre>
+
+    <p>
+      <strong>You have seen this bug.</strong> As a React developer, this is the one where the user posts a comment, the UI shows it
+      (optimistic update), they hit refresh, and it vanishes — then reappears a second later. Frontend teams usually paper over it
+      with an optimistic cache entry, and the actual cause is a read replica that hadn't caught up. It has a name:
+      <strong>read-your-own-writes</strong> (or read-after-write consistency), and naming it correctly in an interview lands
+      extremely well because it's simultaneously a distributed-systems concept and a bug the interviewer has personally debugged.
+    </p>
+
+    <p>The fixes, in the order you should offer them:</p>
+
+    <table>
+      <thead><tr><th>Fix</th><th>How</th><th>Cost</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Read from the leader for your own data</strong></td><td>After a user writes, route <em>that user's</em> reads to the leader for N seconds (sticky, e.g. a cookie/session flag).</td><td>Simple, effective, and the standard answer. Adds leader load; needs care with multi-device users.</td></tr>
+        <tr><td><strong>Read-your-writes token</strong></td><td>The write returns the leader's log position (LSN); the client sends it back; the read waits for a replica that has caught up to that LSN, or falls back to the leader.</td><td>Correct and precise. More plumbing. This is what "monotonic reads via a version token" looks like in practice.</td></tr>
+        <tr><td><strong>Return the written object</strong></td><td>The <code>POST</code> response contains the created comment; the client renders it without re-fetching.</td><td>Free, and you already do this in React. Doesn't fix the hard refresh case on its own.</td></tr>
+        <tr><td><strong>Just don't use replicas for that path</strong></td><td>Send all reads that must be fresh to the leader; use replicas for analytics, feeds, search, dashboards.</td><td>The honest one. Classify your reads by freshness requirement — <em>that's</em> the senior move.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="pitfall">"I'll add read replicas to scale reads" is a correct sentence that must always be followed by the second
+      sentence: <strong>"and I'll accept replication lag, which means reads-after-write must go to the leader."</strong> Candidates
+      who add replicas and never mention lag get a follow-up question they can't answer, and it's the same question every time:
+      <em>"the user posts a comment and immediately refreshes — what do they see?"</em></div>
+
+    <h3>7c. Multi-leader and leaderless <span class="tier tier-3">AWARENESS</span></h3>
+
+    <p>You need to know these exist, know what they buy, and know why you're not choosing them. That's genuinely enough.</p>
+
+    <ul>
+      <li><strong>Multi-leader.</strong> Several nodes accept writes (typically one leader per region, or an offline-capable client
+        acting as a leader). Buys you local write latency and survives a region outage. The price is brutal: <strong>write
+        conflicts are now possible and you must resolve them</strong> — last-write-wins (silently loses data, and depends on clocks
+        you can't trust), application-defined merge, or CRDTs (see 23). Use it for
+        multi-region write-local systems and calendar/offline sync. Avoid it if you can.</li>
+      <li><strong>Leaderless (Dynamo-style).</strong> No leader at all. The client (or a coordinator) writes to <em>N</em> replicas
+        and waits for <em>W</em> acks; reads query <em>N</em> replicas and wait for <em>R</em> responses. If
+        <strong>R + W &gt; N</strong>, the read set and write set overlap, so you're guaranteed to see the latest write. This is
+        Cassandra and DynamoDB's core mechanic — consistency becomes a <em>per-query dial</em>. Stale replicas are healed by
+        <em>read repair</em> (fix them when a read notices they're behind), <em>anti-entropy</em> background repair, and
+        <em>hinted handoff</em> (a live node holds writes destined for a dead one). Quorums get their proper treatment in
+        <a href="05-coordination-consensus.html">05</a> and get built in <a href="08-distributed-cache.html">08</a>.</li>
+    </ul>
+
+    <div class="note">The one-liner that makes the leaderless model click: <strong>R + W &gt; N</strong> with N=3, W=2, R=2 means any
+      read touches at least one node that took the write. Set W=1 for blazing writes and weak reads; set W=3, R=1 for a read-heavy
+      workload that tolerates slow writes. <em>The consistency is a config value.</em> That's the whole Dynamo idea.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="cap">8. CAP and PACELC</h2>
+
+    <p>
+      CAP is the most-cited and least-understood theorem in system design interviews, and I'm going to be blunt with you about it
+      because being blunt about it <em>is</em> the senior signal.
+    </p>
+
+    <h3>8a. What CAP actually says</h3>
+
+    <p>
+      Consistency (every read sees the latest write — really <em>linearizability</em>), Availability (every request to a
+      non-failing node gets a non-error response), Partition tolerance (the system keeps working when the network drops messages
+      between nodes). The theorem: <strong>you can have at most two of the three.</strong>
+    </p>
+
+    <p>
+      Here's the part everyone gets wrong. <strong>P is not optional.</strong> Networks partition. Cables get cut, switches fail,
+      a rack loses connectivity, a GC pause makes a node look dead. If your data is on more than one machine, you <em>will</em>
+      experience partitions, and "we chose CA" is not a design — it's a description of a single-node system. So the theorem
+      collapses to something much smaller and much more useful:
+    </p>
+
+    <div class="senior"><strong>The only correct way to invoke CAP:</strong> <em>"When a network partition happens — and it will —
+      you have exactly one choice: either the minority side keeps serving requests and risks returning stale or divergent data
+      (AP), or it refuses to serve and returns errors until the partition heals (CP). There is no third option. For this system,
+      [X], because [consequence of being wrong]."</em> Then give the consequence: <em>"a stale like-count is invisible to the user,
+      so AP. A double-sold seat is a refund, an angry customer and a support ticket, so CP — during a partition I'd rather return
+      503 than sell the same seat twice."</em></div>
+
+    <table>
+      <thead><tr><th></th><th>CP — choose Consistency</th><th>AP — choose Availability</th></tr></thead>
+      <tbody>
+        <tr><td>During a partition</td><td>Minority nodes reject reads/writes → <strong>errors / timeouts</strong></td><td>All nodes keep serving → <strong>stale or divergent data</strong></td></tr>
+        <tr><td>You're saying</td><td>"Wrong is worse than down."</td><td>"Down is worse than stale."</td></tr>
+        <tr><td>Examples</td><td>Postgres/Spanner with sync replication · ZooKeeper/etcd · HBase · MongoDB (default) · anything holding money, inventory, or a lock</td><td>Cassandra · DynamoDB (default eventual reads) · Riak · DNS · a CDN · a shopping cart · a like counter</td></tr>
+        <tr><td>Reconciliation</td><td>None needed — you never diverged</td><td>Required — read repair, vector clocks, LWW, or app-level merge</td></tr>
+      </tbody>
+    </table>
+
+    <h3>8b. PACELC — the more useful lens</h3>
+
+    <p>
+      CAP only tells you what happens during the (rare) partition. It's silent about the other 99.99% of the time, which is when
+      your system actually runs. <strong>PACELC</strong> fixes that:
+    </p>
+
+<pre><code>  if (Partition)  →  choose  Availability  or  Consistency     [ P: A / C ]
+  Else            →  choose  Latency       or  Consistency     [ E: L / C ]
+</code></pre>
+
+    <p>
+      The <em>else</em> clause is the one that earns your salary. <strong>Even with a perfectly healthy network, consistency costs
+      latency.</strong> If a read must reflect the latest write, it must reach a node that definitely has it — a leader, or a quorum
+      — and that's a network round trip you could have avoided by reading a nearby possibly-stale replica. There is no way out of
+      this; it's the speed of light plus the definition of "latest."
+    </p>
+
+    <table>
+      <thead><tr><th>System</th><th>PACELC classification</th><th>What it means in plain English</th></tr></thead>
+      <tbody>
+        <tr><td>Cassandra / DynamoDB (default)</td><td><strong>PA/EL</strong></td><td>Stay up during a partition; be fast normally. Both times, you accept staleness.</td></tr>
+        <tr><td>Postgres w/ sync replication</td><td><strong>PC/EC</strong></td><td>Refuse rather than diverge; pay the round trip for correct reads. Correctness over everything.</td></tr>
+        <tr><td>Google Spanner</td><td><strong>PC/EC</strong></td><td>Consistent always — and it <em>pays for it in write latency</em> (TrueTime commit-wait). Real ACID at global scale is not free.</td></tr>
+        <tr><td>MongoDB (default)</td><td><strong>PC/EC</strong> (tunable)</td><td>Reads from the primary; you can dial down to secondary reads and become EL.</td></tr>
+        <tr><td>DNS</td><td><strong>PA/EL</strong></td><td>Always answers, possibly with a stale record until the TTL expires. That's a feature.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="senior">The upgrade move, and it's a genuine differentiator: <em>"CAP is a starting point, not a design — it only
+      describes the partition case, and partitions are rare. The lens I actually use is PACELC: during a partition, availability or
+      consistency; and</em> else <em>— which is nearly all the time — latency or consistency. Most of my real decisions live in that</em>
+      else <em>clause. Reading from a nearby replica is 2ms and possibly stale; reading from the leader across a region is 80ms and
+      correct. That's the trade I'm actually making, every request."</em></div>
+
+    <div class="pitfall">Do not say "Cassandra is AP so it's eventually consistent, therefore I can't use it for anything important."
+      Two errors. First, Cassandra's consistency is <em>per-query tunable</em> — <code>QUORUM</code> reads and writes with
+      R + W &gt; N give you strong-ish consistency when you need it, at the cost of latency and availability during a partition.
+      Second, "AP vs CP" is a property of the <em>configuration</em>, not an immutable badge on the logo. Nuance here reads as
+      experience.</div>
+
+    <div class="note"><strong>Consistency in CAP ≠ Consistency in ACID.</strong> CAP's C is linearizability — a distributed-systems
+      property about whether reads see the latest write. ACID's C is "the database's own constraints and invariants hold." They
+      share a letter and nothing else. Noticing this out loud, once, costs you four seconds and is a clean expertise marker.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="consistency">9. Consistency models</h2>
+
+    <p>
+      "Eventual consistency" is where most candidates' vocabulary stops, and it's far too coarse. There's a whole ladder between
+      "strong" and "eventual," and every rung has a <strong>user-visible symptom</strong>. Learn the symptoms — that's how you'll
+      recognize which model a requirement is actually demanding, and it's the vocabulary interviewers listen for.
+    </p>
+
+    <table>
+      <thead><tr><th>Model</th><th>The guarantee</th><th>What the user sees when you <em>don't</em> have it</th><th>Cost</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Strong / linearizable</strong></td>
+          <td>Every read returns the most recent committed write. The system behaves as if there were one copy of the data.</td>
+          <td>—</td>
+          <td>Highest. Reads must hit the leader or a quorum. Latency, and unavailability during partitions.</td>
+        </tr>
+        <tr>
+          <td><strong>Read-your-own-writes</strong><br>(read-after-write)</td>
+          <td>A user always sees their <em>own</em> writes. Says nothing about other users' writes.</td>
+          <td><strong>"I posted a comment, refreshed, and it's gone."</strong> The bug from §7b. Enraging, and the #1 real-world consistency complaint.</td>
+          <td>Cheap. Sticky-route that user's reads to the leader, or use a version token.</td>
+        </tr>
+        <tr>
+          <td><strong>Monotonic reads</strong></td>
+          <td>Once you've seen a value, you never see an <em>older</em> one. Time doesn't move backwards for a given reader.</td>
+          <td><strong>"I saw 43 likes, refreshed, now it says 41, refreshed again, back to 43."</strong> Caused by bouncing between replicas with different lag. Looks like a broken app.</td>
+          <td>Cheap. Pin each user to one replica (hash the user id to a replica).</td>
+        </tr>
+        <tr>
+          <td><strong>Consistent prefix / causal</strong></td>
+          <td>Causally-related writes are seen in order. If B was written after (and because of) A, nobody sees B without A.</td>
+          <td><strong>"I can see the reply before the message it's replying to."</strong> Comments appear out of order; an answer shows up above its question.</td>
+          <td>Moderate. Needs causal metadata (version vectors / logical clocks) or careful partitioning so related writes share a partition.</td>
+        </tr>
+        <tr>
+          <td><strong>Eventual</strong></td>
+          <td>If writes stop, all replicas eventually converge. Says <em>nothing</em> about when, or about what you see meanwhile.</td>
+          <td>All of the above symptoms, potentially at once. But: if the value is a like count, nobody cares.</td>
+          <td>Cheapest. Read any replica, no coordination.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>
+      <strong>The engineering move is to classify each access pattern by the weakest model it can tolerate</strong>, not to pick one
+      model for the whole system. Real systems are consistent in some places and eventual in others, deliberately:
+    </p>
+
+    <table>
+      <thead><tr><th>Data</th><th>Weakest acceptable model</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>Account balance / seat inventory / payment status</td><td><strong>Strong</strong></td><td>Being wrong costs money and trust. Read from the leader.</td></tr>
+        <tr><td>Your own profile edit, your own posted comment</td><td><strong>Read-your-writes</strong></td><td>Other users can lag by a second; <em>you</em> cannot.</td></tr>
+        <tr><td>A chat thread / a comment thread</td><td><strong>Causal</strong></td><td>Replies must not precede their parents. Partition by thread id and it falls out for free.</td></tr>
+        <tr><td>Like count, view count, follower count</td><td><strong>Eventual</strong></td><td>Nobody can tell 10,412 from 10,409, and the count is being aggregated asynchronously anyway.</td></tr>
+        <tr><td>News feed, search results, recommendations</td><td><strong>Eventual</strong></td><td>Freshness is a nice-to-have; a 30-second-old feed is a fine feed.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="senior">The sentence that shows you think in gradients rather than absolutes: <em>"I don't need one consistency model
+      for the system — I need one per access pattern. The seat inventory is strongly consistent and reads from the leader. The
+      user's own bookings need read-your-writes, so I sticky-route them after a write. The 'currently trending events' list is
+      eventual and served from a replica or a cache. Picking strong consistency everywhere would work and would cost me an order of
+      magnitude in latency and availability for no user-visible benefit."</em></div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="blob">10. Blob / object storage</h2>
+
+    <p>
+      Any design involving images, video, documents, avatars, or user uploads has a trap in it, and the trap has a one-line
+      solution you must state before the interviewer asks: <strong>never put files in your database.</strong>
+    </p>
+
+    <h3>10a. The metadata/blob split</h3>
+
+    <p>
+      A 500 MB video stored as a <code>BYTEA</code>/<code>BLOB</code> column destroys your database. Every backup now copies it.
+      Every replica ships it over the wire. It evicts your actual hot rows from the buffer cache. Your <code>SELECT *</code> that
+      you thought was cheap now streams half a gigabyte. And your database — an expensive, hard-to-scale, transactional system —
+      is being used as a very bad file server.
+    </p>
+
+    <p>The split: <strong>the bytes go to object storage; a pointer to the bytes goes in the database.</strong></p>
+
+<pre><code>  ┌─────────────────────┐          ┌───────────────────────────────┐
+  │  Postgres           │          │  S3  (object storage)         │
+  │  videos             │          │                               │
+  │  ─────────────────  │          │  s3://vids/9f2a/master.mp4    │
+  │  id, owner_id,      │          │  s3://vids/9f2a/1080p.m3u8    │
+  │  title, duration,   │─────────▶│  s3://vids/9f2a/720p.m3u8     │
+  │  status, created_at │  the KEY │  ...                          │
+  │  s3_key ◀── pointer │          │                               │
+  └─────────────────────┘          └───────────────┬───────────────┘
+        queryable, small                           │
+        transactional                              ▼
+                                                 CDN ──▶ user
+                                    (bytes NEVER pass through your API)
+</code></pre>
+
+    <p>Object storage (S3, GCS, Azure Blob) is a different animal from a database and it's good at exactly one thing:</p>
+
+    <table>
+      <thead><tr><th>Property</th><th>Object storage</th></tr></thead>
+      <tbody>
+        <tr><td>Interface</td><td><code>PUT(key, bytes)</code> / <code>GET(key)</code> over HTTP. That's basically it.</td></tr>
+        <tr><td>Durability</td><td>Extremely high (S3 quotes eleven nines) — objects replicated across availability zones automatically.</td></tr>
+        <tr><td>Cost</td><td>Very cheap per GB, and tiered — hot (Standard) → warm (Infrequent Access) → cold (Glacier). Lifecycle rules move objects down automatically.</td></tr>
+        <tr><td>Scale</td><td>Effectively unbounded. Objects up to terabytes. No capacity planning.</td></tr>
+        <tr><td>Can't do</td><td>Query the contents. Transactions. Efficient listing at scale. Partial updates (you rewrite the object).</td></tr>
+        <tr><td>Consistency</td><td>Strong read-after-write for PUTs of new objects (since 2020); historically eventual, which is why old designs are full of "wait and retry" hacks.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>10b. Presigned URLs — get the bytes off your servers</h3>
+
+    <p>
+      The naive upload flow is <em>client → your API → S3</em>. That's wrong at scale: every byte of every upload traverses your
+      application servers, burning their bandwidth, memory, and request-handler time on work that adds no value. A 2 GB video
+      upload occupying an app-server thread for four minutes is a self-inflicted outage.
+    </p>
+
+    <p>
+      A <strong>presigned URL</strong> is a time-limited, cryptographically signed URL that grants permission to <code>PUT</code>
+      (or <code>GET</code>) one specific object key. Your API mints it — a cheap signing operation, no bytes involved — and the
+      client talks to S3 directly.
+    </p>
+
+<pre><code>  1. POST /videos            ──▶ API: create row (status=PENDING),
+                                      generate s3_key, sign an upload URL
+  2. { videoId, uploadUrl }  ◀──      (URL expires in 15 min, PUT only, this key only)
+
+  3. PUT &lt;uploadUrl&gt;         ──▶ S3   (client → S3 DIRECTLY. Your API is not involved.
+                                       Gigabytes never touch your servers.)
+
+  4. S3 event / client POST  ──▶ API: mark status=UPLOADED, enqueue transcode job
+</code></pre>
+
+    <p>The same trick runs in reverse for downloads: a presigned <code>GET</code> URL (or a signed CDN URL) lets a private object be
+      served straight from S3/CloudFront to the user, with expiry, without your API proxying the bytes or the object being public.</p>
+
+    <div class="senior">Say this the moment any file appears in a design, before you're asked: <em>"The blob goes in S3, the metadata
+      goes in Postgres, and the DB row holds the S3 key. Uploads use a presigned URL so the bytes go client-to-S3 directly and never
+      traverse my API servers; downloads go through the CDN with a signed URL. The database stays small, queryable and
+      transactional — which is what it's for."</em> That's three sentences and it closes out an entire category of follow-up
+      questions.</div>
+
+    <div class="pitfall">The consistency hole in the split: <strong>the DB write and the S3 write are two systems with no shared
+      transaction.</strong> The upload can succeed and the DB update can fail, leaving an orphaned object; or the row can say
+      <code>UPLOADED</code> when S3 has nothing. The fix is the standard one — make the DB row the source of truth with an explicit
+      status state machine (<code>PENDING → UPLOADED → PROCESSING → READY</code>), drive transitions from S3 events, and run a
+      reconciliation sweep that garbage-collects objects with no <code>READY</code> row. Naming this before the interviewer does is a
+      strong move; it's the same class of problem as the outbox pattern in <a href="05-coordination-consensus.html">05</a>.</div>
+
+    <div class="note"><strong>Forward reference:</strong> this is the backbone of <a href="16-video-streaming.html">16 — Design Video
+      Streaming</a>. Upload via presigned URL → object lands in S3 → event fires → transcoding workers produce HLS/DASH renditions at
+      multiple bitrates → those land back in S3 → CDN serves the segments. The database holds nothing but rows of metadata and S3
+      keys. Every media design you'll ever be asked is a variation on that pipeline.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="qa">Interview Q&amp;A</h2>
+
+    <p>These are the questions, close to verbatim. Answer them out loud, standing up, before you read the answer.</p>
+
+    <details class="qa">
+      <summary>"SQL or NoSQL for this system? Why?"</summary>
+      <div class="answer">
+        <p><strong>Never answer the question as asked.</strong> Reframe it into access patterns first, then answer.</p>
+        <p><em>"Let me answer that from the access patterns rather than from the label. I have three patterns: fetch one item by
+        primary key at 50k QPS; list a user's items, up to a few hundred, sorted by time; and a monthly report that joins across
+        users and items. The first two are key-value and partition-range patterns — trivially served by Dynamo or Cassandra. The
+        third is a join, which they can't do, but it's low-volume and not latency-sensitive, so I'd serve it from a separate
+        analytics store fed by CDC rather than let it dictate my primary store."</em></p>
+        <p><em>"Given that, the primary is a wide-column store partitioned by user id. If the product told me tomorrow they wanted
+        flexible querying on the hot path, that decision flips to Postgres and I take on a sharding problem later."</em></p>
+        <p>Requirement → decision → cost → falsification condition. Four beats. That's the shape of every good answer here.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"Why would you pick Cassandra over Postgres for a write-heavy workload? Be specific — what's actually different?"</summary>
+      <div class="answer">
+        <p>The whole §4 payoff. Do not say "because it's distributed." Say the write path.</p>
+        <p><em>"It's the storage engine. Postgres uses a B-tree: a write locates the correct leaf page and updates it in place —
+        that's a random I/O per write, plus a WAL append, plus maintaining every secondary index. Cassandra uses an LSM-tree: a
+        write is an append to a commit log plus an insert into an in-memory memtable, and nothing more. When the memtable fills it's
+        flushed to disk as an immutable sorted file — sequential write, no seek. Updates and deletes are also just appends, with a
+        newer timestamp or a tombstone. So writes are bounded by sequential disk bandwidth rather than random I/O."</em></p>
+        <p><em>"What I pay for it: read amplification, because a key may live in the memtable or in any of several SSTables — bloom
+        filters prune most of that, but the read path is variable. Compaction runs in the background merging SSTables and it costs
+        real I/O, which shows up as p99 latency spikes. And I lose joins and multi-row transactions. For an ingest-dominated
+        workload like message history or telemetry, that's a trade I'll take."</em></p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"You said you'd add read replicas. A user posts a comment and immediately refreshes the page. What do they see?"</summary>
+      <div class="answer">
+        <p>This is the trap, and it's asked constantly. The wrong answer is "their comment."</p>
+        <p><em>"Possibly nothing — that's the read-your-own-writes problem. The write went to the leader; the refresh read hit a
+        follower that hadn't replayed the WAL yet, so the comment isn't there. It'll appear a second later, which is worse than a
+        clean failure because it looks like the app lost their data."</em></p>
+        <p><em>"Three fixes, and I'd use the first: after a user writes, sticky-route that user's reads to the leader for a few
+        seconds. Alternatively, have the write return the leader's log position and have the read wait for a replica that has caught
+        up to it. And at the UI layer, return the created object in the POST response so the immediate render doesn't need a
+        re-fetch at all — but that doesn't survive a hard refresh, so it's a complement, not a fix."</em></p>
+        <p><em>"More generally: I'd classify reads by freshness requirement. Reads of your own recent writes go to the leader; feeds,
+        search and analytics go to replicas."</em></p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"Explain CAP. Which do you choose?"</summary>
+      <div class="answer">
+        <p>Answer it, then immediately upgrade it — showing that you know its limits is worth more than reciting it.</p>
+        <p><em>"P isn't optional — if the data is on more than one machine, partitions will happen — so CAP really only says: during
+        a partition, do you serve possibly-stale data (AP) or return errors (CP)? For a like counter, AP: stale is invisible. For
+        seat inventory, CP: I'd rather return a 503 than sell the same seat twice."</em></p>
+        <p><em>"Honestly, though, CAP is a starting point, not a design. Partitions are rare; the trade I make on every single
+        request is the PACELC one — else, in normal operation, latency versus consistency. Reading from a nearby replica is 2ms and
+        possibly stale; reading from the leader is a round trip and correct. That's the decision that actually shapes the system."</em></p>
+        <p>Also worth landing: <em>"and CAP's C isn't ACID's C — one is linearizability, the other is constraint satisfaction."</em></p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"Two users try to book the last seat at the same instant. Walk me through preventing a double-booking."</summary>
+      <div class="answer">
+        <p>Show the naive bug first — it proves you understand the race — then the fixes with their costs.</p>
+        <p><em>"The naive version reads the seat, sees FREE, and writes HELD. Under Read Committed, both transactions read FREE
+        before either writes, and both succeed — that's a lost update, and the seat is sold twice. An <code>if</code> in application
+        code cannot prevent this; the check and the write aren't atomic."</em></p>
+        <p><em>"Three real options. <strong>Pessimistic:</strong> <code>SELECT … FOR UPDATE</code> locks the row, so the second
+        transaction blocks until the first commits and then sees HELD. Correct, but it serializes access — under flash-sale
+        contention that's a throughput cliff, and a long-held lock is an outage. <strong>Optimistic:</strong> a conditional update —
+        <code>UPDATE seats SET status='HELD' WHERE id=42 AND status='FREE'</code>. It's atomic in the engine; exactly one
+        transaction gets 1 row affected and the other gets 0 and fails cleanly. Cheap, no locking, ideal when contention is low.
+        <strong>Constraint:</strong> a unique index on (seat_id) in a holds table makes the double-booking literally unrepresentable —
+        the second insert violates the constraint and the DB rejects it."</em></p>
+        <p><em>"For a hot flash sale I'd combine them: a queue or a token gate in front to shed the thundering herd, and an
+        optimistic conditional update at the DB as the correctness backstop. The general principle: make the invariant impossible
+        to violate at the schema level rather than trying to be careful in application code."</em></p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"What's the difference between Read Committed, Repeatable Read and Serializable? What breaks at each?"</summary>
+      <div class="answer">
+        <p><em>"Read Committed — Postgres's default — means you never read uncommitted data, but each statement gets a fresh
+        snapshot, so reading the same row twice in one transaction can give two different values. Non-repeatable reads and phantoms
+        are both possible."</em></p>
+        <p><em>"Repeatable Read — MySQL's default — pins one snapshot for the whole transaction, so re-reading a row is stable. The
+        SQL standard still allows phantoms here; Postgres implements it as true snapshot isolation and prevents them. But
+        <strong>write skew</strong> survives both: two transactions each read a set, each verify an invariant that currently holds,
+        each write a different row, and together they break it. Classic example: two doctors each check that someone else is on call,
+        and both go off call."</em></p>
+        <p><em>"Serializable is the only level that stops write skew — the outcome is as if the transactions ran one at a time.
+        Postgres does it optimistically with SSI, meaning it lets them run and aborts one with a serialization failure. So the
+        catch is that choosing Serializable is also choosing to write retry logic; if my code doesn't retry on 40001, I've converted
+        a race into a 500."</em></p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"How do you store user-uploaded videos?"</summary>
+      <div class="answer">
+        <p><em>"The bytes never go in the database. The video goes to S3; the database holds a row with the metadata — owner, title,
+        duration, status — and the S3 key. Putting a 500 MB blob in Postgres poisons the backups, the replication stream, and the
+        buffer cache, and it uses an expensive transactional system as a bad file server."</em></p>
+        <p><em>"The upload itself doesn't go through my API either — I mint a presigned S3 URL, scoped to one object key, PUT-only,
+        expiring in fifteen minutes, and the client uploads straight to S3. Gigabytes never touch an app server. S3 fires an event
+        when the object lands, and that drives the row from PENDING to UPLOADED and enqueues transcoding. Downloads go through the
+        CDN with signed URLs."</em></p>
+        <p><em>"The one gap: the DB write and the S3 write aren't in the same transaction, so I'd model the row as an explicit state
+        machine and run a reconciliation job that garbage-collects orphaned objects and re-drives stuck rows."</em></p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"The database is slow. Walk me through what you'd do."</summary>
+      <div class="answer">
+        <p>Interviewers use this to see whether you can distinguish classes of problem instead of reaching for a cache immediately.</p>
+        <p><em>"First I'd find out what 'slow' means — is it one query, or everything? If it's one query, I'd look at the plan: a
+        sequential scan on a filtered column is a missing index, and that's a cheap fix."</em></p>
+        <p><em>"If it's everything, I'd separate the read problem from the write problem, because they have different fixes. Reads
+        saturating the primary: cache the hot keys in Redis, then add read replicas, and accept replication lag on the paths where
+        it's tolerable. Writes saturating the primary: <strong>indexes make this worse, not better</strong> — every insert maintains
+        every index. That's a capacity problem, and the answers are partitioning the table, moving the write-heavy table to a store
+        with a cheaper write path, or batching writes through a queue to smooth the peak."</em></p>
+        <p><em>"The distinction I'd want to make explicit: indexing is a search-cost fix. It does nothing for a capacity problem. You
+        cannot index your way out of needing to shard."</em></p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"Is 'schemaless' actually an advantage?"</summary>
+      <div class="answer">
+        <p><em>"There's no such thing as schemaless — there's only 'where does the schema live.' In Postgres it lives in the database,
+        is enforced on every write, and one migration fixes every row. In MongoDB or Dynamo it lives in my application code, is
+        enforced nowhere, and 'migration' means my code handles v1 and v2 documents simultaneously — forever, or until I write a
+        backfill."</em></p>
+        <p><em>"It's a genuine advantage in two cases: when the shape is genuinely heterogeneous — a product catalog where every
+        category has different attributes — and when you're moving fast and the cost of a lock-taking ALTER TABLE on a huge table is
+        real. It's a liability everywhere else, because the enforcement doesn't disappear, it just moves to the place where it's
+        weakest. And if I want the flexible case inside Postgres, JSONB gives me most of it with an escape hatch back to
+        constraints."</em></p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"Your like counts sometimes go 43 → 41 → 43 on refresh. What's happening and how do you fix it?"</summary>
+      <div class="answer">
+        <p>A model-recognition question in disguise. Name the model.</p>
+        <p><em>"That's a <strong>monotonic reads</strong> violation. Successive reads are landing on different replicas with different
+        replication lag, so a fresher value is followed by a staler one — time appears to run backwards for that reader. Eventual
+        consistency permits this; it just looks like a broken app."</em></p>
+        <p><em>"The fix is cheap: pin a given reader to a single replica — hash the user id or session id to a replica so their reads
+        are consistently served from the same node. They may see stale data, but it never goes backwards. If the counter matters more
+        than that, read it from the leader or from a Redis counter that's the authority for that value."</em></p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"When would you NOT use a cache in front of the database?"</summary>
+      <div class="answer">
+        <p>Tests whether you add components reflexively. <a href="06-caching-queues-resilience.html">06</a> goes deep; here's the storage-side answer.</p>
+        <p><em>"When the workload is write-heavy rather than read-heavy — a cache doesn't help writes and every write now also has to
+        invalidate, which is a second correctness problem for no gain. When the data must be strongly consistent, like a balance or
+        seat inventory — a cache is a second copy and a second source of staleness, and stale money is a bug. When the read
+        distribution is uniform rather than skewed — a cache only pays if a small hot set serves most requests; hitting a huge
+        keyspace uniformly gives you a low hit rate and you've added a network hop and an operational dependency for nothing."</em></p>
+        <p><em>"And there's an honest floor: at a few hundred QPS with a warm buffer cache, Postgres <em>is</em> the cache. Adding
+        Redis there is complexity with no benefit, and I'd say so rather than draw the box because it looks impressive."</em></p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"You have 10 TB of data and 50k writes/second. Now what?"</summary>
+      <div class="answer">
+        <p>The numbers are the point. Compute before you decide.</p>
+        <p><em>"50k writes/second is past what I'd ask one Postgres primary to do comfortably — it's not impossible with batching and
+        a fast disk, but it's the wrong shape of problem to fight. Two questions decide it. First: is the write path append-only —
+        events, messages, telemetry — with no cross-row invariants? If yes, this is an LSM workload and I'd use Cassandra or
+        DynamoDB, partitioned on whatever key the reads use, and the 10 TB spreads across nodes as a side effect. Second: does it
+        have invariants — money, inventory, uniqueness? Then I can't just move to an eventually-consistent store, and I'd shard
+        Postgres by tenant or entity id, keeping every transaction inside a single shard so I never need a distributed
+        transaction."</em></p>
+        <p><em>"In practice it's usually both: the transactional core stays relational and small, and the high-volume append-only
+        stream goes to a store built for it. The mistake would be forcing one engine to do both jobs badly."</em></p>
+        <p>Then hand off to <a href="04-partitioning-hashing.html">04</a>: <em>"and how I pick the partition key is the next
+        conversation — get that wrong and you've built a hot shard."</em></p>
+      </div>
+    </details>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="takeaways">What to remember</h2>
+
+    <p>The night before the interview, read only this.</p>
+
+    <ul>
+      <li><strong>Access patterns first, store second.</strong> Never name a database before you've named the queries and the
+        numbers. The grammar of the answer is: <em>"because the dominant access pattern is X and it needs Y, I'll use Z — and I'm
+        accepting that this makes W harder."</em> The last clause is the one you get paid for.</li>
+      <li><strong>"NoSQL because it scales" is a rejection.</strong> The real trade is <em>flexible queries vs horizontal write
+        scale</em>. Relational buys you questions you haven't thought of yet, and you pay with a sharding problem later. NoSQL buys
+        you linear write scale, and you pay by having to know every question up front.</li>
+      <li><strong>Postgres is the honest default</strong> and it scales further than candidates think. Introduce a second store only
+        when you can name the pattern Postgres can't serve.</li>
+      <li><strong>Schemaless is a lie.</strong> There's always a schema; the only question is whether it lives in the database or in
+        your application code, unenforced.</li>
+      <li><strong>B-tree vs LSM is the senior answer to "why Cassandra?"</strong> B-tree: find the page, update in place, random I/O.
+        LSM: append to a commit log, insert into the memtable, flush immutable sorted SSTables, compact in the background — writes
+        never seek. You pay in read amplification (bloom filters help), compaction I/O, and p99 spikes. <strong>It's not magic; it's
+        the write path.</strong></li>
+      <li><strong>Indexes make reads fast and writes slow.</strong> Every index is a second copy of your data that every write must
+        maintain. Indexing is a <em>search-cost</em> fix — it does nothing for a <em>capacity</em> problem, and you cannot index your
+        way out of needing to shard.</li>
+      <li><strong>Isolation levels:</strong> Read Committed (Postgres default) allows non-repeatable reads and phantoms. Repeatable
+        Read (MySQL default) pins one snapshot. Only <strong>Serializable</strong> stops <strong>write skew</strong> — and in Postgres
+        it aborts transactions, so you must retry.</li>
+      <li><strong>Pessimistic locks under high contention, optimistic (conditional update / version column) under low.</strong> Best
+        of all: a database <em>constraint</em>, which makes the invalid state unrepresentable — stronger than any <code>if</code> in
+        your code.</li>
+      <li><strong>Read replicas scale reads and introduce lag.</strong> Always say the second half. The bug is
+        <strong>read-your-own-writes</strong>: post a comment, refresh, it's gone. Fix by sticky-routing that user's reads to the
+        leader after a write. Prefer <strong>semi-synchronous</strong> replication: one replica acks, so a committed write exists on
+        two machines.</li>
+      <li><strong>CAP is a starting point, not a design.</strong> P isn't optional, so it reduces to: during a partition, stale data
+        (AP) or errors (CP)? <strong>PACELC is the useful lens</strong> — <em>else</em>, in normal operation, latency vs consistency.
+        That's the trade you make on every request, not once a year.</li>
+      <li><strong>Consistency is per-access-pattern, not per-system.</strong> Strong for money and inventory; read-your-writes for a
+        user's own actions; causal for threaded conversations; eventual for counts and feeds. Know the user-visible symptom of each:
+        "my comment vanished" (read-your-writes), "the count went backwards" (monotonic reads), "the reply appears before the
+        message" (causal).</li>
+      <li><strong>Blobs go in S3, pointers go in the DB.</strong> Presigned URLs so the bytes never touch your API servers; CDN for
+        delivery; an explicit status state machine plus a reconciliation sweep, because the DB write and the S3 write aren't in one
+        transaction.</li>
+      <li><strong>The one habit:</strong> after every storage decision, say what it costs. A design without a stated cost reads as a
+        guess, even when it's right.</li>
+    </ul>
+
+    <div class="senior">If you take one sentence from this page into the room, take this one: <em>"I don't pick a database — I pick
+      an access pattern, and the database follows."</em> Everything else here is an elaboration of that.</div>
+  </section>
+
+  <nav class="page-nav">
+    <a href="02-networking-delivery.html">← 02 — Networking &amp; Delivery</a>
+    <a href="04-partitioning-hashing.html">04 — Partitioning &amp; Consistent Hashing →</a>
+  </nav>
+
+</main>
+</body>
+</html>

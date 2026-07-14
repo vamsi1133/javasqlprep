@@ -1,0 +1,2034 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>14 — Design Ticket Booking (Ticketmaster / BookMyShow) | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <div class="breadcrumb"><a href="index.html">← Course Home</a></div>
+    <h1>14 — Design Ticket Booking (Ticketmaster / BookMyShow)</h1>
+    <p>Archetype: <strong>inventory under contention</strong>. A finite set of things, and far too many people trying to claim them at the same instant. The whole interview is one question: <em>how do you not sell the same seat twice?</em></p>
+  </div>
+</header>
+
+<main class="container">
+
+  <section>
+    <h2>Why this matters in the interview</h2>
+    <p>
+      Every other case study in this block is fundamentally a <em>scale</em> problem: too many reads, too much fan-out, too
+      many bytes. You solve them by adding machines. This one is a <strong>correctness</strong> problem, and correctness
+      does not get easier when you add machines — it gets harder. You cannot cache your way out of overselling. You cannot
+      shard your way out of it. A design that serves 10M concurrent users beautifully and sells seat 14C to two people is a
+      <em>failed design</em>, and the interviewer will fail it, because in the real world that outcome ends with a refund, a
+      furious customer standing in an aisle holding a valid ticket for an occupied seat, and — at the kind of enterprise and
+      fintech loops you're targeting — a compliance conversation. <strong>This is the hardest correctness problem in the
+      course, and it is a favourite at exactly the companies on your list.</strong> Optum, JPMC and Goldman do not ask you
+      to design Twitter. They ask you how two threads don't both get the last unit of something.
+    </p>
+    <p>
+      The trap is that ticket booking <em>looks</em> like a CRUD app. Events, venues, seats, bookings — you have built this
+      table layout a hundred times. Junior candidates draw those five boxes in four minutes, feel good, and then spend the
+      remaining forty minutes being slowly dismantled. Because the moment 50,000 people press "buy" on 10,000 seats, every
+      naive design breaks, and it breaks in a way that <em>your local testing will never reveal</em>. Concurrency bugs are
+      invisible at one request per second. <strong>The single skill this page teaches is recognising, out loud, in the first
+      two minutes, that this is not a CRUD problem — it is a concurrency problem wearing a CRUD costume.</strong> Say that
+      sentence and the tone of the interview changes.
+    </p>
+    <p>
+      And the archetype is everywhere. Strip the word "seat" out and what you have is: <em>a finite resource, many claimants,
+      exactly one winner per unit, and being wrong is unacceptable.</em> That is flight seats. Hotel rooms. Flash-sale stock
+      on a e-commerce site. Ad impressions in an auction. Parking spots. Warehouse inventory in an order system
+      (<a href="13-payments-orders.html">13</a>). Domain-name registration. Even <em>a distributed lock itself</em> is this
+      problem — a lock is an inventory of exactly one, and everything <a href="05-coordination-consensus.html">05</a> told
+      you about why locks are hard is a special case of what you're about to learn. This page assumes
+      <a href="03-data-storage.html">03</a> (isolation levels, optimistic vs pessimistic concurrency) and
+      <a href="05-coordination-consensus.html">05</a> (distributed locks, sagas, why the invariant belongs in the database).
+      Those pages built the vocabulary. <strong>This page spends it.</strong>
+    </p>
+  </section>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ul>
+      <li><a href="#prompt">1. The prompt</a> — and the recognition that decides everything</li>
+      <li><a href="#requirements">2. Requirements</a> ★ — the one clarifying question that changes the design</li>
+      <li><a href="#estimation">3. Estimation</a> ★ — the write path has a <em>hard ceiling</em></li>
+      <li><a href="#api">4. API design</a> — holds are first-class resources</li>
+      <li><a href="#data-model">5. Data model</a> ★ — the seat row <em>is</em> the lock</li>
+      <li><a href="#hld">6. High-level design</a> — one read and one write, end to end</li>
+      <li><a href="#deep-dive-1">7a. Deep dive: the overselling problem</a> ★ — <strong>this is the page</strong></li>
+      <li><a href="#deep-dive-2">7b. Deep dive: holds, TTLs &amp; the reservation lifecycle</a> ★</li>
+      <li><a href="#deep-dive-3">7c. Deep dive: the flash sale &amp; the virtual waiting room</a> ★</li>
+      <li><a href="#scaling">8. Scaling &amp; bottlenecks</a> — the hot partition in its purest form</li>
+      <li><a href="#tradeoffs">9. Trade-offs</a></li>
+      <li><a href="#followups">10. Follow-ups you should expect</a></li>
+      <li><a href="#qa">Interview Q&amp;A</a></li>
+      <li><a href="#takeaways">What to remember</a></li>
+    </ul>
+  </div>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="prompt">1. The prompt</h2>
+
+    <p>The interviewer says, and this is roughly verbatim at half a dozen companies:</p>
+
+    <blockquote style="border-left:4px solid #cbd5e1; margin:1.2rem 0; padding:.4rem 1.1rem; color:#374151;">
+      <em>"Design Ticketmaster. Users should be able to browse events, see which seats are available, pick one, and buy it."</em>
+    </blockquote>
+
+    <p>
+      That is the entire prompt. It is deliberately, almost insultingly, simple — and it is simple on purpose, because the
+      interviewer is watching to see what you <em>notice</em>. There are two candidates in this room:
+    </p>
+
+    <ul>
+      <li>The one who hears <em>"browse, see, pick, buy"</em> and starts drawing an events table, a seats table, a REST API
+        and a React frontend. He is designing a CRUD app. He will be fine for fifteen minutes.</li>
+      <li>The one who hears <em>"pick one, and buy it"</em> and immediately asks: <em>"how many people are trying to buy at
+        the same time?"</em> — because that single number determines whether this is a weekend project or one of the
+        genuinely hard problems in applied distributed systems.</li>
+    </ul>
+
+    <p>
+      Here is the thing to understand and to <em>say</em>. A cinema booking system for a 200-seat screen with 30 concurrent
+      users is a Postgres table and an afternoon. The same system for a stadium tour on-sale — 10 million people refreshing
+      at 10:00:00 for 50,000 seats — is a fundamentally different machine. <strong>Same requirements document, different
+      system.</strong> Nothing about the functional spec changed; the <em>traffic shape</em> changed, and the traffic shape
+      is the design.
+    </p>
+
+    <div class="senior">Open with this, before you draw anything: <em>"Before I design anything — this looks like a CRUD app,
+      and I want to say up front that I don't think it is one. The read path is easy: it's a catalogue, I can cache it at the
+      edge. The write path is a concurrency problem, because the defining event in this system is 50,000 people trying to
+      claim 10,000 seats in the same second. Everything I design is going to be shaped by not selling the same seat twice
+      under that load. Can I confirm the traffic profile you have in mind?"</em> That is ninety seconds, and it establishes
+      that you have seen this problem before and know where the bodies are buried. Most candidates take twenty minutes to
+      arrive where that sentence puts you immediately.</div>
+
+    <p>
+      The interviewer will now, almost always, lean in and give you the hard version. <strong>That is what you want.</strong>
+      You have just traded the boring version of the question for the one where you get to show judgment.
+    </p>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="requirements">2. Requirements</h2>
+
+    <h3>The clarifying questions to ask first</h3>
+
+    <p>
+      Ask these before you draw a single box. Each one has a right answer you can assume out loud if the interviewer waves
+      you on, and each one visibly changes the design — which is the point of asking.
+    </p>
+
+    <table>
+      <thead><tr><th>Ask</th><th>Assume, if they shrug</th><th>Why it changes the design</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>"Is overselling ever acceptable?"</strong></td>
+          <td><strong>No. Never.</strong> Assigned seats, concert venue.</td>
+          <td><strong>This is the most important question on the page.</strong> See below — the answer flips the entire architecture.</td>
+        </tr>
+        <tr>
+          <td>"Are seats <em>assigned</em> (seat 14C) or general admission (a number of tickets)?"</td>
+          <td>Assigned. Specific seats, a seat map.</td>
+          <td>General admission is a <em>counter</em>, and a counter can be decremented atomically. That is a dramatically easier problem. Assigned seats are what make this hard.</td>
+        </tr>
+        <tr>
+          <td>"Is there a flash-sale / on-sale moment, or is demand smooth?"</td>
+          <td>Flash sale. 10:00:00, everybody at once.</td>
+          <td>Smooth demand needs none of the waiting-room machinery. The flash sale <em>is</em> the design constraint.</td>
+        </tr>
+        <tr>
+          <td>"Do users hold a seat while they pay, or is it buy-or-lose?"</td>
+          <td>A hold, with a TTL. ~10 minutes.</td>
+          <td>Introduces the entire reservation lifecycle and its expiry problem (deep dive 2).</td>
+        </tr>
+        <tr>
+          <td>"Do I own payments, or do I call a provider?"</td>
+          <td>Call Stripe. Payments are <a href="13-payments-orders.html">13's</a> problem.</td>
+          <td>Scopes the question. But the <em>seam</em> between hold and payment is mine, and it's nasty.</td>
+        </tr>
+        <tr>
+          <td>"Single region or global?"</td>
+          <td>Single region for inventory. Reads global via CDN.</td>
+          <td>Cut it explicitly. Multi-region inventory is a genuinely different (and much worse) problem — see follow-ups.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>The question that actually matters: "is overselling ever acceptable?"</h3>
+
+    <p>
+      This is the strongest opening move available on this page, and almost nobody makes it. It sounds like a pedantic
+      clarification. It is not — it is a <strong>fork in the architecture</strong>, and here is why:
+    </p>
+
+    <ul>
+      <li><strong>Airlines deliberately oversell.</strong> They know a predictable percentage of passengers won't show up, so
+        they sell 105% of the seats, and when everyone <em>does</em> show up they run a compensation auction at the gate
+        ("$800 voucher for anyone who takes the next flight"). Overselling is a <em>revenue optimisation</em> with a known,
+        priced-in cost. If overselling is acceptable, <strong>you don't need strict serialisation at all</strong> — you can
+        take writes optimistically, reconcile asynchronously, run the whole thing eventually consistent, and let a
+        compensation workflow clean up the overlap. The system gets radically simpler and faster.</li>
+      <li><strong>A concert does not oversell.</strong> Seat 14C is a physical chair. There is exactly one of it. Two valid
+        tickets for one chair is not a business trade-off, it's an incident. Here you need a hard invariant, enforced, with
+        no wiggle room. <strong>Overselling by one is a bug of the same severity as overselling by a thousand.</strong></li>
+    </ul>
+
+    <div class="senior">Say it like this: <em>"My first question is whether overselling is ever acceptable, because the answer
+      changes the whole system. Airlines oversell on purpose and compensate at the gate — if that's the model, I can run this
+      eventually consistent and reconcile later, and it's a much cheaper design. For a concert with assigned seats, seat 14C is
+      a physical chair and overselling it is an incident, not a trade-off. I'll assume the concert model: <strong>never oversell
+      is a hard correctness constraint, not a soft target.</strong> That means I'm willing to be slow, and I'm willing to make
+      people queue, but I'm not willing to be wrong."</em> That last clause — <em>slow is acceptable, wrong is not</em> — is the
+      thesis of the entire page, and stating it in minute three means every subsequent decision you make has a justification the
+      interviewer already agreed to.</div>
+
+    <h3>Functional requirements</h3>
+    <ul>
+      <li><strong>Browse events</strong> — search/list events by city, date, artist. (Low-stakes; it's a catalogue.)</li>
+      <li><strong>View a seat map</strong> — for an event, see which of the ~50,000 specific seats are available. This is the
+        heaviest read in the system by an enormous margin.</li>
+      <li><strong>Hold a seat</strong> — claim seat 14C temporarily while you enter payment details. The hold has a TTL and a
+        visible countdown.</li>
+      <li><strong>Pay and confirm</strong> — convert the hold into a booking, via a payment provider. Issue a ticket.</li>
+      <li><strong>Release / cancel</strong> — the user backs out, or the hold expires, and the seat returns to inventory.</li>
+    </ul>
+    <p>
+      <strong>Seats are specific.</strong> Not "a ticket" — <em>seat 14C</em>. Say this explicitly, because it is the single
+      requirement that makes the problem hard, and you want the interviewer to see that you know that.
+    </p>
+
+    <p><strong>Explicitly out of scope</strong> (say so, and say why): dynamic pricing, recommendations, the ticket-scanning
+      /turnstile system at the venue, refunds and the secondary resale market, the promoter-facing event-creation CMS. Each is
+      a real system; none of them is <em>this</em> system. Cutting scope out loud is free credibility.</p>
+
+    <h3>Non-functional requirements — and these are the interesting ones</h3>
+
+    <table>
+      <thead><tr><th>Requirement</th><th>Target</th><th>What it really means</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Never oversell</strong></td>
+          <td><strong>Zero. Hard constraint.</strong></td>
+          <td>Not "five nines of not-overselling." <em>Zero.</em> This is a correctness invariant, and it is the only requirement in the entire course I'd call non-negotiable. Everything else bends around it.</td>
+        </tr>
+        <tr>
+          <td>Seat map freshness</td>
+          <td>"Reasonably fresh" — seconds of staleness is fine</td>
+          <td><strong>Deliberately weak, and that's the trick.</strong> The seat map is a <em>hint</em>, not a contract. The write path is where truth lives. Accepting stale reads is what lets you cache aggressively and survive the read load.</td>
+        </tr>
+        <tr>
+          <td>Availability — browsing</td>
+          <td>High. It's a shop window; it must be up.</td>
+          <td>Serve from cache/CDN. Should survive the database being down entirely.</td>
+        </tr>
+        <tr>
+          <td>Availability — checkout</td>
+          <td><strong>Lower, and that is <em>correct</em>, not a compromise</strong></td>
+          <td>It is acceptable — even desirable — to be <em>slow</em>, to <em>queue</em>, or to return "try again" at checkout, rather than to be wrong. <strong>This is a deliberate CP choice</strong> (see <a href="03-data-storage.html">03</a>): during a partition I return a 503 rather than sell a seat twice.</td>
+        </tr>
+        <tr>
+          <td>Flash-sale survival</td>
+          <td>1000× baseline for ~60 seconds</td>
+          <td>The system must not fall over when 10M people arrive simultaneously. Note: <em>not fall over</em> ≠ <em>serve everyone instantly</em>. Making them wait in a queue is a valid answer — arguably <em>the</em> answer.</td>
+        </tr>
+        <tr>
+          <td>Latency</td>
+          <td>Seat map p99 &lt; 200ms · hold &lt; 500ms</td>
+          <td>Modest, honestly. Nobody has ever cancelled a concert purchase over 300ms. Do not over-optimise latency here; you have bigger problems.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="note">Notice what just happened. By ranking <em>correctness &gt; availability</em> on the write path and
+      <em>availability &gt; freshness</em> on the read path, you've split the system into two halves with <strong>opposite
+      consistency requirements</strong>. That split — a wildly available, happily-stale read path in front of a fiercely
+      consistent, deliberately bounded write path — <em>is</em> the architecture. You just derived it from the requirements
+      instead of memorising it, which is precisely what tutorial <a href="01-the-method.html">01</a> said the job was.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="estimation">3. Estimation</h2>
+
+    <p>
+      Forget DAU. Forget monthly actives. <strong>There is exactly one number that matters in this system and it is the
+      shape of the on-sale spike.</strong> Say that out loud, because the standard estimation ritual — "let's say 100M DAU,
+      divide by 86,400 seconds…" — is actively misleading here and a good interviewer knows it.
+    </p>
+
+    <h3>The scenario that defines the system</h3>
+    <p>A stadium tour goes on sale at 10:00:00 on a Friday. Round everything; I'm rounding hard and I'll say so.</p>
+
+<pre><code>  Stadium capacity ................. 50,000 seats
+  People who want a ticket ......... 10,000,000   (a big tour; this is real)
+  On-sale window ................... they ALL arrive within ~60 seconds
+  Demand : supply ratio ............ 200 : 1
+</code></pre>
+
+    <h3>Read load — enormous</h3>
+<pre><code>  10M users arrive in ~60s
+    → ~170,000 users/sec arriving                (10M / 60)
+    → each loads the event page + the seat map
+    → and then REFRESHES, because the map is changing and they're anxious
+    → assume ~3 seat-map fetches per user in the first minute
+
+  Seat-map reads ≈ 10M x 3 / 60s  ≈  500,000 reads/sec   ← peak
+  Payload: 50,000 seats x ~20 bytes (id, status, price tier) ≈ 1 MB raw
+           → compressed / delta-encoded, call it ~100 KB
+
+  Naive bandwidth: 500,000/s x 100 KB  =  50 GB/sec       ← absurd
+</code></pre>
+    <p>
+      50 GB/sec is not a number you serve from an origin. It is not a number you serve from a hundred origins. <strong>This
+      number alone tells you the seat map must be cached at the CDN edge</strong>, and that you must accept staleness to do
+      it. The read path's entire design falls out of this one calculation. (And note the second-order effect: users
+      <em>refresh</em> during a flash sale, so your read multiplier is worse than your instinct says.)
+    </p>
+
+    <h3>Write load — and here is the whole insight</h3>
+
+<pre><code>  Bookings that can POSSIBLY succeed ........  50,000    ← total. Ever. Full stop.
+  Sold out in .............................. ~5 minutes (300s), typically much faster
+
+  Successful booking writes ≈ 50,000 / 300s  ≈  ~170 writes/sec
+
+  Hold ATTEMPTS, though, are a different story:
+  10M people all clicking "buy" on the same 50k seats
+    → hold attempts could be 100,000+/sec
+    → of which >99% MUST FAIL, because there is nothing to sell them
+</code></pre>
+
+    <div class="senior">This is the sentence that wins the estimation section, and I want you to say it more or less verbatim:
+      <em>"The read load is enormous and unbounded — call it 500k requests a second at peak. But the write load has a
+      <strong>hard ceiling</strong>: I literally cannot sell more than 50,000 tickets, because there are only 50,000 chairs.
+      No matter how much traffic arrives, the number of successful writes is bounded by the inventory, not by the demand. That
+      asymmetry is the most useful fact about this system — it means I can protect the write path <em>extremely</em>
+      aggressively, because I know exactly how much work it will ever have to do. Everything else is load I'm allowed to shed."</em>
+      Almost no candidate says this, and it is the observation that makes every subsequent decision — the queue, the aggressive
+      caching, the single Postgres — obviously correct rather than arbitrary.</div>
+
+    <p>
+      Sit with that for a second, because it inverts the usual system-design instinct. Normally traffic drives capacity: more
+      users, more write throughput needed. Here, <strong>10 million users and 100 million users produce the <em>same</em>
+      50,000 successful writes.</strong> The extra demand doesn't create work — it creates <em>failed attempts</em>. And
+      failed attempts are something you are allowed to reject, delay, queue, or shed, because rejecting them is <em>correct</em>:
+      those people were never going to get a ticket anyway. There are 10M people and 50k seats. <strong>99.5% of your users
+      are going home disappointed no matter how good your engineering is.</strong> Your job is to make sure they go home
+      disappointed <em>quickly and politely</em>, rather than by taking your database down on their way out.
+    </p>
+
+    <h3>Storage — trivially small, and say so</h3>
+<pre><code>  Seats:     50,000 rows/event x ~100 bytes            =  5 MB per event
+  10,000 events/year                                   = 50 GB/year of seat rows
+  Bookings:  ~500M tickets/year x ~200 bytes           = 100 GB/year
+  Events, venues, users: rounding error.
+
+  Total: comfortably a few hundred GB/year.
+</code></pre>
+    <div class="note"><strong>Storage is a non-issue and you should say so in one sentence and move on.</strong> "A few
+      hundred gigabytes a year fits on a single Postgres instance with room to spare; storage is not driving this design, so
+      I'm not going to spend time on it." Candidates who lovingly compute five-year storage projections for a system whose
+      actual problem is a 60-second concurrency spike are demonstrating that they run the ritual without understanding why it
+      exists. <strong>The senior move in estimation is knowing which number to <em>ignore</em>.</strong></div>
+
+    <h3>What actually drives the design</h3>
+    <table>
+      <thead><tr><th>Number</th><th>Value</th><th>What it forces</th></tr></thead>
+      <tbody>
+        <tr><td>Peak seat-map reads</td><td>~500k/sec, ~50 GB/s naive</td><td>CDN edge caching. Accept staleness. Read path never touches the DB.</td></tr>
+        <tr><td><strong>Write ceiling</strong></td><td><strong>50,000. Bounded by inventory.</strong></td><td><strong>The key insight.</strong> Lets you protect the write path aggressively and use boring, correct, single-node technology for it.</td></tr>
+        <tr><td>Contention ratio</td><td>200 : 1 (demand : supply)</td><td>&gt;99% of write attempts must fail. Failure must be <em>cheap</em> — a failed hold cannot cost you a lock, a transaction, or a connection for long.</td></tr>
+        <tr><td>Arrival shape</td><td>10M in 60s, 0 before, 0 after</td><td>The virtual waiting room. You cannot provision for this peak; you must <em>flatten</em> it.</td></tr>
+        <tr><td>Storage</td><td>~100s of GB/year</td><td>Nothing. Ignore it. One Postgres.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="pitfall">Do not average the peak away. A candidate who computes "10M users over a day = 116 requests/sec,
+      that's easy" has computed a number that is true and completely useless. <strong>The peak is not an outlier to be smoothed;
+      the peak IS the product.</strong> Nobody books concert tickets at 3am on a Tuesday — the on-sale moment is when the entire
+      system's traffic happens, and a design that only works at the average is a design that only works when nobody is using it.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="api">4. API design</h2>
+
+    <p>
+      Five endpoints. The one that matters is <code>POST /holds</code>, and the design decision to defend is that
+      <strong>a hold is a first-class resource with its own lifetime</strong> — not a flag you flip on a seat, not a field in
+      a session. It has a URI, it can be fetched, it can be deleted, and it expires on its own. Modelling it as a resource is
+      what makes the lifecycle (deep dive 2) tractable.
+    </p>
+
+<pre><code><span class="com">// ---- READ PATH: cacheable, stale-tolerant, never touches the write DB ----</span>
+
+<span class="kw">GET</span> /events?city=london&amp;from=2026-08-01
+  <span class="com">// → the catalogue. Cache for minutes. Boring on purpose.</span>
+
+<span class="kw">GET</span> /events/{eventId}/seats
+  <span class="com">// → the seat map. THE hot read. Served from CDN/edge.</span>
+  <span class="com">// Cache-Control: public, max-age=5, stale-while-revalidate=30</span>
+  <span class="com">// Response is a HINT, not a contract. Explicitly say so in the payload.</span>
+{
+  <span class="str">"eventId"</span>: <span class="str">"evt_88"</span>,
+  <span class="str">"asOf"</span>: <span class="str">"2026-08-01T10:00:03Z"</span>,     <span class="com">// ← tell the client how stale this is</span>
+  <span class="str">"sections"</span>: [
+    { <span class="str">"id"</span>: <span class="str">"A"</span>, <span class="str">"seats"</span>: [
+        { <span class="str">"id"</span>: <span class="str">"A-14C"</span>, <span class="str">"status"</span>: <span class="str">"AVAILABLE"</span>, <span class="str">"priceCents"</span>: <span class="num">12000</span> },
+        { <span class="str">"id"</span>: <span class="str">"A-14D"</span>, <span class="str">"status"</span>: <span class="str">"BOOKED"</span>,    <span class="str">"priceCents"</span>: <span class="num">12000</span> }
+    ]}
+  ]
+}
+
+<span class="com">// ---- WRITE PATH: authoritative, contended, protected ----</span>
+
+<span class="kw">POST</span> /holds
+Idempotency-Key: 9f2c-...          <span class="com">// ← from 13. A double-clicked button must not take two holds.</span>
+{ <span class="str">"eventId"</span>: <span class="str">"evt_88"</span>, <span class="str">"seatIds"</span>: [<span class="str">"A-14C"</span>], <span class="str">"userId"</span>: <span class="str">"u_7"</span> }
+
+  <span class="com">// 201 Created — you got it</span>
+  { <span class="str">"holdId"</span>: <span class="str">"hold_123"</span>,
+    <span class="str">"seatIds"</span>: [<span class="str">"A-14C"</span>],
+    <span class="str">"expiresAt"</span>: <span class="str">"2026-08-01T10:10:00Z"</span>,   <span class="com">// ← the countdown the UI renders</span>
+    <span class="str">"totalCents"</span>: <span class="num">12000</span> }
+
+  <span class="com">// 409 Conflict — somebody beat you. THE most common response during an on-sale.</span>
+  { <span class="str">"error"</span>: <span class="str">"SEAT_UNAVAILABLE"</span>,
+    <span class="str">"seatIds"</span>: [<span class="str">"A-14C"</span>],
+    <span class="str">"message"</span>: <span class="str">"Sorry, that seat just went."</span> }
+
+<span class="kw">POST</span> /bookings                       <span class="com">// convert hold → booking, taking payment</span>
+Idempotency-Key: 4a71-...
+{ <span class="str">"holdId"</span>: <span class="str">"hold_123"</span>, <span class="str">"paymentMethodId"</span>: <span class="str">"pm_x"</span> }
+  <span class="com">// 201 → { bookingId, tickets: [...], status: "CONFIRMED" }</span>
+  <span class="com">// 410 Gone → the hold expired while you were typing your card number.</span>
+  <span class="com">//            (This edge case is nastier than it looks — see deep dive 2.)</span>
+
+<span class="kw">DELETE</span> /holds/{holdId}              <span class="com">// user backed out; release the seat immediately</span>
+
+<span class="kw">GET</span>    /holds/{holdId}              <span class="com">// how long have I got left? (client resync after a reload)</span>
+</code></pre>
+
+    <h3>Three decisions in that API worth defending</h3>
+    <ul>
+      <li><strong>The hold is separate from the booking.</strong> Two calls, not one. You could imagine a single
+        <code>POST /bookings</code> that grabs the seat and charges the card in one shot — and for a low-contention system
+        that's genuinely fine. But it forces you to hold the seat for the entire duration of a payment call you don't control,
+        which is exactly the failure mode that kills the pessimistic-locking design in deep dive 1. Splitting the calls is what
+        lets you <strong>release the database the instant the seat is claimed</strong>, and pay afterwards.</li>
+      <li><strong><code>expiresAt</code> is returned to the client, and it's absolute.</strong> Not "600 seconds remaining" —
+        an absolute timestamp. Relative durations drift across a slow network and a client that got backgrounded. The client
+        renders a countdown from it; the client's countdown is <em>cosmetic</em>. <strong>The server never trusts it.</strong></li>
+      <li><strong>409 is a normal, expected, high-volume response — not an error.</strong> During an on-sale, the overwhelming
+        majority of <code>POST /holds</code> calls will 409, by design, because there are 200 people per seat. Your monitoring
+        must not page on it, your client must render it gracefully ("sorry, that seat just went — here are three others"), and
+        your rate limiter must not treat it as abuse. <em>Failure is the common path here.</em> Design for it as a first-class
+        outcome and say so — it's an unusual observation and interviewers notice it.</li>
+    </ul>
+
+    <div class="note">Idempotency keys on both write endpoints, straight from <a href="13-payments-orders.html">13</a>. A user
+      on a flaky phone connection during a flash sale will absolutely double-tap "buy", and their browser will absolutely retry
+      the POST. Without a key, a retried <code>POST /bookings</code> can charge them twice. This is the one piece of machinery
+      you can lift wholesale from the payments page — don't re-derive it, just name it and move on. Spending 90 seconds
+      re-explaining idempotency keys in <em>this</em> interview is spending time you need for the overselling problem.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="data-model">5. Data model</h2>
+
+    <p>
+      SQL. Postgres. <strong>Made explicitly, defended immediately:</strong> this system's defining requirement is a hard
+      correctness invariant under concurrent writes, and a relational database with ACID transactions and unique constraints is
+      the single best tool humanity has built for exactly that. <a href="03-data-storage.html">03</a> made this point in the
+      abstract; here it's concrete. Reaching for Cassandra or DynamoDB here means re-implementing ACID badly, in application
+      code, and the interviewer will make you prove it can't oversell — and it can. And remember estimation: <strong>the write
+      ceiling is 170/sec.</strong> A single Postgres node does that in its sleep. There is no scale argument for NoSQL here,
+      only a scale argument <em>against</em> it, because you'd be giving up the exact guarantee you need in exchange for
+      throughput you don't.
+    </p>
+
+<pre><code><span class="kw">CREATE TABLE</span> venues (
+  id            <span class="typ">BIGINT</span> <span class="kw">PRIMARY KEY</span>,
+  name          <span class="typ">TEXT</span> <span class="kw">NOT NULL</span>,
+  seat_map      <span class="typ">JSONB</span>            <span class="com">-- static geometry: rows, sections, coordinates</span>
+);
+
+<span class="kw">CREATE TABLE</span> events (
+  id            <span class="typ">BIGINT</span> <span class="kw">PRIMARY KEY</span>,
+  venue_id      <span class="typ">BIGINT</span> <span class="kw">REFERENCES</span> venues(id),
+  name          <span class="typ">TEXT</span> <span class="kw">NOT NULL</span>,
+  starts_at     <span class="typ">TIMESTAMPTZ</span> <span class="kw">NOT NULL</span>,
+  onsale_at     <span class="typ">TIMESTAMPTZ</span> <span class="kw">NOT NULL</span>   <span class="com">-- the 10:00:00 that ruins your day</span>
+);
+
+<span class="com">-- ★ THE TABLE THE WHOLE INTERVIEW IS ABOUT ★</span>
+<span class="kw">CREATE TABLE</span> seats (
+  id            <span class="typ">BIGINT</span> <span class="kw">PRIMARY KEY</span>,
+  event_id      <span class="typ">BIGINT</span> <span class="kw">NOT NULL</span> <span class="kw">REFERENCES</span> events(id),
+  label         <span class="typ">TEXT</span>   <span class="kw">NOT NULL</span>,        <span class="com">-- 'A-14C'</span>
+  price_cents   <span class="typ">INT</span>    <span class="kw">NOT NULL</span>,
+  status        <span class="typ">TEXT</span>   <span class="kw">NOT NULL</span>,        <span class="com">-- AVAILABLE | HELD | BOOKED</span>
+  held_by       <span class="typ">BIGINT</span>,                  <span class="com">-- user holding it, if HELD</span>
+  hold_expires_at <span class="typ">TIMESTAMPTZ</span>,           <span class="com">-- ← the lazy-expiry trick lives here</span>
+  version       <span class="typ">INT</span> <span class="kw">NOT NULL DEFAULT</span> <span class="num">0</span>,   <span class="com">-- optimistic concurrency counter</span>
+
+  <span class="kw">CONSTRAINT</span> uq_seat_label <span class="kw">UNIQUE</span> (event_id, label),
+  <span class="kw">CONSTRAINT</span> ck_status    <span class="kw">CHECK</span> (status <span class="kw">IN</span> (<span class="str">'AVAILABLE'</span>,<span class="str">'HELD'</span>,<span class="str">'BOOKED'</span>))
+);
+<span class="com">-- One row per physical chair. 50,000 rows for a stadium. Pre-generated when</span>
+<span class="com">-- the event is created — NOT created on demand at booking time.</span>
+<span class="kw">CREATE INDEX</span> ix_seats_avail <span class="kw">ON</span> seats (event_id, status);
+
+<span class="kw">CREATE TABLE</span> holds (
+  id            <span class="typ">BIGINT</span> <span class="kw">PRIMARY KEY</span>,
+  user_id       <span class="typ">BIGINT</span> <span class="kw">NOT NULL</span>,
+  event_id      <span class="typ">BIGINT</span> <span class="kw">NOT NULL</span>,
+  status        <span class="typ">TEXT</span>   <span class="kw">NOT NULL</span>,        <span class="com">-- ACTIVE | CONVERTED | RELEASED | EXPIRED</span>
+  expires_at    <span class="typ">TIMESTAMPTZ</span> <span class="kw">NOT NULL</span>,   <span class="com">-- created_at + 10 minutes</span>
+  created_at    <span class="typ">TIMESTAMPTZ</span> <span class="kw">NOT NULL DEFAULT</span> now()
+);
+<span class="kw">CREATE INDEX</span> ix_holds_expiry <span class="kw">ON</span> holds (status, expires_at);  <span class="com">-- for the sweeper</span>
+
+<span class="kw">CREATE TABLE</span> bookings (
+  id            <span class="typ">BIGINT</span> <span class="kw">PRIMARY KEY</span>,
+  user_id       <span class="typ">BIGINT</span> <span class="kw">NOT NULL</span>,
+  event_id      <span class="typ">BIGINT</span> <span class="kw">NOT NULL</span>,
+  seat_id       <span class="typ">BIGINT</span> <span class="kw">NOT NULL</span> <span class="kw">REFERENCES</span> seats(id),
+  payment_id    <span class="typ">TEXT</span>,                    <span class="com">-- the provider's charge id</span>
+  status        <span class="typ">TEXT</span> <span class="kw">NOT NULL</span>,          <span class="com">-- CONFIRMED | CANCELLED</span>
+  created_at    <span class="typ">TIMESTAMPTZ</span> <span class="kw">NOT NULL DEFAULT</span> now(),
+
+  <span class="com">-- ★★ THE BACKSTOP. The database will PHYSICALLY REFUSE to double-book. ★★</span>
+  <span class="kw">CONSTRAINT</span> uq_seat_booked <span class="kw">UNIQUE</span> (event_id, seat_id)
+);
+</code></pre>
+
+    <h3>The punchline: the seat row IS the lock</h3>
+
+    <p>
+      Look hard at the <code>seats</code> table. It has a <code>status</code> column, a <code>held_by</code> column, an
+      <code>expires_at</code> and a <code>version</code>. Now compare that with a Redis distributed lock from
+      <a href="05-coordination-consensus.html">05</a>: a key (the resource), a value (who holds it), a TTL (when it expires),
+      and — if you were doing it properly — a fencing token (the version).
+    </p>
+
+    <p><strong>They are the same object.</strong> You have just built a lock. The difference is that this one lives inside a
+      database with a linearizable lock manager, a durable WAL, and real transactions, and it costs you nothing extra because
+      you needed the row anyway.</p>
+
+    <div class="senior">This is the highest-value sentence on the page and it is worth rehearsing until it's automatic:
+      <em>"I want to point out what the seats table actually is. A row with a status, a holder and an expiry <strong>is a
+      lock</strong> — it's the same shape as a Redis lock key, except it's stored in a database that already gives me atomicity,
+      durability and a real concurrency-control mechanism for free. So when someone asks me later whether I'd add a distributed
+      lock to protect the seat, my answer is that <strong>the seat row is already the lock</strong>, and adding a second,
+      weaker lock over the top of a correct one can only make things worse."</em> That reframing — <em>the resource is the
+      lock</em> — is the through-line from tutorial 05, it is the reason this design is correct, and it is the answer to about
+      four of the follow-up questions before they're asked.</div>
+
+    <h3>Access patterns, and the schema that serves them</h3>
+    <table>
+      <thead><tr><th>Pattern</th><th>Frequency</th><th>Served by</th></tr></thead>
+      <tbody>
+        <tr><td>Render the seat map for an event</td><td><strong>500k/sec at peak</strong></td><td>Not the DB at all. A materialised blob in the cache, refreshed on a short interval, served from the CDN. See deep dive 3.</td></tr>
+        <tr><td>Claim seat X</td><td>~100k attempts/sec, ~170 successes/sec</td><td>A <em>single</em> conditional <code>UPDATE</code> on the primary key. The whole game.</td></tr>
+        <tr><td>Convert hold → booking</td><td>~170/sec</td><td>One transaction on the primary. Trivial load.</td></tr>
+        <tr><td>Expire stale holds</td><td>Continuous</td><td>Lazy predicate at claim time, plus a sweeper. See deep dive 2.</td></tr>
+        <tr><td>"My tickets"</td><td>Low</td><td><code>bookings</code> by <code>user_id</code>. Read replica; staleness is fine.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="pitfall">Don't put the seat's booking state <em>only</em> in a separate <code>bookings</code> table and compute
+      availability with a <code>LEFT JOIN … WHERE booking IS NULL</code>. It sounds cleanly normalised and it makes the hot
+      path — "is this seat free, and claim it if so" — into a join under contention rather than a single-row conditional update.
+      Denormalising <code>status</code> onto the seat row is what makes the atomic claim possible. <strong>The <code>bookings</code>
+      unique constraint is your backstop, not your primary mechanism</strong> — you want both, and you want to know which is
+      which.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="hld">6. High-level design</h2>
+
+    <p>
+      The architecture is the requirements made physical: <strong>a fat, stale, wildly-available read path, and a thin,
+      guarded, fiercely-consistent write path.</strong> Draw them as two separate flows, because they are two separate
+      systems that happen to share a database, and the single most common way to fail this question is to let the read load
+      anywhere near the write path.
+    </p>
+
+<pre><code>                        ┌──────────────────────────────────────┐
+   500k req/s  ────────▶│  CDN / EDGE   (seat map, event pages)│  ← 99% of traffic
+   (browsers)           │  cached 5s, stale-while-revalidate   │    dies here
+                        └──────────────┬───────────────────────┘
+                                       │ misses only (~1%)
+                                       ▼
+                        ┌──────────────────────────────────────┐
+                        │  Seat Map Service (read-only)        │
+                        │  serves a pre-baked blob from Redis  │
+                        └──────────────┬───────────────────────┘
+                                       │ rebuilt every ~1-5s
+   ════════════════════════════════════╪══════ the staleness boundary ══════
+                                       │
+   ┌─────────────────┐                 │
+   │ VIRTUAL WAITING │  admits ~1000   │       ┌──────────────────────┐
+   │ ROOM  (queue)   │  users/sec ────────────▶│  Booking Service     │
+   │ 10M waiting     │                 │       │  (the write path)    │
+   └─────────────────┘                 │       └──────────┬───────────┘
+        ▲                              │                  │ ONE conditional
+        │ everyone else                │                  │ UPDATE per claim
+   (10M browsers)                      │                  ▼
+                                       │       ┌──────────────────────┐
+                                       └───────│  POSTGRES (primary)  │
+                                    reads      │  seats · holds ·     │
+                                    for the    │  bookings            │
+                                    blob       │  ~170 writes/sec MAX │
+                                               └──────────┬───────────┘
+                                                          │ saga (see 13)
+                                                          ▼
+                                               ┌──────────────────────┐
+                                               │  Payment Provider    │
+                                               │  (Stripe) — SLOW     │
+                                               └──────────────────────┘
+</code></pre>
+
+    <p>
+      Note the proportions, because they're the argument. <strong>The read path is enormous and does not talk to Postgres.
+      The write path is tiny and does nothing but talk to Postgres.</strong> Between them sits a queue whose entire job is to
+      guarantee the write path never sees more load than it can absorb — and since you know from estimation that it will never
+      need to do more than 50,000 units of work total, you can size that admission rate with confidence rather than hope.
+    </p>
+
+    <h3>Walkthrough: a read (the seat map)</h3>
+    <ol>
+      <li>Browser requests <code>GET /events/88/seats</code>.</li>
+      <li><strong>CDN hit</strong> — 99%+ of the time, during an on-sale, this returns a blob that is up to 5 seconds old.
+        Zero backend load. This is where half a million requests per second go to die.</li>
+      <li>On a miss, the Seat Map Service returns a pre-baked JSON blob out of Redis. It does <em>not</em> query Postgres to
+        build it per-request — that would be 50,000 rows scanned per request, and at even 1% miss rate that's 5,000 req/s ×
+        50k rows and your primary is on fire.</li>
+      <li>A background job rebuilds that blob from Postgres every ~1–5 seconds and pushes it to Redis. <strong>One reader of
+        the database, serving everyone.</strong> (This is fan-out-on-write applied to a cache — the same trick as
+        <a href="10-news-feed.html">10</a>, at a different layer.)</li>
+      <li>The browser renders the map. <strong>Some of those "available" seats are already gone.</strong> That is expected,
+        accepted, and designed for.</li>
+    </ol>
+
+    <h3>Walkthrough: a write (claiming a seat)</h3>
+    <ol>
+      <li>User clicks seat A-14C. Browser fires <code>POST /holds</code> with an idempotency key.</li>
+      <li>The request carries a <strong>waiting-room token</strong>. No valid token → 403, back to the queue. During an
+        on-sale this rejects the overwhelming majority of requests <em>at the edge</em>, before they cost you anything.</li>
+      <li>Rate limiter (<a href="09-rate-limiter.html">09</a>) — per-user and per-IP. Scalper bots are the real adversary here.</li>
+      <li>Booking Service issues <strong>one statement</strong>:
+        <code>UPDATE seats SET status='HELD', … WHERE id=? AND status='AVAILABLE'</code>. It checks the affected-row count.
+        <strong>1 → you won. 0 → someone beat you, return 409.</strong> No explicit lock. No <code>SELECT</code> first. No
+        transaction spanning anything slow. The statement is the entire critical section, and it lasts under a millisecond.</li>
+      <li>Insert a <code>holds</code> row with <code>expires_at = now() + 10 minutes</code>, in the same transaction. Commit.
+        <strong>The database connection is released. The seat is claimed. Nothing is locked.</strong></li>
+      <li>Return the hold and its expiry. The UI starts a 10:00 countdown.</li>
+      <li>User enters card details — <em>taking however long they take, while your database sits idle.</em></li>
+      <li><code>POST /bookings</code> → re-validate the hold is still ACTIVE and unexpired → call Stripe (3 seconds, and this
+        happens <strong>outside</strong> any lock) → on success, transactionally flip the seat to <code>BOOKED</code>, insert
+        the <code>bookings</code> row (where the <code>UNIQUE (event_id, seat_id)</code> constraint stands as the final
+        backstop), mark the hold CONVERTED.</li>
+      <li>Async: issue the ticket, email it, invalidate the seat-map cache.</li>
+    </ol>
+
+    <div class="senior">The line that makes an interviewer nod: <em>"The critical section is a single UPDATE statement that
+      completes in under a millisecond, and the slow thing — the payment call — happens completely outside it. That's the
+      entire trick. Every design that fails this question fails because it holds something across the payment."</em> Keep that
+      sentence in your pocket; it is the compressed form of the next section and you can deploy it the moment anyone mentions
+      locking.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="deep-dive-1">7a. Deep dive: the overselling problem</h2>
+
+    <p><strong>This is where the interview really happens.</strong> Everything before this was setup. If you get thirty
+      minutes into a ticket-booking question and haven't been pushed here, the interviewer is either being kind or has stopped
+      paying attention. Every other section on this page can be a little wrong. <em>This one cannot.</em></p>
+
+    <p>
+      The question is one sentence: <strong>two users click seat 14C at the same millisecond. How does exactly one of them
+      get it?</strong> There are five answers people give. Four of them are wrong or bad, and knowing <em>why</em> — precisely,
+      mechanically why — is the whole assessment. Walk them in escalating order. Do this out loud; the walk itself is the
+      signal.
+    </p>
+
+    <h3>Approach 1 — Read-then-write. The naive one. It is broken.</h3>
+
+    <p>This is what everyone writes the first time, and it is what a CRUD instinct produces:</p>
+
+<pre><code><span class="com">-- Thread A                                    Thread B</span>
+<span class="kw">SELECT</span> status <span class="kw">FROM</span> seats <span class="kw">WHERE</span> id=<span class="num">14</span>;    <span class="com">-- 'AVAILABLE'</span>
+<span class="com">-- application: if (status == AVAILABLE) {</span>
+<span class="kw">UPDATE</span> seats <span class="kw">SET</span> status=<span class="str">'BOOKED'</span> <span class="kw">WHERE</span> id=<span class="num">14</span>;
+</code></pre>
+
+    <p>Looks fine. It is not fine. Here is the interleaving, and <strong>draw this timeline on the whiteboard — do not just
+      describe it</strong>, because the picture is the proof:</p>
+
+<pre><code>  time ──────────────────────────────────────────────────────────────▶
+
+  Thread A   SELECT id=14 ──▶ 'AVAILABLE'
+                                    │
+                                    │        ┌── Thread B  SELECT id=14 ──▶ 'AVAILABLE'
+                                    │        │             (!!! still available — A hasn't
+                                    │        │              written yet. B's read is CORRECT.)
+                                    ▼        │
+  Thread A   if (available) ✓ ──▶ UPDATE ... │
+                                  status='BOOKED'
+                                             ▼
+                                    Thread B  if (available) ✓ ──▶ UPDATE
+                                                                   status='BOOKED'
+
+  Result: TWO people hold a valid booking for seat 14C.
+          Neither thread did anything "wrong". The DB did exactly what it was told.
+</code></pre>
+
+    <p>
+      This is a <strong>TOCTOU race</strong> — time-of-check to time-of-use. The check ("is it available?") and the use
+      ("take it") are two separate operations, and <em>anything can happen in the gap between them</em>. The window is
+      microseconds wide. At 5 requests/sec you will never, ever see this bug — not in dev, not in staging, not in a load test
+      you wrote yourself. At 100,000 requests/sec on one seat, <strong>it happens constantly</strong>.
+    </p>
+
+    <div class="pitfall">Wrapping the two statements in <code>BEGIN … COMMIT</code> <strong>does not fix this.</strong> This
+      is the single most common wrong answer in the entire question, and candidates say it with real confidence. A transaction
+      gives you atomicity (both statements or neither) and isolation <em>at the level you configured</em> — and Postgres's
+      default is <strong>Read Committed</strong>, under which both transactions cheerfully read <code>'AVAILABLE'</code> before
+      either writes. You have wrapped a lost update in a transaction. It is still a lost update. (See
+      <a href="03-data-storage.html">03</a>'s anomaly table: this is precisely the "lost update" row, and Read Committed does
+      not prevent it.) If you say "I'd use a transaction" and stop there, the interviewer's next question is "at what isolation
+      level?", and if you don't have an answer, the round is effectively over.</div>
+
+    <h3>Approach 2 — Pessimistic locking. Correct, and it will still take your site down.</h3>
+
+<pre><code><span class="kw">BEGIN</span>;
+<span class="kw">SELECT</span> status <span class="kw">FROM</span> seats <span class="kw">WHERE</span> id = <span class="num">14</span> <span class="kw">FOR</span> <span class="kw">UPDATE</span>;  <span class="com">-- row lock, held until COMMIT</span>
+<span class="com">-- Thread B blocks HERE until A commits. No race. Genuinely correct.</span>
+<span class="kw">UPDATE</span> seats <span class="kw">SET</span> status=<span class="str">'BOOKED'</span> <span class="kw">WHERE</span> id = <span class="num">14</span>;
+<span class="kw">COMMIT</span>;
+</code></pre>
+
+    <p>
+      <code>SELECT … FOR UPDATE</code> takes an exclusive row lock. Thread B's <code>SELECT</code> blocks until A commits,
+      then sees <code>'BOOKED'</code> and correctly declines. <strong>This is correct.</strong> Say that out loud — do not
+      dismiss it, because dismissing a correct solution without understanding it is a worse look than proposing it. Millions of
+      systems run this way and are fine.
+    </p>
+
+    <p>But look at what happens when you put the payment inside the transaction, which is exactly what a candidate under time
+      pressure does:</p>
+
+<pre><code>  <span class="com">// The design that kills the company</span>
+  BEGIN
+    SELECT ... FOR UPDATE          <span class="com">// row lock acquired  ← t=0ms</span>
+    charge = stripe.charge(card)   <span class="com">// ⏳ 3 SECONDS. Network. Third party.</span>
+                                   <span class="com">//    THE ROW LOCK IS STILL HELD.</span>
+                                   <span class="com">//    THE DB CONNECTION IS STILL HELD.</span>
+    UPDATE seats SET ...
+  COMMIT                           <span class="com">//                    ← t=3000ms</span>
+</code></pre>
+
+    <p>Do the arithmetic, because the arithmetic is the argument:</p>
+
+<pre><code>  Connection pool ................. 100 connections (a generous default)
+  Time each booking holds one ..... 3 seconds (the Stripe call)
+  Max booking throughput .......... 100 / 3s  =  ~33 bookings/sec
+
+  Incoming during on-sale ......... 100,000 requests/sec
+
+  → Pool exhausted in ~1 millisecond.
+  → Every subsequent request BLOCKS waiting for a connection.
+  → The seat-map service shares the pool. It blocks too.
+  → Health checks need a connection. They block. The LB marks
+    every node unhealthy and pulls them out of rotation.
+  → The entire site is down, including the parts that had nothing
+    to do with booking.
+</code></pre>
+
+    <p>
+      And it's worse than throughput collapse. If Stripe hangs for 30 seconds, you hold a row lock for 30 seconds.
+      <strong>Locks are a shared, finite, global resource, and a slow third party you don't control is now holding them.</strong>
+      You have coupled your database's health to Stripe's p99 latency. That is a catastrophic piece of coupling, and it is
+      invisible in a code review.
+    </p>
+
+    <div class="senior">Here is the distinction that separates a 7-YOE answer from a 3-YOE one, and it's the most important
+      thing in this section: <em>"Pessimistic locking with <code>SELECT FOR UPDATE</code> is <strong>correct</strong> — it will
+      never oversell. I'm rejecting it for a <strong>throughput</strong> reason, not a correctness reason, and I want to be
+      precise about which. It serialises every contender on a hot seat and, more dangerously, it tempts you into holding a row
+      lock and a pooled connection across a three-second call to a payment provider you don't control. Under a flash sale my
+      connection pool is exhausted in about a millisecond and the whole site goes down — including browsing, which didn't need
+      the database at all. <strong>The lock isn't the problem; the duration of the lock is the problem.</strong>"</em>
+      Naming <em>why</em> a correct solution is still the wrong solution is exactly the judgment being graded. A candidate who
+      says "pessimistic locking is bad" has memorised a slogan. A candidate who says "it's correct but it holds a connection
+      across a third-party call and that's an outage" has understood the system.</div>
+
+    <p>
+      <em>Could you keep pessimistic locking and just move the payment outside the transaction?</em> Yes — and now you have
+      re-invented holds, which is exactly what the two-phase hold/booking API does. That's a fine thing to say out loud: it
+      shows the design isn't arbitrary. But once the payment is outside the transaction, the lock is only being held for a
+      single-row status flip, and at that point <em>you don't need the explicit lock at all</em> — which brings us to:
+    </p>
+
+    <h3>Approach 3 — Optimistic concurrency. The answer. ★</h3>
+
+    <p>Stop reading first. Make the check <em>part of the write</em>:</p>
+
+<pre><code><span class="com">-- ★ THE ONE STATEMENT THIS ENTIRE PAGE IS ABOUT ★</span>
+<span class="kw">UPDATE</span> seats
+   <span class="kw">SET</span> status          = <span class="str">'HELD'</span>,
+       held_by         = :userId,
+       hold_expires_at = now() + <span class="kw">INTERVAL</span> <span class="str">'10 minutes'</span>,
+       version         = version + <span class="num">1</span>
+ <span class="kw">WHERE</span> id     = :seatId
+   <span class="kw">AND</span> status = <span class="str">'AVAILABLE'</span>;      <span class="com">-- ← THE CHECK *IS* THE WRITE</span>
+
+<span class="com">-- Then look at the affected-row count:</span>
+<span class="com">--   1  → you got the seat. It's yours for 10 minutes.</span>
+<span class="com">--   0  → someone beat you. Return 409. No harm, no lock, no retry storm.</span>
+</code></pre>
+
+    <p>
+      <strong>Why this is safe, stated precisely</strong> — and you must be able to state it precisely, because "optimistic
+      locking" as a phrase is worth nothing without the mechanism:
+    </p>
+    <p>
+      A single <code>UPDATE … WHERE &lt;predicate&gt;</code> is <strong>atomic within the database engine</strong>. When two
+      transactions target the same row, the engine takes a row-level write lock <em>internally</em>, for the duration of that
+      one statement — microseconds. The second writer blocks momentarily, and then — critically — <em>under Read Committed,
+      Postgres re-evaluates the <code>WHERE</code> clause against the newly committed version of the row</em>. It sees
+      <code>status = 'HELD'</code>, the predicate no longer matches, and the update affects <strong>zero rows</strong>. The
+      database's own concurrency control does the work. You didn't write a lock; you <em>used</em> the one that was already
+      there, correctly, for the shortest possible time.
+    </p>
+    <p>
+      There is no window between check and use, <em>because there is no separate check.</em> That's the whole idea. The TOCTOU
+      race is not mitigated — it is <strong>eliminated by construction</strong>, because there is no gap in which to interleave.
+    </p>
+
+    <h4>The Java / Spring version</h4>
+
+<pre><code><span class="ann">@Repository</span>
+<span class="kw">public interface</span> <span class="typ">SeatRepository</span> <span class="kw">extends</span> <span class="typ">JpaRepository</span>&lt;<span class="typ">Seat</span>, <span class="typ">Long</span>&gt; {
+
+    <span class="ann">@Modifying</span>
+    <span class="ann">@Query</span>(value = <span class="str">"""</span>
+<span class="str">        UPDATE seats
+           SET status = 'HELD',
+               held_by = :userId,
+               hold_expires_at = now() + interval '10 minutes',
+               version = version + 1
+         WHERE id = :seatId
+           AND (status = 'AVAILABLE'
+                OR (status = 'HELD' AND hold_expires_at &lt; now()))</span>
+<span class="str">        """</span>, nativeQuery = <span class="kw">true</span>)
+    <span class="typ">int</span> tryHold(<span class="ann">@Param</span>(<span class="str">"seatId"</span>) <span class="typ">long</span> seatId, <span class="ann">@Param</span>(<span class="str">"userId"</span>) <span class="typ">long</span> userId);
+    <span class="com">// ↑ returns the AFFECTED ROW COUNT. That integer is the entire answer.</span>
+    <span class="com">// Note the OR clause — that's lazy expiry, deep dive 2. It costs nothing here.</span>
+}
+
+<span class="ann">@Service</span>
+<span class="kw">public class</span> <span class="typ">HoldService</span> {
+
+    <span class="ann">@Transactional</span>
+    <span class="kw">public</span> <span class="typ">Hold</span> hold(<span class="typ">long</span> seatId, <span class="typ">long</span> userId) {
+
+        <span class="typ">int</span> rows = seatRepo.tryHold(seatId, userId);   <span class="com">// ← atomic. sub-millisecond.</span>
+
+        <span class="kw">if</span> (rows == <span class="num">0</span>) {
+            <span class="com">// Someone beat me. This is the COMMON case during an on-sale —</span>
+            <span class="com">// it is not an error, it is the expected outcome for 99% of users.</span>
+            <span class="kw">throw new</span> <span class="typ">SeatUnavailableException</span>(seatId);   <span class="com">// → HTTP 409</span>
+        }
+
+        <span class="kw">return</span> holdRepo.save(<span class="typ">Hold</span>.active(seatId, userId, <span class="typ">Duration</span>.ofMinutes(<span class="num">10</span>)));
+    }
+    <span class="com">// TRANSACTION ENDS HERE. Connection returned to the pool.</span>
+    <span class="com">// NOTHING is locked. The user can now take 9 minutes to find their wallet.</span>
+    <span class="com">// Payment happens LATER, in a completely separate request. That is the point.</span>
+}
+</code></pre>
+
+    <div class="pitfall">Two things that will bite you in the code, not the design. <strong>First:</strong> if you use JPA's
+      <code>@Version</code> annotation and a normal <code>save()</code>, Hibernate does a read-modify-write and throws
+      <code>OptimisticLockException</code> on conflict. That is <em>also</em> correct, but it costs you a read, and at 100k
+      contended attempts/sec you're generating a hundred thousand exceptions per second — exceptions with stack traces are
+      genuinely expensive in the JVM. The raw conditional <code>UPDATE</code> returning a row count is <em>strictly better under
+      contention</em>: no read, no exception, just an integer. Knowing that difference is a real Java-plus-Postgres signal, and
+      you just spent a whole phase on both. <strong>Second:</strong> <code>@Modifying</code> queries bypass the persistence
+      context — the entity in your L1 cache is now stale. Don't read it back and trust it in the same transaction.</div>
+
+    <h4>The retry storm — and why it doesn't materialise here</h4>
+    <p>
+      The standard objection to optimistic concurrency, and <a href="03-data-storage.html">03</a> raises it explicitly, is:
+      <em>"under high contention, the losers all retry, and you livelock."</em> That objection is <strong>correct in general and
+      does not apply to this system</strong>, and knowing why is a genuinely senior distinction:
+    </p>
+    <ul>
+      <li><strong>The losers don't retry the same row.</strong> If you lose seat 14C, retrying 14C is pointless — it's gone
+        forever, not temporarily busy. The correct client behaviour is to <em>fail fast and pick a different seat</em>, which is
+        exactly what the UI does. Compare this with an optimistic update on a bank balance, where the row is still there and you
+        genuinely must retry until you succeed. <strong>Seat contention is not retryable contention.</strong> That's a lovely
+        thing to say out loud.</li>
+      <li><strong>Losing is cheap.</strong> One statement, zero rows affected, sub-millisecond, no lock held, connection back in
+        the pool. You can afford to lose 99,830 times a second. Contrast with pessimistic locking, where <em>losing costs you a
+        blocked thread and a held connection.</em></li>
+    </ul>
+
+    <div class="senior">Deliver approach 3 like this: <em>"I'd make the check and the write a single atomic statement:
+      <code>UPDATE seats SET status='HELD' WHERE id=? AND status='AVAILABLE'</code>, and then look at the affected-row count.
+      One means I won; zero means someone beat me and I return a 409. The database guarantees that a single UPDATE with a
+      predicate is atomic — it re-evaluates the WHERE clause against the committed row — so there is <strong>no window between
+      the check and the write, because there is no separate check</strong>. And critically, no lock is held across the payment:
+      the seat is claimed in under a millisecond, and Stripe gets called afterwards, outside any transaction. That gives me
+      pessimistic locking's correctness with optimistic locking's throughput, which is the combination this problem
+      needs."</em></div>
+
+    <h3>Approach 4 — The unique constraint. The backstop that cannot be bribed. ★</h3>
+
+    <p>
+      Everything so far has been <em>your application logic</em> being careful. Application logic has bugs. Someone will add a
+      code path in eighteen months, an admin tool will do a bulk seat reassignment, a migration script will run at 2am, a
+      developer will "just quickly" write a raw UPDATE without the WHERE clause. So put the invariant somewhere it cannot be
+      bypassed:
+    </p>
+
+<pre><code><span class="kw">ALTER TABLE</span> bookings
+  <span class="kw">ADD CONSTRAINT</span> uq_seat_booked <span class="kw">UNIQUE</span> (event_id, seat_id);
+
+<span class="com">-- Now the database will PHYSICALLY REFUSE to record two bookings for one seat.</span>
+<span class="com">-- Not "will validate". Not "should catch". REFUSE. The INSERT errors out at</span>
+<span class="com">-- the storage layer, inside the engine, regardless of what your application</span>
+<span class="com">-- code believes, regardless of which service wrote it, regardless of any bug</span>
+<span class="com">-- anyone introduces at any point in the future.</span>
+</code></pre>
+
+<pre><code><span class="kw">try</span> {
+    bookingRepo.save(<span class="kw">new</span> <span class="typ">Booking</span>(eventId, seatId, userId, chargeId));
+} <span class="kw">catch</span> (<span class="typ">DataIntegrityViolationException</span> e) {
+    <span class="com">// The constraint fired. This should be IMPOSSIBLE if the hold logic is</span>
+    <span class="com">// correct — which is exactly why catching it matters. It is a canary.</span>
+    <span class="com">// Refund the charge (saga compensation — see 13), page someone, and</span>
+    <span class="com">// be extremely grateful that the customer never found out.</span>
+    payments.refund(chargeId);
+    alerts.critical(<span class="str">"DOUBLE BOOKING PREVENTED BY CONSTRAINT"</span>, eventId, seatId);
+    <span class="kw">throw new</span> <span class="typ">SeatUnavailableException</span>(seatId);
+}
+</code></pre>
+
+    <div class="senior">This is the through-line from <a href="05-coordination-consensus.html">05</a>, and it is worth landing
+      hard: <em>"<strong>Push the invariant into the database.</strong> An application-level check is advisory — it holds only as
+      long as every code path that ever touches this table remembers to perform it. A constraint is <em>enforced</em> — the
+      database will reject the write no matter which service, script, or intern produced it. The conditional UPDATE is my
+      primary mechanism because it's fast; the unique constraint is my backstop because it's <em>unbypassable</em>. I want both,
+      and if the constraint ever fires in production I want it to page me, because it means my primary mechanism has a bug I
+      don't know about."</em> That last clause — treating the constraint violation as a <em>monitoring signal</em>, a canary for
+      bugs in your own logic, rather than just an error to swallow — is a genuinely senior thought and I have watched it change
+      the temperature of an interview.</div>
+
+    <h3>Approach 5 — A distributed lock in Redis. The trap. ✗</h3>
+
+    <p>
+      Ask a candidate how to stop a double-booking and nine out of ten say <em>"a distributed lock in Redis."</em> It is the
+      reflex answer. It is on every blog. Here, it is <strong>the worst of the five options</strong>, and being the tenth
+      candidate is worth a lot.
+    </p>
+
+<pre><code>  <span class="com">// The reflex answer</span>
+  <span class="typ">String</span> token = <span class="typ">UUID</span>.randomUUID().toString();
+  <span class="kw">if</span> (redis.set(<span class="str">"lock:seat:"</span> + seatId, token, nx().px(<span class="num">10_000</span>))) {
+      <span class="com">// ... check seat, book seat ...   ← and now you have a WORSE system</span>
+  }
+</code></pre>
+
+    <p>Why it's bad here — and give all three reasons, in this order:</p>
+    <ol>
+      <li><strong>It is not safe for correctness.</strong> Straight from <a href="05-coordination-consensus.html">05</a>: a
+        GC pause longer than the TTL and two clients hold the lock; clock skew expires it early; Redis's <em>asynchronous</em>
+        replication means a routine primary failover can hand the same lock to two clients, and nobody did anything wrong.
+        Redlock is contested (Kleppmann's critique) and still issues no fencing token. <strong>You would be protecting a hard
+        correctness invariant with a mechanism that is explicitly not safe for correctness invariants.</strong></li>
+      <li><strong>You already have a correct lock and you're paying for it.</strong> Postgres has a linearizable lock manager,
+        a durable WAL, and real transactions. The seat row <em>is</em> the lock. Adding Redis means layering a weaker,
+        best-effort lock on top of a stronger one that you're using anyway. <em>It cannot make the system more correct. It can
+        only add a new failure mode.</em></li>
+      <li><strong>It adds a new dependency on the critical path.</strong> Now "can I book a seat?" depends on Redis being up,
+        reachable, and un-failed-over. You've reduced availability to buy nothing.</li>
+    </ol>
+
+    <div class="senior">The exact sentence, and it is a genuine differentiator: <em>"I'd deliberately <strong>not</strong> use a
+      distributed lock here, and I want to explain why, because I think it's the trap in this question. A Redis lock isn't safe
+      for a correctness invariant — GC pauses, clock skew, and async replication on failover can all hand the same lock to two
+      clients, which is exactly the Kleppmann critique of Redlock. But the deeper point is that <strong>I don't need one</strong>:
+      I already have a database with a linearizable lock manager, and the seat row is the lock. Reaching for Redlock when a
+      <code>WHERE status='AVAILABLE'</code> clause would do is adding an unsafe distributed lock on top of a safe local one.
+      That's strictly worse on correctness, availability <em>and</em> complexity."</em> <strong>Volunteering this before you're
+      asked</strong> — pre-empting the trap rather than falling into it — is one of the strongest moves available anywhere in
+      this course.</div>
+
+    <div class="note"><strong>When <em>would</em> you use a distributed lock?</strong> Be fair to it, because a candidate who
+      can only criticise looks dogmatic. If the inventory did <em>not</em> live in one transactional database — say the seat
+      state is sharded across a system with no cross-shard transactions, or it lives in a third-party system with no conditional
+      write — then you have no atomic primitive to lean on and you need coordination from outside: an etcd/ZooKeeper lock (which
+      is consensus-backed, unlike Redis) plus a <strong>fencing token</strong> the resource itself enforces. The rule from 05
+      holds: <em>use a lock only when the resource can't enforce the invariant itself.</em> Here, it can. So don't.</div>
+
+    <h3>The comparison table — the one to memorise</h3>
+
+    <table>
+      <thead><tr>
+        <th>Approach</th><th>Correct?</th><th>Scales under flash sale?</th><th>Verdict</th>
+      </tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>1. Read-then-write</strong><br><code>SELECT</code> then <code>UPDATE</code></td>
+          <td><strong>✗ NO</strong> — TOCTOU race. Lost update. Oversells.</td>
+          <td>n/a — it's wrong</td>
+          <td><strong>Never.</strong> And note: wrapping it in a transaction does <em>not</em> fix it at Read Committed.</td>
+        </tr>
+        <tr>
+          <td><strong>2. Pessimistic</strong><br><code>SELECT … FOR UPDATE</code></td>
+          <td><strong>✓ Yes</strong> — a real exclusive row lock</td>
+          <td><strong>✗ Poorly.</strong> Serialises contenders; catastrophic if the lock spans a payment call — pool exhaustion in ~1ms.</td>
+          <td>Fine for low contention. <strong>Correct but doesn't scale</strong> — and saying <em>exactly that</em> is the senior move.</td>
+        </tr>
+        <tr>
+          <td><strong>3. Optimistic / conditional UPDATE</strong><br><code>UPDATE … WHERE status='AVAILABLE'</code></td>
+          <td><strong>✓ Yes</strong> — atomicity of a single predicated UPDATE</td>
+          <td><strong>✓ Excellently.</strong> Sub-ms critical section, no lock across payment, losing is cheap.</td>
+          <td><strong>★ THE ANSWER.</strong> Primary mechanism. Check the affected-row count.</td>
+        </tr>
+        <tr>
+          <td><strong>4. Unique constraint</strong><br><code>UNIQUE (event_id, seat_id)</code></td>
+          <td><strong>✓✓ Absolutely</strong> — enforced by the engine, unbypassable by any bug</td>
+          <td>✓ Free. It's an index you'd want anyway.</td>
+          <td><strong>★ ALWAYS. Use it <em>with</em> #3, not instead of it.</strong> Backstop + canary. If it fires, you have a bug.</td>
+        </tr>
+        <tr>
+          <td><strong>5. Distributed lock</strong><br>Redis <code>SET NX PX</code> / Redlock</td>
+          <td><strong>✗ Not safely</strong> — pauses, clock skew, failover; no fencing token</td>
+          <td>✗ Adds a network hop and a dependency to the hot path</td>
+          <td><strong>The trap.</strong> Strictly worse than #3 on every axis. Use only when the resource can't enforce the invariant itself — which here, it can.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>
+      <strong>The shipping answer is 3 + 4.</strong> A conditional <code>UPDATE</code> as the mechanism, a unique constraint as
+      the backstop, and a monitoring alert if the backstop ever fires. That is roughly ten lines of code, it is boring, it is
+      correct at any concurrency the hardware can physically deliver, and <em>boring and correct is the entire product</em>.
+    </p>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="deep-dive-2">7b. Deep dive: holds, TTLs &amp; the reservation lifecycle</h2>
+
+    <p>
+      Deep dive 1 solved <em>claiming</em> a seat. Now the awkward part: a human being has to type in a card number, and
+      humans are slow. You are stuck between two unacceptable options:
+    </p>
+    <ul>
+      <li><strong>Hold the seat forever</strong> while they fumble for their wallet → someone opens 500 tabs, holds every seat
+        in the stadium, and buys none of them. Your inventory is now zero and your revenue is also zero. This is not
+        hypothetical; it is a <em>trivially easy denial-of-inventory attack</em> and scalpers do it.</li>
+      <li><strong>Release the seat instantly</strong> → the seat gets taken from under a paying customer mid-checkout. Their
+        card is charged and they have no seat, or the payment fails at the last step. Terrible, and it's the exact failure that
+        makes people hate ticket sites.</li>
+    </ul>
+
+    <p>
+      So: <strong>a hold with a TTL.</strong> Typically <strong>10 minutes</strong> — that's the countdown timer you've seen on
+      every ticket site you've ever used, and now you know it isn't a UX flourish, it's a <em>distributed systems lease</em>
+      rendered as a clock. It's the same idea as a lock TTL in <a href="05-coordination-consensus.html">05</a>: <em>you get
+      exclusive access, but only for a bounded time, so that your crash (or your abandonment) doesn't deadlock everyone else
+      forever.</em> The countdown is a lease made visible to a human.
+    </p>
+
+<pre><code>            POST /holds                          POST /bookings
+                │                                      │
+                ▼                                      ▼
+   AVAILABLE ──────▶ HELD ─────────────────────────────────▶ BOOKED
+       ▲             │  │                                      │
+       │             │  │ DELETE /holds/{id}   (user bails)    │
+       │◀────────────┘  │                                      │
+       │  TTL expires   │                                      │ refund /
+       │  (10 min)      │                                      │ cancellation
+       │                ▼                                      │
+       │        [ 10:00 countdown ]                            │
+       └───────────────────────────────────────────────────────┘
+                     seat returns to inventory
+</code></pre>
+
+    <h3>How does the hold actually expire? Three options, and one is quietly the best.</h3>
+
+    <p>
+      This is a beautiful little interview question in its own right, because the obvious answer (a cron job) is the <em>worst</em>
+      one, and the elegant answer is nearly free. An interviewer who asks "so how does the seat come back?" is checking whether
+      you reach for a background job reflexively.
+    </p>
+
+    <h4>Option A — A background sweeper job</h4>
+<pre><code><span class="com">-- Every 30 seconds, a scheduled job (see 12 — distributed scheduler):</span>
+<span class="kw">UPDATE</span> seats
+   <span class="kw">SET</span> status = <span class="str">'AVAILABLE'</span>, held_by = <span class="kw">NULL</span>, hold_expires_at = <span class="kw">NULL</span>
+ <span class="kw">WHERE</span> status = <span class="str">'HELD'</span>
+   <span class="kw">AND</span> hold_expires_at &lt; now();
+</code></pre>
+    <p>
+      Simple, and it has the significant virtue that <strong>the seat map becomes correct on its own</strong> — an expired seat
+      actually reads as AVAILABLE, so the cached map shows it and users can see it come back. But: it's another moving part,
+      it needs leader election or a lock so two instances don't both run it (<a href="12-notifications-scheduler.html">12</a>),
+      and it introduces a <strong>window of wrongness</strong> — for up to 30 seconds a seat is expired-but-still-marked-HELD,
+      and therefore unbuyable by anyone. In the last minutes of a sold-out on-sale, 30 seconds of unbuyable inventory is real
+      money.
+    </p>
+
+    <h4>Option B — Lazy expiry at read/claim time ★</h4>
+    <p>Don't clean up. <strong>Just don't believe the status column on its own.</strong> Make the predicate tell the truth:</p>
+
+<pre><code><span class="com">-- The claim, upgraded. An EXPIRED hold is, by definition, available.</span>
+<span class="kw">UPDATE</span> seats
+   <span class="kw">SET</span> status = <span class="str">'HELD'</span>, held_by = :userId,
+       hold_expires_at = now() + <span class="kw">INTERVAL</span> <span class="str">'10 minutes'</span>,
+       version = version + <span class="num">1</span>
+ <span class="kw">WHERE</span> id = :seatId
+   <span class="kw">AND</span> ( status = <span class="str">'AVAILABLE'</span>
+         <span class="kw">OR</span> (status = <span class="str">'HELD'</span> <span class="kw">AND</span> hold_expires_at &lt; now()) );   <span class="com">-- ← ★</span>
+
+<span class="com">-- Still ONE atomic statement. Still zero-or-one rows. Still no lock.</span>
+<span class="com">-- No job. No scheduler. No leader election. No window of wrongness.</span>
+<span class="com">-- Expiry is now a PROPERTY OF THE READ, not an EVENT that must be processed.</span>
+</code></pre>
+
+    <p>
+      This is genuinely elegant and it is <strong>the honest right answer for a great many systems</strong>. The expiry isn't a
+      thing that <em>happens</em> — it's a thing that <em>is true</em>, evaluated at the only moment anyone cares: when someone
+      tries to claim the seat. There is no window in which an expired seat is unbuyable, because the very act of trying to buy
+      it is what recognises the expiry. And it composes perfectly with deep dive 1: it's the same single atomic UPDATE, with a
+      slightly richer predicate. It costs you <em>nothing</em>.
+    </p>
+
+    <div class="senior">Say this, because it generalises far beyond seats: <em>"I'd do expiry lazily, in the WHERE clause of the
+      claim: <code>status='AVAILABLE' OR (status='HELD' AND hold_expires_at &lt; now())</code>. An expired hold <strong>is</strong>
+      an available seat — I don't need a job to make that true, I just need to stop pretending the status column is the whole
+      truth. That removes a scheduled job, a leader election, and a window where an expired seat is unbuyable, and it's still a
+      single atomic statement. <strong>I'd rather derive state at read time than maintain it with a background process</strong>,
+      wherever the predicate is cheap enough — and here it's an index lookup."</em> Then immediately volunteer the catch, because
+      there is one and the interviewer is about to find it.</div>
+
+    <div class="pitfall"><strong>The catch with pure lazy expiry: the seat map lies.</strong> If nothing ever writes
+      <code>status='AVAILABLE'</code> back to the row, then the <code>seats</code> table still says HELD, so your cached seat map
+      still <em>renders</em> it as unavailable — and nobody clicks a greyed-out seat, so nobody ever triggers the lazy expiry that
+      would free it. The seat is claimable-but-invisible. <strong>The seat becomes a ghost.</strong> This is a real bug and it's
+      exactly the kind of second-order thinking that distinguishes a strong candidate.
+      <br><br>
+      <strong>The fix, and it's the answer you want:</strong> use <em>both</em>. Lazy expiry in the claim predicate is your
+      <strong>correctness</strong> mechanism — it guarantees no seat is ever permanently lost, even if the job dies. A sweeper is
+      your <strong>visibility</strong> mechanism — it exists so the seat map is accurate, not so the system is correct. That
+      split matters: <em>if the sweeper is down for an hour, the site is still correct, it just shows fewer seats than it has.</em>
+      That's a degraded mode, not an outage. Designing so that your background job's failure is a cosmetic problem rather than a
+      correctness problem is precisely the instinct being graded — and the seat-map rebuild job (deep dive 3) can do the sweep
+      itself, so it isn't even a new component.</div>
+
+    <h4>Option C — Redis key expiry</h4>
+    <p>
+      Store the hold as a Redis key with a 600-second TTL and let Redis evict it. Attractive, and it's what a lot of blog posts
+      suggest — but it means <strong>your inventory's source of truth is now split across two systems</strong> with no
+      transaction between them. If Postgres commits the hold and the Redis SETEX fails, the seat is held forever. If Redis
+      evicts and Postgres doesn't know, you have inconsistency in the direction that <em>oversells</em>. You'd need a
+      reconciliation loop to fix the drift, and now you've built more machinery than option B, to be less correct.
+      <strong>Redis expiry is great for caches and rate limits (<a href="09-rate-limiter.html">09</a>), and a poor choice for
+      inventory truth.</strong> Keep the truth in one place.
+    </p>
+
+    <table>
+      <thead><tr><th>Expiry mechanism</th><th>Correctness</th><th>Cost</th><th>Verdict</th></tr></thead>
+      <tbody>
+        <tr><td><strong>A. Sweeper job</strong></td><td>Good, but a window of unbuyable inventory</td><td>A scheduler, leader election, a job to monitor</td><td>Useful — but for <em>visibility</em>, not correctness</td></tr>
+        <tr><td><strong>B. Lazy predicate</strong> ★</td><td><strong>Excellent</strong> — no window, no job to fail</td><td>Free. One extra <code>OR</code> in a WHERE clause.</td><td><strong>The correctness mechanism.</strong> Always have this.</td></tr>
+        <tr><td><strong>C. Redis TTL</strong></td><td>Split-brain risk between two sources of truth</td><td>A second datastore on the critical path + reconciliation</td><td>No. Inventory truth belongs in one place.</td></tr>
+        <tr><td><strong>B + A together</strong> ★★</td><td>Correct by B; accurate by A</td><td>Small — the sweeper rides along with the seat-map rebuild</td><td><strong>The shipping answer.</strong> Correctness that doesn't depend on a job; visibility that does.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>The hold → booking transition, and its genuinely nasty failure modes</h3>
+
+    <p>
+      Converting a hold into a booking means touching two systems — <em>your database</em> and <em>a payment provider</em> —
+      with no transaction spanning them. That is a <strong>saga</strong> (<a href="05-coordination-consensus.html">05</a>,
+      <a href="13-payments-orders.html">13</a>), and it has the failure modes every saga has. Name them; do not let the
+      interviewer find them for you.
+    </p>
+
+<pre><code>  1. re-validate hold ──▶ 2. charge card ──▶ 3. write booking ──▶ 4. issue ticket
+     (fast, local)          (SLOW, remote,      (fast, local,        (async)
+                             third party)        constrained)
+                                  │                    │
+                                  │                    └── ✗ FAILS?
+                                  │                        → money taken, no seat
+                                  └── ✗ FAILS?                COMPENSATE: refund.
+                                      → no money, seat still
+                                        held → release it
+</code></pre>
+
+    <h4>Failure mode 1: payment succeeds, the booking write fails</h4>
+    <p>
+      You charged the customer £120 and your database fell over before recording that they own a seat. <strong>This is the
+      worst outcome in the system</strong> — the customer has paid and has nothing, and unlike an oversell, <em>they'll find out
+      immediately.</em>
+    </p>
+    <p>
+      The answer is a <strong>saga with a compensating transaction, and the compensation is a refund.</strong> Concretely:
+      before calling Stripe you write a row recording your <em>intent</em> to charge (a <code>PENDING</code> booking or an
+      outbox row); if the confirming write fails, a reconciliation job finds charges with no confirmed booking and refunds them.
+      This is exactly the machinery from <a href="13-payments-orders.html">13</a> — the outbox, the idempotency key, the
+      reconciliation loop against a provider you don't control. <strong>Don't re-derive it here, name it and move on:</strong>
+      <em>"That's a saga; the compensation is a refund, and I'd drive it from the outbox and reconciliation loop I'd have built
+      for payments anyway."</em> Thirty seconds, full credit, and you've bought yourself time for the next one, which is worse.
+    </p>
+
+    <h4>Failure mode 2: the hold expires <em>during</em> payment ★</h4>
+
+    <p>
+      This is the genuinely nasty one and it is worth naming <em>unprompted</em>, because it's the edge case interviewers keep
+      in their back pocket. The sequence:
+    </p>
+
+<pre><code>  t=0:00   User holds seat 14C.       Hold expires at t=10:00.
+  t=9:58   User clicks "Pay".         Hold is still valid ✓ — you check, it's fine.
+  t=9:59   You call Stripe. It's slow — a 3D-Secure challenge, a bank redirect.
+  t=10:00  ⏰ HOLD EXPIRES. Another user's claim hits the lazy predicate
+           and legitimately takes seat 14C. It is now HELD by someone else.
+  t=10:04  Stripe returns SUCCESS. You have the customer's money.
+           You do not have a seat to give them.
+</code></pre>
+
+    <p>
+      Both users behaved correctly. Your system behaved correctly at every individual step. And you have taken money for a seat
+      that belongs to someone else. <strong>Every check you did was valid at the time you did it, and the world moved
+      underneath you</strong> — which is, of course, the TOCTOU race from deep dive 1 wearing a different hat, stretched across
+      seconds instead of microseconds.
+    </p>
+
+    <p>You must have an answer. There are three, and a strong candidate names the trade-off between them:</p>
+
+    <ol>
+      <li><strong>Re-validate at capture time and compensate if you lost.</strong> After the charge returns, atomically
+        re-assert that the hold is still yours: <code>UPDATE seats SET status='BOOKED' WHERE id=? AND held_by=? AND
+        status='HELD' AND hold_expires_at &gt; now()</code>. If it affects 0 rows, <strong>you lost the seat — refund
+        immediately</strong>, apologise loudly, and offer them the nearest equivalent. <em>The conditional UPDATE saves you
+        again</em>, and note it's the same primitive doing the same job. Ugly for the user, but <strong>correct</strong>, and
+        correct is the constraint.</li>
+      <li><strong>Two-phase the payment: authorise, then capture.</strong> Authorise the card <em>before</em> the hold gets
+        close to expiry (an auth is fast and reversible), then capture only after you've locked in the seat. A voided auth is
+        far cheaper and less upsetting than a refund — the customer often never sees it. This is what mature systems actually
+        do, and mentioning auth/capture is a strong signal that you've worked near real payments.</li>
+      <li><strong>Extend the hold when payment begins.</strong> When <code>POST /bookings</code> arrives, push
+        <code>hold_expires_at</code> out by a few minutes — the user has demonstrably committed; they're not a bot squatting
+        inventory. Cheap, effective, and it shrinks the window rather than closing it. <strong>Combine with #1</strong>: shrink
+        the window, and still handle the case where it happens anyway.</li>
+    </ol>
+
+    <div class="senior">The framing that makes this land: <em>"The uncomfortable truth is that I cannot make this window zero,
+      because I have a slow external call and a lease that has to expire. So I do three things: I <strong>shrink</strong> the
+      window by extending the hold when payment starts, I <strong>cheapen</strong> the failure by authorising rather than
+      capturing, and I <strong>re-validate atomically at capture</strong> so that if I lost the race anyway I detect it and
+      compensate with a refund rather than silently overselling. <strong>I'd much rather refund one unlucky customer than seat
+      two people in the same chair.</strong>"</em> That last sentence is the whole page in one line — <em>a bounded, visible,
+      compensable failure beats an unbounded, invisible, uncompensable one</em> — and it's the sentence I'd want you to walk out
+      of this tutorial with.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="deep-dive-3">7c. Deep dive: the flash sale &amp; the thundering herd</h2>
+
+    <p>
+      10 million people. 10:00:00. Sixty seconds. Your correctness problem is now solved — the conditional UPDATE will never
+      oversell no matter how much load you throw at it. But <strong>a correct system that is on fire is still on fire.</strong>
+      Postgres will not oversell; Postgres will simply stop responding, and every one of those 10M people will see a spinner
+      and then a 502.
+    </p>
+    <p>
+      Here's the reframe that makes this tractable, and it goes straight back to your estimation: <strong>you do not need to
+      serve 10 million people. You need to serve 50,000 people — you just don't know which 50,000 yet.</strong> Everyone else is
+      going to be told "sold out" regardless of how good your engineering is. So the design goal is not "absorb 10M concurrent
+      checkouts." It is: <em>absorb 10M arrivals, admit them to the write path at a rate the write path can handle, and tell
+      everyone else the truth, politely, without falling over.</em>
+    </p>
+
+    <h3>The virtual waiting room ★</h3>
+
+    <p>
+      This is what Ticketmaster genuinely does, and it is the single most important structural idea in this section. When the
+      on-sale opens, you do <strong>not</strong> let 10M people into the purchase flow. You put them in a queue and admit them
+      at a controlled rate.
+    </p>
+
+<pre><code>  10:00:00 — 10,000,000 arrive
+       │
+       ▼
+  ┌──────────────────────────────────────────────────────────────┐
+  │  VIRTUAL WAITING ROOM  (at the edge — CDN worker / gateway)  │
+  │                                                              │
+  │  • On arrival, get a signed token + a queue position         │
+  │  • Page shows: "You are 847,203 of 10,412,388"               │
+  │              "Estimated wait: 24 minutes"                    │
+  │  • This page is STATIC + a polling endpoint. It costs        │
+  │    you almost nothing to serve. No DB. No inventory.         │
+  └───────────────────────────┬──────────────────────────────────┘
+                              │  admit ~1,000 users/sec
+                              │  (a rate YOU choose, based on
+                              │   what the write path can absorb)
+                              ▼
+  ┌──────────────────────────────────────────────────────────────┐
+  │  PURCHASE FLOW  — seat map, holds, checkout                  │
+  │  Sees a steady, BOUNDED ~1,000/sec. Never sees the herd.     │
+  │  Has a short-lived admission token; without it → back to     │
+  │  the queue.                                                  │
+  └──────────────────────────────────────────────────────────────┘
+</code></pre>
+
+    <p>
+      Mechanically it's simple, which is part of its beauty. Arrivals get a signed token containing a monotonic sequence number
+      (a Redis <code>INCR</code>, which is atomic and does ~100k+/sec quite happily — and note this is <em>exactly</em> the
+      general-admission counter problem, so it's easy). A "now serving" watermark advances at your chosen rate. Your token is
+      valid for the purchase flow when your number is below the watermark. Everything else — the position page, the polling —
+      is static or edge-cached and costs you nothing.
+    </p>
+
+    <p>The properties are exactly what you need:</p>
+    <ul>
+      <li><strong>It converts an unbounded thundering herd into a bounded, steady stream.</strong> The write path — which you
+        proved in estimation has a hard ceiling of 50,000 units of work — now sees a load you <em>chose</em>, not one the
+        internet chose for you.</li>
+      <li><strong>The admission rate is a dial.</strong> Database struggling? Turn it down. Seats moving slowly? Turn it up.
+        You have a control knob on the single most dangerous flow in the system, and you can turn it during an incident.</li>
+      <li><strong>It's fair, and fairness is a product requirement here.</strong> First-come-first-served by arrival time beats
+        "whoever has the fastest connection and the most aggressive retry loop", which is what an unmanaged free-for-all
+        rewards — i.e. scalpers.</li>
+      <li><strong>It's honest.</strong> "You are 847,203rd for 50,000 seats" is a brutal message, but it is <em>true</em>, and
+        it's infinitely better than a spinner that eventually 502s. It also lets a large fraction of users self-select out,
+        which sheds load for free.</li>
+    </ul>
+
+    <div class="senior">The observation that makes an interviewer sit up: <em>"The waiting room is <strong>load-shedding turned
+      into a product feature</strong>. Under this kind of load I have to shed traffic — there's no configuration of servers that
+      serves 10M concurrent checkouts against 50k seats, and buying that capacity would be absurd for something used twice a
+      year. My options are to shed it <em>badly</em>, with timeouts and 502s and a site that's down for everyone including people
+      who just wanted to browse, or to shed it <em>well</em>: put people in an ordered queue, tell them where they stand, and
+      admit them at a rate my write path can absorb. <strong>Same load-shedding, but it's fair, it's honest, and the user
+      understands what's happening.</strong> The queue isn't a workaround for the flash sale — it <em>is</em> the design."</em>
+      That reframing — an infrastructure necessity presented as a deliberate product decision — is a distinctly senior move, and
+      it's the sort of thing that gets remembered in the debrief.</div>
+
+    <h3>Protecting the read path: cache hard, accept lies</h3>
+
+    <p>
+      Estimation said 500k seat-map reads/sec and a naive 50 GB/sec of bandwidth. That never touches your origin. Three moves:
+    </p>
+
+    <ul>
+      <li><strong>Cache the seat map at the CDN edge</strong> with a short TTL (~5s) and
+        <code>stale-while-revalidate</code>. One origin fetch per edge PoP per 5 seconds, instead of half a million per second.
+        The entire flash sale's read load is served by machines you don't own.</li>
+      <li><strong>Pre-bake the map; never build it per request.</strong> A single background job reads the 50k seat rows from
+        Postgres every few seconds, serialises the blob, and pushes it to Redis/the CDN. <strong>One reader of the database,
+        serving 10 million people.</strong> Do not build the map per-request even on a cache miss — that's the stampede
+        (<a href="06-caching-queues-resilience.html">06</a>), and a cache stampede against a 50,000-row scan is how you kill the
+        primary you were trying to protect.</li>
+      <li><strong>Compress and delta.</strong> Send the full map once; then send diffs ("these 400 seats changed"). At 5-second
+        intervals during an on-sale the delta is a fraction of the size. Awareness-level; mention it, don't dwell.</li>
+    </ul>
+
+    <p>
+      All of which means: <strong>the seat map is stale, and stale means it lies.</strong> A seat rendered as green may have
+      been taken 4 seconds ago. Users <em>will</em> click seats that are already gone — in fact, during the first seconds of a
+      hot on-sale, <em>most</em> clicks will land on already-taken seats. That's not a bug to fix. It is a property of the
+      system, and it's the correct trade: you accepted staleness on the read path in your non-functional requirements precisely
+      so that you could survive this.
+    </p>
+
+    <div class="senior">Here's where your frontend background is worth actual money, so use it: <em>"The seat map is a
+      <strong>hint</strong>, not a contract. It's cached at the edge and it will be seconds stale, which means users will
+      absolutely click seats that are already gone — and during the first ten seconds of an on-sale, most of them will. So the
+      UI has to treat 'sorry, that seat just went' as a <em>normal, expected outcome</em> rather than an error state: keep the
+      user on the seat map, grey out the seat, suggest three nearby ones, and don't lose their place. This is exactly
+      <strong>optimistic UI plus an authoritative write</strong> — the client renders the optimistic view instantly, the server
+      is the only thing that can say yes, and the client reconciles when it's told no. <strong>The truth lives in the write
+      path.</strong> The read path is allowed to be wrong, and designing the UI around that is what makes the aggressive caching
+      affordable."</em> That connects a distributed-systems consistency decision to a UX decision, out loud, and very few
+      backend-track candidates can do it. <strong>It is your differentiator in this round — spend it.</strong></div>
+
+    <h3>Rate limiting and the bot problem</h3>
+
+    <p>
+      Your real adversary is not 10M excited fans. It is a few thousand <strong>scalper bots</strong> that are faster than any
+      human, better at retrying, and economically motivated to take every seat. Ignoring this is a missed opportunity, because
+      it's a genuinely interesting product-and-security dimension that most candidates never mention.
+    </p>
+
+    <ul>
+      <li><strong>Rate limit per user and per IP</strong> (<a href="09-rate-limiter.html">09</a> — token bucket at the gateway).
+        A human clicks a seat every few seconds; a bot fires 500 requests/sec. That's a trivially detectable difference and it's
+        your cheapest defence.</li>
+      <li><strong>Cap concurrent holds per user.</strong> One or two seats-worth. This alone kills the
+        "hold every seat in the stadium" denial-of-inventory attack outright, and it costs one query.</li>
+      <li><strong>Make the waiting room require identity.</strong> Verified account, payment method on file, phone verification.
+        Raising the <em>cost per queue slot</em> is far more effective than trying to detect bots after the fact — you're
+        changing the economics rather than playing whack-a-mole.</li>
+      <li><strong>CAPTCHA / proof-of-work at admission</strong>, not at browse. Never tax the read path with this; tax the point
+        of scarcity.</li>
+      <li><strong>Rate-limit by behaviour, not just volume:</strong> a client that requests exactly one seat 30ms after each map
+        refresh is not a person. Awareness-level, but naming it shows you've thought past the obvious.</li>
+    </ul>
+
+    <div class="note"><strong>The honest framing to offer:</strong> <em>"You cannot win this with engineering alone — a
+      sufficiently motivated adversary with residential proxies and real identities will get through, and Ticketmaster's actual
+      answer has been partly technical and partly commercial: verified fans, identity-bound tickets, and controlled resale. The
+      engineering goal isn't to eliminate bots, it's to <strong>make them expensive enough that they can't take the whole
+      inventory</strong>."</em> Being realistic about the limits of a technical fix, and knowing where the real solution is
+      commercial rather than architectural, is a mature thing to say — and it's true.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="scaling">8. Scaling &amp; bottlenecks</h2>
+
+    <h3>What breaks first: the single hot event</h3>
+
+    <p>
+      Here is the bottleneck, and it is beautiful in a horrible way. <strong>All the contention in this system is on
+      <em>one</em> event's seats.</strong> Not spread across a million events — concentrated on the one that went on sale
+      thirty seconds ago. Every other event in your database is idle.
+    </p>
+
+    <p>
+      So the reflex answer — <em>"I'd shard by <code>event_id</code>"</em> — is worth examining, because it sounds right and
+      it <strong>does not help you at all</strong>:
+    </p>
+
+<pre><code>  Shard by event_id:
+
+    Shard 1 ── events 1..1000     ← idle
+    Shard 2 ── events 1001..2000  ← idle
+    Shard 3 ── events 2001..3000  ← 🔥 THE TAYLOR SWIFT ON-SALE 🔥
+    Shard 4 ── events 3001..4000  ← idle
+
+  100% of the load is on ONE shard. By definition. Because the load IS one event.
+
+  Adding shards 5..100 does nothing. You have not divided the load;
+  you have divided the IDLE.
+</code></pre>
+
+    <p>
+      This is the <strong>hot-partition / celebrity-key problem</strong> from <a href="04-partitioning-hashing.html">04</a>, in
+      its purest and most inescapable form. In the news feed (<a href="10-news-feed.html">10</a>) the celebrity problem is bad
+      but at least you can hybridise. Here it's worse: <em>you cannot split the work, because the work is definitionally about
+      one key.</em> Sharding distributes <em>independent</em> load, and this load is not independent — it's 10 million people
+      contending for one event's 50,000 rows.
+    </p>
+
+    <p>
+      <strong>Could you shard <em>within</em> the event?</strong> By seat range or section — seats 1–10k on shard A, 10k–20k
+      on shard B. This actually does work, because each seat is independent of every other seat, and no transaction ever spans
+      two seats (until group bookings, which is exactly why they're hard — see follow-ups). It's a legitimate answer and worth
+      offering. But be honest about it: it adds cross-shard complexity to a write path that, by your own estimation, only needs
+      to do <strong>170 writes/sec</strong>. You'd be sharding to solve a throughput problem you don't have.
+    </p>
+
+    <div class="senior">The trap here is that "shard by event_id" is the <em>reflexively correct-sounding</em> answer, and
+      saying it unprompted is a tell. Instead: <em>"Sharding by event_id is the obvious move and I don't think it helps, because
+      the load is on <strong>one</strong> event by definition — I'd be partitioning the idle, not the hot. This is the
+      hot-partition problem in its purest form: the key <em>is</em> the workload. What actually saves me is different, and it's
+      two things. First, the write ceiling: I can only ever sell 50,000 tickets, so the hot shard's total work is bounded and
+      small — a single Postgres primary handles a couple of hundred writes a second without noticing. Second, the queue: it
+      guarantees that bounded work arrives at a bounded <em>rate</em>. <strong>I don't scale the hot partition out; I bound what
+      arrives at it.</strong>"</em> That is the correct and non-obvious answer, and it demonstrates you understand <em>why</em>
+      sharding works when it works — which is a much better signal than knowing that it exists.</div>
+
+    <h3>The bottleneck table</h3>
+
+    <table>
+      <thead><tr><th>What breaks</th><th>When</th><th>Fix</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Seat-map reads crush the origin</strong></td>
+          <td>Immediately. This is the first thing to break, and it breaks at 10:00:01.</td>
+          <td>CDN edge cache + a pre-baked blob rebuilt by one background reader. Accept staleness. <strong>The read path must never touch the write DB.</strong></td>
+        </tr>
+        <tr>
+          <td><strong>Connection pool exhaustion</strong></td>
+          <td>Instantly, <em>if</em> you hold locks or connections across the payment call.</td>
+          <td>Don't. The hold is one sub-millisecond statement; payment happens in a separate request, outside any transaction. This is deep dive 1's whole point.</td>
+        </tr>
+        <tr>
+          <td><strong>The write path is swamped by failing attempts</strong></td>
+          <td>100k hold attempts/sec against 170/sec of real capacity.</td>
+          <td>The virtual waiting room. Admit at a rate you choose. <strong>Shed the rest at the edge</strong>, where it's cheap.</td>
+        </tr>
+        <tr>
+          <td><strong>Hot row: the last few seats</strong></td>
+          <td>End of the on-sale — thousands of people hammering the same 10 rows.</td>
+          <td>Mostly fine: losers fail in one statement with zero rows affected, no lock held. Losing is <em>cheap</em>, which is why optimistic wins. If it ever hurts, the queue throttles it anyway.</td>
+        </tr>
+        <tr>
+          <td><strong>The seat-map rebuild job</strong></td>
+          <td>If it dies, the map freezes and expired seats never reappear.</td>
+          <td>Degraded, not broken — <strong>lazy expiry means the system stays correct</strong>, it just shows fewer seats than it has. Alert on rebuild staleness. Design so this job's death is cosmetic.</td>
+        </tr>
+        <tr>
+          <td><strong>The payment provider is slow or down</strong></td>
+          <td>Whenever Stripe feels like it. You don't control this.</td>
+          <td>Circuit breaker + timeouts (<a href="06-caching-queues-resilience.html">06</a>). Auth-then-capture. And critically: <em>a slow provider must not consume a hold, a lock, or a connection</em>. Extend holds if the provider degrades — see follow-ups.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>At 10× — a 500,000-seat festival, or 100M arrivals</h3>
+    <p>
+      Notice what doesn't change. <strong>The write ceiling scales with inventory, not with demand</strong> — 10× the users is
+      still 50,000 tickets and still ~170 writes/sec. The read path is already CDN-served, so 10× the readers costs you nothing
+      you own. The queue just gets longer, and a longer queue is a <em>product</em> problem, not an engineering one. 10× the
+      <em>inventory</em> (a 500k-seat festival) merely 10×'s the write ceiling to ~1,700/sec — which a single Postgres primary
+      still handles comfortably. <em>This system scales unusually gracefully, and it's because you bounded the write path
+      deliberately rather than by accident.</em> Say that; it's the payoff of the estimation section, delivered.
+    </p>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="tradeoffs">9. Trade-offs</h2>
+
+    <table>
+      <thead><tr><th>Decision</th><th>I chose</th><th>Alternative</th><th>I'd flip if…</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>Concurrency control</td>
+          <td><strong>Optimistic conditional UPDATE</strong> + unique constraint</td>
+          <td><code>SELECT … FOR UPDATE</code></td>
+          <td>…contention were low and the flow simple. Pessimistic is <em>correct</em> and easier to reason about; it just can't take a flash sale. For a 200-seat cinema, <code>FOR UPDATE</code> and go home.</td>
+        </tr>
+        <tr>
+          <td>Database</td>
+          <td><strong>Postgres.</strong> One primary for inventory.</td>
+          <td>Cassandra / DynamoDB</td>
+          <td>…never, for the inventory. The whole requirement is a hard invariant under concurrency; that's what ACID is <em>for</em>. Write ceiling is 170/sec — there is no scale argument for NoSQL, only against.</td>
+        </tr>
+        <tr>
+          <td>Distributed lock</td>
+          <td><strong>None.</strong> The seat row is the lock.</td>
+          <td>Redis / Redlock / etcd</td>
+          <td>…inventory lived outside a transactional store with no conditional write. Then: etcd + a fencing token the resource enforces. Never Redis-for-correctness.</td>
+        </tr>
+        <tr>
+          <td>Hold expiry</td>
+          <td><strong>Lazy predicate</strong> (correctness) <strong>+ sweeper</strong> (visibility)</td>
+          <td>Sweeper only; or Redis TTL</td>
+          <td>…the seat map didn't matter (then lazy alone). Redis TTL: never — it splits inventory truth across two stores with no transaction between them.</td>
+        </tr>
+        <tr>
+          <td>Seat-map consistency</td>
+          <td><strong>Stale, CDN-cached, seconds old</strong></td>
+          <td>Live via WebSocket per user</td>
+          <td>…the venue were small. 500 concurrent users watching a 200-seat map? Push live updates; it's lovely UX. 10M users on a stadium map? Absolutely not — you've built a fan-out problem on top of a contention problem.</td>
+        </tr>
+        <tr>
+          <td>Flash-sale handling</td>
+          <td><strong>Virtual waiting room</strong> — admit at a chosen rate</td>
+          <td>Autoscale and pray</td>
+          <td>…demand were smooth. But you cannot autoscale a single hot Postgres row, and you cannot buy capacity for 200:1 contention. <strong>The queue is not a workaround; it's the design.</strong></td>
+        </tr>
+        <tr>
+          <td>Hold vs. buy-now</td>
+          <td><strong>Two-phase: hold, then pay</strong></td>
+          <td>One-shot atomic purchase</td>
+          <td>…payment were instant and local (account credit, a wallet balance). Then skip the hold entirely — one transaction, no lifecycle, no expiry problem. <em>The hold exists solely because payment is slow and remote.</em></td>
+        </tr>
+        <tr>
+          <td>Checkout availability</td>
+          <td><strong>CP — 503 rather than risk a double-sell</strong></td>
+          <td>AP — accept writes, reconcile later</td>
+          <td>…overselling were acceptable (airlines!). Then AP, and compensate at the gate. <strong>This is the clarifying question from section 2 cashing out.</strong></td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="note">Read the "I'd flip if" column again. Every single flip traces back to <strong>one of two facts</strong>:
+      how much contention there is, and whether overselling is acceptable. That's it. That is the whole decision tree for this
+      archetype, and it's why the clarifying questions in section 2 were worth the ninety seconds they cost. <strong>You cannot
+      design this system until you know those two numbers, and a candidate who starts designing without asking has skipped the
+      part that was being graded.</strong></div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="followups">10. Follow-ups you should expect</h2>
+
+    <h3>"What if it's general admission — no assigned seats?"</h3>
+
+    <p>
+      The problem collapses. <strong>Now it's a counter</strong>, and a counter can be decremented atomically:
+    </p>
+
+<pre><code><span class="com">-- The ENTIRE general-admission booking system:</span>
+<span class="kw">UPDATE</span> events
+   <span class="kw">SET</span> tickets_remaining = tickets_remaining - <span class="num">1</span>
+ <span class="kw">WHERE</span> id = :eventId
+   <span class="kw">AND</span> tickets_remaining &gt; <span class="num">0</span>;      <span class="com">-- ← can't go below zero. Ever.</span>
+
+<span class="com">-- 1 row → you got a ticket.   0 rows → sold out.  That's it. That's the system.</span>
+<span class="com">-- Even better: Redis DECR is atomic and does 100k+/sec, and here the</span>
+<span class="com">-- correctness bar is low enough that you can genuinely front the DB with it.</span>
+</code></pre>
+
+    <p>
+      One atomic decrement, one row, no seat map, no per-seat contention, and it can live in Redis because the invariant
+      ("≥ 0") is enforceable by the primitive itself. <strong>You can also shard the counter</strong> — give each of 10 shards
+      5,000 tickets and let them run independently, which removes even the single-row contention (the classic technique, and
+      the same one from <a href="09-rate-limiter.html">09</a>). The cost is a little slop at the boundary: one shard sells out
+      while another has stock. Trivially fixable by rebalancing.
+    </p>
+
+    <div class="senior">Land the point rather than just answering: <em>"General admission is a dramatically easier problem, and
+      it's worth saying why — <strong>it's the assigned-seat requirement that made this hard.</strong> With GA, inventory is a
+      single integer, and an atomic decrement with a <code>&gt; 0</code> guard is a complete and correct solution — I could even
+      shard the counter to remove the last of the contention. Everything difficult in my design — the seat map, the per-seat
+      holds, the map staleness, the contention on individual rows — exists <em>only</em> because seat 14C is a specific chair
+      that exactly one person can sit in. <strong>The identity of the resource is what creates the difficulty.</strong>"</em>
+      That's the archetype stated in its most general form, and it's exactly the transferable lesson: <em>fungible inventory is
+      a counter; identified inventory is a contention problem.</em></div>
+
+    <h3>"What about group bookings — 4 adjacent seats, all or nothing?"</h3>
+
+    <p>
+      Now you genuinely need a transaction across multiple rows, and this is the one follow-up that legitimately makes the
+      design harder. Single-row atomicity was doing all your work; it can't cover four rows.
+    </p>
+
+<pre><code><span class="kw">BEGIN</span>;
+  <span class="com">-- Claim all four in ONE statement. Atomic, all-or-nothing.</span>
+  <span class="kw">UPDATE</span> seats
+     <span class="kw">SET</span> status = <span class="str">'HELD'</span>, held_by = :userId,
+         hold_expires_at = now() + <span class="kw">INTERVAL</span> <span class="str">'10 minutes'</span>
+   <span class="kw">WHERE</span> id <span class="kw">IN</span> (:s1, :s2, :s3, :s4)
+     <span class="kw">AND</span> (status = <span class="str">'AVAILABLE'</span>
+          <span class="kw">OR</span> (status = <span class="str">'HELD'</span> <span class="kw">AND</span> hold_expires_at &lt; now()));
+
+  <span class="com">-- ★ THE CHECK: I asked for 4. Did I get 4?</span>
+  <span class="com">-- If affected_rows != 4, someone took one of them → ROLLBACK.</span>
+  <span class="com">-- Partial success is NOT success. All or nothing.</span>
+<span class="kw">COMMIT</span>;   <span class="com">-- or ROLLBACK if affected_rows &lt; 4</span>
+</code></pre>
+
+    <p>
+      The affected-row count generalises beautifully: <em>ask for N, check you got N, roll back otherwise.</em> But two real
+      complications appear, and naming them unprompted is worth a lot:
+    </p>
+    <ul>
+      <li><strong>Deadlocks.</strong> Two group bookings overlapping on seats {5,6} and {6,5} can each hold one and wait for the
+        other. <strong>Fix: always lock rows in a deterministic order</strong> — sort the seat IDs ascending before the
+        statement. This is a classic and the interviewer is often specifically listening for it. (A single <code>UPDATE … WHERE
+        id IN (...)</code> in Postgres will generally lock in a consistent order anyway, but <em>say the rule</em>, because the
+        rule is the knowledge.)</li>
+      <li><strong>Contention gets much worse.</strong> A 4-seat group needs 4 rows to <em>simultaneously</em> be free; under a
+        200:1 flash sale, most attempts fail, and now each failure wastes 4 rows' worth of work and a rollback. Retry logic
+        needs to pick a <em>different</em> block of 4, not retry the same one. In practice, a real system pre-computes
+        contiguous blocks and hands them out, rather than letting users assemble arbitrary sets.</li>
+    </ul>
+
+    <h3>"How do cancellations and returns work?"</h3>
+    <p>
+      A cancellation returns a seat to inventory: flip <code>status</code> back to <code>AVAILABLE</code>, mark the booking
+      <code>CANCELLED</code>, refund via the payment saga (<a href="13-payments-orders.html">13</a>). Three things to say:
+    </p>
+    <ul>
+      <li><strong>Never delete the booking row.</strong> Cancellation is a state transition, not a deletion. You need the audit
+        trail — and at a fintech loop, <em>saying the word "audit trail" unprompted is worth real points</em>. The
+        <code>UNIQUE (event_id, seat_id)</code> constraint then needs to be a <em>partial</em> unique index so a cancelled
+        booking doesn't block the seat's resale: <code>CREATE UNIQUE INDEX … ON bookings (event_id, seat_id) WHERE status =
+        'CONFIRMED'</code>. That's a genuinely nice detail — the constraint must know about the lifecycle.</li>
+      <li><strong>Returned seats re-enter a sold-out event</strong>, which creates a mini flash sale of its own. This is why
+        people sit refreshing sold-out events. A waitlist with a notification (<a href="12-notifications-scheduler.html">12</a>)
+        is a better product than a refresh war, and it converts a thundering herd into a queue — <em>the same move as the
+        waiting room</em>, which is worth pointing out.</li>
+      <li><strong>Refund before returning the seat, or after?</strong> After. Return the seat first (it's cheap and reversible);
+        the refund is the slow, external, saga-driven part. Never make inventory wait on a payment provider — that's the same
+        lesson as deep dive 1, showing up again.</li>
+    </ul>
+
+    <h3>"What if the payment provider is slow?"</h3>
+    <p>
+      This is a favourite because it probes whether your design is actually decoupled. The answers, in order:
+    </p>
+    <ul>
+      <li><strong>Nothing in your database is waiting on it</strong> — no lock, no transaction, no connection. That's the
+        design, and it's why you can survive a slow provider at all. Lead with this.</li>
+      <li><strong>Circuit breaker + timeout</strong> (<a href="06-caching-queues-resilience.html">06</a>). If Stripe's p99 goes
+        to 30 seconds, trip the breaker and fail fast rather than piling up requests.</li>
+      <li><strong>Extend holds when the provider degrades.</strong> If payments are taking 30s, a 10-minute hold is suddenly
+        much tighter for everyone. Widening the TTL under provider degradation is a lovely adaptive touch and almost nobody
+        says it.</li>
+      <li><strong>Auth now, capture later.</strong> Get a fast authorisation, confirm the seat, capture asynchronously. The
+        customer gets their confirmation immediately; the money settles in the background.</li>
+      <li><strong>Worst case, queue the payment</strong> and confirm the booking as PENDING — but be careful, because you've now
+        promised a seat you haven't been paid for. Acceptable if your auth succeeded; not otherwise. <em>Naming that boundary is
+        the point of the answer.</em></li>
+    </ul>
+
+    <h3>"Dynamic pricing?"</h3>
+    <p>
+      Awareness-level; it's rarely the meat of the round, so don't sink time into it unless pushed. Price becomes a function of
+      remaining inventory and demand velocity, computed by a separate service, cached on the seat map. <strong>The one thing
+      worth saying:</strong> the price must be <em>locked at hold time</em> and stored on the hold, or the price changes between
+      the seat map and the checkout page and you've built a system that lies to customers about what they're paying — which, at
+      a fintech loop, is not merely a UX bug, it's a <em>regulatory</em> one. <em>"I'd snapshot the price onto the hold. The
+      quoted price is part of the offer."</em> One sentence, full marks, move on.
+    </p>
+
+    <h3>"Multi-region?"</h3>
+    <p>
+      Say no, and say why, because the reasoning is the answer. <strong>Inventory must have a single writer.</strong> A seat
+      cannot be simultaneously owned by a US primary and an EU primary without consensus on every claim — and cross-region
+      consensus adds 100ms+ to every write, which you'd be paying on the hottest path in the system. So: <strong>reads global
+      (CDN), writes to one region.</strong> A user in Sydney takes a 200ms round-trip to claim a seat, and <em>that is entirely
+      acceptable</em> — it's a hold, not a video call. If you truly needed regional write locality, you'd have to
+      <strong>partition the inventory by region</strong> (this block of seats is sold by the EU region only), which is really
+      just "shard the inventory and accept that a region can sell out while another has stock." Airlines actually do this.
+      <em>"I'd take a 200ms write latency over a consensus protocol on my hot path"</em> is the right instinct and the right
+      sentence.
+    </p>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="qa">Interview Q&amp;A</h2>
+
+    <details class="qa">
+      <summary>1. Two users click seat 14C at the same millisecond. Walk me through exactly how only one gets it.</summary>
+      <div class="answer">
+        <p>The <em>only</em> question that matters. Answer in three beats.</p>
+        <p><strong>What breaks:</strong> the naive version reads the seat, sees AVAILABLE, and writes BOOKED. Two threads both
+        read AVAILABLE before either writes — a TOCTOU race, the classic lost update. And <strong>wrapping it in a transaction
+        does not fix it</strong>: Postgres defaults to Read Committed, under which both transactions happily read AVAILABLE.</p>
+        <p><strong>What works:</strong> make the check part of the write.
+        <code>UPDATE seats SET status='HELD', version=version+1 WHERE id=14 AND status='AVAILABLE'</code>, then check the
+        affected-row count. <strong>1 = I won; 0 = someone beat me, return 409.</strong> A single predicated UPDATE is atomic
+        inside the engine — the second writer blocks for microseconds, then re-evaluates the WHERE clause against the newly
+        committed row, sees HELD, and updates zero rows. <em>There's no window between check and use because there is no
+        separate check.</em></p>
+        <p><strong>The backstop:</strong> <code>UNIQUE (event_id, seat_id)</code> on bookings. Even if my application logic has a
+        bug, the database will physically refuse to record the second booking. If that constraint ever fires, it pages me,
+        because it means my primary mechanism is broken.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>2. Why not just use <code>SELECT … FOR UPDATE</code>? It's correct, isn't it?</summary>
+      <div class="answer">
+        <p><strong>Yes, it is correct — say that first.</strong> Dismissing it as "wrong" is a worse answer than proposing it,
+        and the interviewer is checking whether you know the difference between a correctness objection and a throughput
+        objection.</p>
+        <p>I'm rejecting it for <strong>throughput</strong>. It serialises every contender on a hot seat, and — much more
+        dangerously — it tempts you into holding a row lock <em>and a pooled DB connection</em> across a 3-second call to Stripe.
+        Do the arithmetic: a 100-connection pool, 3 seconds per booking, gives you ~33 bookings/sec, and 100,000 requests/sec
+        arriving. The pool is exhausted in about a millisecond, every request then blocks waiting for a connection, health checks
+        can't get one either, and the load balancer pulls every node out of rotation. <strong>The whole site goes down —
+        including browsing, which didn't even need the database.</strong></p>
+        <p>The one-liner: <em>"The lock isn't the problem. The <strong>duration</strong> of the lock is the problem."</em> And
+        for a 200-seat cinema with 30 concurrent users? <code>FOR UPDATE</code> is completely fine. Use it and go home.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>3. Would you use a distributed lock in Redis to protect the seat?</summary>
+      <div class="answer">
+        <p><strong>No — and this is the trap in the question.</strong> Three reasons, in order:</p>
+        <p><strong>It isn't safe for correctness.</strong> A GC pause longer than the TTL means two clients hold the lock. Clock
+        skew expires it early. Redis replication is asynchronous, so a routine primary failover can hand the same lock to two
+        clients with nobody doing anything wrong. Redlock is contested — Kleppmann's critique is that it still depends on timing
+        assumptions and issues no fencing token. I would be protecting a <em>hard</em> correctness invariant with a mechanism
+        that is explicitly unsafe for correctness invariants.</p>
+        <p><strong>I already have a correct lock.</strong> The seat row <em>is</em> the lock — a row with a status, a holder and
+        an expiry is exactly the shape of a lock key, except it lives in a database with a linearizable lock manager and a
+        durable WAL. Adding Redis layers a weaker lock on top of a stronger one I'm using anyway. It cannot make the system more
+        correct; it can only add a failure mode and a dependency on the hot path.</p>
+        <p><strong>When would I?</strong> If inventory lived outside a transactional store with no conditional write — then I'd
+        need coordination from outside: etcd or ZooKeeper (consensus-backed, unlike Redis) plus a fencing token the resource
+        itself enforces. The rule: <em>use a lock only when the resource can't enforce the invariant itself.</em> Here, it can.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>4. How do seat holds expire? Don't say "a cron job."</summary>
+      <div class="answer">
+        <p><strong>Lazily, in the WHERE clause of the claim</strong> — and that's the elegant answer:</p>
+        <p><code>WHERE status='AVAILABLE' OR (status='HELD' AND hold_expires_at &lt; now())</code></p>
+        <p>An expired hold <em>is</em> an available seat. Expiry isn't an event that must be processed — it's a property that's
+        true, evaluated at the only moment anyone cares: when someone tries to claim the seat. No scheduler, no leader election,
+        no window in which an expired seat is unbuyable, and it's still the same single atomic statement.</p>
+        <p><strong>The catch, which you should volunteer:</strong> if nothing writes AVAILABLE back to the row, the cached seat
+        map still shows the seat as taken — so nobody clicks it, so nobody triggers the lazy expiry. <strong>The seat becomes a
+        ghost: claimable but invisible.</strong></p>
+        <p><strong>So: use both.</strong> Lazy expiry is the <em>correctness</em> mechanism (no seat is ever permanently lost,
+        even if every background job dies). A sweeper is the <em>visibility</em> mechanism (the map is accurate). If the sweeper
+        dies, the system is still correct — it just displays fewer seats than it has. That's a cosmetic degradation, not an
+        outage, and designing so that a background job's failure is cosmetic is the actual signal here.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>5. The hold expires while the user is on the payment page and Stripe is slow. Now what?</summary>
+      <div class="answer">
+        <p>The nastiest edge case in the system, and naming it before you're asked is worth a lot. At t=9:58 the user clicks Pay;
+        the hold is valid, you check, it's fine. Stripe takes 6 seconds (3D-Secure). At t=10:00 the hold expires and another user
+        legitimately takes the seat. At t=10:04 Stripe returns SUCCESS. <strong>You have their money and no seat.</strong> Every
+        check was valid when you made it, and the world moved underneath you — it's the same TOCTOU race, stretched across
+        seconds instead of microseconds.</p>
+        <p>I can't make the window zero — a slow external call and an expiring lease guarantee it exists. So three moves:</p>
+        <p><strong>Shrink it:</strong> extend <code>hold_expires_at</code> when payment begins. The user has demonstrably
+        committed; they're not a bot squatting inventory.</p>
+        <p><strong>Cheapen the failure:</strong> <em>authorise</em> rather than capture. A voided auth is far less upsetting (and
+        often invisible) compared with a refund.</p>
+        <p><strong>Re-validate atomically at capture:</strong> <code>UPDATE seats SET status='BOOKED' WHERE id=? AND held_by=?
+        AND status='HELD' AND hold_expires_at &gt; now()</code>. Zero rows → I lost the race → refund immediately and apologise.
+        The conditional UPDATE saves me again — same primitive, same job.</p>
+        <p>The framing: <em>"I'd much rather refund one unlucky customer than seat two people in the same chair."</em> A bounded,
+        visible, compensable failure beats an unbounded, invisible, uncompensable one.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>6. 10 million people arrive at 10:00:00 for 50,000 seats. What do you do?</summary>
+      <div class="answer">
+        <p>Start with the reframe: <strong>I don't need to serve 10 million people. I need to serve 50,000 — I just don't know
+        which 50,000 yet.</strong> The other 9.95 million are getting "sold out" no matter how good my engineering is. My job is
+        to make sure they get it <em>quickly and politely</em>, not by taking the database down on their way out.</p>
+        <p><strong>A virtual waiting room.</strong> Everyone gets a signed token with a monotonic sequence number (a Redis INCR —
+        atomic, 100k+/sec). A "now serving" watermark advances at a rate <em>I choose</em> — say 1,000/sec. Below the watermark,
+        your token admits you to the purchase flow. Above it, you see "you are 847,203 of 10,412,388," which is a static page
+        plus a polling endpoint and costs me almost nothing.</p>
+        <p>This converts an unbounded thundering herd into a bounded, steady stream that my bounded write path can absorb.
+        Crucially, <strong>the admission rate is a dial I can turn during an incident.</strong></p>
+        <p>And the senior framing: <strong>the waiting room is load-shedding made into a product feature.</strong> I have to shed
+        traffic — there is no server configuration that serves 10M concurrent checkouts against 50k seats. My choice is to shed
+        it badly (timeouts, 502s, the whole site down) or shed it well (an ordered, fair, honest queue). The queue isn't a
+        workaround for the flash sale. It <em>is</em> the design.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>7. Shard by <code>event_id</code>?</summary>
+      <div class="answer">
+        <p><strong>It doesn't help, and saying it unprompted is a tell.</strong> All the contention is on <em>one</em> event by
+        definition — the one that went on sale thirty seconds ago. Sharding by event_id puts 100% of the load on one shard and
+        distributes the <em>idle</em> across the others. This is the hot-partition problem in its purest form: <strong>the key
+        IS the workload.</strong> Sharding divides independent load, and this load is not independent.</p>
+        <p><strong>What actually saves me is two things.</strong> First, the write ceiling: I can only ever sell 50,000 tickets,
+        so the hot shard's total work is <em>bounded and small</em> — a single Postgres primary does ~170 writes/sec without
+        noticing. Second, the queue: it guarantees that bounded work arrives at a bounded <em>rate</em>. <em>I don't scale the
+        hot partition out; I bound what arrives at it.</em></p>
+        <p>Could I shard <em>within</em> the event, by seat range? Yes — seats are independent, so it works. But I'd be adding
+        cross-shard complexity to solve a throughput problem I don't have.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>8. Is overselling ever acceptable? Why is that your first question?</summary>
+      <div class="answer">
+        <p>Because <strong>the answer forks the entire architecture</strong>, and asking it is the strongest opening move
+        available.</p>
+        <p><strong>Airlines oversell deliberately.</strong> They know a percentage won't show, so they sell 105% and run a
+        compensation auction at the gate. If overselling is acceptable, I don't need strict serialisation at all — I can take
+        writes optimistically, run the whole thing eventually consistent, reconcile asynchronously, and let a compensation
+        workflow clean up. Radically simpler and faster.</p>
+        <p><strong>A concert does not.</strong> Seat 14C is a physical chair; two valid tickets for it is an incident, not a
+        trade-off. Overselling by one is as bad as overselling by a thousand. That means a hard invariant, enforced in the
+        database, with no wiggle room.</p>
+        <p>The thesis it sets up: <em>"never oversell is a hard correctness constraint, not a soft target. I'm willing to be
+        slow, and I'm willing to make people queue. I'm not willing to be wrong."</em> Every subsequent decision on the page
+        follows from that sentence — which is why it's worth ninety seconds up front.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>9. Your seat map is cached and stale. Users will click seats that are already gone. Isn't that a bug?</summary>
+      <div class="answer">
+        <p>No — it's a deliberate trade, and it's what makes the read path survivable. 500k reads/sec at ~100KB is 50 GB/sec
+        naive; that must be served from the CDN edge, and edge caching means staleness. I accepted that in my non-functional
+        requirements precisely so I could afford this.</p>
+        <p><strong>The seat map is a hint, not a contract. The truth lives in the write path.</strong> During the first seconds
+        of a hot on-sale, <em>most</em> clicks will land on already-taken seats — that's not a failure, it's the expected
+        behaviour at 200:1 contention.</p>
+        <p>Which makes it a <strong>UI</strong> problem: "sorry, that seat just went" must be a normal, expected outcome rather
+        than an error state. Keep the user on the map, grey the seat out, suggest three nearby ones, don't lose their place.
+        That's <strong>optimistic UI plus an authoritative write</strong>: the client renders optimistically, the server is the
+        only thing that can say yes, and the client reconciles when told no. And it's why the 409 response is a high-volume,
+        first-class path in my API — my monitoring must not page on it and my rate limiter must not treat it as abuse.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>10. Postgres or Cassandra?</summary>
+      <div class="answer">
+        <p><strong>Postgres, and it isn't close.</strong> The defining requirement of this system is a hard correctness
+        invariant under concurrent writes. ACID transactions, conditional updates and unique constraints are the best tools ever
+        built for exactly that.</p>
+        <p>Choosing Cassandra here means <strong>re-implementing ACID badly in application code</strong>, and the interviewer
+        will make me prove it can't oversell — and it can, because eventual consistency and last-write-wins are precisely the
+        semantics that lose one of two concurrent claims silently. (Lightweight transactions with Paxos exist, and they're slow
+        and still not what I want.)</p>
+        <p>And the scale argument evaporates on contact with the estimation: <strong>the write ceiling is ~170/sec</strong>,
+        because I cannot sell more than 50,000 tickets. There is no throughput case for NoSQL here — only a case against it,
+        because I'd be trading away the exact guarantee I need for throughput I will never use. Storage is a few hundred GB a
+        year. One Postgres primary. Boring and correct.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>11. How would you handle a group booking — 4 adjacent seats, all or nothing?</summary>
+      <div class="answer">
+        <p>Single-row atomicity was doing all my work; now I need a real multi-row transaction. The pattern generalises cleanly:
+        <strong>ask for N, check you got N.</strong></p>
+        <p><code>UPDATE seats SET status='HELD' … WHERE id IN (s1,s2,s3,s4) AND (status='AVAILABLE' OR expired)</code> — then
+        check the affected-row count. <strong>If it isn't 4, roll back.</strong> Partial success is not success.</p>
+        <p>Two complications worth naming unprompted. <strong>Deadlocks:</strong> two overlapping group bookings can each hold
+        one row and wait for the other — <em>always claim rows in a deterministic order</em> (sort the seat IDs ascending). That
+        rule is what the interviewer is listening for. <strong>Contention gets much worse:</strong> a 4-seat group needs 4 rows
+        simultaneously free, so under a flash sale most attempts fail, and the retry must pick a <em>different</em> block, not
+        the same one. Real systems pre-compute contiguous blocks and hand them out rather than letting users assemble arbitrary
+        sets.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>12. What's the transferable lesson? Where else is this the same problem?</summary>
+      <div class="answer">
+        <p><strong>Any finite resource that many people try to claim at once.</strong> Strip the word "seat" out and the shape
+        is: a finite resource, many claimants, exactly one winner per unit, and being wrong is unacceptable.</p>
+        <p>Flight seats. Hotel rooms. Flash-sale stock. Ad impressions in an auction. Parking spots. Warehouse inventory in an
+        order system. Domain-name registration. Limited-edition drops. <strong>And a distributed lock itself</strong> — a lock is
+        an inventory of exactly one, which is why everything that makes locks hard shows up here too.</p>
+        <p>The mechanism is always the same three-layer answer: <strong>(1)</strong> make the check part of the write — a single
+        atomic conditional update, never read-then-write; <strong>(2)</strong> push the invariant into the database as a
+        constraint, so no application bug can violate it; <strong>(3)</strong> bound what arrives at the contended resource,
+        because you cannot scale a hot key out.</p>
+        <p>And the meta-lesson, which is the one to carry into every other design: <strong>identified inventory is a contention
+        problem; fungible inventory is a counter.</strong> The moment the resource has an identity — seat 14C, not "a ticket" —
+        you're here, and you need this page.</p>
+      </div>
+    </details>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="takeaways">What to remember</h2>
+
+    <h3>The one-sentence version</h3>
+    <p style="font-size:1.05rem;">
+      <strong>Make the check part of the write</strong> — a single atomic conditional <code>UPDATE</code> whose affected-row
+      count tells you if you won — <strong>back it with a unique constraint the database cannot be talked out of</strong>, and
+      <strong>bound what arrives at the contended resource with a queue</strong>, because you cannot scale a hot key out.
+    </p>
+
+    <h3>The archetype</h3>
+    <ul>
+      <li><strong>Inventory under contention.</strong> A finite resource, many claimants, one winner per unit, and being wrong
+        is unacceptable. Concert seats, flight seats, hotel rooms, flash-sale stock, ad impressions, parking spots, warehouse
+        inventory — <em>and a distributed lock, which is an inventory of exactly one.</em></li>
+      <li><strong>Identified inventory is a contention problem; fungible inventory is a counter.</strong> Seat 14C is hard. "A
+        ticket" is an atomic decrement. <em>The identity of the resource is what creates the difficulty</em>, and noticing that
+        out loud is the transferable insight.</li>
+      <li><strong>It looks like CRUD and it is concurrency.</strong> Say so in the first two minutes.</li>
+    </ul>
+
+    <h3>The mechanics — know these cold</h3>
+    <ul>
+      <li><strong>Read-then-write is broken.</strong> TOCTOU / lost update. And <em>a transaction does not fix it</em> — Read
+        Committed lets both transactions read AVAILABLE. This is the most common wrong answer in the question.</li>
+      <li><strong><code>SELECT … FOR UPDATE</code> is <em>correct</em> and doesn't scale.</strong> Say both halves. It dies
+        because it holds a row lock and a pooled connection across a 3-second payment call; your pool is gone in a millisecond
+        and the whole site follows. <em>The lock isn't the problem — the duration is.</em></li>
+      <li><strong>The conditional UPDATE is the answer.</strong>
+        <code>UPDATE seats SET status='HELD' WHERE id=? AND status='AVAILABLE'</code> → check the affected-row count. 1 = won,
+        0 = 409. No window between check and use because <em>there is no separate check</em>.</li>
+      <li><strong>The unique constraint is the backstop.</strong> <code>UNIQUE (event_id, seat_id)</code>. Application checks
+        are advisory; constraints are <em>enforced</em>. And if it ever fires, <strong>page someone</strong> — it's a canary for
+        a bug in your own logic.</li>
+      <li><strong>Redis locks are the trap.</strong> Unsafe for correctness (pauses, clock skew, async-replication failover, no
+        fencing token) — and unnecessary, because <strong>the seat row IS the lock</strong>, in a database that already does
+        this correctly and for free.</li>
+      <li><strong>Lazy expiry beats a cron job.</strong> <code>OR (status='HELD' AND hold_expires_at &lt; now())</code>. An
+        expired hold <em>is</em> an available seat. Add a sweeper for <em>visibility</em>, not for correctness — so that its
+        death is cosmetic.</li>
+      <li><strong>Nothing slow happens inside the critical section.</strong> The claim is one sub-millisecond statement; payment
+        is a separate request. <em>Every design that fails this question fails by holding something across the payment.</em></li>
+    </ul>
+
+    <h3>The numbers</h3>
+    <ul>
+      <li><strong>The write path has a hard ceiling.</strong> 50,000 seats means at most 50,000 successful writes — ~170/sec —
+        <em>no matter how much demand arrives</em>. 10M users and 100M users produce the same number of writes. This asymmetry
+        is the most useful fact in the system, and it's what lets you use one boring Postgres.</li>
+      <li><strong>The read path is unbounded.</strong> ~500k/sec, ~50 GB/sec naive → CDN edge, a pre-baked blob, one background
+        reader of the database serving 10 million people.</li>
+      <li><strong>Contention is 200:1.</strong> &gt;99% of write attempts must fail, so <em>failing must be cheap</em> — which is
+        precisely why optimistic beats pessimistic here.</li>
+      <li><strong>Ignore storage.</strong> A few hundred GB/year. Say so in one sentence and move on; knowing which number to
+        ignore is the senior move in estimation.</li>
+    </ul>
+
+    <h3>The lines to have ready</h3>
+    <ul>
+      <li><em>"Is overselling ever acceptable? Airlines do it deliberately and compensate at the gate; a concert can't. The
+        answer changes the whole design."</em></li>
+      <li><em>"This looks like a CRUD app. It's a concurrency problem."</em></li>
+      <li><em>"Never oversell is a hard correctness constraint, not a soft target. <strong>I'm willing to be slow. I'm not
+        willing to be wrong.</strong>"</em></li>
+      <li><em>"The read load is unbounded, but the write load has a ceiling — I can't sell more than 50,000 tickets. That lets
+        me protect the write path aggressively."</em></li>
+      <li><em>"The check IS the write. Zero rows affected means someone beat me."</em></li>
+      <li><em>"Pessimistic locking is correct — I'm rejecting it on throughput, not correctness, and the distinction
+        matters."</em></li>
+      <li><em>"Push the invariant into the database. An application check is advisory; a constraint is enforced."</em></li>
+      <li><em>"The seat row is already the lock. Adding a Redis lock on top of it is strictly worse."</em></li>
+      <li><em>"The waiting room is load-shedding turned into a product feature."</em></li>
+      <li><em>"The seat map is a hint, not a contract. The truth lives in the write path."</em></li>
+      <li><em>"Sharding by event_id partitions the idle, not the load."</em></li>
+      <li><em>"I'd rather refund one unlucky customer than seat two people in the same chair."</em></li>
+    </ul>
+
+    <div class="note">Next is <a href="15-geospatial-nearby.html">15 — Design Nearby / Ride-Hailing</a>, and it's a complete
+      change of gear: after two pages of correctness under contention (<a href="13-payments-orders.html">13</a>'s money and this
+      page's inventory), 15 is a <em>data-structure</em> problem — how do you index a million objects that are all moving, and
+      answer "who's within 2km" fast enough to dispatch a car. Different archetype, different muscles. <strong>But note what
+      travels:</strong> matching a rider to a driver is <em>also</em> inventory under contention — two riders must not be
+      assigned the same car — and when that comes up in 15, the answer is a conditional UPDATE on the driver row. You already
+      know it. <em>That's the archetype announcing itself in a different costume, which is exactly what this block was built to
+      teach you to see.</em></div>
+  </section>
+
+  <nav class="page-nav">
+    <a href="13-payments-orders.html">← 13 — Payments &amp; Orders</a>
+    <a href="15-geospatial-nearby.html">15 — Design Nearby / Ride-Hailing →</a>
+  </nav>
+
+</main>
+</body>
+</html>

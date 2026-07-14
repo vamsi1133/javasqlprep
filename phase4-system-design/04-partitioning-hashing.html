@@ -1,0 +1,1185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 — Partitioning &amp; Consistent Hashing | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <div class="breadcrumb"><a href="index.html">← Course Home</a></div>
+    <h1>04 — Partitioning &amp; Consistent Hashing</h1>
+    <p>How you split data across machines — and the one algorithm that shows up in half the case studies.</p>
+  </div>
+</header>
+
+<main class="container">
+
+  <section>
+    <h2>Why this matters in the interview</h2>
+    <p>
+      Replication (tutorial 03) gives you more <em>copies</em> of the same data. Partitioning gives you more <em>data</em> than
+      one machine can hold, and more write throughput than one machine can absorb. Every design that outgrows a single box
+      eventually needs both, and the moment you say "I'll shard by user ID" the interviewer's follow-ups are already loaded:
+      <em>what happens when you add a node? what if one user is 400× bigger than the others? how do you run a query that spans
+      shards?</em> Those three questions are the entire content of this page, and they are asked in almost every distributed
+      round. Candidates who have only memorized diagrams answer the first one with "rehash everything," which is the wrong
+      answer, and the interviewer stops learning anything from them.
+    </p>
+    <p>
+      <strong>Consistent hashing is the single most reusable idea in this phase.</strong> It is the core of the distributed
+      cache (08), it decides which node owns a rate-limit counter (09), it's how a sticky load balancer routes sessions (02),
+      and it's the partitioning scheme inside Cassandra, DynamoDB, Riak, Memcached clients and Envoy. You will be asked to
+      explain it at a whiteboard, from memory, with a diagram. So we are not going to state it — we are going to
+      <em>derive</em> it. Start from the naive scheme, watch it fail with real numbers, and the ring will feel inevitable
+      rather than magical. If you can draw the ring, place the keys, walk clockwise, and then say "and virtual nodes fix the
+      lumpiness and the failure hot-spot," you have covered what 90% of interviewers want and you've done it in ninety seconds.
+    </p>
+  </section>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ul>
+      <li><a href="#why">1. Why partition at all — and why it's a last resort</a></li>
+      <li><a href="#vh">2. Vertical vs horizontal partitioning</a></li>
+      <li><a href="#strategies">3. Sharding strategies</a> — range · hash · directory</li>
+      <li><a href="#modn">4. The <code>hash(key) % N</code> disaster</a> ★</li>
+      <li><a href="#ring">5. Consistent hashing: the ring</a> ★</li>
+      <li><a href="#vnodes">6. Virtual nodes</a> ★</li>
+      <li><a href="#java">7. A consistent-hash ring in Java (~35 lines)</a></li>
+      <li><a href="#hot">8. Hot keys &amp; celebrity partitions</a></li>
+      <li><a href="#rebalance">9. Rebalancing without a full reshuffle</a></li>
+      <li><a href="#crossshard">10. The cross-shard problem</a></li>
+      <li><a href="#qa">Interview Q&amp;A</a></li>
+      <li><a href="#takeaways">What to remember</a></li>
+    </ul>
+  </div>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="why">1. Why partition at all — and why it's a last resort</h2>
+
+    <p>
+      A single Postgres box in 2026 is enormous. You can rent a machine with 128 vCPUs, 1&nbsp;TB of RAM and 30&nbsp;TB of
+      NVMe. That will comfortably serve tens of thousands of QPS and hold billions of rows. <strong>Vertical scaling — buy a
+      bigger box — is the correct first answer, and saying so is a senior signal.</strong> It has zero engineering cost and it
+      keeps every query, every join, every transaction working exactly as written.
+    </p>
+    <p>But it has a ceiling and a curve:</p>
+    <ul>
+      <li><strong>The ceiling is physical.</strong> There is a largest instance type. Once you're on it, there is no next step.</li>
+      <li><strong>The curve is superlinear.</strong> The top instance type costs far more than 2× the one below it. You pay a premium for the last increment of headroom.</li>
+      <li><strong>It doesn't help availability.</strong> One box is one blast radius. A bigger box is a bigger blast radius.</li>
+      <li><strong>Writes are the real wall.</strong> Read replicas scale reads almost for free. Nothing scales writes on a single leader — every write still lands on one machine's WAL.</li>
+    </ul>
+
+    <p>So you partition (shard): split the data set into disjoint subsets, each owned by a different node. Now you have more total RAM, more total IOPS, more total write throughput, and a smaller blast radius per failure. That's the win. Here's the bill:</p>
+
+    <table>
+      <thead><tr><th>What sharding costs you</th><th>Why it hurts</th></tr></thead>
+      <tbody>
+        <tr><td>Cross-shard joins</td><td>A <code>JOIN</code> that used to be one index lookup becomes an application-level fan-out to N nodes plus a merge in your own code. Postgres can't help you anymore.</td></tr>
+        <tr><td>Distributed transactions</td><td>"Debit A, credit B" is trivially ACID on one node. Across two shards it needs 2PC or a saga (tutorial 05) — and both are worse than what you had.</td></tr>
+        <tr><td>Rebalancing</td><td>Adding capacity is no longer "restart with a bigger instance." It's a data migration with correctness risk while live traffic is flowing.</td></tr>
+        <tr><td>Hot shards</td><td>Even distribution of <em>keys</em> does not mean even distribution of <em>load</em>. One shard melts and the other nine are idle.</td></tr>
+        <tr><td>Operational surface</td><td>Ten databases to back up, monitor, patch, and fail over. Schema migrations now run N times and can be half-applied.</td></tr>
+        <tr><td>Secondary indexes</td><td>A unique constraint or a query on a non-shard-key column no longer has a cheap answer. See §10.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="senior">Say this out loud before you shard anything: <em>"Before I partition, I'd exhaust the cheaper options — vertical scaling, read replicas for the read load, a cache in front of the hot 5% of keys, and archiving cold rows out of the hot table. Sharding is the last thing I'd reach for, because it costs me joins and transactions permanently. I'd shard when writes exceed what one leader can take, or when the working set no longer fits in RAM."</em> That single paragraph is worth more than a perfectly drawn ring diagram, because it shows you know sharding is a cost, not an achievement.</div>
+
+    <div class="pitfall">The most common self-inflicted wound in these interviews: a candidate hears "10 million users" in minute three and immediately says "so I'll shard the users table by user_id." Ten million user rows is about 2&nbsp;GB. It fits in RAM on a laptop. You just took on distributed transactions to solve a problem you don't have, and a good interviewer will push back hard — not because sharding is wrong, but because you didn't do the arithmetic first. <strong>Estimate, then decide.</strong></div>
+
+    <div class="note">The vocabulary is muddled and you should just be explicit. <em>Partitioning</em> is the general term for splitting a dataset. <em>Sharding</em> usually means partitioning across separate <em>machines</em>. <em>Partitioning</em> inside Postgres (declarative table partitioning) splits one table across files on <em>one</em> machine — helpful for pruning and for dropping old data cheaply, but it does not add throughput. Kafka calls its units <em>partitions</em>; Cassandra calls them <em>partitions</em> too but places them by token; DynamoDB says <em>partitions</em>; MongoDB says <em>chunks</em> in <em>shards</em>. Same idea, different nouns.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="vh">2. Vertical vs horizontal partitioning</h2>
+
+    <p>Two different words that sound like variants of one idea, and they solve unrelated problems. Interviewers occasionally ask you to distinguish them just to check you're not parroting.</p>
+
+    <h3>Vertical partitioning — split by column / by concern</h3>
+    <p>
+      You take a wide table and cut it lengthways. The <code>users</code> table has <code>id, email, name</code> (read on
+      every request, 200 bytes) and <code>bio, avatar_blob, preferences_json</code> (read almost never, 40&nbsp;KB). Put the
+      hot narrow columns in one table and the cold fat ones in another. Now the hot table's rows are tiny, so far more of them
+      fit per page, so far more of the table fits in the buffer cache, so your common query gets faster without any new
+      machines.
+    </p>
+    <p>
+      Scaled up, vertical partitioning <em>is</em> service decomposition: users live in the user service's database, orders in
+      the order service's database. That's why microservices lose joins — you vertically partitioned your schema across
+      network boundaries.
+    </p>
+<pre><code>BEFORE                          AFTER (vertical split)
+┌───────────────────────┐       ┌──────────────┐   ┌────────────────────┐
+│ users                 │       │ users        │   │ user_profiles      │
+│  id, email, name,     │  ──▶  │  id, email,  │   │  user_id, bio,     │
+│  bio, avatar, prefs   │       │  name        │   │  avatar, prefs     │
+└───────────────────────┘       └──────────────┘   └────────────────────┘
+   40 KB rows, cold data           200-byte rows       fetched on demand
+   evicting hot rows               stay cached         only on profile view
+</code></pre>
+    <p><strong>What it buys:</strong> cache efficiency, smaller I/O per query, isolation of concerns. <strong>What it doesn't buy:</strong> write throughput or capacity past one machine. Every row still lives on one box.</p>
+
+    <h3>Horizontal partitioning (sharding) — split by row</h3>
+    <p>
+      Same columns everywhere; the <em>rows</em> are divided. Users 1–1M on shard A, 1M–2M on shard B. Each shard is a
+      complete, independent database with the identical schema. This is the one that actually scales, and it's what the rest of
+      this page is about.
+    </p>
+<pre><code>            ┌──────────── shard router / client lib ────────────┐
+            │      partition key = user_id → which shard?        │
+            └───┬───────────────┬───────────────┬───────────────┬┘
+                ▼               ▼               ▼               ▼
+           ┌─────────┐     ┌─────────┐     ┌─────────┐     ┌─────────┐
+           │ shard 0 │     │ shard 1 │     │ shard 2 │     │ shard 3 │
+           │ users   │     │ users   │     │ users   │     │ users   │
+           │ (same   │     │ (same   │     │ (same   │     │ (same   │
+           │ schema) │     │ schema) │     │ schema) │     │ schema) │
+           └─────────┘     └─────────┘     └─────────┘     └─────────┘
+</code></pre>
+
+    <p>
+      <strong>Choosing the partition key is the whole game.</strong> Everything else on this page is downstream of that one
+      decision, and it is essentially irreversible once you have data. The key you pick should (a) appear in the vast majority
+      of your queries, so most requests hit exactly one shard, and (b) have high cardinality and even access, so no single
+      value can dominate. For a chat app, <code>channel_id</code> beats <code>message_id</code>, because you always read
+      messages <em>by channel</em>. For a multi-tenant SaaS, <code>tenant_id</code> keeps every tenant's data co-located — one
+      query, one shard — at the price of the "one whale tenant" problem in §8.
+    </p>
+
+    <div class="senior">The sentence that earns the point: <em>"I'd pick the partition key by looking at the dominant access pattern, not at the data. If 95% of my reads are 'give me the last 50 messages in channel X', then channel_id is the key — that makes the common query single-shard. Any key that makes my hottest query a scatter-gather is the wrong key, no matter how evenly it distributes."</em></div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="strategies">3. Sharding strategies</h2>
+
+    <p>Three ways to map a key to a shard. Each is genuinely used in production; each fails in a characteristic way, and the interviewer is listening for whether you can name the failure without being prompted.</p>
+
+    <h3>3a. Range-based partitioning</h3>
+    <p>
+      Sort the key space and cut it into contiguous ranges. Users <code>A–F</code> → shard 0, <code>G–M</code> → shard 1, and
+      so on. HBase, Bigtable, and Postgres declarative range partitioning work this way; so does MongoDB's default.
+    </p>
+<pre><code>key space:  [ A ────── F ][ G ────── M ][ N ────── S ][ T ────── Z ]
+                shard 0       shard 1       shard 2       shard 3
+</code></pre>
+    <p>
+      <strong>Good at:</strong> range scans. "Give me every event between 09:00 and 10:00" or "every user whose name starts
+      with S" touches exactly one shard, because the data you want is physically adjacent. This is the <em>only</em> strategy
+      that preserves ordering, and if your dominant query is a range query, it's the right answer.
+    </p>
+    <p>
+      <strong>Fails at:</strong> sequential keys. And your keys are almost always sequential, because the most natural key in
+      the world is a timestamp or an auto-increment ID. Partition events by <code>created_at</code> and <em>100% of today's
+      writes go to the newest shard.</em> You have bought four machines and you are writing to one of them. The other three
+      hold cold history and idle. This is the classic time-series hot-spot, and it's the single most common way range
+      partitioning blows up.
+    </p>
+    <p>
+      <strong>The fix, when you must have ranges:</strong> compound the key. Partition by <code>(sensor_id, timestamp)</code>
+      rather than <code>timestamp</code> alone. Now writes from a thousand sensors spread across shards, and "the last hour of
+      readings <em>for one sensor</em>" is still a single-shard range scan. You lose "the last hour across all sensors" as a
+      cheap query — that becomes scatter-gather. That trade is usually worth naming out loud.
+    </p>
+
+    <div class="pitfall">Range partitioning by an auto-increment primary key has exactly the same disease as partitioning by timestamp — an auto-increment ID <em>is</em> a timestamp with extra steps. Every new row goes to the highest range. If you catch yourself saying "I'll shard by ID range," check whether the ID is monotonic. If it is, you've built a one-node write path with three-node hosting costs.</div>
+
+    <h3>3b. Hash-based partitioning</h3>
+    <p>
+      Run the key through a hash function first, then map the hash to a shard. Because a good hash is uniform and avalanching,
+      <code>user_1</code> and <code>user_2</code> land in completely unrelated places, so writes spread evenly no matter how
+      sequential the input was. Cassandra (token ring), DynamoDB, Kafka (<code>hash(key) % partitions</code>), and Memcached
+      all do this.
+    </p>
+<pre><code>  "user_8842"  ─hash─▶  0x9F2A…  ─map─▶  shard 2
+  "user_8843"  ─hash─▶  0x0C71…  ─map─▶  shard 0   ← neighbours in input,
+  "user_8844"  ─hash─▶  0x7B3D…  ─map─▶  shard 1      strangers on disk
+</code></pre>
+    <p>
+      <strong>Good at:</strong> even distribution, with no thought required. Point lookups by the partition key are a single
+      hop: hash it, go to that node, done. This is the default, and if you don't have a reason to do something else, do this.
+    </p>
+    <p>
+      <strong>Fails at:</strong> range scans. Ordering is destroyed by design — that was the point — so "all events between
+      09:00 and 10:00" now has to ask <em>every</em> shard and merge the results. That's a scatter-gather, and §10 explains why
+      it's expensive in a way that averages hide.
+    </p>
+    <p>
+      <strong>Also fails at:</strong> naive resizing. <code>hash(key) % N</code> is the obvious way to map a hash to a shard,
+      and it is a trap. That's §4, and it's why consistent hashing exists.
+    </p>
+
+    <div class="note">Cassandra's answer to "even writes but ordered reads" is worth stealing for interviews: it hashes the <em>partition key</em> (spreads data across the ring) but stores rows <em>sorted</em> by a separate <em>clustering key</em> within each partition. So <code>PRIMARY KEY ((sensor_id), timestamp)</code> gives you uniform placement across nodes and an ordered, seekable range scan inside one node. Hash between partitions, sort within them. If you can say that sentence you've said something most candidates can't.</div>
+
+    <h3>3c. Directory / lookup-based partitioning</h3>
+    <p>
+      Stop computing the location and just <em>look it up</em>. Keep a lookup service — a table, a config in ZooKeeper/etcd —
+      that maps key (or key-range, or tenant) → shard. The router asks the directory, then goes to the shard.
+    </p>
+<pre><code>   client ──▶ ┌────────────────────┐
+              │ directory service  │   tenant_42  → shard 3
+              │  (ZooKeeper/etcd/  │   tenant_43  → shard 1
+              │   a Postgres table)│   tenant_44  → shard 3
+              └─────────┬──────────┘   tenant_45  → shard 0   ← moved here
+                        │                                        yesterday
+                        ▼
+                  go to shard 3
+</code></pre>
+    <p>
+      <strong>Good at:</strong> flexibility. You want to move one noisy tenant onto its own dedicated shard? Change one row in
+      the directory. You want to place a European customer's data on EU hardware for GDPR? One row. Rebalancing becomes
+      metadata editing rather than a re-derivation of a hash function, and you can make placement decisions no formula could
+      express ("these three whales each get their own box"). This is exactly why it's common in multi-tenant B2B systems and
+      in fintech, where per-customer isolation and data-residency rules are real requirements. If your interview is at a
+      SaaS/enterprise shop, this is a strong, unfashionable, correct answer.
+    </p>
+    <p>
+      <strong>Fails at:</strong> being a single point of failure and a chokepoint. Every single request now consults the
+      directory first. If it's down, your database is down — even though the database is fine. If it's slow, everything is
+      slow, and you've added a network hop to every read. The mitigations are the obvious ones and you should name them
+      unprompted: <em>replicate the directory, cache the map aggressively in every client (it changes very rarely), and version
+      it so a stale client can be told "your map is old, refresh"</em>. In practice the map is small — a few thousand entries —
+      so caching it in process memory makes the hop disappear on the happy path.
+    </p>
+
+    <h3>Comparison</h3>
+    <table>
+      <thead><tr><th></th><th>Range</th><th>Hash</th><th>Directory</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Mapping</strong></td><td>key → range → shard</td><td>hash(key) → shard</td><td>lookup table → shard</td></tr>
+        <tr><td><strong>Distribution</strong></td><td>Uneven; skew follows the data</td><td>Even (for keys)</td><td>Whatever you decide — can be perfect</td></tr>
+        <tr><td><strong>Range scans</strong></td><td>Excellent — one shard</td><td>Terrible — scatter-gather</td><td>Depends on how you assigned ranges</td></tr>
+        <tr><td><strong>Point lookups</strong></td><td>One hop</td><td>One hop</td><td>Two hops (directory, then shard)</td></tr>
+        <tr><td><strong>Hot-spot risk</strong></td><td><strong>High</strong> — sequential keys all land on the newest shard</td><td>Low for keys, but <strong>hot keys still burn one shard</strong> (§8)</td><td>Low — you can move the hot thing by hand</td></tr>
+        <tr><td><strong>Rebalancing</strong></td><td>Split a range in two; moderate</td><td>Hard if naive (§4); easy with consistent hashing</td><td>Easiest — edit metadata, migrate that slice</td></tr>
+        <tr><td><strong>Extra failure mode</strong></td><td>—</td><td>—</td><td>Directory is a SPOF and a bottleneck</td></tr>
+        <tr><td><strong>Used by</strong></td><td>HBase, Bigtable, MongoDB (default), Postgres partitions</td><td>Cassandra, DynamoDB, Kafka, Memcached</td><td>Many multi-tenant SaaS; Vitess-style routing; YouTube historically</td></tr>
+        <tr><td><strong>Reach for it when</strong></td><td>Range queries dominate <em>and</em> the key isn't monotonic</td><td>Default. Point lookups by key dominate.</td><td>Tenants differ wildly in size, or you need per-customer placement (residency, isolation)</td></tr>
+      </tbody>
+    </table>
+
+    <div class="senior">A composite answer scores best: <em>"I'd hash-partition by tenant_id as the default, but I'd put a thin directory layer in front of it so I can override placement for a handful of whale tenants and pin them to dedicated shards. The formula handles the 99%; the directory handles the exceptions. Pure formulas can't express 'this one customer is 100× the others,' and that customer always exists."</em></div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="modn">4. The <code>hash(key) % N</code> disaster</h2>
+
+    <p>
+      You've chosen hash-based partitioning. You have four cache nodes. The obvious mapping is the one every engineer writes
+      first:
+    </p>
+<pre><code><span class="typ">int</span> node = <span class="typ">Math</span>.floorMod(key.hashCode(), N);   <span class="com">// N = 4 nodes</span>
+</code></pre>
+    <p>
+      This is correct, uniform, O(1), and requires no coordination. Every client computes the same answer independently. It is
+      also, the moment <code>N</code> changes, one of the great foot-guns in distributed systems — and the interviewer wants to
+      see you find that out for yourself.
+    </p>
+
+    <h3>Do the arithmetic</h3>
+    <p>
+      Take ten keys with these hash values, and map them with N&nbsp;=&nbsp;4 and then with N&nbsp;=&nbsp;5 — you just added a
+      fifth cache node because the working set grew.
+    </p>
+    <table>
+      <thead><tr><th>key</th><th>hash</th><th>hash % 4</th><th>hash % 5</th><th>moved?</th></tr></thead>
+      <tbody>
+        <tr><td>k1</td><td>17</td><td>1</td><td>2</td><td><strong>yes</strong></td></tr>
+        <tr><td>k2</td><td>23</td><td>3</td><td>3</td><td>no</td></tr>
+        <tr><td>k3</td><td>36</td><td>0</td><td>1</td><td><strong>yes</strong></td></tr>
+        <tr><td>k4</td><td>41</td><td>1</td><td>1</td><td>no</td></tr>
+        <tr><td>k5</td><td>58</td><td>2</td><td>3</td><td><strong>yes</strong></td></tr>
+        <tr><td>k6</td><td>62</td><td>2</td><td>2</td><td>no</td></tr>
+        <tr><td>k7</td><td>74</td><td>2</td><td>4</td><td><strong>yes</strong></td></tr>
+        <tr><td>k8</td><td>85</td><td>1</td><td>0</td><td><strong>yes</strong></td></tr>
+        <tr><td>k9</td><td>91</td><td>3</td><td>1</td><td><strong>yes</strong></td></tr>
+        <tr><td>k10</td><td>99</td><td>3</td><td>4</td><td><strong>yes</strong></td></tr>
+      </tbody>
+    </table>
+    <p>
+      <strong>Seven of ten keys moved.</strong> That isn't bad luck in a small sample — it's the expected behaviour. A key
+      stays put only if <code>h % 4 == h % 5</code>, and in general a key survives a change from N to N+1 with probability
+      roughly <code>1/(N+1)</code>. Going from 4 nodes to 5, about <strong>1 in 5 keys keeps its home and ~80% of your keys
+      remap.</strong> Going from 100 to 101, ~99% remap. The scheme doesn't degrade gracefully; adding one node to a hundred is
+      nearly as destructive as adding one to four.
+    </p>
+    <p>
+      The reason is structural: the modulus is part of the mapping for <em>every</em> key. Change the modulus and you haven't
+      adjusted the function, you've replaced it. There is no relationship between the old assignment and the new one.
+    </p>
+
+    <h3>Why that's a catastrophe, not an inconvenience</h3>
+    <p>Now attach it to a real system. Say those N nodes are a Memcached/Redis tier fronting Postgres, and Postgres is only alive because the cache absorbs 95% of reads.</p>
+<pre><code>steady state          N = 4, hit rate 95%
+                      DB sees   5% of 200k QPS  =  10k QPS   ← DB is fine
+
+you add node 5        ~80% of keys now hash to a node that has never seen them
+                      hit rate collapses toward 20%
+                      DB sees  80% of 200k QPS  = 160k QPS   ← DB is dead
+
+                      … and every timed-out request retries, so it's worse
+</code></pre>
+    <p>
+      That's a <strong>cache miss storm</strong>: a scaling action — the thing you did to <em>improve</em> capacity — instantly
+      becomes an outage. The cache didn't lose the data; every node still holds its entries. But nobody asks for them anymore,
+      because the mapping moved out from under the keys. The data is present and unreachable, which is the most annoying kind
+      of unavailable.
+    </p>
+    <p>
+      And node <em>removal</em> is not opt-in. A cache node crashing is exactly the same event: N drops from 4 to 3, and ~75% of
+      keys remap. So <code>% N</code> means <em>any single cache node failure triggers a near-total cache flush and a thundering
+      herd onto your database.</em> You cannot operate this. It is a system that punishes you for both growth and failure.
+    </p>
+
+    <div class="pitfall">Candidates often try to patch <code>% N</code> rather than replace it: "I'll warm the new node first," or "I'll add nodes in powers of two." Warming doesn't help — the problem is that keys move <em>between existing nodes</em>, not just onto the new one; k1 above moved from node 1 to node 2, and neither of those is the new node. Doubling (4 → 8) does have a nice property (<code>h % 8</code> is either <code>h % 4</code> or <code>h % 4 + 4</code>, so exactly half the keys move and each stays "near" its old home), but you can only ever double, you always move 50%, and it does nothing for the case that actually matters — a node <em>dying</em>, which is not a doubling. Note the reasoning, then discard it. The real fix is a different mapping.</div>
+
+    <p><strong>State the requirement precisely, because it is what the next section is designed to satisfy:</strong></p>
+    <blockquote>
+      <p><em>When a node joins or leaves, I want to remap only the keys that node is responsible for — roughly <code>K/N</code> keys — and leave every other key exactly where it was. Adding a 5th node to 4 should move ~20% of keys, not 80%. And I want that with no central coordinator: every client should be able to compute the owner of a key on its own.</em></p>
+    </blockquote>
+
+    <div class="senior">In the interview, do not jump to "consistent hashing" the instant someone says "distributed cache." Spend twenty seconds building the problem first: <em>"The naive thing is hash mod N. That works until N changes — and if I go from 4 nodes to 5, about 80% of keys map to a different node, so my cache hit rate collapses and the whole read load lands on the database at once. Same thing happens when a node just dies. So I need a mapping where adding or removing a node only disturbs that node's share of the keyspace. That's consistent hashing."</em> Deriving the requirement before naming the solution is the difference between someone who has memorized the term and someone who understands it — and interviewers can tell instantly which one you are.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="ring">5. Consistent hashing: the ring</h2>
+
+    <p>The trick that makes it all work is one sentence, and it is worth memorizing verbatim:</p>
+    <blockquote>
+      <p><strong>Hash the nodes onto the same ring you hash the keys onto, and let each key be owned by the first node it meets walking clockwise.</strong></p>
+    </blockquote>
+    <p>
+      That's it. Every consequence below falls out of that. Note what disappeared: <code>N</code> is no longer in the formula.
+      The key's position on the ring depends only on the key. Nothing about the key's hash changes when nodes come and go —
+      only the question of <em>which node is next clockwise from it</em> can change, and that only for keys in one arc.
+    </p>
+
+    <h3>Construction, step by step</h3>
+    <ol>
+      <li><strong>Take a hash function with a big output space</strong> — say MD5 or MurmurHash, giving you numbers in
+        <code>[0, 2³²)</code>. Now bend that number line into a circle by declaring that <code>2³² − 1</code> is adjacent to
+        <code>0</code>. That circle is <em>the ring</em>. It is just the hash output space with wraparound; it is not a
+        physical thing and nothing "goes around" it.</li>
+      <li><strong>Place the nodes.</strong> For each server, hash something stable about it — its name or IP,
+        <code>hash("10.0.0.7")</code> — and that number is its position on the ring. Nodes are now scattered around the circle
+        at pseudo-random positions.</li>
+      <li><strong>Place the keys.</strong> Hash each key with the <em>same</em> function into the <em>same</em> space.
+        <code>hash("user:8842")</code> is a point on the same circle.</li>
+      <li><strong>Assign ownership.</strong> Starting from the key's position, walk <strong>clockwise</strong> (i.e. toward
+        increasing hash values, wrapping past the top back to 0) until you hit a node. That node owns the key. Equivalently:
+        each node owns the arc from the previous node's position up to its own.</li>
+    </ol>
+
+<pre><code>                          0 / 2³²
+                              │
+                  ┌───────────┴───────────┐
+             ●B ─┤                         ├─ ●A          ● = node
+                 │                         │              ○ = key
+              ○k4│         the ring        │○k1
+                 │                         │
+          3·2³⁰ ─┤                         ├─ 2³⁰
+                 │                         │
+              ○k3│                         │○k2
+             ●D ─┤                         ├─ ●C
+                  └───────────┬───────────┘
+                              │
+                           2³¹
+
+   walk CLOCKWISE from each key to the first node:
+       k1 ─▶ C      (k1 sits just past A, next node clockwise is C)
+       k2 ─▶ C
+       k3 ─▶ D
+       k4 ─▶ A      (k4 is past B; walking clockwise wraps past 0 to A)
+
+   so:  A owns the arc (D → A]      C owns the arc (A → C]
+        B owns the arc (?? → B]     D owns the arc (C → D]
+</code></pre>
+    <p>
+      Draw it clockwise, always. The direction is arbitrary — the algorithm works identically counter-clockwise — but everyone
+      draws and describes it clockwise, so pick the convention the interviewer expects and don't spend a second on it.
+    </p>
+
+    <h3>What happens when a node joins</h3>
+    <p>
+      Add node <strong>E</strong> and it hashes to some position on the ring, say between A and C. Which keys change owner?
+      Only the keys that lie in the arc between A and E — those used to walk clockwise past E's (previously empty) position and
+      land on C; now they stop at E. <strong>Every other key on the ring is completely undisturbed.</strong> Keys before A still
+      go to A. Keys after E still go to C. Keys owned by B and D never even noticed.
+    </p>
+<pre><code>BEFORE                            AFTER adding E
+   ●A                                ●A
+    │  arc owned by C                 │  arc owned by E  ← ONLY these keys move,
+    │  (keys k1, k2)                  │  (keys k1, k2)      and they move A→E's
+    │                                 ●E                    slice only
+    │                                 │  still owned by C
+   ●C                                ●C
+
+   keys owned by B: unchanged.  keys owned by D: unchanged.
+   ~K/N keys move, from exactly ONE node, to the new node.
+</code></pre>
+
+    <h3>The informal proof — say this out loud</h3>
+    <p>
+      With <code>N</code> nodes at pseudo-random ring positions and <code>K</code> keys hashed uniformly onto the same ring,
+      each node owns an arc that is on average <code>1/N</code> of the circumference, and therefore roughly <code>K/N</code>
+      keys. When you add the <code>(N+1)</code>th node, it lands in exactly one existing node's arc and splits it. The only keys
+      whose clockwise walk now terminates somewhere new are the keys in the portion of that arc <em>before</em> the new node's
+      position. So the number of keys that move is <strong>at most the keys of one node — on average <code>K/N</code>, i.e.
+      <code>1/N</code> of the data.</strong> Every key belonging to the other <code>N−1</code> nodes is provably untouched,
+      because its clockwise walk never passes the new node's position at all.
+    </p>
+    <p>
+      Removal is the mirror image: when a node dies, its arc merges into its clockwise successor, so only <em>that dead node's</em>
+      <code>K/N</code> keys move, and they all move to one place. (That last clause is a problem — hold onto it, it's what §6
+      fixes.)
+    </p>
+
+    <table>
+      <thead><tr><th>Go from 4 nodes to 5</th><th><code>hash % N</code></th><th>Consistent hashing</th></tr></thead>
+      <tbody>
+        <tr><td>Fraction of keys remapped</td><td><strong>~80%</strong></td><td><strong>~20%</strong> (1/5)</td></tr>
+        <tr><td>Go from 100 to 101</td><td>~99%</td><td>~1%</td></tr>
+        <tr><td>One node crashes (N → N−1)</td><td>~75% remap (of 4)</td><td>Only the dead node's 25%</td></tr>
+        <tr><td>Cache hit rate after the change</td><td>Collapses → DB dies</td><td>Dips by 1/N → DB absorbs it</td></tr>
+        <tr><td>Lookup cost</td><td>O(1)</td><td>O(log&nbsp;V) — binary search on a sorted ring of V positions</td></tr>
+        <tr><td>Coordination needed</td><td>None</td><td>None — every client computes the same ring from the same node list</td></tr>
+      </tbody>
+    </table>
+
+    <div class="note">The name is literal and worth unpacking, because it makes the idea stick: the mapping is <em>consistent</em> across changes in the node set. It was invented at Akamai in 1997 (Karger et al.) for exactly the caching problem in §4 — distributing web objects across a fleet of edge caches that constantly join and leave. Amazon's 2007 Dynamo paper then took it into the database world, and Cassandra, Riak and DynamoDB all descend from that. If someone asks "where does this come from?", that two-sentence lineage is a nice thing to have.</div>
+
+    <div class="senior">The 60-second whiteboard version, which is what you will actually be asked to produce: <em>"I take a hash function with a 32-bit output and treat that output space as a circle. I hash every server's ID onto the circle, and I hash every key onto the same circle. A key belongs to the first server you meet walking clockwise from the key's position. So each server owns the arc behind it. When I add a server, it lands inside exactly one existing arc and takes over the front half of it — only that slice of keys, about K over N, changes owner; everything else on the ring is untouched. When a server dies, its arc merges into its clockwise neighbour. That's the whole idea. It has one real problem, which is that with only five servers the arcs are very uneven — and virtual nodes fix that."</em> Then draw the ring, and keep talking while you draw.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="vnodes">6. Virtual nodes — the fix for the ring's two real problems</h2>
+
+    <p>
+      The plain ring solves the remapping problem and immediately introduces two new ones. Both come from the same root cause:
+      <strong>with a small number of nodes, "pseudo-random positions" are lumpy.</strong> Random points on a circle do not
+      spread out politely; they clump. Say this out loud, because interviewers specifically listen for whether you know the
+      basic ring is not the finished answer.
+    </p>
+
+    <h3>Problem 1 — the arcs are uneven, so the load is uneven</h3>
+    <p>
+      Four nodes on a ring do not carve it into four neat quarters. They land wherever their hashes put them, and it is
+      entirely normal for one node to end up owning 45% of the ring and another 8%. That node with 45% gets 45% of your keys
+      and 45% of your traffic while its peer idles — you're paying for four machines and getting the capacity of about two and
+      a half. With a large N the law of large numbers rescues you, but you don't have a large N; you have six cache nodes.
+    </p>
+<pre><code>PLAIN RING — 4 nodes, lumpy by accident (this is typical, not unlucky)
+
+     0 ────────── A ─── B ──────────────────────── C ─── D ──── 2³²
+        ▲             ▲                          ▲
+        │ D's arc     │ A's tiny arc             │ B's HUGE arc
+        │ (wraps)     │ (8% of keys)             │ (45% of keys)  ← melts
+</code></pre>
+
+    <h3>Problem 2 — when a node dies, its <em>entire</em> range dumps on one neighbour</h3>
+    <p>
+      This one is worse, and it's the one candidates miss. On a plain ring, node B's arc is a single contiguous stretch of the
+      circle, and its only clockwise successor is C. So when B dies, <strong>100% of B's load transfers to C — one machine.</strong>
+      C was already running at its own steady-state load; now it's asked to serve roughly double. So C falls over. And when C
+      falls over, <em>its</em> arc (now B's + C's) dumps entirely onto D. You have built a cascading failure: a single node
+      death takes down the cluster, one machine at a time, around the ring.
+    </p>
+    <p>
+      What you actually want when a node dies is for its load to be <strong>spread across all the surviving nodes</strong>, so
+      each one absorbs an extra <code>1/(N−1)</code> and nobody notices. The plain ring gives you the opposite.
+    </p>
+
+    <h3>The fix: each physical node gets many positions</h3>
+    <p>
+      Don't hash the node once. Hash it <strong>V times</strong> under different labels — <code>hash("A#0")</code>,
+      <code>hash("A#1")</code>, … <code>hash("A#149")</code> — and put a marker at every one of those positions. Each marker is
+      a <em>virtual node</em> (a <em>vnode</em>, or in Cassandra/Dynamo language, a <em>token</em>). All V markers for a given
+      label route to the same physical machine. Typical V is <strong>100–200</strong> per physical node; Cassandra's default is
+      256 tokens per node.
+    </p>
+    <p>Nothing else about the algorithm changes. You still hash the key, still walk clockwise, still take the first marker you find. You just look up which <em>physical</em> box that marker belongs to.</p>
+
+<pre><code>WITH VIRTUAL NODES — the same 4 machines, 150 markers each (6 shown)
+
+  0 ─ A₁ ─ C₄ ─ B₂ ─ D₇ ─ A₉ ─ B₅ ─ C₁ ─ D₃ ─ A₄ ─ C₈ ─ B₉ ─ D₂ ─ 2³²
+      └───┬───┘                         each machine's ownership is now
+   many small arcs, interleaved         ~600 tiny arcs sprinkled evenly
+                                        around the whole circle
+
+  1. LOAD IS EVEN.  Averaging 150 random arcs per machine crushes the
+     variance. Ownership converges hard on 1/N each.
+
+  2. FAILURE SPREADS.  Kill machine B. Every one of B's 150 arcs merges
+     into whatever marker happens to be clockwise of it — and those
+     markers belong to A, C and D roughly equally. So B's load is
+     redistributed across ALL survivors, ~1/(N-1) extra each,
+     instead of 100% onto one poor neighbour.
+
+     B's arcs ─┬─▶ A   (≈ 1/3 of B's load)
+               ├─▶ C   (≈ 1/3)
+               └─▶ D   (≈ 1/3)     ← no cascade
+</code></pre>
+
+    <p>
+      Problem 2 is really the headline. Even load is nice; <strong>not cascading when a machine dies is the reason this is
+      non-optional in production.</strong> Same reason a joining node is painless: it picks up 150 small arcs from many
+      different existing machines, so the migration work is shared and no single donor gets hammered while it streams data out.
+    </p>
+
+    <h3>Bonus: weighting heterogeneous hardware</h3>
+    <p>
+      Virtual nodes give you a free knob that the plain ring can't express. Ownership is proportional to the number of markers,
+      so <strong>give a bigger machine more markers.</strong> Your fleet has old 32&nbsp;GB boxes and new 64&nbsp;GB boxes? Give
+      the old ones 100 vnodes and the new ones 200, and the new ones will naturally own about twice the keyspace and take about
+      twice the traffic. No special-casing, no separate config — capacity becomes a single integer per node.
+    </p>
+    <p>
+      This matters more than it sounds. Real clusters are never homogeneous: you're mid-migration, or one AZ has different
+      instance types available, or you're bin-packing on shared hardware. Mention the weighting in the interview — it's a
+      one-liner and very few candidates have it.
+    </p>
+
+    <table>
+      <thead><tr><th></th><th>Plain ring (1 position/node)</th><th>Virtual nodes (V ≈ 150/node)</th></tr></thead>
+      <tbody>
+        <tr><td>Load balance across nodes</td><td>Lumpy — a node can easily own 2–3× its fair share</td><td>Tight — variance falls roughly as 1/√V</td></tr>
+        <tr><td>When a node dies</td><td>All of its load → its single clockwise neighbour → cascade</td><td>Its load spreads over all survivors, ~1/(N−1) each</td></tr>
+        <tr><td>When a node joins</td><td>Takes keys from one node; that node bears the whole migration</td><td>Takes small slices from every node; migration is parallel</td></tr>
+        <tr><td>Heterogeneous hardware</td><td>Can't express it</td><td>Free — more vnodes = proportionally more data</td></tr>
+        <tr><td>Cost</td><td>—</td><td>N × V entries in the ring structure (a few thousand — trivial), and O(log(N·V)) lookup instead of O(log N). Nothing.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="pitfall">Two things people get wrong here. (1) <strong>Virtual nodes are not extra processes or extra machines.</strong> They are extra <em>entries in a sorted map</em>. Nothing is deployed. If you say "so we'd spin up 150 virtual nodes per server," the interviewer will hear that you don't know what the mechanism is. Say "150 <em>positions on the ring</em>, all pointing at the same box." (2) <strong>Virtual nodes do not fix hot keys.</strong> They fix uneven <em>key distribution</em>. If one key is being read a million times a second, it hashes to exactly one position, which belongs to exactly one machine, and that machine burns — no number of vnodes changes that. That's §8, and conflating the two is the most common way this topic goes wrong.</div>
+
+    <div class="senior">The line that shows you've operated one of these, not just read about one: <em>"I'd use virtual nodes — 150 or so per physical node. The even-load argument is the one people give, but the real reason is failure behaviour: with one position per node, when a node dies its entire range lands on a single neighbour, which doubles that neighbour's load and takes it down too — you cascade around the ring. With vnodes, a dead node's ranges are scattered, so its load is picked up by every survivor in small slices. It also lets me weight bigger boxes just by giving them more positions."</em></div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="java">7. A consistent-hash ring in Java</h2>
+
+    <p>
+      Occasionally an interviewer will hand you this as a coding exercise — it's a favourite at the boundary between LLD and
+      system design, and it's a natural pairing with your Phase 1 Java. The whole thing is a <code>TreeMap</code> and one
+      method call. The insight that makes it collapse to nothing:
+    </p>
+    <blockquote>
+      <p><strong>"Walk clockwise to the first node" is exactly <code>TreeMap.ceilingKey(hash)</code> — the smallest ring position ≥ the key's position. And "wrap past the top back to zero" is exactly <code>TreeMap.firstKey()</code> when <code>ceilingKey</code> returns null.</strong></p>
+    </blockquote>
+    <p>Say that sentence and then write the code; it makes the implementation self-evident.</p>
+
+<pre><code><span class="kw">import</span> java.security.MessageDigest;
+<span class="kw">import</span> java.util.*;
+
+<span class="kw">public class</span> <span class="typ">ConsistentHashRing</span> {
+
+    <span class="com">// The ring: ring position (0 .. 2^32) → the PHYSICAL node at that position.</span>
+    <span class="com">// TreeMap because we need "smallest key &gt;= x" — that IS the clockwise walk.</span>
+    <span class="kw">private final</span> <span class="typ">TreeMap</span>&lt;<span class="typ">Long</span>, <span class="typ">String</span>&gt; ring = <span class="kw">new</span> <span class="typ">TreeMap</span>&lt;&gt;();
+
+    <span class="com">// How many ring positions each physical node occupies. 100-200 is typical.</span>
+    <span class="com">// This is the virtual-node count: it flattens load and spreads a node's</span>
+    <span class="com">// keys over ALL survivors when it dies, instead of dumping on one neighbour.</span>
+    <span class="kw">private final</span> <span class="typ">int</span> vnodes;
+
+    <span class="kw">public</span> <span class="typ">ConsistentHashRing</span>(<span class="typ">int</span> vnodes, <span class="typ">Collection</span>&lt;<span class="typ">String</span>&gt; nodes) {
+        <span class="kw">this</span>.vnodes = vnodes;
+        <span class="kw">for</span> (<span class="typ">String</span> n : nodes) add(n);
+    }
+
+    <span class="com">// Adding a node: drop `vnodes` markers for it around the ring.</span>
+    <span class="com">// Each marker steals only the small arc behind it from ONE existing marker,</span>
+    <span class="com">// so total keys moved ~= K/N, taken in slices from every other node.</span>
+    <span class="kw">public void</span> add(<span class="typ">String</span> node) {
+        <span class="kw">for</span> (<span class="typ">int</span> i = <span class="num">0</span>; i &lt; vnodes; i++) {
+            ring.put(hash(node + <span class="str">"#"</span> + i), node);   <span class="com">// "10.0.0.7#37" → some position</span>
+        }
+    }
+
+    <span class="com">// Removing a node (crash or scale-down): delete its markers. Each of its arcs</span>
+    <span class="com">// silently merges into whatever marker is clockwise of it — different physical</span>
+    <span class="com">// nodes for different arcs. No other key in the ring is affected.</span>
+    <span class="kw">public void</span> remove(<span class="typ">String</span> node) {
+        <span class="kw">for</span> (<span class="typ">int</span> i = <span class="num">0</span>; i &lt; vnodes; i++) ring.remove(hash(node + <span class="str">"#"</span> + i));
+    }
+
+    <span class="com">// THE LOOKUP. Hash the key onto the same ring, walk clockwise to the first</span>
+    <span class="com">// marker. ceilingKey = smallest position &gt;= h. If there is none, we ran off</span>
+    <span class="com">// the top of the ring — wrap around to firstKey(). That null check IS the ring.</span>
+    <span class="kw">public</span> <span class="typ">String</span> getNode(<span class="typ">String</span> key) {
+        <span class="kw">if</span> (ring.isEmpty()) <span class="kw">return null</span>;
+        <span class="typ">Long</span> pos = ring.ceilingKey(hash(key));
+        <span class="kw">return</span> ring.get(pos != <span class="kw">null</span> ? pos : ring.firstKey());   <span class="com">// O(log N·V)</span>
+    }
+
+    <span class="com">// Any well-distributed hash works; MD5/Murmur are the usual choices.</span>
+    <span class="com">// String.hashCode() is a poor ring hash — it clusters badly on similar inputs.</span>
+    <span class="kw">private long</span> hash(<span class="typ">String</span> s) {
+        <span class="kw">try</span> {
+            <span class="typ">byte</span>[] d = <span class="typ">MessageDigest</span>.getInstance(<span class="str">"MD5"</span>).digest(s.getBytes());
+            <span class="kw">return</span> ((<span class="kw">long</span>) (d[<span class="num">0</span>] &amp; <span class="num">0xFF</span>) &lt;&lt; <span class="num">24</span>) | ((<span class="kw">long</span>) (d[<span class="num">1</span>] &amp; <span class="num">0xFF</span>) &lt;&lt; <span class="num">16</span>)
+                 | ((<span class="kw">long</span>) (d[<span class="num">2</span>] &amp; <span class="num">0xFF</span>) &lt;&lt; <span class="num">8</span>)  |  (<span class="kw">long</span>) (d[<span class="num">3</span>] &amp; <span class="num">0xFF</span>);   <span class="com">// 32-bit ring</span>
+        } <span class="kw">catch</span> (<span class="typ">Exception</span> e) { <span class="kw">throw new</span> <span class="typ">RuntimeException</span>(e); }
+    }
+}
+</code></pre>
+
+    <p>Points to volunteer while you write it, in rough order of value:</p>
+    <ul>
+      <li><strong><code>ceilingKey</code> + the <code>firstKey</code> fallback is the entire algorithm.</strong> Everything else is bookkeeping. If you're short on time, write <code>getNode</code> first and say the rest is obvious.</li>
+      <li><strong>Lookup is O(log(N·V))</strong> — a binary search over a few thousand entries, i.e. ~12 comparisons. Nobody cares; it's nanoseconds and it's local. There's no network call to find the owner, which is exactly the property that makes this scale: <em>every client independently computes the same answer from the same node list.</em></li>
+      <li><strong>Don't use <code>String.hashCode()</code>.</strong> It's fast but poorly distributed for similar strings, and "similar strings" is precisely what your vnode labels are (<code>node#0</code>, <code>node#1</code>, …). Clustered vnodes defeat the purpose of having them. MD5 or Murmur3.</li>
+      <li><strong>Replication is a two-line extension.</strong> To store each key on 3 nodes (as Dynamo/Cassandra do), don't stop at the first marker clockwise — keep walking and collect the next 3 <em>distinct physical</em> nodes. That "distinct physical" filter matters: with vnodes, the next two markers might belong to the same box you already picked, and you'd have three copies on one machine. Mentioning that filter unprompted is a real signal — it's the bug everyone writes first.</li>
+      <li><strong>Thread safety:</strong> in production the ring is read constantly and mutated rarely (only on membership change). So don't lock reads — build a new immutable ring on change and swap a <code>volatile</code> reference. Copy-on-write, the same pattern you'd use for a React context value that changes once an hour.</li>
+    </ul>
+
+    <div class="note">The ring is also stateless <em>derived</em> data — it's a pure function of the node list. So the real distributed-systems problem isn't the ring, it's <strong>agreeing on the membership list</strong>: who is alive right now? Cassandra and Dynamo answer with a gossip protocol; a Redis Cluster client answers with the cluster's slot map; a Kafka client asks the controller. That's tutorial 05 (coordination) and tutorial 08 (the distributed cache). Point at it and move on — "and I'd need a way to agree on the live node set, either gossip or a coordination service like etcd" — is exactly the right amount to say here.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="hot">8. Hot keys &amp; celebrity partitions</h2>
+
+    <p>Here is the sentence that this entire section exists to install in your head, because it is the thing candidates freeze on:</p>
+    <blockquote>
+      <p><strong>Hashing gives you an even distribution of <em>keys</em>. It does not give you an even distribution of <em>load</em>.</strong></p>
+    </blockquote>
+    <p>
+      Consistent hashing, virtual nodes, the ring — all of it assumes every key is worth about the same amount of traffic. Real
+      workloads are Zipfian: a tiny minority of keys take a huge majority of the requests. The distribution is not a bell curve,
+      it's a cliff.
+    </p>
+    <ul>
+      <li><strong>The celebrity.</strong> A user with 200 million followers. Every one of their posts fans out to a fifth of the
+        product. Their user row is read constantly.</li>
+      <li><strong>The viral item.</strong> One tweet, one video, one product on Black Friday. Yesterday it had 3 reads/sec;
+        right now it has 800,000/sec.</li>
+      <li><strong>The whale tenant.</strong> You sharded a B2B SaaS by <code>tenant_id</code>. It works beautifully, and then
+        you sign an enterprise customer who is bigger than your other 40,000 customers combined. They are one key. They live on
+        one shard. That shard is now your product's capacity ceiling.</li>
+      <li><strong>The default value.</strong> The dull one nobody mentions and everybody ships: 60% of rows have
+        <code>country = 'US'</code> or <code>status = NULL</code>, and you partitioned on that column. Low cardinality is a hot
+        key wearing a disguise.</li>
+    </ul>
+    <p>
+      In all four cases the hash function does its job perfectly. The key hashes to one position, that position belongs to one
+      node, and that node is now serving a hundred times what its peers serve. It saturates its CPU or its NIC and starts timing
+      out — and because a single shard being down usually looks like the whole product being broken, you have an outage on
+      one-sixteenth of your fleet. <strong>No amount of virtual nodes helps. A single key cannot be split by a hash function.</strong>
+    </p>
+
+<pre><code>  hashing worked perfectly:  keys are spread evenly across shards
+  load did not care:
+
+  shard 0  ████                       2k QPS
+  shard 1  ███                        1.5k QPS
+  shard 2  ██████████████████████████████████████████  190k QPS  ◀── @celebrity
+  shard 3  ████                       2k QPS
+
+  Every shard holds ~25% of the KEYS. One shard takes ~95% of the LOAD.
+</code></pre>
+
+    <h3>The fixes — have four of these ready</h3>
+    <p>This is a very common follow-up ("what if one user is much more popular than the rest?"), and the good answer is not one technique, it's a ladder from cheap to expensive. Walk it in order.</p>
+
+    <h4>1. Cache the hot key — the first and usually sufficient answer</h4>
+    <p>
+      Hot keys are hot precisely <em>because</em> they're read over and over, which makes them the most cacheable objects in your
+      entire system. A celebrity's profile has a 99.999% hit rate on any cache you put in front of it. So put one there: an
+      in-process LRU in every application server, or a small Redis tier in front of the shard. Now the hot key is served from
+      memory on the app tier and the hot shard never sees the traffic.
+    </p>
+    <p>
+      <strong>Say it like this:</strong> <em>"Hot keys are the easiest thing in the world to cache — that's what makes them
+      hot. A tiny local cache on each app server with a one-second TTL turns a million reads per second on one shard into one
+      read per second per app server. I'd reach for that before I did anything structural."</em> A one-second TTL sounds
+      useless and is devastatingly effective: at a million QPS it eliminates 99.9999% of the load, and one second of staleness
+      on a follower count is fine.
+    </p>
+
+    <h4>2. Request coalescing (single-flight)</h4>
+    <p>
+      When the hot key's cache entry expires, a thousand concurrent requests all miss at the same instant and all stampede the
+      shard — you've re-created the problem at the TTL boundary. Fix it by letting <em>one</em> request go fetch and making the
+      other 999 wait on that same in-flight promise. In Java that's a <code>ConcurrentHashMap&lt;Key, CompletableFuture&lt;V&gt;&gt;</code>;
+      you already know this pattern from React Query / SWR deduplicating identical fetches in flight. Related: the thundering
+      herd and cache stampede (tutorial 06).
+    </p>
+
+    <h4>3. Key salting / splitting — split the key across shards</h4>
+    <p>
+      If the key is <em>write</em>-hot rather than read-hot (a like counter on a viral post, an ad-impression counter), caching
+      can't save you — you can't cache a write. So <strong>split the key into N sub-keys and reassemble on read.</strong>
+    </p>
+<pre><code>  HOT WRITE KEY                     SALTED
+  likes:post_9931                   likes:post_9931:0   ──▶ shard 1
+     │                              likes:post_9931:1   ──▶ shard 3
+  all increments →                  likes:post_9931:2   ──▶ shard 0
+  ONE shard, melts                  …
+                                    likes:post_9931:9   ──▶ shard 2
+
+  WRITE: pick a random salt 0..9, increment that counter    → load ÷ 10
+  READ:  read all 10 and SUM them                           → 10 reads, 1 result
+</code></pre>
+    <p>
+      You've traded a cheap read for a cheap write, which is the right trade when writes are the problem. Note the salt count
+      is a knob: 10 sub-keys divides the write load by 10 and multiplies the read cost by 10. And you don't need to salt
+      everything — <strong>salt only the keys you've detected as hot</strong>, keeping a small set of "currently hot keys" that
+      readers consult. Same technique, different name, in the ad-click aggregator (tutorial 18).
+    </p>
+
+    <h4>4. Replicate the hot shard / add read replicas</h4>
+    <p>
+      If the load is reads and you can tolerate replica lag, give the hot shard extra read replicas and fan reads across them.
+      Straightforward and it composes with everything else. It doesn't help writes at all, and it's a per-shard-level fix — you
+      end up with an asymmetric cluster, which is operationally annoying but entirely legitimate.
+    </p>
+
+    <h4>5. Special-case it — put the celebrity on its own shard</h4>
+    <p>
+      This is where the directory strategy from §3c earns its rent. Detect the whale, and <em>pin it</em>: give the biggest
+      tenant its own dedicated shard, or its own dedicated cluster. Formulas can't express "this one is different"; a lookup
+      table can. Every mature multi-tenant system ends up with a handful of hand-placed customers, and saying so is a mark of
+      someone who's run one.
+    </p>
+
+    <h4>6. Change the algorithm entirely</h4>
+    <p>
+      Sometimes the right response isn't to spread the hot key but to stop touching it. The canonical example is the
+      <strong>news feed</strong>: fan-out-on-write pushes a post into every follower's feed, which is fine for you and
+      catastrophic for a celebrity with 200M followers. The real answer is a <em>hybrid</em> — fan out on write for normal
+      users, and for celebrities don't fan out at all; pull their posts in at read time and merge. That's not a partitioning
+      fix; it's a design change driven by exactly this problem. <strong>Forward reference: tutorial 10 (News Feed) is where the
+      celebrity problem gets its full treatment</strong>, and it's the highest-frequency version of this question in real loops.
+    </p>
+
+    <h3>You also have to <em>detect</em> the hot key</h3>
+    <p>
+      All of the above assumes you know which key is hot, and hot keys appear without warning — that's what "viral" means. So
+      you need per-key traffic accounting, which you can't do exactly at a million QPS. Sample requests, or keep an approximate
+      heavy-hitters structure (a <strong>count-min sketch</strong> — fixed memory, small overcount, never undercounts) at the
+      proxy or client, and emit "top-K keys by request rate" every few seconds. Then a hot key can trigger salting or promotion
+      into a local cache <em>automatically</em>. Naming count-min sketch here is a nice, cheap flex; you don't need to derive it.
+    </p>
+
+    <div class="pitfall">The trap answer is "I'd use consistent hashing with virtual nodes, so the load is balanced." That answers a different question. Virtual nodes balance the <em>keyspace</em>; a hot key is a single point in the keyspace. If you offer this, the interviewer will simply ask "but all million requests are for the <em>same</em> key — where do they go?" and you'll have burned your credibility on the topic. Get ahead of it: say <em>"note that vnodes don't help here — one key is one position on the ring, so it's one node no matter what. Hot keys need a different set of tools."</em></div>
+
+    <div class="senior">The compressed answer to "your shard is hot — what do you do?", which is worth rehearsing until it's fluent: <em>"First I'd find out whether it's hot on reads or on writes, because the fixes are disjoint. If it's reads: cache the key — hot keys are trivially cacheable, and a one-second TTL in a local app-server cache kills nearly all of it — plus request coalescing so I don't stampede on expiry, and read replicas of that shard if I still need more. If it's writes: I can't cache a write, so I'd salt the key — split the counter into ten sub-keys on ten shards, increment a random one, sum on read. And if the hotness is structural rather than transient — a whale tenant — I'd stop trying to be clever and just pin it to its own shard through a directory layer. What I would not say is 'add virtual nodes': a single key is a single point on the ring, so that changes nothing."</em></div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="rebalance">9. Rebalancing without a full reshuffle</h2>
+
+    <p>
+      Rebalancing is what happens after the ring diagram: nodes get added because you grew, removed because you shrank, and
+      replaced because they died. The interviewer's question is <em>"you added a node — now what physically happens to the data,
+      and is the system up while it happens?"</em> Consistent hashing tells you <em>which</em> keys must move. It says nothing
+      about <em>how</em> they move, and that's the operational half of the answer.
+    </p>
+
+    <h3>Fixed partition count — the pragmatic answer, and the one to lead with</h3>
+    <p>
+      The move used by Riak, Kafka, Elasticsearch and (in effect) Cassandra's vnodes: <strong>decouple the number of partitions
+      from the number of nodes.</strong> At day one, create far more partitions than you have machines — say 1,024 — and never
+      change that number. Then assign partitions to nodes, many per node.
+    </p>
+<pre><code>  1024 fixed partitions, 4 nodes:      add a 5th node:
+
+  node A: partitions   0-255           node A: 0-204     (gave away ~51)
+  node B: partitions 256-511    ──▶    node B: 256-460   (gave away ~51)
+  node C: partitions 512-767           node C: 512-716   (gave away ~51)
+  node D: partitions 768-1023          node D: 768-972   (gave away ~51)
+                                       node E: ~205 partitions, taken in
+                                               whole chunks from A,B,C,D
+
+  hash(key) → partition   NEVER CHANGES.   ← the key point
+  partition → node        is the only mapping that moves.
+</code></pre>
+    <p>
+      <strong>The key never moves between partitions. Only whole partitions move between nodes.</strong> That's the whole
+      idea, and it's a beautiful simplification, because it turns rebalancing from "recompute where 200 billion keys live" into
+      "move 51 files and update a small metadata table." The <code>key → partition</code> map is a pure, fixed function that
+      every client can compute offline. The <code>partition → node</code> map is a tiny piece of cluster metadata — 1,024 rows —
+      that lives in ZooKeeper/etcd or is gossiped, and it's the only thing that changes.
+    </p>
+    <p>Choosing the partition count is a real trade-off and worth naming:</p>
+    <table>
+      <thead><tr><th>Too few partitions</th><th>Too many partitions</th></tr></thead>
+      <tbody>
+        <tr><td>Coarse-grained — you can't balance well across many nodes, and each partition is huge, so moving one is a big slow transfer</td><td>Per-partition overhead: files, memory, open handles, metadata, replication streams. Kafka in particular degrades with tens of thousands of partitions.</td></tr>
+        <tr><td>Caps your maximum cluster size at (partitions) nodes</td><td>Wasteful at small scale, and the metadata map gets unwieldy</td></tr>
+      </tbody>
+    </table>
+    <p>
+      The rule of thumb: pick a number comfortably larger than the biggest cluster you can imagine — 10× your current nodes is
+      a common heuristic — and accept it as permanent, because changing it later means rehashing everything, which is the
+      problem you were avoiding. (Kafka lets you <em>add</em> partitions, but doing so breaks per-key ordering for existing keys
+      because <code>hash(key) % partitions</code> changes. Same disease as §4, in a different costume. Over-provision the
+      partition count up front.)
+    </p>
+
+    <div class="senior">Lead with this rather than with the ring when the question is about <em>rebalancing</em> specifically: <em>"I'd fix the partition count up front — say 1,024 — much larger than the node count, and never change it. Keys hash to partitions, and that mapping is permanent. Rebalancing is then just reassigning whole partitions to nodes, which is a metadata change plus a bulk file copy — I never rehash a single key. Consistent hashing and fixed partitions are complementary: the ring tells me who owns what without a coordinator; the fixed partition count makes the unit of movement coarse and cheap."</em></div>
+
+    <h3>How the data actually migrates, with the system up</h3>
+    <p>You can't take the write path offline while you copy gigabytes. The standard dance, and it is basically the same in every system:</p>
+    <ol>
+      <li><strong>Assign, but don't cut over.</strong> The new node is told it will own partitions 205–255. The old owner keeps
+        serving all reads and writes for them. Nothing has changed for clients yet — this is the crucial property.</li>
+      <li><strong>Bulk copy.</strong> Stream the existing data for those partitions from the old owner to the new one, throttled
+        so the migration doesn't starve live traffic of I/O. This may take hours. Everything still works.</li>
+      <li><strong>Catch up on the delta.</strong> While you copied, writes kept arriving. So the old owner also forwards its
+        ongoing writes for those partitions (or the new node tails the replication log / commit log) until the new node is
+        within a few milliseconds of live.</li>
+      <li><strong>Flip the pointer.</strong> Atomically update <code>partition 205 → node E</code> in the metadata store.
+        Traffic starts arriving at E. This step must be atomic and ordered, which is exactly why a coordination service
+        (ZooKeeper, etcd) is used for the map rather than a config file — see tutorial 05.</li>
+      <li><strong>Handle in-flight stragglers.</strong> Clients cache the map, so some will briefly still ask the old owner. Two
+        standard answers: the old owner <em>redirects</em> them (Redis Cluster does this literally, with a <code>MOVED</code>
+        response carrying the new address), or it <em>proxies</em> the request through for a grace period. Either way clients
+        refresh their map and converge. This is also where a version number on the map earns its keep.</li>
+      <li><strong>Delete on the old node, after a delay.</strong> Not immediately — keep it until you're confident, so a bad
+        cutover can be rolled back by flipping the pointer again.</li>
+    </ol>
+
+    <div class="note"><strong>Rebalancing should be manual, or at least human-approved — say this.</strong> Automatic rebalancing plus automatic failure detection is a famous way to destroy a cluster: a node gets slow (GC pause, saturated NIC), the system decides it's dead, and starts migrating its data away — which consumes network and makes the node <em>actually</em> unresponsive, so more nodes are declared dead, so more data moves. The cluster rebalances itself to death under load. Both the Dynamo paper and <em>Designing Data-Intensive Applications</em> come down on the side of "automate the mechanism, but keep a human in the decision." Offering that unprompted is a strong operational-maturity signal, and it costs one sentence.</div>
+
+    <h3>Removal and failure are different events — don't conflate them</h3>
+    <ul>
+      <li><strong>Planned removal (scale-down, host replacement):</strong> the node drains first — it copies its partitions to
+        their new owners while still serving, then leaves. No availability impact.</li>
+      <li><strong>Unplanned failure (crash):</strong> its data is <em>gone from that box</em>, so its replicas must serve while a
+        new node backfills from them. This is why replication and partitioning are two different axes and you need both: a
+        partition with no replica is a partition you lose. In Dynamo-style systems the write that arrives during the gap gets
+        <em>hinted handoff</em> — a neighbour temporarily accepts and stores it with a note saying "this belongs to the dead node,
+        deliver it when it returns." That's tutorial 08.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="crossshard">10. The cross-shard problem</h2>
+
+    <p>
+      Everything above assumed you know the partition key at request time. When you do, sharding is nearly free: one hop, one
+      node, one index lookup. The bill arrives for every query that <em>doesn't</em> name the partition key, and for every write
+      that touches two of them. This is the permanent tax, and a senior candidate quantifies it rather than waving at it.
+    </p>
+
+    <h3>10a. Cross-shard joins → scatter-gather</h3>
+    <p>
+      <code>JOIN</code> across shards does not exist. Your database can't do it, because the two tables are on different
+      machines that don't know about each other. Your options are all worse than a join:
+    </p>
+    <ul>
+      <li><strong>Co-locate.</strong> Choose a partition key that keeps things that are joined together <em>on the same shard</em>.
+        Shard <code>orders</code> and <code>order_items</code> both by <code>customer_id</code>, and the join is local — a
+        normal Postgres join on one box. This is the best answer and you should always reach for it first. It's why picking the
+        partition key is really picking your <em>join boundary</em>.</li>
+      <li><strong>Denormalize.</strong> Copy the fields you need into the row that needs them. Store <code>author_name</code> on
+        the post instead of joining to <code>users</code>. You now own the consistency problem (rename → update N rows,
+        asynchronously) and you accept it, because a stale display name for thirty seconds is not a real problem.</li>
+      <li><strong>Application-side join.</strong> Fetch from shard A, collect the IDs, fetch from shard B, stitch in your code.
+        This is what you actually do, and it's fine at small fan-out. You've moved the join into the app tier, where it has no
+        indexes and no query planner.</li>
+      <li><strong>Scatter-gather.</strong> Ask every shard, merge the answers.</li>
+    </ul>
+
+<pre><code>  SCATTER-GATHER — "find all users named 'Chen'" (shard key is user_id)
+
+              ┌──▶ shard 0  ──▶  12 ms  ✓
+              │
+  query ──────┼──▶ shard 1  ──▶  15 ms  ✓
+   (fan out   │
+   to ALL     ├──▶ shard 2  ──▶  11 ms  ✓
+   16 shards) │
+              └──▶ shard 15 ──▶ 340 ms  ◀── GC pause. everyone waits.
+                                  │
+                          merge ──┘   total latency = 340 ms
+</code></pre>
+
+    <h3>The tail-latency trap — this is why P99 matters</h3>
+    <p>
+      Here is the point most candidates miss, and it is a genuinely strong thing to say. <strong>A scatter-gather is as slow as
+      its slowest shard.</strong> You must wait for all of them, so your response time is the <em>maximum</em> of 16 samples, not
+      the average. And that maximum is drawn from the tail of the latency distribution.
+    </p>
+    <p>Do the arithmetic, because the number is shocking:</p>
+    <ul>
+      <li>Each shard is fast: P99 = 100&nbsp;ms means only 1% of requests are slow. Sounds great.</li>
+      <li>You query 16 shards in parallel. The chance <em>all</em> are fast is 0.99¹⁶ ≈ <strong>0.85</strong>.</li>
+      <li>So <strong>~15% of your user-facing requests take 100&nbsp;ms or more</strong> — even though each individual shard hits
+        its P99 SLA perfectly. Your service's P85 is now your shards' P99.</li>
+      <li>Go to 100 shards: 0.99¹⁰⁰ ≈ 0.37. <strong>63% of requests hit a slow shard.</strong> Your median is now your shards'
+        tail.</li>
+    </ul>
+    <p>
+      This is Jeff Dean's "tail at scale," and it's the reason latency is measured at P99/P99.9 and not as an average: <em>at
+      fan-out, the tail of your components becomes the body of your service.</em> Averages are a lie for exactly this reason. The
+      mitigations are worth knowing: <strong>hedged requests</strong> (after P95 elapses, send a duplicate request to a replica
+      and take whichever answers first — costs ~5% extra load, cuts the tail dramatically), <strong>tolerating partial results</strong>
+      (return 15 of 16 shards' results and degrade rather than block — a search page can do this; a bank balance cannot), and
+      most importantly <strong>designing the access pattern so you don't scatter-gather at all.</strong>
+    </p>
+
+    <div class="senior">The sentence that will make an interviewer sit up: <em>"The real cost of scatter-gather isn't the extra work, it's the tail. I have to wait for the slowest shard, so my latency is the max of N samples, not the mean. If each shard has a 100ms P99 and I fan out to 16, then 1 minus 0.99 to the 16th — about 15% of my requests — hit at least one slow shard. My service's P85 is my shards' P99. That's why I'd design the partition key so the hot path never fans out, and why I'd use hedged requests if it has to."</em></div>
+
+    <h3>10b. Cross-shard transactions</h3>
+    <p>
+      "Transfer $100 from account A to account B" is an ACID one-liner on a single Postgres node — you did this in Phase 1. Put A
+      and B on different shards and there is no single node that can commit or roll back both. Your options, all covered in
+      tutorial 05:
+    </p>
+    <table>
+      <thead><tr><th>Option</th><th>What it costs</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Avoid it</strong> — pick a partition key that keeps things that change together on one shard (both accounts of a transfer? often impossible. A user and their own orders? easy.)</td><td>Constrains the partition key. Always try this first.</td></tr>
+        <tr><td><strong>2PC</strong> (two-phase commit)</td><td>Correct, and it blocks: participants hold locks while waiting for the coordinator, and if the coordinator dies mid-commit they hold them indefinitely. Availability drops with every extra participant. Rare in internet-scale systems, real in enterprise/XA/fintech contexts.</td></tr>
+        <tr><td><strong>Saga</strong> — a sequence of local transactions with compensating actions</td><td>Available and scalable, but you give up isolation: intermediate states are visible, and "compensate" is not the same as "roll back" (you can't un-send an email). You now own the semantics.</td></tr>
+        <tr><td><strong>Outbox pattern</strong> — commit the state change and an event atomically in one local transaction, publish the event asynchronously</td><td>The workhorse. Gives you at-least-once delivery, so consumers must be idempotent. This is the pattern to name at a fintech loop.</td></tr>
+      </tbody>
+    </table>
+    <p>Notice all four answers are "make it not be a distributed transaction, or accept eventual consistency." That's the honest state of the art, and saying so plainly is better than pretending 2PC is fine.</p>
+
+    <h3>10c. Secondary indexes: local vs global</h3>
+    <p>
+      You sharded <code>users</code> by <code>user_id</code>. Now: <em>find the user with email <code>x@y.com</code></em>. The
+      email doesn't tell you the shard. This is the same scatter-gather problem, and it has a genuine architectural fork.
+    </p>
+
+<pre><code>LOCAL SECONDARY INDEX              GLOBAL SECONDARY INDEX
+(index is partitioned by            (index is partitioned by the
+ the DOCUMENT's shard key)            INDEXED TERM itself)
+
+ shard 0: users 0-999               index shard A: emails a*–m*
+   └ idx: email → local users         └ x@y.com → user 8842 (on shard 8)
+ shard 1: users 1000-1999           index shard B: emails n*–z*
+   └ idx: email → local users         └ …
+
+ WRITE: cheap. Index update is      WRITE: expensive. Writing one user
+ local to the shard you already     touches its data shard AND a
+ wrote — one transaction.           different index shard → cross-shard.
+                                    Usually done ASYNC ⇒ the index is
+ READ: expensive. You don't know    eventually consistent (you can write
+ which shard → ask ALL of them,     a row and not find it by email for a
+ scatter-gather.                    moment). DynamoDB GSIs behave exactly
+                                    like this — a documented gotcha.
+                                    READ: cheap. Hash the email → one hop.
+</code></pre>
+    <p>
+      <strong>The trade is read cost vs write cost, and consistency is the tiebreaker.</strong> Local (a.k.a. document-partitioned)
+      indexes make writes fast and consistent, reads a fan-out — this is Cassandra's and Elasticsearch's model, and it's fine
+      when reads are already scoped to a shard or when fan-out is affordable. Global (term-partitioned) indexes make reads a
+      single hop and writes a distributed, usually asynchronous, eventually-consistent problem — DynamoDB's GSIs.
+    </p>
+    <p>
+      For the specific "login by email" case there is a much simpler answer that you should give first, because it's what you'd
+      actually ship: <strong>keep a separate small <code>email → user_id</code> lookup table, sharded by email.</strong> It's a
+      hand-rolled global index over one column, it's a single extra hop, and it's easy to reason about. Then add: <em>"which is
+      the same shape as a global secondary index — I'm just building it explicitly instead of asking the database to."</em>
+    </p>
+
+    <div class="pitfall">Unique constraints die when you shard, and almost nobody mentions it. <code>UNIQUE(email)</code> is enforced by one node inspecting one index. Across 16 shards, two concurrent signups with the same email can land on two different shards and both succeed — neither node can see the other. The fixes: (a) route the uniqueness check through a single shard by <em>sharding the uniqueness table by the unique column</em> (the email lookup table above, with a unique constraint on it, written first — a "claim" record), or (b) accept it and reconcile after the fact. Bringing this up unprompted is a strong signal, especially in a fintech loop where correctness is the thing being graded.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="qa">Interview Q&amp;A</h2>
+
+    <details class="qa">
+      <summary>"Walk me through consistent hashing." ★ (the one you will actually be asked)</summary>
+      <div class="answer">
+        <p><strong>Structure your answer in four beats. Do not skip beat 1 — it's what makes the rest land.</strong></p>
+        <p><strong>1. The problem.</strong> "The naive way to spread keys over N nodes is <code>hash(key) % N</code>. That's uniform and needs no coordination, but the modulus is baked into every key's mapping. So the moment N changes, the whole mapping changes. Going from 4 nodes to 5, about 80% of keys land on a different node. If those nodes are caches, my hit rate collapses and the full read load lands on the database at once — a scaling action becomes an outage. And a node <em>dying</em> is the same event, so I can't even avoid it by not scaling."</p>
+        <p><strong>2. The construction.</strong> "So I want a mapping where adding or removing a node only disturbs that node's share. Take a hash with a 32-bit output and treat the output space as a circle. Hash each server's ID onto the circle. Hash each key onto the same circle. A key is owned by the first server you hit walking clockwise. Equivalently, each server owns the arc behind it." <em>(Draw it. Four dots for servers, a few for keys, arrows clockwise.)</em></p>
+        <p><strong>3. The property.</strong> "Now add a server. It lands inside exactly one existing arc and takes over the part of it before its position. Only those keys — about K/N — change owner. Every other key's clockwise walk never passes the new position, so it's provably untouched. Remove a server and its arc merges into its clockwise neighbour; only its own keys move. That's the guarantee: O(K/N) remapping instead of O(K)."</p>
+        <p><strong>4. The problem with the basic version, and the fix.</strong> "With only a handful of servers the arcs are lumpy — one node can easily own 40% of the ring. Worse, when a node dies its <em>entire</em> range dumps on one neighbour, which doubles that neighbour's load and can take it down too — you cascade around the ring. So each physical node gets ~150 <em>virtual</em> positions instead of one: hash <code>node#0</code>, <code>node#1</code>, … <code>node#149</code>. Ownership becomes many small interleaved arcs, load evens out, and a dead node's ranges are picked up by <em>all</em> the survivors in small slices. It also lets me weight bigger machines by giving them more positions."</p>
+        <p>Then stop and let them ask. If they want implementation: "it's a TreeMap from ring position to node, and <code>ceilingKey</code> is the clockwise walk, falling back to <code>firstKey</code> to wrap around."</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"Your shard is hot — what do you do?" ★</summary>
+      <div class="answer">
+        <p><strong>First, diagnose. The fixes for read-hot and write-hot are completely different, and asking which it is <em>is</em> part of the answer.</strong></p>
+        <p><strong>Read-hot</strong> (a celebrity profile, a viral post):</p>
+        <ol>
+          <li><strong>Cache it.</strong> Hot keys are the most cacheable objects you have — that's what makes them hot. An in-process LRU on every app server with even a 1-second TTL turns a million reads/sec on one shard into one read/sec per app server. Do this before anything structural.</li>
+          <li><strong>Coalesce requests</strong> so the TTL expiry doesn't stampede: one in-flight fetch, everyone else waits on it.</li>
+          <li><strong>Read replicas of that shard</strong> if you still need more, accepting replica lag.</li>
+        </ol>
+        <p><strong>Write-hot</strong> (a like counter on a viral post, ad impressions):</p>
+        <ol>
+          <li><strong>Salt the key.</strong> You can't cache a write, so split it: <code>likes:post_9931:0..9</code>, increment a random one, sum the ten on read. Write load ÷ 10, read cost × 10 — the right trade when writes are the problem.</li>
+          <li>Or <strong>buffer and batch</strong> — aggregate increments in memory / in a stream processor and flush periodically. That's the ad-click aggregator's answer.</li>
+        </ol>
+        <p><strong>Structurally hot</strong> (a whale tenant, permanently 100× the others): stop being clever and <strong>pin it</strong> — give it its own dedicated shard via a directory/lookup layer. Formulas can't say "this one is different."</p>
+        <p><strong>And name the trap:</strong> "Note that virtual nodes don't help here. A single key hashes to a single point on the ring, which is a single machine, no matter how many virtual positions that machine has. Hot keys are a load problem, not a keyspace problem."</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"Why not just use <code>hash(key) % N</code>? Show me why it breaks."</summary>
+      <div class="answer">
+        <p>Do it with numbers — it's far more convincing than the general argument. "Take hash 17 with 4 nodes: <code>17 % 4 = 1</code>. Add a node: <code>17 % 5 = 2</code>. It moved. A key only stays put if <code>h % 4 == h % 5</code>, which happens for roughly 1 in 5 keys. So going from 4 to 5 nodes remaps about 80% of keys. Going from 100 to 101 remaps about 99%."</p>
+        <p>"The reason is structural: the modulus is part of the mapping for every key, so changing N doesn't <em>adjust</em> the function, it <em>replaces</em> it — there's no relationship between the old assignment and the new one."</p>
+        <p>"Concretely, if those are cache nodes, adding one node collapses the hit rate from 95% to about 20%, so my database instantly sees 16× its normal read load and falls over. The same thing happens when a cache node just crashes. That's a system that punishes me for both growth and failure, so I need a mapping where a membership change only disturbs that node's slice — consistent hashing."</p>
+        <p><em>Follow-up they may push:</em> "What about doubling — 4 to 8?" "That's better: <code>h % 8</code> is either <code>h % 4</code> or <code>h % 4 + 4</code>, so exactly half the keys move. But I can only ever double, I still move 50%, and it does nothing for the case that matters — a node dying isn't a doubling."</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"When would you NOT shard?"</summary>
+      <div class="answer">
+        <p>"Almost always, until the numbers force me. In order, I'd exhaust: <strong>vertical scaling</strong> (a modern box holds 30 TB and 1 TB of RAM — most 'we need to shard' problems fit on one machine), <strong>read replicas</strong> (nearly free, and most workloads are read-heavy), <strong>caching</strong> the hot working set, <strong>archiving</strong> cold rows out of the hot table, and <strong>indexing / query fixes</strong> — a surprising number of 'we're out of capacity' problems are one missing index."</p>
+        <p>"I'd shard when <strong>writes exceed what a single leader can absorb</strong>, or when the <strong>working set no longer fits in RAM</strong> and I'm I/O bound, or when the data simply doesn't fit on the biggest available disk. Those are physical limits. Everything before that is a preference."</p>
+        <p>"The reason I'm cautious is that sharding costs me joins and single-node transactions <em>permanently</em>, and it's very hard to undo. It's a one-way door."</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"How do you pick the partition key?"</summary>
+      <div class="answer">
+        <p>"By looking at the <strong>dominant access pattern</strong>, not at the data. Three criteria:"</p>
+        <ul>
+          <li><strong>It should appear in most queries</strong>, so the common request is single-shard. If 95% of my reads are 'the last 50 messages in channel X', then <code>channel_id</code> is the key. Any key that turns my hottest query into a scatter-gather is the wrong key, however evenly it distributes.</li>
+          <li><strong>High cardinality and even access.</strong> <code>country</code> or <code>status</code> is a hot key wearing a disguise — 60% of rows will share one value.</li>
+          <li><strong>It should co-locate things that are joined or transacted together.</strong> Picking a partition key is really picking your join boundary and your transaction boundary. Shard <code>orders</code> and <code>order_items</code> both by <code>customer_id</code> and the join stays local.</li>
+        </ul>
+        <p>"And I'd say out loud that this decision is effectively irreversible once there's data on disk, so it's worth spending real time on — it's the one choice that's expensive to get wrong."</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"You've added a node to the ring. What actually happens to the data — is the system up?"</summary>
+      <div class="answer">
+        <p>"The ring tells me <em>which</em> keys move; it says nothing about <em>how</em>. The migration is a five-step dance and the system stays up throughout:"</p>
+        <ol>
+          <li><strong>Assign but don't cut over</strong> — the new node is told it will own these ranges; the old owner keeps serving them. Nothing changed for clients.</li>
+          <li><strong>Bulk copy</strong> the existing data, throttled so we don't starve live traffic of I/O. Can take hours; everything still works.</li>
+          <li><strong>Catch up the delta</strong> — the old owner forwards ongoing writes for those ranges (or the new node tails the commit log) until it's within milliseconds of live.</li>
+          <li><strong>Flip the pointer</strong> atomically in the metadata store. This is why the partition map lives in something like etcd/ZooKeeper rather than a config file — the flip has to be atomic and ordered.</li>
+          <li><strong>Handle stragglers</strong> — clients cache the map, so some still hit the old owner briefly. It either redirects them (Redis Cluster literally returns <code>MOVED</code> with the new address) or proxies for a grace period, and clients refresh. Then delete the old copy, after a delay, so a bad cutover can be rolled back.</li>
+        </ol>
+        <p>"And I'd keep rebalancing <strong>human-approved</strong>, not fully automatic: automatic rebalancing plus automatic failure detection is how clusters kill themselves — a node GC-pauses, gets declared dead, its data starts migrating, the migration saturates the network, more nodes look dead, and it cascades."</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"Explain virtual nodes. Why not just one position per node?"</summary>
+      <div class="answer">
+        <p>"Two reasons, and the second is the important one."</p>
+        <p><strong>1. Load balance.</strong> "Random points on a circle clump. With four nodes it's entirely normal for one to own 45% of the ring and another 8% — you pay for four machines and get the capacity of about two and a half. Giving each node ~150 positions averages 150 random arcs per node, which crushes the variance and converges ownership on 1/N."</p>
+        <p><strong>2. Failure behaviour — the real reason.</strong> "With one position per node, a node's range is one contiguous arc, and its only clockwise successor is one neighbour. So when it dies, <em>100% of its load lands on that single machine</em>, roughly doubling it. That neighbour falls over, and its combined range dumps on the next one — you cascade around the ring and lose the cluster from one node death. With virtual nodes, the dead node's 150 arcs each merge into whatever marker is clockwise, and those belong to <em>different</em> physical machines — so its load is picked up by every survivor, about 1/(N−1) extra each. Nobody notices. The same is true when a node joins: it takes small slices from everyone, so the migration is parallel instead of hammering one donor."</p>
+        <p><strong>3. Free bonus.</strong> "Ownership is proportional to marker count, so I can weight heterogeneous hardware just by giving the bigger boxes more positions — 200 vs 100. Real fleets are never homogeneous."</p>
+        <p>And be precise about what they <em>are</em>: "virtual nodes are entries in a sorted map, not processes. Nothing gets deployed."</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"Range-based or hash-based sharding for a time-series workload?"</summary>
+      <div class="answer">
+        <p>"This is the trap question, so I'd name the trap. <strong>Pure range partitioning by timestamp is the worst possible choice</strong> even though it looks natural: all of today's writes fall into the newest range, so 100% of write traffic goes to one shard while the others sit idle holding cold history. I've bought N machines and I'm writing to one."</p>
+        <p>"<strong>Pure hash partitioning</strong> fixes the writes and destroys the reads — 'give me the last hour for sensor 7' now has to ask every shard and merge, because ordering was deliberately destroyed."</p>
+        <p>"<strong>The answer is a compound key.</strong> Partition by <code>(sensor_id, timestamp)</code>: hash on <code>sensor_id</code> so writes from thousands of sensors spread evenly across the cluster, and store rows <em>sorted by timestamp within</em> each partition so 'the last hour for one sensor' is still a local ordered range scan. That's exactly Cassandra's model — <code>PRIMARY KEY ((sensor_id), timestamp)</code>: hash <em>between</em> partitions, sort <em>within</em> them."</p>
+        <p>"What I give up is 'the last hour across all sensors' as a cheap query — that becomes a scatter-gather. If that's actually the dominant query I'd handle it with a separate rollup/aggregation pipeline rather than by re-partitioning."</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"How do you query by a non-shard-key column? E.g. find the user by email when you sharded by user_id."</summary>
+      <div class="answer">
+        <p>"Three options, in the order I'd offer them."</p>
+        <p><strong>1. A dedicated lookup table</strong> — the one I'd actually ship. A small <code>email → user_id</code> table, sharded <em>by email</em>. Login becomes two hops: hash the email, get the user_id, hash the user_id, get the user. It's a hand-rolled global index over one column, it's cheap, and it's easy to reason about."</p>
+        <p><strong>2. A global (term-partitioned) secondary index</strong> — the same shape, done by the database. Reads are one hop. Writes get expensive: writing a user now touches its data shard <em>and</em> a different index shard, so it's a cross-shard write, which in practice is done asynchronously — meaning <strong>the index is eventually consistent</strong>. DynamoDB GSIs behave exactly like this and it's a documented gotcha: you can write a row and briefly not find it by the indexed attribute."</p>
+        <p><strong>3. A local (document-partitioned) secondary index</strong> — each shard indexes only its own rows. Writes are cheap and consistent (one local transaction), but reads must ask every shard and merge — scatter-gather. This is Cassandra's and Elasticsearch's model, fine when reads are already shard-scoped or fan-out is affordable."</p>
+        <p>"So it's read cost vs write cost, with consistency as the tiebreaker. For login-by-email specifically, reads are constant and writes are rare, so I want the global shape — I'd just build it explicitly."</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"What breaks when you scatter-gather? Why do people care so much about P99?"</summary>
+      <div class="answer">
+        <p>"Because a scatter-gather is <strong>as slow as its slowest shard</strong> — I have to wait for all of them, so my latency is the <em>maximum</em> of N samples, not the mean. And the max is drawn from the tail."</p>
+        <p>"Do the numbers. Say each shard has a P99 of 100ms — only 1% of its requests are slow, which sounds excellent. I fan out to 16 shards. The chance that <em>all sixteen</em> are fast is 0.99¹⁶ ≈ 0.85. So <strong>15% of my user-facing requests take 100ms or more</strong>, even though every shard is meeting its SLA perfectly. My service's P85 is my shards' P99. At 100 shards, 0.99¹⁰⁰ ≈ 0.37 — <strong>63% of requests hit a slow shard.</strong>"</p>
+        <p>"That's 'the tail at scale', and it's exactly why we measure P99 and not averages: <em>at fan-out, the tail of your components becomes the body of your service.</em> An average would hide all of this."</p>
+        <p>"Mitigations: <strong>hedged requests</strong> — once P95 elapses, fire a duplicate at a replica and take whichever returns first; costs ~5% extra load and cuts the tail dramatically. <strong>Tolerate partial results</strong> — return 15 of 16 shards and degrade, which a search page can do and a bank balance cannot. And above all, <strong>choose the partition key so the hot path never fans out in the first place.</strong>"</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"You sharded the users table. What happened to <code>UNIQUE(email)</code>?"</summary>
+      <div class="answer">
+        <p>"It quietly stopped working, and this is the kind of thing that gets shipped and discovered in production."</p>
+        <p>"A unique constraint is enforced by <em>one node</em> checking <em>one index</em>. Once <code>users</code> is spread over 16 shards, two concurrent signups with the same email hash to two different shards, each node checks its own local index, sees nothing, and both succeed. Neither node can see the other. The constraint is now a local constraint pretending to be a global one."</p>
+        <p>"Two fixes. The clean one: make the uniqueness check itself single-shard by putting the unique column in a <strong>claim table sharded by that column</strong> — an <code>emails</code> table partitioned by email, with a real unique constraint, written <em>first</em> as a claim. Whoever wins that insert gets to create the user; the loser gets a duplicate-email error. That's the same lookup table I'd already want for login-by-email, so it costs nothing extra."</p>
+        <p>"The pragmatic one: accept the tiny race and reconcile — detect duplicates asynchronously and merge or reject. Fine for a username; not fine for anything financial."</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"How many partitions would you create, and why can't you change it later?"</summary>
+      <div class="answer">
+        <p>"I'd fix the partition count up front at a number much larger than my node count — 1,024 is a common choice — and treat it as permanent. Keys hash to <em>partitions</em>, and that mapping never changes; only the <code>partition → node</code> assignment moves. So rebalancing is 'move 50 whole partitions and update a small metadata table', never 'rehash 200 billion keys'. Riak, Elasticsearch and Kafka all work this way."</p>
+        <p><strong>Too few:</strong> "I cap my maximum cluster size at the partition count, and each partition is huge, so moving one is a big slow transfer and balancing is coarse."</p>
+        <p><strong>Too many:</strong> "Per-partition overhead — files, memory, open handles, metadata, replication streams. Kafka degrades badly with tens of thousands of partitions."</p>
+        <p><strong>Why it's permanent:</strong> "Changing the count changes <code>hash(key) % partitions</code> for existing keys — which is precisely the mod-N disaster again, one level up. Kafka <em>does</em> let you add partitions, and the price is that per-key ordering breaks for existing keys, because a key can now map to a different partition than its history. So: over-provision on day one and never touch it."</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"Is consistent hashing always the right answer for partitioning?" (a good candidate says no)</summary>
+      <div class="answer">
+        <p>"No, and I'd be suspicious of a design that reaches for it reflexively."</p>
+        <p>"Consistent hashing solves one specific problem: <strong>minimizing remapping when membership changes, with no central coordinator.</strong> It shines when nodes join and leave <em>often</em> and clients must route <em>independently</em> — caches, Dynamo-style stores, sticky load balancing."</p>
+        <p>"If membership is stable and you already have a coordination service, a <strong>directory / explicit partition map</strong> is often better: it's easier to reason about, easier to debug ('where does tenant 42 live?' is a lookup, not a hash computation), and it lets you place data deliberately — pin a whale tenant, satisfy data-residency rules, isolate a noisy neighbour. A formula can't say 'this one is different', and that one always exists."</p>
+        <p>"If range queries dominate and the key isn't monotonic, <strong>range partitioning</strong> beats both, because it's the only scheme that preserves ordering."</p>
+        <p>"In practice the best real designs combine them: hash-based placement as the default, a fixed large partition count so movement is coarse, and a thin directory layer so exceptions can be hand-placed. Formula for the 99%, table for the 1%."</p>
+      </div>
+    </details>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="takeaways">What to remember</h2>
+
+    <ul>
+      <li><strong>Sharding is a last resort, not an opening move.</strong> Vertical scaling → read replicas → caching → archiving → <em>then</em> shard. Shard when writes exceed one leader, or the working set won't fit in RAM. Saying this unprompted is worth more than a perfect ring diagram.</li>
+      <li><strong>The permanent bill for sharding:</strong> no cross-shard joins, no single-node transactions, no global unique constraints, rebalancing, hot shards. It's a one-way door.</li>
+      <li><strong>Vertical partitioning</strong> = split columns by concern (cache efficiency; it's what microservices do to a schema). <strong>Horizontal partitioning / sharding</strong> = split rows (the one that scales).</li>
+      <li><strong>Picking the partition key is the whole design.</strong> Choose it from the dominant access pattern: it must appear in most queries, have high cardinality, and co-locate what you join and transact together. It's effectively irreversible.</li>
+      <li><strong>Range</strong> = great range scans, hot-spots on sequential keys (timestamps, auto-increment IDs — 100% of today's writes on one shard). <strong>Hash</strong> = even distribution, kills range scans. <strong>Directory</strong> = maximum flexibility and per-tenant placement, but it's a SPOF and an extra hop. Compound keys (hash between partitions, sort within — Cassandra) get you both.</li>
+      <li><strong><code>hash(key) % N</code> is a trap.</strong> 4 nodes → 5 remaps ~80% of keys; 100 → 101 remaps ~99%. For a cache that's a total miss storm and the database dies. A node <em>crashing</em> is the same event, so you can't avoid it by not scaling. <strong>Derive this before naming consistent hashing.</strong></li>
+      <li><strong>Consistent hashing, in one sentence:</strong> hash nodes and keys onto the same circular space; a key is owned by the first node clockwise from it. Adding or removing a node only remaps that node's arc — <strong>~K/N keys, not ~K.</strong> No coordinator needed: every client computes the same ring from the same node list.</li>
+      <li><strong>Virtual nodes</strong> (~150 positions per physical node): the arcs stop being lumpy, and — the real reason — a dead node's load spreads across <em>all</em> survivors instead of dumping entirely on one neighbour and cascading. Bonus: weight heterogeneous hardware by giving bigger boxes more positions. They are map entries, not processes.</li>
+      <li><strong>Implementation:</strong> a <code>TreeMap&lt;Long, Node&gt;</code>. <code>ceilingKey(hash(key))</code> <em>is</em> the clockwise walk; <code>firstKey()</code> on null <em>is</em> the wraparound. For replication, keep walking to the next R <em>distinct physical</em> nodes.</li>
+      <li><strong>Hashing evens out keys, not load.</strong> Hot keys — celebrities, viral posts, whale tenants, low-cardinality defaults — melt one shard no matter how many vnodes you have. <strong>Read-hot:</strong> cache it (a 1s TTL kills 99.9999% of load), coalesce requests, add read replicas. <strong>Write-hot:</strong> salt the key into N sub-keys and sum on read; or buffer and batch. <strong>Structurally hot:</strong> pin it to its own shard via a directory.</li>
+      <li><strong>Rebalancing:</strong> fix a large partition count up front (1,024) and never change it. Keys→partitions is permanent; only partitions→nodes moves. Migrate live: assign → bulk copy (throttled) → catch up the delta → atomically flip the pointer → redirect stragglers → delete late. Keep the <em>decision</em> human — auto-rebalance plus auto-failure-detection is how clusters kill themselves.</li>
+      <li><strong>Scatter-gather's real cost is the tail.</strong> You wait for the slowest shard, so latency is the max of N samples. 16 shards each with a 100ms P99 ⇒ ~15% of your requests are slow. <strong>Your service's P85 is your shards' P99.</strong> That's why P99 matters and averages lie. Mitigate with hedged requests, partial results, or — best — a partition key that never fans out.</li>
+      <li><strong>Secondary indexes:</strong> local/document-partitioned = cheap consistent writes, scatter-gather reads (Cassandra, Elasticsearch). Global/term-partitioned = one-hop reads, cross-shard async writes ⇒ <em>eventually consistent</em> (DynamoDB GSIs). For login-by-email, just build an <code>email → user_id</code> table sharded by email, and say it's a hand-rolled GSI.</li>
+      <li><strong>Sharding silently breaks <code>UNIQUE</code>.</strong> Two concurrent signups on two shards both win. Fix with a claim table sharded by the unique column, written first.</li>
+      <li><strong>Where this reappears:</strong> the distributed cache (08) is consistent hashing in anger; the rate limiter (09) uses it to place counters; the news feed (10) is the celebrity problem at full size; the ad-click aggregator (18) is key-salting at scale. Learn it once here.</li>
+    </ul>
+
+    <div class="senior">If you remember one thing from this page, remember to <strong>derive before you name</strong>. Anyone can say "consistent hashing." Only a senior candidate says: <em>"mod N breaks because changing N replaces the mapping for every key — 80% of them move — so I need a scheme where a membership change only disturbs one node's slice; that's the ring; and the ring's own failure mode is that a dead node dumps everything on one neighbour, so I need virtual nodes."</em> Same five minutes, completely different grade.</div>
+  </section>
+
+  <nav class="page-nav">
+    <a href="03-data-storage.html">← 03 — Data &amp; Storage Engines</a>
+    <a href="05-coordination-consensus.html">05 — Coordination, Consensus &amp; Distributed Transactions →</a>
+  </nav>
+
+</main>
+</body>
+</html>
