@@ -1,0 +1,1576 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 — Coordination, Consensus &amp; Distributed Transactions | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <div class="breadcrumb"><a href="index.html">← Course Home</a></div>
+    <h1>05 — Coordination, Consensus &amp; Distributed Transactions</h1>
+    <p>Getting independent machines to agree — quorums, leaders, locks, 2PC vs saga, and why "exactly once" is a sales pitch.</p>
+  </div>
+</header>
+
+<main class="container">
+
+  <section>
+    <h2>Why this matters in the interview</h2>
+    <p>
+      Every previous page in this phase made your system <em>bigger</em>: more replicas (03), more shards (04). This page
+      is the bill for that. The moment your data lives on more than one machine, you have a new class of problem that
+      does not exist on a single box: two nodes can hold different opinions about the truth, and there is no referee. A
+      single Postgres instance gives you ACID for free — <code>BEGIN … COMMIT</code>, one lock manager, one clock, one
+      answer. Spread the same workload across three services and two databases and every one of those guarantees has to
+      be rebuilt by hand, badly, at the application layer. Coordination is the study of how to rebuild them, and how much
+      of them you can afford to give up.
+    </p>
+    <p>
+      <strong>Calibrate hard here, because this topic is a trap in both directions.</strong> Interviewers will not ask you
+      to implement Raft. If you spend eight minutes on the whiteboard drawing election terms and log-matching invariants,
+      you have misread the room, burned the clock, and answered a question nobody asked — that reads as <em>junior</em>,
+      not deep. Raft and Paxos are <strong>awareness level</strong>: know what consensus buys you, know the shape of it,
+      and know the one sentence that closes the topic ("I'd use etcd or ZooKeeper rather than build this"). What
+      <em>does</em> decide interviews — especially the enterprise and fintech loops you're targeting — is the boring,
+      money-adjacent half: <strong>2PC vs saga, the outbox pattern, idempotency keys, and why your Redis lock is not
+      actually a lock.</strong> Those come up in almost every payments, orders, booking, or inventory question, and a
+      7-YOE candidate is expected to reach for them unprompted. Go deep there. Name the rest and move on.
+    </p>
+  </section>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ul>
+      <li><a href="#hard">1. Why coordination is hard</a> — you cannot tell slow from dead</li>
+      <li><a href="#quorums">2. Quorums</a> — R + W &gt; N, and tunable consistency</li>
+      <li><a href="#leader">3. Leader election, leases &amp; fencing tokens</a> ★</li>
+      <li><a href="#consensus">4. Raft &amp; Paxos</a> — awareness level, and how to say so</li>
+      <li><a href="#coordinators">5. ZooKeeper, etcd &amp; Consul</a> — what they're actually for</li>
+      <li><a href="#locks">6. Distributed locks</a> — harder than they look ★</li>
+      <li><a href="#transactions">7. Distributed transactions: 2PC vs saga</a> ★★ the core of this page</li>
+      <li><a href="#outbox">8. The outbox pattern</a> — the dual-write problem, solved ★</li>
+      <li><a href="#idempotency">9. Idempotency &amp; the exactly-once myth</a> ★</li>
+      <li><a href="#qa">Interview Q&amp;A</a></li>
+      <li><a href="#takeaways">What to remember</a></li>
+    </ul>
+  </div>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="hard">1. Why coordination is hard</h2>
+
+    <p>
+      There is exactly one root cause, and everything else on this page is a consequence of it:
+    </p>
+
+    <p style="font-size:1.15rem; font-weight:700; color:#111827; border-left:4px solid #8b5cf6; padding-left:1rem;">
+      You send a request to another node and get no reply. You cannot tell whether the node is dead, the node is slow,
+      the network dropped your request, or the network dropped its reply.
+    </p>
+
+    <p>
+      Sit with that. From the caller's point of view those four situations are <em>byte-for-byte identical</em>: silence.
+      And the four demand opposite responses. If the node is dead, you should fail over and let someone else take its
+      work. If the node is merely slow — a 4-second JVM stop-the-world GC pause, a noisy-neighbour VM, a saturated NIC —
+      then failing over means <strong>two nodes are now doing the same job</strong>, and if that job is "deduct money from
+      this account," you have just built a bug that costs real currency.
+    </p>
+
+    <p>
+      <strong>So a timeout is not a fact. A timeout is a guess.</strong> Choosing 5 seconds instead of 30 doesn't make
+      the guess correct; it just trades false positives (declaring a healthy node dead) against slow failure detection.
+      There is no timeout value that eliminates both. Say that sentence in an interview when someone asks "how do you
+      detect that a node is down" and you have already out-answered most candidates — the wrong answer is "heartbeats,"
+      full stop; the right answer is "heartbeats, and then I have to accept that my failure detector will sometimes be
+      wrong, so the design has to stay correct even when it is."
+    </p>
+
+    <h3>The theory, honestly, in one paragraph</h3>
+    <p>
+      Two results get name-dropped in this space and you should be able to name them back without pretending to more
+      depth than you have. <strong>The Two Generals Problem</strong> proves that over a lossy channel, two parties can
+      never become <em>certain</em> they've agreed — every acknowledgement needs an acknowledgement, forever. That's why
+      no distributed commit is ever truly atomic across a network; you can only shrink the window of doubt.
+      <strong>The FLP impossibility result</strong> (Fischer, Lynch, Paterson, 1985) proves that in a fully asynchronous
+      network with no timing bounds, no algorithm can guarantee consensus if even one node may crash — because, again,
+      you can't distinguish crashed from slow. Real systems escape FLP by cheating in a benign way: they assume
+      <em>partial synchrony</em> (the network is usually well-behaved) and use timeouts, giving up guaranteed liveness
+      (progress) in order to keep safety (never two truths). Raft can stall during a bad partition; it will never elect
+      two leaders in the same term.
+    </p>
+
+    <div class="senior">The sentence that shows you understand the whole field: <em>"Consensus protocols always prioritise safety over liveness — if the network is bad enough, the system stops making progress rather than risk giving two different answers. My job as a designer is to decide which of those failure modes my product can tolerate."</em> A checkout that stalls for 10 seconds is annoying. A checkout that double-charges is a Jira ticket with a legal team attached.</div>
+
+    <div class="note">Awareness level. Say "FLP" or "two generals" once, in one clause, to show you know the ground you're standing on — then move to the practical content. Nobody has ever passed a system design loop by proving an impossibility result at the whiteboard.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="quorums">2. Quorums — R + W &gt; N</h2>
+
+    <p>
+      You have N replicas of a piece of data. If you write to <em>one</em> replica and read from <em>another</em>, you can
+      read stale data — that's just replication lag (page 03). A quorum is the cheapest possible fix, and it's pure
+      arithmetic, no protocol required.
+    </p>
+
+    <ul>
+      <li><strong>N</strong> — the replication factor: how many copies of each key exist.</li>
+      <li><strong>W</strong> — the write quorum: how many replicas must acknowledge a write before the client is told "OK".</li>
+      <li><strong>R</strong> — the read quorum: how many replicas the coordinator must hear from before returning a read.</li>
+    </ul>
+
+    <p style="font-size:1.15rem; font-weight:700; color:#111827; border-left:4px solid #8b5cf6; padding-left:1rem;">
+      If R + W &gt; N, the read set and the write set must overlap in at least one replica — so any read is guaranteed to
+      see at least one copy of the latest acknowledged write.
+    </p>
+
+    <p>
+      That's the entire idea, and it's just the pigeonhole principle. You wrote to W replicas; you're reading from R
+      replicas; if R + W exceeds the total N, those two sets cannot be disjoint. At least one node you read from was one
+      of the nodes you wrote to. Attach a version number or timestamp to each copy, take the newest one you see, and the
+      read is fresh.
+    </p>
+
+    <h3>Concrete numbers: N = 3, W = 2, R = 2</h3>
+    <p>
+      The default in Cassandra, DynamoDB, and roughly every Dynamo-style store. 2 + 2 = 4 &gt; 3 ✓.
+    </p>
+
+<pre><code>N = 3 replicas: [ A ] [ B ] [ C ]
+
+WRITE v7 with W=2  ──▶ A: v7 ✓   B: v7 ✓   C: still v6 (slow/down — write is
+                                                        replicated later, async)
+                       └─ 2 acks received → client told "OK"
+
+READ with R=2      ──▶ ask A and C
+                       A returns v7   C returns v6
+                       └─ coordinator picks the highest version → v7  ✓ FRESH
+                          (and repairs C in the background — "read repair")
+</code></pre>
+
+    <p>
+      Try to escape it and you can't: whichever 2 of the 3 you read, at least one of them is A or B. Now break the
+      arithmetic — <strong>W = 1, R = 1</strong> (1 + 1 = 2, not &gt; 3). Write v7 lands on A only. Read hits C. You get
+      v6. Stale. That is not a bug in the database; it's a configuration you chose, and it's sometimes exactly the right
+      one.
+    </p>
+
+    <h3>Tunable consistency: what each dial buys and costs</h3>
+    <p>
+      This is the point of quorums in an interview. Cassandra lets you set R and W <em>per query</em>, which means
+      consistency stops being a property of your database and becomes a property of each individual operation. That's a
+      genuinely powerful thing to say out loud.
+    </p>
+
+    <table>
+      <thead><tr><th>Setting (N=3)</th><th>R + W &gt; N?</th><th>What it buys</th><th>What it costs</th><th>Use it for</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>W=1, R=1</strong></td>
+          <td>No (2 &gt; 3 false)</td>
+          <td>Fastest possible writes and reads; survives 2 of 3 nodes down</td>
+          <td>Reads can be stale. No overlap guarantee at all.</td>
+          <td>Metrics, click events, "last seen" timestamps, sensor data — high volume, low value per item</td>
+        </tr>
+        <tr>
+          <td><strong>W=2, R=2</strong> (quorum)</td>
+          <td>Yes (4 &gt; 3)</td>
+          <td>Reads see the latest write. Tolerates 1 node down on both paths.</td>
+          <td>Latency = the <em>2nd-fastest</em> replica, so you're exposed to the median tail, not the best node</td>
+          <td>The default. User profiles, orders, most business data.</td>
+        </tr>
+        <tr>
+          <td><strong>W=3, R=1</strong></td>
+          <td>Yes (4 &gt; 3)</td>
+          <td>Reads are single-replica fast (great for read-heavy workloads)</td>
+          <td><strong>Writes fail if any single replica is down.</strong> Write availability is terrible.</td>
+          <td>Config data, feature flags — written once a week, read a million times a second</td>
+        </tr>
+        <tr>
+          <td><strong>W=1, R=3</strong></td>
+          <td>Yes (4 &gt; 3)</td>
+          <td>Writes are as fast as one ack; reads still guaranteed fresh</td>
+          <td>Reads fail if any replica is down; read latency = the <em>slowest</em> replica</td>
+          <td>Write-heavy ingest where the rare read must be correct (audit logs)</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>
+      Read that table as a single insight: <strong>W and R are a seesaw.</strong> Whatever you take off one side you pay
+      for on the other. Pushing W up makes writes slower and less available but reads cheap; pushing R up does the
+      mirror image. Quorum (W=R=2 at N=3) is the balanced middle, which is why it's the default — not because it's
+      magic, but because it's the least-bad compromise when you don't know the workload.
+    </p>
+
+    <div class="senior">The line that lands: <em>"I'd run N=3, W=2, R=2 by default — that satisfies R+W &gt; N so reads are consistent — but for the analytics write path I'd drop to W=1, because losing a click event is fine and I want that path to never block a user request."</em> You just demonstrated that consistency is a per-workload decision, not a database feature. That is a 7-YOE answer.</div>
+
+    <h3>What quorums do NOT give you</h3>
+    <p>
+      Be careful here, because this is where over-claiming gets punished. Quorums give you <em>fresh reads</em>. They do
+      <strong>not</strong> give you transactions, and they do <strong>not</strong> give you consensus.
+    </p>
+    <ul>
+      <li><strong>Concurrent writes still conflict.</strong> Two clients both write to a quorum at the same time with the
+        same version. Both succeed. Now replicas disagree and someone must resolve it — last-write-wins (which silently
+        drops data), vector clocks, or a CRDT. Quorum arithmetic is silent on this.</li>
+      <li><strong>"Latest" needs a definable order.</strong> LWW relies on timestamps, and timestamps rely on clocks, and
+        clocks on different machines drift. A write with a fast clock can beat a genuinely later write. Real fix:
+        logical versions, not wall clocks.</li>
+      <li><strong>Sloppy quorums make it worse.</strong> Dynamo-style systems under partition will accept a write on
+        <em>any</em> N healthy nodes, not necessarily the "right" N (this is "hinted handoff"). Availability goes up;
+        your R+W&gt;N guarantee quietly evaporates, because the overlapping node you were counting on wasn't in the write
+        set at all.</li>
+    </ul>
+
+    <div class="pitfall">Do not say "we use quorum reads so it's strongly consistent." Quorum gives you <em>read-your-writes on acknowledged writes</em>; it does not give you linearizability in the presence of concurrent writers, failed writes that partially landed, or clock skew. If the interviewer needs true linearizability (leader election, a lock, a unique-constraint), you need consensus — the next two sections — or a single-writer database, not a quorum.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="leader">3. Leader election, leases &amp; fencing tokens</h2>
+
+    <h3>Why you want a leader at all</h3>
+    <p>
+      Concurrency is only hard when two things write at once. So the oldest trick in distributed systems is to make sure
+      only one thing ever writes: <strong>elect a leader, funnel all writes through it, and the conflict problem
+      disappears by construction.</strong> The leader serialises operations into a single ordered log; the followers
+      replay that log. No conflict resolution, no vector clocks, no last-write-wins data loss — because there is never a
+      "last write" ambiguity in the first place.
+    </p>
+    <p>
+      You already know a system built exactly this way: <strong>Postgres primary + read replicas.</strong> One writer.
+      Everything else follows. Kafka does it per partition (one leader broker per partition). MySQL, MongoDB, Elasticsearch
+      shards, HDFS NameNode — same shape. When an interviewer asks "how do you avoid write conflicts across replicas,"
+      the first-order answer is <em>"I don't allow concurrent writers — I elect a leader."</em>
+    </p>
+    <p>
+      The cost is equally simple and you should name it in the same breath: <strong>the leader is a bottleneck and a
+      single point of failure.</strong> Write throughput is capped by one machine, and when it dies you have a gap where
+      nobody can write until a new leader is chosen. Which raises the actual hard question — <em>how do you choose one,
+      and how do you make sure you only ever have one?</em>
+    </p>
+
+    <h3>Leases: a lock with an expiry</h3>
+    <p>
+      The naive approach — "the leader holds a flag in a database" — deadlocks the instant the leader dies while holding
+      the flag. Nobody can take over; the flag never gets released. So real systems use a <strong>lease</strong>: leadership
+      is granted for a bounded time (say 10 seconds) and the leader must keep renewing it (heartbeating) to stay leader.
+      Stop renewing — because you crashed, or you were partitioned — and the lease expires on its own, and someone else
+      can claim it.
+    </p>
+
+<pre><code>t=0s    Node A acquires lease  (expires t=10s)     A is leader ✓
+t=3s    A renews               (expires t=13s)
+t=6s    A renews               (expires t=16s)
+t=9s    A ────────────────────── CRASHES ─────────────────
+t=16s   lease expires — nobody holds it
+t=16s   Node B acquires lease  (expires t=26s)     B is leader ✓
+
+        Gap with no leader: ~7s. That gap is the price of the timeout.
+        Shorter lease = faster failover, but more false expiries.
+</code></pre>
+
+    <p>
+      Note the trade-off baked into the lease duration — it is the timeout problem from section 1 wearing a different
+      hat. A 30-second lease means 30 seconds of write unavailability after a crash. A 2-second lease means a leader with
+      a 3-second GC pause gets fired for no reason. There is no correct number, only a choice.
+    </p>
+
+    <h3>Split-brain — and why it's a correctness bug, not a hiccup</h3>
+    <p>
+      <strong>Split-brain is when two nodes both believe they are the leader.</strong> It follows directly from section 1:
+      A is paused, not dead; A's lease expires; B takes over; A wakes up <em>still believing it's the leader</em>, because
+      from A's point of view no time passed at all. Now both A and B are writing.
+    </p>
+
+<pre><code>       A (leader, lease → t=10s)
+       │
+   t=4 ├── begins a 12-SECOND STOP-THE-WORLD GC PAUSE  ⏸
+       │                     (A is frozen; it does not know it)
+  t=10 │   ····· lease expires ·····
+  t=11 │   B acquires the lease → B is now leader, starts writing
+       │
+  t=16 ├── A wakes up. Its last thought was "I am the leader."
+       └── A writes to the storage system.        💥 TWO WRITERS
+</code></pre>
+
+    <p>
+      The obvious "fix" — have A check whether its lease is still valid before writing — <strong>does not work</strong>,
+      and understanding why is the whole point. A can check the lease, see it's valid with 6 seconds left, and <em>then</em>
+      get paused for 12 seconds between the check and the write. There is no way to make "check the lease" and "perform
+      the write" atomic across two different machines. The check is always stale by the time the write lands. Any design
+      that relies on the pauser noticing it was paused is broken, because a paused process by definition notices nothing.
+    </p>
+
+    <div class="pitfall">Candidates almost always say "we use a lock with a TTL, so if the node dies the lock is released." That sentence is fine right up until the node <em>isn't</em> dead. GC pauses, VM live-migration, a stalled disk write, an overloaded scheduler, a laptop lid closing — the process freezes and resumes with no awareness of the gap. A TTL protects you against crashes; it actively <em>creates</em> the two-writer window against pauses. Do not stop your answer at "TTL."</div>
+
+    <h3>Fencing tokens — the fix, and the thing that makes interviewers sit up</h3>
+    <p>
+      You cannot stop a node from being paused, and you cannot stop a paused node from writing. So stop trying. Instead,
+      <strong>make the storage system reject the stale write.</strong>
+    </p>
+    <p>
+      Every time the lock/lease service grants leadership, it hands out a <strong>monotonically increasing number</strong>
+      — the fencing token. Token 33, then 34, then 35; never reused, never decreasing. The leader must include its token
+      with every write. The storage system remembers the highest token it has ever seen and <strong>rejects any write
+      carrying a token lower than that.</strong>
+    </p>
+
+<pre><code>  Lock service          Client A            Client B         Storage
+       │                    │                   │               │  (highest seen: 32)
+       │◀── acquire ────────┤                   │               │
+       ├─── token 33 ──────▶│                   │               │
+       │                    │ ⏸ GC PAUSE        │               │
+       │        lease expires                   │               │
+       │◀────────── acquire ────────────────────┤               │
+       ├─────────── token 34 ──────────────────▶│               │
+       │                    │                   ├── write(tok=34) ──▶  ✓ 34 &gt; 32
+       │                    │                   │               │  (highest seen: 34)
+       │                    │ ▶ wakes up        │               │
+       │                    ├── write(tok=33) ──────────────────▶  ✗ REJECTED
+       │                    │                   │               │     33 &lt; 34
+</code></pre>
+
+    <p>
+      A's write is refused <em>by the resource itself</em>, without the resource needing to know anything about leases,
+      pauses, or who is supposed to be leader. It just enforces one rule: tokens never go backwards. This turns a
+      distributed-agreement problem into a local monotonicity check — which is why it actually works.
+    </p>
+
+    <p>In Java, against a normal SQL database, the fencing check is a <code>WHERE</code> clause. That's it:</p>
+
+<pre><code><span class="com">// The resource (a row) remembers the highest fencing token it has accepted.</span>
+<span class="com">// The conditional UPDATE makes "check token" and "write" ONE atomic operation</span>
+<span class="com">// inside the database — which is exactly what we could not do across machines.</span>
+<span class="ann">@Transactional</span>
+<span class="kw">public</span> <span class="kw">void</span> writeWithFencing(<span class="typ">String</span> resourceId, <span class="typ">long</span> token, <span class="typ">String</span> payload) {
+    <span class="typ">int</span> rows = jdbc.update(<span class="str">"""
+        UPDATE resource
+           SET payload     = ?,
+               fence_token = ?
+         WHERE id = ?
+           AND fence_token &lt; ?          -- reject anything from a stale leader
+        """</span>, payload, token, resourceId, token);
+
+    <span class="kw">if</span> (rows == <span class="num">0</span>) {
+        <span class="com">// A newer leader has already written. We were paused. We are not the leader.</span>
+        <span class="com">// Correct behaviour: give up loudly. Do NOT retry — retrying is the bug.</span>
+        <span class="kw">throw</span> <span class="kw">new</span> <span class="typ">FencedOutException</span>(<span class="str">"stale token "</span> + token + <span class="str">" for "</span> + resourceId);
+    }
+}
+</code></pre>
+
+    <p>
+      Where does the token come from? Anything that can hand out a strictly increasing sequence with consensus behind it:
+      ZooKeeper's <code>zxid</code> or a sequential znode, etcd's <code>revision</code> on a key, a Postgres sequence, or
+      Kafka's producer epoch. The number itself is trivial. What's expensive — and what a coordination service exists to
+      sell you — is the guarantee that <em>no two callers ever get the same number</em>.
+    </p>
+
+    <div class="senior">Say this and watch the interviewer's pen move: <em>"A TTL-based lock is safe against crashes but not against pauses — a GC pause longer than the TTL gives you two live holders. If correctness depends on the lock, I need fencing: the lock service issues a monotonically increasing token, and the resource rejects any write with a lower token than one it's already seen. That way the stale writer is stopped at the resource, not at the lock."</em> This is the single highest-value paragraph on this page. It's the exact thing that separates "has read a blog post about Redis locks" from "has debugged one at 3am."</div>
+
+    <div class="note">If the resource <em>can't</em> enforce fencing — say it's a third-party payment API with no token concept — then no lock can make it safe, and you must stop pretending otherwise. Push the correctness down to something that <em>can</em> enforce it: an idempotency key at the provider (section 9), or a unique constraint in your own database. This escape hatch is the honest answer, and interviewers respect it far more than a more elaborate lock.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="consensus">4. Raft &amp; Paxos <span class="tier tier-3">AWARENESS</span></h2>
+
+    <p>
+      <strong>Read this section once, understand the shape, and do not go deeper.</strong> I'm being explicit about the
+      calibration because this is where prep material lies to you. You will find 40-minute videos on Raft log compaction
+      and Multi-Paxos ballot numbers. That knowledge has approximately zero expected value in a 45-minute system design
+      round, and negative value if it tempts you into a tangent. Nobody is going to ask a 7-YOE full-stack candidate to
+      derive a consensus protocol. What they <em>will</em> do is check that you know what consensus <em>is</em>, that you
+      know when your design needs it, and — critically — that you know not to build it yourself.
+    </p>
+
+    <h3>What consensus actually gives you</h3>
+    <p>
+      Consensus is the primitive that lets a group of N nodes <strong>agree on a single value even though some of them
+      may crash</strong>, and — this is the part that matters — <strong>never disagree</strong>. Not "usually agree."
+      Never disagree. Feed a consensus system a sequence of decisions and it gives every surviving node the same
+      <em>replicated log</em> in the same order. Every distributed-coordination primitive you actually want is built on
+      top of that one log:
+    </p>
+    <ul>
+      <li><strong>Leader election</strong> — the log's first entry for a term says who the leader is; everybody agrees.</li>
+      <li><strong>Distributed locks</strong> — "client X holds lock L" is just an entry in the log.</li>
+      <li><strong>Fencing tokens</strong> — the log index <em>is</em> a monotonic counter, free of charge.</li>
+      <li><strong>Config / service discovery</strong> — a small, strongly-consistent key-value store that is the log's state machine.</li>
+      <li><strong>Atomic compare-and-swap on a key</strong> — the operation on which everything else is built.</li>
+    </ul>
+
+    <h3>The shape of Raft (this is enough)</h3>
+    <p>
+      Raft was designed to be understandable, so the summary is fair rather than a cartoon. Four ideas:
+    </p>
+    <ol>
+      <li><strong>Roles.</strong> Every node is a <em>leader</em>, a <em>follower</em>, or a <em>candidate</em>. There is
+        at most one leader at a time.</li>
+      <li><strong>Terms.</strong> Time is divided into numbered terms — a logical clock. Each term has at most one leader.
+        Term numbers only ever increase, and a node seeing a higher term immediately steps down. (Notice: that's a fencing
+        token again. Same idea, different name.)</li>
+      <li><strong>Election.</strong> Followers expect heartbeats from the leader. If a follower's randomised election
+        timeout fires without hearing one, it bumps the term, becomes a candidate, and asks the others to vote for it. A
+        candidate that wins votes from a <strong>majority</strong> becomes leader. The randomised timeouts are what stop
+        everyone from campaigning simultaneously forever.</li>
+      <li><strong>Log replication &amp; majority commit.</strong> All client writes go to the leader. The leader appends
+        the entry to its log and ships it to followers. Once a <strong>majority</strong> (including itself) has durably
+        stored it, the entry is <em>committed</em> and can be applied and acknowledged to the client.</li>
+    </ol>
+
+<pre><code>            client write
+                 │
+                 ▼
+          ┌─────────────┐   AppendEntries   ┌───────────┐
+          │   LEADER    │──────────────────▶│ FOLLOWER  │  ack ✓
+          │  (term 7)   │──────────────────▶│ FOLLOWER  │  ack ✓
+          └─────────────┘──────────────────▶│ FOLLOWER  │  (slow — no ack yet)
+                 │                          └───────────┘
+                 │   2 acks + itself = 3 of 5 = MAJORITY
+                 └─▶ entry COMMITTED → apply to state machine → reply "OK"
+
+  The slow follower catches up later. It does not block the commit.
+</code></pre>
+
+    <p>
+      <strong>"Majority" is why cluster sizes are odd.</strong> With 5 nodes, a majority is 3, so you survive 2 failures.
+      With 3 nodes, a majority is 2, so you survive 1. Adding a 4th node to a 3-node cluster raises the majority to 3 —
+      you still only survive 1 failure, but you now have one more machine that can break. That's the whole reason etcd
+      and ZooKeeper clusters are 3 or 5 and never 4. And majorities are what make split-brain <em>structurally</em>
+      impossible: two disjoint majorities can't exist in one set, so two leaders in the same term can't exist either. The
+      minority side of a partition simply stops accepting writes — it sacrifices liveness to preserve safety, exactly as
+      section 1 predicted.
+    </p>
+
+    <h3>Paxos, in the only depth you need</h3>
+    <p>
+      Paxos (Lamport, 1989) is the original, and it solves the same problem: get a majority to agree on one value, safely,
+      despite failures. It's famously hard to follow and famously under-specified for real use, which is why practical
+      systems use Multi-Paxos, ZAB (ZooKeeper's protocol), or Raft — Raft being explicitly a "make Paxos
+      understandable" project. <strong>You need one sentence:</strong> <em>"Paxos and Raft solve the same problem —
+      majority-based consensus over a replicated log — and Raft is the one people actually implement because it's
+      comprehensible. Google's Chubby uses Paxos; ZooKeeper uses ZAB; etcd and Consul use Raft."</em> Done. Move on.
+    </p>
+
+    <h3>What to actually say in the interview</h3>
+    <div class="senior">The expected answer, verbatim: <em>"For leader election and distributed locks I'd use an existing consensus system — etcd or ZooKeeper — rather than build one. Implementing Raft correctly, including membership changes and log compaction, is a multi-year project and it's a solved problem. What matters for this design is where I need consensus and where I don't."</em> That sentence is not a dodge. It <strong>is</strong> the senior answer, and offering to hand-roll Raft is the junior one. The follow-up — "so where do you need it here?" — is the real question, and it's the one worth your remaining minutes.</div>
+
+    <p>
+      And the honest engineering point underneath: <strong>consensus is expensive.</strong> Every decision costs a
+      network round trip to a majority, and every write is serialised through one leader. You would never run your
+      product's data plane through Raft — you'd never put a million QPS of user writes through etcd. Consensus systems
+      handle <em>small, infrequent, critical</em> metadata: who's the leader, what's the current shard map, who holds
+      this lock. High volume goes to the databases and queues; the coordination service just tells them what the world
+      looks like.
+    </p>
+
+    <div class="pitfall">Don't put consensus in the hot path. A common wrong turn is "every request takes a distributed lock in ZooKeeper to be safe." You've now capped your entire system's throughput at the throughput of one Raft leader and added a round trip to every request. Ask instead: can the database enforce this with a unique constraint or a conditional update on the row you were already writing? Usually yes — and it's faster, simpler, and one fewer thing to run.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="coordinators">5. ZooKeeper, etcd &amp; Consul</h2>
+
+    <p>
+      These are the products you point at when you say "I'd use an existing consensus system." All three are, at heart,
+      <strong>a small, strongly-consistent, highly-available key-value store with a consensus protocol underneath and a
+      few extra primitives on top</strong> (watches, ephemeral/TTL keys, atomic compare-and-swap). They are not databases.
+      They hold megabytes, not terabytes — the whole dataset lives in memory on every node — and they answer a few
+      thousand writes per second, not a million.
+    </p>
+
+    <p>
+      The lineage is worth 10 seconds of interview time: Google built <strong>Chubby</strong> (a Paxos-backed lock
+      service) and wrote a famous paper about it; ZooKeeper is the open-source descendant of that idea, built at Yahoo
+      for Hadoop; etcd is the modern, Raft-backed, HTTP/gRPC-native version that ended up as the brain of Kubernetes
+      (every object in your cluster is a key in etcd); Consul is HashiCorp's take with service discovery and health
+      checking as the headline feature.
+    </p>
+
+    <h3>What they're actually for</h3>
+    <table>
+      <thead><tr><th>Use case</th><th>How it works</th><th>Real example</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Leader election</strong></td>
+          <td>Every candidate tries to create the same key with a compare-and-swap ("create only if absent"). Exactly one wins — consensus guarantees that. The key is ephemeral or has a TTL, so it vanishes when the winner's session dies, triggering a new election.</td>
+          <td>Kafka controller election; HDFS active NameNode</td>
+        </tr>
+        <tr>
+          <td><strong>Distributed locks &amp; fencing</strong></td>
+          <td>Same mechanism as election, plus the store hands you a monotonic revision/zxid to use as a fencing token.</td>
+          <td>Any "only one worker should run this job" cron</td>
+        </tr>
+        <tr>
+          <td><strong>Service discovery</strong></td>
+          <td>Each instance registers itself (<code>/services/payments/host-3 → 10.0.4.7:8080</code>) with a TTL and heartbeats. Clients <strong>watch</strong> the prefix and get pushed an update the moment an instance appears or dies.</td>
+          <td>Consul + Spring Cloud; Kubernetes' own endpoints</td>
+        </tr>
+        <tr>
+          <td><strong>Dynamic config / feature flags</strong></td>
+          <td>Config lives in a key; services watch it and reconfigure live without redeploying.</td>
+          <td>Rate-limit thresholds, kill switches</td>
+        </tr>
+        <tr>
+          <td><strong>Cluster metadata / shard map</strong></td>
+          <td>"Which node owns which partition" is a single strongly-consistent document everyone reads.</td>
+          <td>The directory-based sharding from page 04</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>
+      <strong>Watches are the underrated feature.</strong> Without them, every service would poll ("is the config
+      different yet?"), which is either slow or expensive. A watch is a subscription: the store pushes you the change.
+      This is exactly the difference between polling an API in React and holding a WebSocket, and it's the same reason —
+      push beats poll when changes are rare but latency matters.
+    </p>
+
+    <h3>When you'd add one, and when it's overkill</h3>
+    <table>
+      <thead><tr><th>Add a coordination service when…</th><th>It's overkill when…</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>You genuinely need <strong>exactly one</strong> of something running (one scheduler, one controller, one compactor) and two would be a correctness bug.</td>
+          <td>You just need a lock and you already have Postgres — <code>SELECT … FOR UPDATE</code> or an advisory lock is free and it's <em>actually</em> linearizable, unlike your Redis lock.</td>
+        </tr>
+        <tr>
+          <td>You need service discovery in a dynamic fleet where instances come and go constantly.</td>
+          <td>You're already on Kubernetes, which gives you Services and DNS out of the box — <em>and which is itself backed by etcd</em>. You have a coordination service; don't run a second one.</td>
+        </tr>
+        <tr>
+          <td>You need a shard map or cluster membership that every node must see identically.</td>
+          <td>Your "config" changes twice a year. Put it in the repo and deploy it.</td>
+        </tr>
+        <tr>
+          <td>You need a fencing-token source with a real guarantee behind it.</td>
+          <td>The uniqueness you need can be enforced by a <strong>unique constraint</strong> on a table you were writing to anyway. This is the boring right answer more often than candidates expect.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="senior">The judgment sentence: <em>"ZooKeeper or etcd is another stateful cluster to operate, monitor, and back up — I'd only introduce one if I need coordination that my database genuinely can't express. Most 'we need a distributed lock' requirements turn out to be 'we need a unique constraint' or 'we need a conditional update', and those are cheaper, faster and harder to get wrong."</em> Interviewers at enterprise shops love this, because they have all been burned by an under-maintained ZooKeeper ensemble.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="locks">6. Distributed locks — and why they're harder than they look</h2>
+
+    <p>
+      Ask a candidate "how do you stop two servers from processing the same order twice" and nine out of ten say
+      <em>"a distributed lock in Redis."</em> It's the reflex answer, it's on every blog, and it is <strong>usually
+      wrong</strong>. This section is about being the tenth candidate.
+    </p>
+
+    <p>
+      Start by separating the two reasons you might want a lock, because they have completely different answers:
+    </p>
+    <ul>
+      <li><strong>Efficiency.</strong> "I'd rather not have two workers generate the same PDF — it's wasted CPU." If the
+        lock occasionally fails and the PDF gets generated twice, you lose a few cents of compute. <em>A Redis lock is
+        fine here.</em> Genuinely fine. Use it and move on.</li>
+      <li><strong>Correctness.</strong> "Two workers must never both mark this seat as sold / both capture this payment /
+        both write this file." If the lock fails, you have oversold a seat or double-charged a customer. <em>A Redis lock
+        is NOT fine here</em>, and this is the distinction the interviewer is fishing for.</li>
+    </ul>
+
+    <h3>The naive Redis lock</h3>
+    <p>Everyone's first implementation, and it has a bug on every line except the last one:</p>
+
+<pre><code><span class="com">// SET key value NX PX 10000</span>
+<span class="com">//   NX      = only set if the key does NOT already exist  (this is the "lock")</span>
+<span class="com">//   PX 10000 = auto-expire after 10s, so a crashed holder doesn't deadlock everyone</span>
+<span class="com">//   value    = a random UUID identifying THIS holder — not optional, see below</span>
+
+<span class="typ">String</span> token = <span class="typ">UUID</span>.randomUUID().toString();
+<span class="typ">Boolean</span> acquired = redis.set(<span class="str">"lock:order:"</span> + orderId, token,
+                            <span class="typ">SetArgs</span>.Builder.nx().px(<span class="num">10_000</span>));
+
+<span class="kw">if</span> (!<span class="typ">Boolean</span>.TRUE.equals(acquired)) <span class="kw">throw</span> <span class="kw">new</span> <span class="typ">LockBusyException</span>();
+
+<span class="kw">try</span> {
+    processOrder(orderId);          <span class="com">// ← the "critical section" (allegedly)</span>
+} <span class="kw">finally</span> {
+    <span class="com">// Release must be a compare-and-delete, NOT a plain DEL.</span>
+    <span class="com">// Plain DEL would let you delete a lock that ALREADY EXPIRED and was</span>
+    <span class="com">// re-acquired by somebody else — you'd be unlocking a stranger's lock.</span>
+    <span class="com">// Redis has no atomic compare-and-delete, so it takes a Lua script:</span>
+    redis.eval(<span class="str">"if redis.call('get', KEYS[1]) == ARGV[1] "</span> +
+               <span class="str">"then return redis.call('del', KEYS[1]) else return 0 end"</span>,
+               <span class="typ">List</span>.of(<span class="str">"lock:order:"</span> + orderId), token);
+}
+</code></pre>
+
+    <p>
+      Even done <em>correctly</em> — with the UUID and the Lua compare-and-delete, which most implementations get wrong —
+      this lock is <strong>not safe for correctness</strong>. Three independent reasons, and you should be able to list
+      all three:
+    </p>
+
+    <ol>
+      <li><strong>GC pauses / process stalls.</strong> Section 3's whole story. You hold the lock, you freeze for 12
+        seconds, the 10-second TTL expires, someone else takes the lock, you wake up and write. Two holders. The lock
+        told you nothing was wrong, because from your perspective nothing was.</li>
+      <li><strong>Clock skew.</strong> The TTL is enforced by Redis's own clock. If that clock jumps forward (NTP
+        correction, VM snapshot restore, leap-second handling), the lock expires early — while its rightful holder is
+        happily working. Any lock whose safety rests on wall-clock time is resting on sand.</li>
+      <li><strong>Failover loses the lock entirely.</strong> Redis replication is <em>asynchronous</em>. You acquire the
+        lock on the primary; the primary dies before replicating that key; the replica is promoted and has never heard of
+        your lock; a second client acquires it. Two holders again — and this one isn't even exotic, it's a routine
+        failover.</li>
+    </ol>
+
+<pre><code>  Client A ──SET NX──▶ Redis PRIMARY   (lock acquired ✓)
+                            │
+                            │  ✗ dies before replicating the key
+                            ▼
+                       Redis REPLICA  ──promoted──▶ new PRIMARY
+                       (has no lock:order:42 key at all)
+
+  Client B ──SET NX──▶ new PRIMARY     (lock acquired ✓ !!)
+
+  A and B are both in the critical section. Nobody did anything wrong.
+</code></pre>
+
+    <h3>Redlock, and the honest note about it</h3>
+    <p>
+      Redis's author (Salvatore Sanfilippo, "antirez") proposed <strong>Redlock</strong> to fix reason 3: run 5
+      independent Redis masters, acquire the lock on a majority of them (3 of 5), and only consider yourself the holder
+      if you got a majority <em>and</em> the acquisition took much less time than the TTL. It's a quorum, so a single
+      node's failover can't hand the lock to two people.
+    </p>
+    <p>
+      <strong>Martin Kleppmann (the DDIA author) published a well-known critique</strong> arguing Redlock still isn't
+      safe for correctness: it fixes the failover problem but does nothing about pauses and clock jumps, because it still
+      fundamentally relies on timing assumptions, and it still issues no fencing token. Antirez replied. The exchange is
+      one of the more famous arguments in the field, and it has never been settled to everyone's satisfaction.
+    </p>
+
+    <div class="senior">Do not take a side; take the <em>engineering</em> position. Say: <em>"Redlock is contested — Kleppmann's critique is that it still depends on timing assumptions and doesn't give you a fencing token, and I find that persuasive. But I'd frame it differently: if my correctness depends on the lock, I don't want to be in this argument at all. I want the resource itself to reject the stale writer, either through a fencing token or by pushing the invariant down into the database."</em> That answer shows you know the literature <em>and</em> that you know arguing about it is not how you ship a correct payment system.</div>
+
+    <h3>The conclusion that actually matters</h3>
+    <p>
+      Here is the decision rule. Learn it as a rule, because under interview pressure you want a rule and not a debate:
+    </p>
+
+    <table>
+      <thead><tr><th>Situation</th><th>Reach for</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>Lock is for <strong>efficiency</strong> (avoid duplicate work; duplicates are merely wasteful)</td>
+          <td>Redis <code>SET NX PX</code>. One line. Ship it.</td>
+          <td>The failure mode costs CPU, not money. Don't over-engineer.</td>
+        </tr>
+        <tr>
+          <td>Lock is for <strong>correctness</strong> and the resource is <strong>your own database</strong></td>
+          <td><strong>Don't use a lock.</strong> Use a unique constraint, or a conditional/optimistic update: <code>UPDATE … WHERE version = ?</code> / <code>WHERE status = 'AVAILABLE'</code>.</td>
+          <td>The DB already has a linearizable lock manager and a durable commit. Reuse it instead of rebuilding a worse one over the network.</td>
+        </tr>
+        <tr>
+          <td>Lock is for <strong>correctness</strong> and the resource is <strong>external</strong> (a file store, another service)</td>
+          <td>Consensus-backed lock (etcd/ZooKeeper) + <strong>fencing token</strong> the resource enforces.</td>
+          <td>Only monotonic tokens survive pauses. Nothing else does.</td>
+        </tr>
+        <tr>
+          <td>Correctness needed, but the resource <strong>cannot</strong> enforce fencing (third-party API)</td>
+          <td><strong>Idempotency keys</strong> (section 9). Make the duplicate call harmless instead of trying to prevent it.</td>
+          <td>You can't prevent a duplicate you can't see. You can make it a no-op.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>
+      Notice that in three of four rows the answer is <em>not a distributed lock</em>. That's not an accident. <strong>The
+      most senior move available on this topic is to eliminate the need for the lock</strong>, by pushing the invariant
+      into a component that can enforce it atomically and durably. Postgres enforcing <code>UNIQUE (event_id)</code>, or
+      an <code>UPDATE seats SET status='HELD' WHERE id=? AND status='AVAILABLE'</code> that returns 0 rows when someone
+      beat you to it — these are unglamorous, and they are <em>correct</em>, and correct is what you're being graded on.
+    </p>
+
+    <div class="note">The seat-booking version of exactly this argument — distributed lock vs optimistic concurrency vs a database constraint, and why the flash-sale traffic pattern makes the choice matter — is the deep dive in <a href="14-ticket-booking.html">14 — Design Ticket Booking</a>. When an interviewer pushes on locks there, the conditional-update answer is the one that wins, and this section is why.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="transactions">7. Distributed transactions: 2PC vs saga</h2>
+
+    <p>
+      <strong>This is the core of the page and it is the highest-frequency distributed-systems question in enterprise and
+      fintech loops.</strong> If you learn one thing here, learn this. "Place an order" touches the Order service, the
+      Payment service, and the Inventory service — three services, three databases. On one Postgres you'd wrap all three
+      writes in <code>BEGIN … COMMIT</code> and go home. Across three services you cannot, because there is no shared
+      transaction. So what do you do when payment succeeds but inventory says "out of stock"?
+    </p>
+    <p>
+      There are exactly two families of answer, and an interviewer wants to hear you name both, pick one, and justify it.
+    </p>
+
+    <h3>7a. Two-Phase Commit (2PC)</h3>
+    <p>
+      2PC tries to preserve real atomicity across services. A <strong>coordinator</strong> drives all participants through
+      two phases:
+    </p>
+    <ol>
+      <li><strong>Prepare (voting).</strong> The coordinator asks every participant: "can you commit this?" Each
+        participant does all the work — validates, takes locks, writes to its own log — and then <em>stops just short of
+        committing</em>, replying YES or NO. A YES is a <strong>promise</strong>: "I will be able to commit this even if I
+        crash and restart." The participant is now holding locks and cannot release them.</li>
+      <li><strong>Commit (decision).</strong> If every vote was YES, the coordinator durably records COMMIT and tells
+        everyone to commit. If any vote was NO (or timed out), it records ABORT and tells everyone to roll back.
+        Participants have already promised, so they must obey.</li>
+    </ol>
+
+<pre><code>  Coordinator          Order DB        Payment DB      Inventory DB
+       │                  │                │                │
+   1   ├─── prepare? ────▶│                │                │
+       ├─── prepare? ──────────────────────▶│               │
+       ├─── prepare? ───────────────────────────────────────▶│
+       │◀── YES (locked) ─┤                │                │
+       │◀── YES (locked) ──────────────────┤                │
+       │◀── YES (locked) ───────────────────────────────────┤
+       │
+       │  ★ coordinator durably writes "COMMIT" to its own log ★
+       │
+   2   ├─── COMMIT ──────▶│  ✓             │                │
+       ├─── COMMIT ────────────────────────▶│  ✓            │
+       ├─── COMMIT ─────────────────────────────────────────▶│  ✓
+       │
+       └─▶ all-or-nothing achieved.  Locks held from prepare → commit.
+</code></pre>
+
+    <h3>The fatal flaw: coordinator death after prepare</h3>
+    <p>
+      Look at the star. Between "everyone voted YES" and "everyone got the decision," the coordinator crashes.
+    </p>
+    <p>
+      Every participant is now sitting in the <strong>prepared</strong> state, holding its locks, having <em>promised</em>
+      to commit. It cannot commit — it doesn't know if the others voted YES. It cannot abort — it already promised, and if
+      the coordinator wrote COMMIT before dying, aborting would break atomicity. It cannot ask its peers, because 2PC
+      gives it no way to. So it does the only thing it can: <strong>it waits. Holding locks. Indefinitely.</strong>
+    </p>
+    <p>
+      This is why 2PC is called a <strong>blocking</strong> protocol, and it's the sentence you must say: <em>"2PC's
+      failure mode is that a coordinator crash after prepare leaves every participant blocked, holding locks, until the
+      coordinator comes back — and meanwhile every other transaction that touches those rows queues up behind them."</em>
+      In a busy system that isn't a stalled order; it's a cascading outage, because the held locks take out unrelated
+      traffic. (You can add a backup coordinator, or make the coordinator itself a Raft group — that's basically what
+      Spanner does — but now you've built a consensus system to run your checkout.)
+    </p>
+
+    <div class="pitfall">The other half of 2PC's cost is one candidates forget: <strong>it's synchronous and it holds locks across a network round trip.</strong> Your transaction's lock duration is now bounded by the slowest participant's network latency, not by your own database. Throughput collapses under contention, and one slow service degrades everything it touches. 2PC doesn't just fail badly — it performs badly even when it works.</div>
+
+    <h3>When 2PC is still the right answer</h3>
+    <p>
+      Don't sneer at it. 2PC is still in production everywhere, and knowing <em>when</em> is a maturity signal:
+    </p>
+    <ul>
+      <li><strong>Single organisation, few participants, all in one datacenter.</strong> Two databases and a message
+        broker in the same rack, XA transactions via JTA — this works, it's boring, and it's correct.</li>
+      <li><strong>Java/Spring's <code>JtaTransactionManager</code> with an XA-capable datasource</strong> is exactly this.
+        You may well meet it at a bank.</li>
+      <li><strong>When the business truly cannot tolerate a temporary inconsistency</strong>, even for milliseconds, and
+        the volume is low enough that blocking is affordable. Some core-banking ledgers are genuinely in this bucket.</li>
+      <li><strong>Inside a single database engine.</strong> Postgres does 2PC internally across its own shards; Spanner
+        does 2PC over Paxos groups. The protocol is fine — it's the <em>cross-service, cross-vendor, over-the-internet</em>
+        version that hurts.</li>
+    </ul>
+    <p>
+      What kills it is scale and heterogeneity: microservices with independent teams, third-party APIs (Stripe does not
+      support XA), and any participant you don't control. That's most modern systems. Hence sagas.
+    </p>
+
+    <h3>7b. Sagas</h3>
+    <p>
+      A saga gives up on atomicity and buys back availability. Instead of one distributed transaction, you run a
+      <strong>sequence of local transactions</strong> — each one commits immediately in its own service's database — and
+      if a later step fails, you run <strong>compensating transactions</strong> to semantically undo the earlier ones.
+    </p>
+    <p style="font-size:1.05rem; font-weight:700; color:#111827; border-left:4px solid #8b5cf6; padding-left:1rem;">
+      No locks are held across services. Nothing blocks. The system is temporarily inconsistent — and you accept that, in
+      exchange for never having a participant stuck waiting on a dead coordinator.
+    </p>
+
+    <h3>What "compensating transaction" really means</h3>
+    <p>
+      This is the part candidates hand-wave, and the part interviewers probe. A compensation is <strong>not a
+      rollback</strong>. A rollback erases history as if nothing happened. A compensation is a <em>new business action
+      that counteracts the old one</em>, and the original remains visible forever.
+    </p>
+    <ul>
+      <li>You cannot un-send an email. You send <strong>an apology email</strong>. The customer saw both.</li>
+      <li>You cannot un-charge a card. You issue <strong>a refund</strong>. The customer's statement shows a charge
+        <em>and</em> a refund, and in some countries you've paid processing fees on both.</li>
+      <li>You cannot un-ship a package. You <strong>issue a return label</strong>.</li>
+      <li>You can't un-reserve inventory silently — you <strong>release the reservation</strong>, and in the intervening
+        200ms someone else may have failed to buy the item that was falsely held.</li>
+    </ul>
+    <p>
+      That last clause is the honest cost of sagas, and saying it out loud is a strong signal: <strong>a saga's
+      intermediate states are visible to users and to other transactions.</strong> There is a window where the order
+      exists but isn't paid, where money has left the account but no order exists yet. Your data model and your UI must
+      tolerate that — which is why saga-based systems always have an explicit status field (<code>PENDING</code>,
+      <code>PAID</code>, <code>FAILED</code>, <code>COMPENSATING</code>) rather than pretending a row springs into
+      existence fully-formed.
+    </p>
+
+    <h3>A concrete order-placement saga</h3>
+
+<pre><code>  STEP                        LOCAL TXN                 COMPENSATION (if a later step fails)
+  ──────────────────────────────────────────────────────────────────────────────────────────
+  1. Create order             INSERT order              UPDATE order SET status='CANCELLED'
+                              status = PENDING
+
+  2. Reserve inventory        UPDATE stock              UPDATE stock
+                              SET reserved += qty       SET reserved -= qty
+                              WHERE available &gt;= qty    ("release the hold")
+
+  3. Charge payment           INSERT payment            INSERT refund
+                              (call PSP w/ idem key)    (call PSP refund API)
+
+  4. Confirm order            UPDATE order              — (final step: nothing to undo)
+                              SET status='CONFIRMED'
+
+  5. Notify customer          send email                send "we're sorry" email
+
+  Failure at step 3 (card declined) ⇒ run compensations for 2 then 1, in REVERSE order:
+      release the inventory hold, then cancel the order.  Nothing to compensate for 3
+      because it never committed.
+</code></pre>
+
+    <p>
+      Two rules that fall out of that diagram, and both are worth saying:
+    </p>
+    <ul>
+      <li><strong>Compensate in reverse order.</strong> Undo the most recent completed step first, exactly like unwinding
+        a stack. Otherwise you can release inventory that a compensating step still depends on.</li>
+      <li><strong>Order the steps so that the ones you <em>can't</em> compensate come last.</strong> Send the email last;
+        ship the package last. If an irreversible step is in the middle, every failure after it leaves you with a mess a
+        human has to clean up. Sequencing the saga to put the cheapest-to-compensate steps first and the
+        impossible-to-compensate steps at the end is a real design decision, and it's the kind of thing a 3-YOE candidate
+        never mentions.</li>
+    </ul>
+
+    <h3>Choreography vs orchestration</h3>
+    <p>Two ways to actually run the saga, and the interviewer will ask which:</p>
+
+<pre><code>  CHOREOGRAPHY — no coordinator; services react to each other's events
+
+    Order ──OrderCreated──▶ [bus] ──▶ Inventory ──StockReserved──▶ [bus] ──▶ Payment
+                                                                                 │
+    Order ◀── OrderConfirmed ◀── [bus] ◀────────── PaymentCaptured ◀─────────────┘
+
+    On failure Payment emits PaymentFailed; Inventory listens and releases;
+    Order listens and cancels.  Nobody owns the flow.  Nobody can see the flow.
+
+
+  ORCHESTRATION — a coordinator service explicitly drives each step
+
+               ┌──────────────────────────┐
+               │   OrderSaga orchestrator │  (owns the state machine + a DB row
+               │   state: AWAITING_PAYMENT│   recording exactly where we are)
+               └──┬───────┬───────┬───────┘
+      command ────┘       │       └──── command
+          ▼               ▼             ▼
+      Inventory        Payment       Shipping     ── each replies success/failure
+</code></pre>
+
+    <table>
+      <thead><tr><th></th><th>Choreography</th><th>Orchestration</th></tr></thead>
+      <tbody>
+        <tr><td><strong>How it works</strong></td><td>Each service publishes events; others subscribe and react</td><td>A coordinator service sends commands and awaits replies</td></tr>
+        <tr><td><strong>Coupling</strong></td><td>Loose — services only know event schemas</td><td>The orchestrator knows everyone; participants know nothing</td></tr>
+        <tr><td><strong>Where is the flow?</strong></td><td><strong>Nowhere.</strong> It's emergent — smeared across N codebases. To answer "what happens when an order is placed?" you must read every service.</td><td><strong>In one file.</strong> An explicit state machine you can read, test, and show a product manager.</td></tr>
+        <tr><td><strong>Debugging a stuck order</strong></td><td>Hard. Trace events across services and hope you have distributed tracing.</td><td>Easy. Query the saga row: <code>state = AWAITING_PAYMENT since 4h</code>.</td></tr>
+        <tr><td><strong>Cyclic dependency risk</strong></td><td>Real — A listens to B, B listens to A, and now you have a loop nobody designed</td><td>None</td></tr>
+        <tr><td><strong>Single point of failure</strong></td><td>No coordinator to lose</td><td>The orchestrator — though it's stateless-ish and its state is in the DB, so it just restarts and resumes</td></tr>
+        <tr><td><strong>Good for</strong></td><td>2–3 steps, simple flows, teams that want autonomy</td><td>4+ steps, anything with money, anything you'll be paged about</td></tr>
+      </tbody>
+    </table>
+
+    <div class="senior">The recommendation, and say it with conviction: <em>"For a 2-step flow I'd use choreography — an orchestrator would be ceremony. For anything with money or more than about three steps, I'd use orchestration, because the business process becomes an explicit state machine I can query, retry and audit. The moment someone asks 'why is order 12345 stuck', choreography makes you read five codebases and orchestration makes you read one row."</em> That last sentence is the one that lands, because every interviewer has lived it.</div>
+
+    <h3>2PC vs saga: the comparison table</h3>
+    <table>
+      <thead><tr><th></th><th>2PC</th><th>Saga</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Atomicity</strong></td><td>Real — all or nothing, at every instant</td><td>Eventual — intermediate states are visible</td></tr>
+        <tr><td><strong>Isolation</strong></td><td>Yes (locks held through the transaction)</td><td><strong>None.</strong> Others can read your half-finished state. You must design for it.</td></tr>
+        <tr><td><strong>Blocking?</strong></td><td>Yes — coordinator death after prepare blocks everyone, holding locks</td><td>No — every local txn commits and releases immediately</td></tr>
+        <tr><td><strong>Latency</strong></td><td>Synchronous; bounded by the slowest participant</td><td>Async; the user gets an immediate "we're processing your order"</td></tr>
+        <tr><td><strong>Scales to many services?</strong></td><td>Poorly — coordination cost and lock contention grow fast</td><td>Yes — this is why microservice shops use it</td></tr>
+        <tr><td><strong>Works with third parties?</strong></td><td>No (Stripe will not join your XA transaction)</td><td>Yes — a compensation is just another API call</td></tr>
+        <tr><td><strong>Complexity lives…</strong></td><td>In the infrastructure (XA, coordinator recovery)</td><td>In <strong>your application code</strong> — you write and test every compensation</td></tr>
+        <tr><td><strong>Failure mode</strong></td><td>System stalls, locks pile up, availability dies</td><td>Business-level mess: refunds issued, apology emails, a stuck saga someone must resolve</td></tr>
+      </tbody>
+    </table>
+
+    <h3>The rule for which to reach for</h3>
+    <ul>
+      <li><strong>Default to saga</strong> in any multi-service design. It's what real microservice systems do, it's what
+        the interviewer expects to hear, and it's honest about the fact that you can't have distributed ACID for free.</li>
+      <li><strong>Reach for 2PC only when</strong> you control every participant, they're all XA-capable, they're all in
+        one datacenter, the volume is modest, and the business genuinely cannot show an intermediate state. Name those
+        conditions when you say it — that's what proves you're choosing rather than defaulting.</li>
+      <li><strong>Best of all: dodge the question.</strong> If two services are so tightly coupled that they need a
+        distributed transaction on every request, that's often a service-boundary smell. Merging them into one service
+        with one database gives you real ACID and deletes the entire problem. Saying <em>"before I design a saga, I'd ask
+        whether these two services should be one service"</em> is a genuinely senior thing to say — and sometimes it's
+        the answer the interviewer was hoping for.</li>
+    </ul>
+
+    <div class="note">The full worked version — an order/payment system with the saga, the ledger, and the reconciliation job — is <a href="13-payments-orders.html">13 — Design a Payment / Order System</a>. That page is the reason this one exists.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="outbox">8. The outbox pattern</h2>
+
+    <p>
+      <strong>This is the most immediately useful pattern on the page.</strong> It's small, it's cheap, you can implement
+      it in an afternoon, and it fixes a bug that is sitting in production in a shocking number of systems right now.
+    </p>
+
+    <h3>The dual-write problem</h3>
+    <p>
+      A saga step almost always looks like this: <em>change something in my database, then tell everyone else about it.</em>
+      Which in code becomes:
+    </p>
+
+<pre><code><span class="ann">@Transactional</span>
+<span class="kw">public</span> <span class="kw">void</span> placeOrder(<span class="typ">Order</span> order) {
+    orderRepository.save(order);                              <span class="com">// write #1 → Postgres</span>
+    kafkaTemplate.send(<span class="str">"orders"</span>, <span class="kw">new</span> <span class="typ">OrderCreated</span>(order));   <span class="com">// write #2 → Kafka</span>
+}
+<span class="com">// ↑ This is broken. Two different systems, two different commits, no shared</span>
+<span class="com">//   transaction. @Transactional covers the DB. It does NOT cover Kafka.</span>
+</code></pre>
+
+    <p>
+      You are writing to two systems that cannot commit together. There is no ordering of those two lines that is safe:
+    </p>
+    <ul>
+      <li><strong>DB first, then Kafka:</strong> the DB commits, the process crashes (or Kafka is down) before the publish.
+        The order exists. <strong>No event was ever emitted.</strong> Inventory is never reserved, no email is ever sent,
+        the saga never starts. The order sits there forever, silently. This is the failure you'll actually see, and it's
+        invisible until a customer complains.</li>
+      <li><strong>Kafka first, then DB:</strong> the event is published, then the DB transaction rolls back. Now every
+        downstream service is reacting to an order <strong>that does not exist</strong>. You've reserved stock and charged
+        a card for a phantom.</li>
+      <li><strong>"Just publish inside the <code>@Transactional</code> block":</strong> doesn't help. The send happens
+        during the transaction, but the transaction can still roll back afterwards — and Kafka has already got the
+        message. (Spring's <code>TransactionalEventListener(AFTER_COMMIT)</code> narrows the window but doesn't close it:
+        the process can still die between the commit and the publish.)</li>
+    </ul>
+    <p>
+      You cannot fix this by reordering, retrying, or trying harder. It's structural. <strong>Two systems, no atomic
+      commit across them.</strong> Naming it — "this is a dual-write problem" — is itself a scoring moment.
+    </p>
+
+    <h3>The fix: make it one write</h3>
+    <p>
+      If you can't atomically write to two systems, then <strong>write to one system twice.</strong> Insert the event into
+      an <code>outbox</code> table in the <em>same local transaction</em> as your business data. Now the order and the
+      intent-to-publish commit or roll back <em>together</em>, atomically, because they're in the same database. A
+      separate <strong>relay</strong> process reads the outbox and publishes to Kafka afterwards.
+    </p>
+
+<pre><code>   ┌────────── ONE LOCAL POSTGRES TRANSACTION ──────────┐
+   │                                                     │
+   │   INSERT INTO orders  (...)                         │  ← atomic together.
+   │   INSERT INTO outbox  (event payload)               │    both or neither.
+   │                                                     │
+   └────────────────────┬────────────────────────────────┘
+                        │ COMMIT
+                        ▼
+                  ┌───────────┐
+                  │  outbox   │  (a normal table in YOUR database)
+                  │   table   │
+                  └─────┬─────┘
+                        │  relay: poll for unpublished rows
+                        │         (or read the WAL via Debezium/CDC)
+                        ▼
+                  ┌───────────┐        ┌──────────────────┐
+                  │  Kafka    │───────▶│ consumers (saga) │
+                  └───────────┘        └──────────────────┘
+                        │
+              publish succeeded → mark the outbox row published
+              publish failed     → the row is still there → RETRY.
+                                   Nothing is lost. Worst case: a duplicate.
+</code></pre>
+
+    <p>
+      That last line is the whole point. The relay crashing after publishing but before marking the row means the event
+      gets published <strong>twice</strong>. That's fine — it converts an <em>unfixable</em> problem (a lost event) into a
+      <em>trivially fixable</em> one (a duplicate event), and duplicates are handled by idempotent consumers, which is the
+      next section. <strong>At-least-once is achievable; at-most-once loses data; you always choose at-least-once and
+      dedupe.</strong>
+    </p>
+
+    <h3>The table</h3>
+
+<pre><code><span class="kw">CREATE TABLE</span> outbox (
+    id              <span class="typ">BIGSERIAL</span>    <span class="kw">PRIMARY KEY</span>,   <span class="com">-- also gives you ordering</span>
+    aggregate_type  <span class="typ">TEXT</span>         <span class="kw">NOT NULL</span>,      <span class="com">-- 'Order'   → becomes the topic</span>
+    aggregate_id    <span class="typ">TEXT</span>         <span class="kw">NOT NULL</span>,      <span class="com">-- '12345'   → becomes the partition key,</span>
+                                                <span class="com">--             so one order's events stay ordered</span>
+    event_type      <span class="typ">TEXT</span>         <span class="kw">NOT NULL</span>,      <span class="com">-- 'OrderCreated'</span>
+    payload         <span class="typ">JSONB</span>        <span class="kw">NOT NULL</span>,      <span class="com">-- the event body</span>
+    event_id        <span class="typ">UUID</span>         <span class="kw">NOT NULL UNIQUE</span>, <span class="com">-- the consumer's dedup key (section 9)</span>
+    created_at      <span class="typ">TIMESTAMPTZ</span>  <span class="kw">NOT NULL DEFAULT</span> now(),
+    published_at    <span class="typ">TIMESTAMPTZ</span>                  <span class="com">-- NULL = not yet published</span>
+);
+
+<span class="com">-- The relay's query hits only unpublished rows, so this partial index stays</span>
+<span class="com">-- tiny even when the table has 100M historical rows in it.</span>
+<span class="kw">CREATE INDEX</span> idx_outbox_unpublished
+    <span class="kw">ON</span> outbox (id) <span class="kw">WHERE</span> published_at <span class="kw">IS NULL</span>;
+</code></pre>
+
+    <p>And the write side — note that there is now only one <code>@Transactional</code> boundary and it covers everything:</p>
+
+<pre><code><span class="ann">@Transactional</span>                                  <span class="com">// ONE local transaction. Both rows or neither.</span>
+<span class="kw">public</span> <span class="typ">Order</span> placeOrder(<span class="typ">PlaceOrderCommand</span> cmd) {
+    <span class="typ">Order</span> order = orderRepository.save(<span class="typ">Order</span>.pending(cmd));
+
+    outboxRepository.save(<span class="kw">new</span> <span class="typ">OutboxEvent</span>(
+        <span class="str">"Order"</span>,                              <span class="com">// aggregate_type</span>
+        order.getId().toString(),             <span class="com">// aggregate_id → Kafka partition key</span>
+        <span class="str">"OrderCreated"</span>,                       <span class="com">// event_type</span>
+        json.write(<span class="typ">OrderCreated</span>.from(order)),  <span class="com">// payload</span>
+        <span class="typ">UUID</span>.randomUUID()                     <span class="com">// event_id → consumer dedup key</span>
+    ));
+
+    <span class="kw">return</span> order;   <span class="com">// commit. The event is now GUARANTEED to be published eventually.</span>
+}
+</code></pre>
+
+    <h3>The relay: polling vs CDC</h3>
+    <table>
+      <thead><tr><th></th><th>Polling relay</th><th>CDC (Debezium reading the WAL)</th></tr></thead>
+      <tbody>
+        <tr><td><strong>How</strong></td><td>A scheduled job: <code>SELECT … WHERE published_at IS NULL ORDER BY id LIMIT 100 FOR UPDATE SKIP LOCKED</code>, publish, mark published</td><td>Tails the database's replication log; every INSERT into <code>outbox</code> streams straight to Kafka</td></tr>
+        <tr><td><strong>Latency</strong></td><td>Your poll interval (100ms–1s)</td><td>Milliseconds</td></tr>
+        <tr><td><strong>DB load</strong></td><td>A constant trickle of queries, even when idle</td><td>Near zero — it's reading the WAL the DB was writing anyway</td></tr>
+        <tr><td><strong>Ops cost</strong></td><td><strong>None.</strong> It's a <code>@Scheduled</code> method. 30 lines.</td><td>Debezium + Kafka Connect: another distributed system to run</td></tr>
+        <tr><td><strong>Verdict</strong></td><td><strong>Start here.</strong> It's correct, and correct-and-simple beats correct-and-clever.</td><td>Worth it at high volume, or when you're already running Kafka Connect</td></tr>
+      </tbody>
+    </table>
+
+    <p>
+      <code>FOR UPDATE SKIP LOCKED</code> is the detail worth dropping: it's how you run several relay instances safely.
+      Each one grabs a batch of rows nobody else has locked and skips the rest, so you get parallel relays with no
+      coordination service, no lock, and no duplicate publishing from concurrent relays. That's a Postgres feature
+      earning its keep — and a nice callback to the "let the database enforce it" theme.
+    </p>
+
+    <div class="senior">Drop this into any design with a database and a queue, unprompted: <em>"I'd use the outbox pattern here rather than writing to Postgres and publishing to Kafka in the same method — that's a dual write and it silently drops events when the publish fails after the commit. Instead the event goes into an outbox table in the same transaction, and a relay publishes it at-least-once. Consumers are idempotent, so the occasional duplicate is harmless."</em> This single paragraph demonstrates: you know what a dual write is, you know why it's broken, you know the fix, and you know the fix's cost. Very few candidates volunteer it.</div>
+
+    <div class="pitfall">Don't forget to reap the table. An outbox on a busy service grows by millions of rows a day. Either delete rows once published (simplest) or partition by day and drop old partitions. An unbounded outbox table that nobody vacuums will eventually take down the very database it was protecting — a genuinely common production incident, and mentioning it shows you've operated something.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="idempotency">9. Idempotency &amp; the exactly-once myth</h2>
+
+    <p>
+      Everything on this page has been quietly leading here. The outbox gives you at-least-once delivery. Retries give
+      you at-least-once. A failed lock gives you a duplicate. A user double-clicking "Pay" gives you a duplicate. A
+      client that times out and retries gives you a duplicate — <em>and the original request may well have succeeded;
+      the client just never saw the response.</em> Duplicates are not an edge case in distributed systems. Duplicates are
+      the weather.
+    </p>
+    <p>
+      So you stop trying to prevent them and instead make them <strong>harmless</strong>.
+    </p>
+
+    <h3>The definition, stated precisely</h3>
+    <p>
+      <strong>An operation is idempotent if performing it N times has the same effect as performing it once.</strong> You
+      already live with this in HTTP: <code>GET</code>, <code>PUT</code> and <code>DELETE</code> are idempotent by
+      specification; <code>POST</code> is not. <code>SET balance = 100</code> is idempotent. <code>balance = balance -
+      50</code> is emphatically not — run it twice and you've stolen fifty pounds. That distinction is the whole game, and
+      most business operations are unfortunately in the second category.
+    </p>
+
+    <h3>Idempotency keys — how the second category gets fixed</h3>
+    <p>
+      The client generates a unique key for the <em>intent</em> and sends it with the request. Retries reuse the
+      <strong>same</strong> key. The server records keys it has already processed, and on a repeat it does not redo the
+      work — it <strong>returns the original response</strong>. This is exactly what Stripe's
+      <code>Idempotency-Key</code> header does, and describing it correctly is a free win in any payments interview.
+    </p>
+
+<pre><code>  POST /payments
+  Idempotency-Key: 7c9e6679-7425-40de-944b-e07fc1f90ae7     ← generated by the CLIENT,
+  { "orderId": 12345, "amountCents": 4999 }                   stable across retries
+
+  1st call  → key unseen  → charge the card → store (key → response) → 201 Created
+  2nd call  → key SEEN    → do NOT charge   → replay stored response → 201 Created
+             (identical body, identical payment id — the client can't tell,
+              and more importantly the customer is charged exactly once)
+</code></pre>
+
+    <p>
+      Three details that separate a real implementation from a whiteboard sketch, and interviewers do probe them:
+    </p>
+    <ul>
+      <li><strong>The key must come from the client</strong>, generated once per logical intent — not per HTTP attempt.
+        A key the <em>server</em> generates is useless, because a retry would get a new one. In your React app: generate
+        the UUID when the user opens the checkout form, not when the request fires.</li>
+      <li><strong>Store the response, not just the key.</strong> If you only record "seen" and return <code>409
+        Conflict</code>, the retrying client doesn't know whether it succeeded and has to go hunting. Replay the original
+        response body and the retry becomes genuinely invisible.</li>
+      <li><strong>Handle the concurrent case.</strong> Two copies of the same request arrive 5ms apart, both check "have
+        I seen this key?", both see no, both charge the card. The check-then-act race is back. The fix is the same as
+        always: don't check-then-act — <strong>let the database's unique constraint decide</strong>, atomically.</li>
+    </ul>
+
+    <h3>The implementation — the unique constraint does the work</h3>
+
+<pre><code><span class="kw">CREATE TABLE</span> idempotency_key (
+    key           <span class="typ">UUID</span>        <span class="kw">PRIMARY KEY</span>,   <span class="com">-- ← THE lock. Not Redis. This.</span>
+    request_hash  <span class="typ">TEXT</span>        <span class="kw">NOT NULL</span>,      <span class="com">-- guards against key reuse with a different body</span>
+    status        <span class="typ">TEXT</span>        <span class="kw">NOT NULL</span>,      <span class="com">-- 'IN_PROGRESS' | 'COMPLETED'</span>
+    response_body <span class="typ">JSONB</span>,                     <span class="com">-- the stored reply, replayed on retry</span>
+    response_code <span class="typ">INT</span>,
+    created_at    <span class="typ">TIMESTAMPTZ</span> <span class="kw">NOT NULL DEFAULT</span> now()  <span class="com">-- expire after ~24h</span>
+);
+</code></pre>
+
+<pre><code><span class="ann">@Transactional</span>
+<span class="kw">public</span> <span class="typ">PaymentResponse</span> charge(<span class="typ">UUID</span> idemKey, <span class="typ">ChargeRequest</span> req) {
+
+    <span class="com">// 1. Claim the key. The INSERT is the atomic check-and-act: the PRIMARY KEY</span>
+    <span class="com">//    constraint means exactly ONE concurrent caller can win this row. No race,</span>
+    <span class="com">//    no distributed lock, no Redlock argument. The database already solved it.</span>
+    <span class="typ">int</span> claimed = jdbc.update(<span class="str">"""
+        INSERT INTO idempotency_key (key, request_hash, status)
+        VALUES (?, ?, 'IN_PROGRESS')
+        ON CONFLICT (key) DO NOTHING
+        """</span>, idemKey, hash(req));
+
+    <span class="kw">if</span> (claimed == <span class="num">0</span>) {
+        <span class="com">// Somebody already claimed this key — a retry, or a concurrent duplicate.</span>
+        <span class="typ">IdemRecord</span> prior = idemRepo.findById(idemKey).orElseThrow();
+
+        <span class="kw">if</span> (!prior.requestHash().equals(hash(req)))       <span class="com">// same key, DIFFERENT body:</span>
+            <span class="kw">throw</span> <span class="kw">new</span> <span class="typ">IdempotencyKeyReuseException</span>();      <span class="com">// a client bug. 422. Loudly.</span>
+
+        <span class="kw">if</span> (prior.status().equals(<span class="str">"IN_PROGRESS"</span>))          <span class="com">// original is still running:</span>
+            <span class="kw">throw</span> <span class="kw">new</span> <span class="typ">RequestInFlightException</span>();         <span class="com">// 409 + Retry-After. Do NOT</span>
+                                                             <span class="com">// run it a second time.</span>
+        <span class="kw">return</span> prior.responseBody();                      <span class="com">// COMPLETED → replay the reply ✓</span>
+    }
+
+    <span class="com">// 2. We won the key. Do the actual work.</span>
+    <span class="typ">PaymentResponse</span> res = paymentGateway.capture(req);   <span class="com">// (pass idemKey downstream too!)</span>
+
+    <span class="com">// 3. Record the outcome IN THE SAME TRANSACTION as the business write, so the</span>
+    <span class="com">//    key and the payment can never disagree about whether this happened.</span>
+    paymentRepo.save(<span class="typ">Payment</span>.from(res));
+    jdbc.update(<span class="str">"UPDATE idempotency_key SET status='COMPLETED', response_body=?, "</span> +
+                <span class="str">"response_code=? WHERE key=?"</span>, json.write(res), <span class="num">201</span>, idemKey);
+    <span class="kw">return</span> res;
+}
+</code></pre>
+
+    <div class="note">Look at what's <em>not</em> in that code: no Redis, no ZooKeeper, no lock, no consensus. A primary key constraint and one transaction. That is the "boring right answer" this page keeps promising, and it's what a real payments service actually does. If you can write this on a whiteboard from memory in a fintech loop, you are ahead of most of the field.</div>
+
+    <h3>The idempotent consumer</h3>
+    <p>
+      The same idea, applied to your Kafka consumers, closes the loop the outbox opened. The outbox publishes
+      at-least-once, so a consumer <em>will</em> see duplicates. Give every event an <code>event_id</code> (you did — it's
+      in the outbox schema) and have the consumer record processed IDs in the same transaction as its side effect:
+    </p>
+
+<pre><code><span class="ann">@Transactional</span>
+<span class="kw">public</span> <span class="kw">void</span> on(<span class="typ">OrderCreated</span> evt) {
+    <span class="typ">int</span> inserted = jdbc.update(
+        <span class="str">"INSERT INTO processed_event (event_id) VALUES (?) ON CONFLICT DO NOTHING"</span>,
+        evt.eventId());
+
+    <span class="kw">if</span> (inserted == <span class="num">0</span>) <span class="kw">return</span>;   <span class="com">// already processed this exact event — skip. Done.</span>
+
+    inventory.reserve(evt.orderId(), evt.items());   <span class="com">// the side effect, same txn</span>
+}
+<span class="com">// The dedup row and the side effect commit together. If the consumer crashes</span>
+<span class="com">// after reserving but before acking to Kafka, the redelivery hits the dedup</span>
+<span class="com">// row and does nothing. THIS is what "effectively-once" actually means.</span>
+</code></pre>
+
+    <h3>"Exactly-once delivery is a myth. Exactly-once <em>processing</em> is achievable."</h3>
+    <p>
+      Learn that sentence. Interviewers bait it deliberately — "so how would you guarantee exactly-once delivery?" — and
+      the trap is to answer the question as asked.
+    </p>
+    <p>
+      <strong>Why delivery can't be exactly-once:</strong> straight back to section 1. The sender transmits a message and
+      waits for an ack. The ack doesn't arrive. It cannot know whether the message was lost, or the message arrived and
+      the <em>ack</em> was lost. It has two choices and only two: retry (risking a duplicate → <strong>at-least-once</strong>)
+      or don't (risking a loss → <strong>at-most-once</strong>). There is no third option. Adding more acknowledgements
+      doesn't help — that's Two Generals, and it's turtles all the way down. No protocol, no vendor, no amount of money
+      escapes this.
+    </p>
+    <p>
+      <strong>Why processing <em>can</em> be exactly-once:</strong> because you control the receiver. Deliver
+      at-least-once, and make the <em>effect</em> of processing idempotent — dedup by event ID, or write with a unique
+      constraint, or use a conditional update. The message may arrive five times; the state changes once. The industry
+      calls this <strong>effectively-once</strong>, and it is the only honest thing anyone means when they say
+      "exactly-once."
+    </p>
+
+    <table>
+      <thead><tr><th>Guarantee</th><th>How</th><th>Failure mode</th><th>Use when</th></tr></thead>
+      <tbody>
+        <tr><td><strong>At-most-once</strong></td><td>Fire and forget; never retry</td><td><strong>Messages are lost</strong></td><td>Metrics, telemetry, "user is typing" — where a miss is invisible</td></tr>
+        <tr><td><strong>At-least-once</strong></td><td>Retry until acked</td><td><strong>Duplicates</strong></td><td>The default for everything that matters. Pair it with dedup.</td></tr>
+        <tr><td><strong>Exactly-once <em>delivery</em></strong></td><td>—</td><td><strong>Does not exist.</strong></td><td>Never. It's a marketing phrase.</td></tr>
+        <tr><td><strong>Exactly-once <em>processing</em></strong> (effectively-once)</td><td>At-least-once delivery + idempotent consumer</td><td>Slightly more work; a dedup table to maintain</td><td>Payments, orders, inventory — anything where a duplicate costs money</td></tr>
+      </tbody>
+    </table>
+
+    <div class="senior">The answer to the bait question, word for word: <em>"Exactly-once delivery isn't achievable — the sender can never distinguish a lost message from a lost acknowledgement, so it must either retry and risk a duplicate, or not retry and risk a loss. What I can build is exactly-once <strong>processing</strong>: at-least-once delivery plus an idempotent consumer that dedupes on an event ID in the same transaction as its side effect. Kafka's 'exactly-once semantics' is exactly this — idempotent producers plus transactional offset commits — not magic on the wire."</em> If you deliver that calmly, the interviewer will usually just move on, because there's nowhere left to push.</div>
+
+    <div class="pitfall">Careful with Kafka's EOS claim in an interview — but be precise, not dismissive. Kafka <em>does</em> offer exactly-once semantics, and it's real: a producer epoch (a fencing token, again) that dedupes retried sends to a partition, plus transactions that atomically commit the produced messages and the consumer offsets together. But that only holds <strong>inside Kafka</strong>. The moment your consumer writes to Postgres or calls Stripe, you're outside the transaction and you're back to needing your own idempotency. Saying "Kafka EOS is real but it doesn't extend to my external side effects" is precisely the kind of nuance that separates you from someone who has only read the docs page.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="qa">Interview Q&amp;A</h2>
+
+    <details class="qa">
+      <summary>"Why can't you just use a distributed transaction across microservices?"</summary>
+      <div class="answer">
+        <p>
+          You can — that's 2PC — but you almost never should, and the reason is its failure mode, not its complexity.
+          2PC has a prepare phase where every participant takes locks and promises to commit, and a commit phase where
+          the coordinator tells them the decision. <strong>If the coordinator dies between those two phases, every
+          participant is stuck holding locks indefinitely</strong>: it can't commit (it doesn't know the decision) and it
+          can't abort (it already promised). It blocks, and everything queued behind those locks blocks with it. That
+          turns a coordinator failure into a system-wide outage.
+        </p>
+        <p>
+          On top of that, it's synchronous — your transaction is as slow as the slowest participant — it doesn't scale
+          with the number of services, and third parties won't join it (Stripe does not speak XA). So the standard answer
+          is a <strong>saga</strong>: a chain of local transactions with compensating actions, which never blocks and
+          never holds a cross-service lock, at the price of giving up isolation and accepting visible intermediate states.
+        </p>
+        <p>
+          And the senior addendum: <em>"If two services need a distributed transaction on every single request, I'd first
+          question whether they should be two services at all."</em>
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"Walk me through a saga for placing an order. What happens when the payment fails?"</summary>
+      <div class="answer">
+        <p>Four local transactions, each committing in its own service, driven by an orchestrator:</p>
+        <ol>
+          <li><strong>Order service:</strong> <code>INSERT order (status=PENDING)</code>. Compensation: set status CANCELLED.</li>
+          <li><strong>Inventory service:</strong> reserve the stock (a conditional update: <code>WHERE available &gt;= qty</code>). Compensation: release the reservation.</li>
+          <li><strong>Payment service:</strong> capture the card, passing an idempotency key. Compensation: refund.</li>
+          <li><strong>Order service:</strong> status = CONFIRMED. Final step — nothing to compensate.</li>
+        </ol>
+        <p>
+          Payment fails at step 3 ⇒ the orchestrator runs compensations <strong>in reverse order</strong>: release the
+          inventory reservation, then cancel the order. Step 3 never committed, so there's nothing to undo there — but
+          note that if the card <em>was</em> charged and we merely failed to hear about it, the compensation is a refund,
+          not a rollback, and reconciliation against the PSP will catch it.
+        </p>
+        <p>
+          The two things to volunteer without being asked: <strong>(1)</strong> a compensation is a new business action,
+          not a rollback — a refund is visible on the customer's statement forever; <strong>(2)</strong> the customer can
+          observe the intermediate state, so the order status field is part of the contract, and the UI shows "processing"
+          rather than pretending the order atomically appeared.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"You write to your database and publish to Kafka. What's wrong with that?"</summary>
+      <div class="answer">
+        <p>
+          It's a <strong>dual write</strong> — two systems, no atomic commit across them. If the DB commits and the
+          process dies before the publish, the row exists and no event was ever emitted: the downstream saga never starts
+          and nobody notices until a customer complains. Reverse the order and you can publish an event for a transaction
+          that then rolls back — downstream services react to an order that doesn't exist. There is no ordering of those
+          two writes that is safe.
+        </p>
+        <p>
+          The fix is the <strong>outbox pattern</strong>: insert the event into an <code>outbox</code> table in the
+          <em>same</em> local transaction as the business data, so they commit or roll back together. A relay process
+          (polling the table, or Debezium tailing the WAL) publishes rows to Kafka and marks them published. If the relay
+          crashes after publishing but before marking, the event is published twice — which is fine, because consumers
+          dedupe on <code>event_id</code>. You've converted an unfixable failure (a lost event) into a trivially fixable
+          one (a duplicate).
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"Is a Redis lock safe? How would you make a distributed lock correct?"</summary>
+      <div class="answer">
+        <p>First I'd ask what the lock is <em>for</em>, because the answer differs:</p>
+        <ul>
+          <li><strong>Efficiency</strong> (avoid duplicate work; a duplicate just wastes CPU) — <code>SET key val NX PX
+            10000</code> with a UUID value and a Lua compare-and-delete on release. Perfectly adequate. Ship it.</li>
+          <li><strong>Correctness</strong> (a duplicate double-charges someone) — <strong>it is not safe</strong>, for
+            three separate reasons: a GC pause longer than the TTL gives you two live holders; clock skew can expire the
+            lock early; and Redis's async replication means a primary failover can hand the same lock to two clients.</li>
+        </ul>
+        <p>
+          Redlock (quorum across 5 independent Redis masters) fixes the failover case but not pauses or clocks — that's
+          Kleppmann's critique, and I find it persuasive. The real fix is a <strong>fencing token</strong>: the lock
+          service issues a monotonically increasing number with each grant, the holder attaches it to every write, and
+          the <em>resource</em> rejects any write bearing a token lower than the highest it has seen. That stops the
+          paused writer at the resource, which is the only place it can be stopped.
+        </p>
+        <p>
+          But my actual first answer: <strong>if the resource is my own database, don't use a lock at all.</strong> Use a
+          unique constraint or a conditional update — <code>UPDATE seats SET status='HELD' WHERE id=? AND
+          status='AVAILABLE'</code>. Zero rows updated means someone beat me. The database already has a correct,
+          durable, linearizable lock manager; rebuilding a worse one over the network is the mistake.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"What is a fencing token and what exactly does it protect against?" ★</summary>
+      <div class="answer">
+        <p>
+          A strictly increasing number handed out by the lock service on every grant. The holder sends it with every
+          write; the resource remembers the highest token it has accepted and rejects anything lower.
+        </p>
+        <p>
+          It protects against the <strong>paused-holder</strong> problem, which no TTL can fix. A node acquires a
+          10-second lease, then suffers a 12-second stop-the-world GC pause. The lease expires; another node legitimately
+          acquires it and starts writing. The first node wakes up <em>still believing it holds the lock</em> — from its
+          own perspective no time has passed — and writes. Two writers.
+        </p>
+        <p>
+          You can't fix this by "checking the lease before writing," because the pause can happen <em>between</em> the
+          check and the write, and there's no way to make those two steps atomic across two machines. With fencing, the
+          new holder got token 34 and has already written; the stale holder shows up with token 33 and the resource
+          refuses it. The check becomes a local monotonicity comparison at the resource, which <em>is</em> atomic. In SQL
+          that's literally <code>UPDATE … SET fence_token = ? WHERE id = ? AND fence_token &lt; ?</code>.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"How do you guarantee exactly-once delivery?" (this is bait)</summary>
+      <div class="answer">
+        <p>
+          <strong>You don't — exactly-once delivery isn't achievable, and I'd push back on the framing.</strong> A sender
+          that gets no acknowledgement cannot distinguish "my message was lost" from "the ack was lost." It has exactly
+          two options: retry (at-least-once, risking duplicates) or don't (at-most-once, risking loss). More
+          acknowledgements don't help — that's the Two Generals problem.
+        </p>
+        <p>
+          What <em>is</em> achievable is <strong>exactly-once processing</strong>, sometimes called effectively-once:
+          at-least-once delivery plus an idempotent consumer. Give every message an event ID; the consumer inserts that
+          ID into a <code>processed_event</code> table with a unique constraint <em>in the same transaction as its side
+          effect</em>. A duplicate hits the constraint and becomes a no-op. The message may arrive five times; the state
+          changes once.
+        </p>
+        <p>
+          And on Kafka's "exactly-once semantics": it's real, but it's scoped to Kafka — idempotent producers (a producer
+          epoch, which is a fencing token) plus transactions that atomically commit produced messages and consumer
+          offsets. The moment my consumer writes to Postgres or calls a payment provider, I'm outside that transaction
+          and I need my own idempotency again.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"Explain R + W &gt; N. What does N=3, W=2, R=2 give you, and when would you change it?"</summary>
+      <div class="answer">
+        <p>
+          With N replicas, if the write quorum W and the read quorum R sum to more than N, the read set and the write set
+          must overlap in at least one node — pigeonhole. So any read is guaranteed to touch at least one replica holding
+          the latest acknowledged write, and by taking the highest version among the replicas you read, you get a fresh
+          value.
+        </p>
+        <p>
+          N=3, W=2, R=2 (4 &gt; 3 ✓) is the balanced default: tolerates one node down on both the read and write paths,
+          latency is that of the second-fastest replica. I'd change it per workload: <strong>W=1</strong> for high-volume,
+          low-value writes like click events (fast, never blocks a user request, accepts staleness);
+          <strong>W=3, R=1</strong> for read-heavy config data (writes become fragile — any node down blocks them — but
+          reads are single-replica fast).
+        </p>
+        <p>
+          The caveat I'd volunteer: quorums give fresh reads, <em>not</em> transactions and <em>not</em> consensus.
+          Concurrent writes still conflict and need LWW or vector clocks, and sloppy quorums with hinted handoff quietly
+          break the overlap guarantee during a partition. If I need real linearizability — a lock, an election, a
+          uniqueness constraint — a quorum isn't enough; I need consensus or a single-writer database.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"Would you implement Raft?"</summary>
+      <div class="answer">
+        <p>
+          <strong>No.</strong> "I'd use an existing consensus system — etcd, ZooKeeper, or Consul — rather than build one.
+          Implementing Raft correctly, including membership changes, log compaction and snapshotting, is a multi-year
+          effort and it's a solved problem." That's the whole answer, and it's not a dodge — it's the expected one.
+        </p>
+        <p>
+          What I <em>would</em> say about it: consensus gives a group of nodes an identical replicated log despite
+          crashes, and every coordination primitive is built on that — leader election, locks, fencing tokens (the log
+          index <em>is</em> a monotonic counter), and a strongly-consistent config store. Raft's shape is: one leader per
+          numbered term, followers vote on randomised election timeouts, writes go to the leader and are committed once a
+          <strong>majority</strong> has stored them. Majorities are why clusters are 3 or 5 and never 4, and why
+          split-brain is structurally impossible — two disjoint majorities can't exist.
+        </p>
+        <p>
+          The design point that actually matters: <strong>consensus is expensive and belongs on the control plane, not
+          the data plane.</strong> Every decision costs a round trip to a majority through one leader. You put cluster
+          metadata and locks in etcd; you do not put a million QPS of user writes through it.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"Choreography or orchestration for your saga?"</summary>
+      <div class="answer">
+        <p>
+          <strong>Choreography:</strong> no coordinator — services emit events and others react. Loosely coupled, no
+          single point of failure, and fine for two or three steps. The killer weakness is that <em>the business process
+          exists nowhere</em>: to answer "what happens when an order is placed?" you read five codebases, and to debug a
+          stuck order you trace events across all of them. You can also build accidental cycles nobody designed.
+        </p>
+        <p>
+          <strong>Orchestration:</strong> a coordinator service sends commands and tracks the saga's state in a database
+          row. The flow is one readable state machine you can test, retry, and audit. It's a component to run, but it's
+          effectively stateless — its state is in the DB, so it restarts and resumes.
+        </p>
+        <p>
+          My rule: <em>two steps, choreography; anything with money or more than about three steps, orchestration.</em>
+          When someone asks "why is order 12345 stuck," choreography makes you read five services and orchestration makes
+          you read one row. That's the whole argument.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"A user double-clicks 'Pay'. Two identical requests. What happens?"</summary>
+      <div class="answer">
+        <p>
+          Nothing bad, because the client attached an <strong>idempotency key</strong> — a UUID generated when the
+          checkout form <em>mounted</em>, not when the button was clicked, so both requests carry the same key.
+        </p>
+        <p>
+          Server side, I don't do check-then-act (both requests would check "seen this key?", both see no, both charge).
+          I let the database's unique constraint arbitrate: <code>INSERT INTO idempotency_key (key, status) VALUES (?,
+          'IN_PROGRESS') ON CONFLICT DO NOTHING</code>. Exactly one caller inserts a row. The winner charges the card and
+          then stores the response body against the key, in the same transaction as the payment row. The loser sees 0
+          rows inserted and either replays the stored response (if COMPLETED) or gets a 409 with a <code>Retry-After</code>
+          (if still IN_PROGRESS) — what it must <em>never</em> do is charge the card a second time.
+        </p>
+        <p>
+          I'd also pass the same idempotency key down to the payment provider, since Stripe and its peers implement
+          exactly this mechanism — so even a retry inside my own service can't produce a second charge at the PSP.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"When would you actually reach for ZooKeeper or etcd?"</summary>
+      <div class="answer">
+        <p>
+          When I need <strong>exactly one</strong> of something and two would be a correctness bug — one scheduler, one
+          controller, one compaction job — or when I need service discovery in a fleet where instances constantly come
+          and go, or a cluster/shard map that every node must see identically, or a fencing-token source with a real
+          guarantee behind it. They're small, strongly-consistent KV stores with consensus underneath, plus watches and
+          ephemeral keys. Not databases: megabytes and a few thousand writes/sec.
+        </p>
+        <p>
+          When it's <strong>overkill</strong>: when Postgres can already do it. Advisory locks, <code>SELECT … FOR
+          UPDATE</code>, a unique constraint, a conditional update — all linearizable, all free, all one fewer stateful
+          cluster to operate and back up. And if I'm on Kubernetes I already have etcd and DNS-based service discovery;
+          running a second coordination service on top would be silly.
+        </p>
+        <p>
+          The line I'd say: <em>"Most 'we need a distributed lock' requirements turn out to be 'we need a unique
+          constraint.'"</em>
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"Why can't you just use a longer timeout to tell if a node is dead?"</summary>
+      <div class="answer">
+        <p>
+          Because a timeout is a guess, not a fact — and lengthening it doesn't make the guess correct, it just moves you
+          along a trade-off curve. A node that doesn't reply might be dead, might be slow, might have had your request
+          dropped, or might have had its reply dropped; those four are indistinguishable from the caller's side. A short
+          timeout gives fast failover and frequent false positives (you fire a healthy node, and now two nodes are doing
+          its job). A long timeout gives fewer false positives and a longer outage window while everyone waits.
+        </p>
+        <p>
+          There's no value that eliminates both, which is FLP in practical clothing: with no bound on message delay you
+          cannot reliably distinguish crashed from slow, so you can't guarantee consensus. Real systems assume partial
+          synchrony, use timeouts anyway, and accept that the failure detector will sometimes be wrong.
+        </p>
+        <p>
+          <strong>The design consequence is the real answer:</strong> stop trying to make the detector perfect and make
+          the system correct <em>despite</em> a wrong detector. That's what fencing tokens, majority quorums and
+          idempotency are all for — they keep you safe when you've wrongly declared a live node dead.
+        </p>
+      </div>
+    </details>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="takeaways">What to remember</h2>
+
+    <p><strong>The one root cause.</strong> You cannot distinguish a slow node from a dead one. A timeout is a guess. Every
+    pattern on this page exists to keep the system correct <em>when that guess is wrong</em>.</p>
+
+    <p><strong>Where to go deep, and where to stop</strong> — the calibration, restated because it's worth money:</p>
+    <table>
+      <thead><tr><th>Topic</th><th>Depth</th><th>What that means in the room</th></tr></thead>
+      <tbody>
+        <tr><td>2PC vs saga · outbox · idempotency</td><td><span class="tier tier-1">CORE</span></td><td>Volunteer these unprompted in any payments, orders, booking or inventory design. They decide fintech loops.</td></tr>
+        <tr><td>Fencing tokens · distributed locks</td><td><span class="tier tier-1">CORE</span></td><td>Know why a TTL lock is unsafe and what fixes it. This is the answer that makes an interviewer look up.</td></tr>
+        <tr><td>Quorums (R + W &gt; N)</td><td><span class="tier tier-2">COMMON</span></td><td>Do the arithmetic out loud. Tie R and W to the workload.</td></tr>
+        <tr><td>Leader election · leases · split-brain</td><td><span class="tier tier-2">COMMON</span></td><td>"One writer means no conflicts" is the reason half of all systems have a leader.</td></tr>
+        <tr><td>ZooKeeper / etcd / Consul</td><td><span class="tier tier-2">COMMON</span></td><td>Name them, know what they're for, know when they're overkill.</td></tr>
+        <tr><td>Raft · Paxos · FLP · Two Generals</td><td><span class="tier tier-3">AWARENESS</span></td><td><strong>Name them in one clause and move on.</strong> Rat-holing here reads as junior, not deep.</td></tr>
+      </tbody>
+    </table>
+
+    <p><strong>The compressed recall list:</strong></p>
+    <ul>
+      <li><strong>R + W &gt; N</strong> ⇒ read and write sets overlap ⇒ reads see the latest write. N=3/W=2/R=2 is the balanced default. W=1 for cheap high-volume writes; R=1 for read-heavy config. Quorums give fresh reads, <em>not</em> transactions and <em>not</em> consensus.</li>
+      <li><strong>Leader = single writer = no write conflicts.</strong> Cost: bottleneck + failover gap. Leadership is a <strong>lease</strong>, and the lease duration is the same timeout trade-off in a new hat.</li>
+      <li><strong>Split-brain isn't fixed by a TTL.</strong> A GC pause longer than the lease gives you two live holders, and the pauser cannot notice it was paused. Only <strong>fencing tokens</strong> — a monotonic number the <em>resource</em> checks — actually stop the stale writer.</li>
+      <li><strong>Raft/Paxos:</strong> majority-based agreement on a replicated log. Clusters are 3 or 5 (majorities) and never 4. <em>"I'd use etcd or ZooKeeper rather than build one"</em> IS the expected answer. Consensus belongs on the control plane, never in the hot path.</li>
+      <li><strong>2PC:</strong> prepare → commit. Real atomicity. Fatal flaw: the coordinator dies after prepare and every participant blocks, holding locks, indefinitely. Synchronous, doesn't scale, no third parties. Still fine single-org, single-DC, XA, modest volume.</li>
+      <li><strong>Saga:</strong> local transactions + compensations. Never blocks; no isolation, so intermediate states are visible and you must design for them. A compensation is a <em>new business action</em> — you refund, you apologise, you don't rewind. Compensate in reverse order; put the irreversible steps last.</li>
+      <li><strong>Choreography</strong> (events, no coordinator, flow lives nowhere) vs <strong>orchestration</strong> (a coordinator, flow lives in one state machine). Money or 4+ steps ⇒ orchestration.</li>
+      <li><strong>Dual write = bug.</strong> DB + Kafka in one method silently drops events. Fix: <strong>outbox table in the same transaction</strong>, relay publishes at-least-once (poll with <code>FOR UPDATE SKIP LOCKED</code>, or CDC). Reap the table.</li>
+      <li><strong>Idempotency keys:</strong> client-generated, stable across retries, stored <em>with the response</em>. Let a <strong>unique constraint</strong> arbitrate concurrent duplicates — never check-then-act.</li>
+      <li><strong>"Exactly-once delivery is a myth; exactly-once <em>processing</em> is achievable."</strong> At-least-once + idempotent consumer = effectively-once. Kafka's EOS is real but stops at Kafka's boundary.</li>
+      <li><strong>The thread running through the whole page:</strong> whenever you can, <strong>push the invariant into the database</strong>. A unique constraint or a conditional update (<code>UPDATE … WHERE status='AVAILABLE'</code>) is atomic, durable, linearizable and free — and it beats every distributed lock you could build over the network. The boring answer is usually the correct one, and saying so out loud is the senior signal.</li>
+    </ul>
+  </section>
+
+  <nav class="page-nav">
+    <a href="04-partitioning-hashing.html">← 04 — Partitioning &amp; Consistent Hashing</a>
+    <a href="06-caching-queues-resilience.html">06 — Caching, Queues, Resilience &amp; Observability →</a>
+  </nav>
+
+</main>
+</body>
+</html>

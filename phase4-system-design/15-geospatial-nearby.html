@@ -1,0 +1,1958 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>15 — Design Nearby / Ride-Hailing (Uber, Yelp) | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <div class="breadcrumb"><a href="index.html">← Course Home</a></div>
+    <h1>15 — Design Nearby / Ride-Hailing (Uber, Yelp)</h1>
+    <p>The one where an ordinary index is useless. Archetype: <strong>geospatial indexing</strong> — crush two dimensions into one so a B-tree can do its job.</p>
+  </div>
+</header>
+
+<main class="container">
+
+  <section>
+    <h2>Why this matters in the interview</h2>
+    <p>
+      "Find things near me" is one question wearing a dozen costumes. <strong>Uber</strong> and <strong>Lyft</strong> (find drivers
+      near me). <strong>Yelp</strong> and Google Maps (find restaurants near me). <strong>DoorDash</strong> (find couriers near the
+      restaurant). <strong>Tinder</strong> (find people near me). <strong>Pokémon Go</strong> (find monsters near me). And every
+      enterprise version of the same thing that never gets a cute name — "find the nearest ATM," "find the nearest in-stock
+      warehouse," "which of our 4,000 retail stores can fulfil this order in under two hours," "which field technicians are within
+      30 minutes of this outage." Optum will ask you to find in-network providers near a member's ZIP. It is the same problem. Learn
+      the shape once here and you can walk into any of them.
+    </p>
+    <p>
+      What makes it a real interview question — and not just an API call — is a single uncomfortable fact you should state in the
+      first ninety seconds: <strong>a normal index cannot answer a proximity query.</strong> You know how a B-tree works; you spent a
+      whole phase on Postgres. An index sorts on <em>one</em> ordering key. Location is <em>two</em> numbers. An index on latitude
+      hands you a horizontal strip wrapped around the entire planet; an index on longitude hands you a vertical strip from pole to
+      pole; and the thing you actually want is the tiny intersection of the two. The database has to walk one of those enormous
+      strips and throw almost all of it away. <strong>The entire field of geospatial indexing exists for one reason: to reduce two
+      dimensions to one, so that an ordinary sorted index works again.</strong> Geohash, quadtrees, S2, H3 — every one of them is a
+      different answer to that same sentence. Once you see that, the techniques stop feeling like arbitrary trivia you have to
+      memorize and start feeling inevitable, which is exactly how you want to sound when you explain them.
+    </p>
+  </section>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ul>
+      <li><a href="#prompt">1. The prompt</a> — and the two problems hiding inside it</li>
+      <li><a href="#requirements">2. Requirements</a> — Yelp vs Uber: static search vs the write firehose ★</li>
+      <li><a href="#estimation">3. Estimation</a> — 250k location writes/sec, and what it forbids ★★</li>
+      <li><a href="#api">4. API design</a> — three endpoints, wildly different traffic profiles</li>
+      <li><a href="#data-model">5. Data model</a> — durable business data vs ephemeral hot state</li>
+      <li><a href="#hld">6. High-level design</a> — one ping and one search, end to end</li>
+      <li><a href="#deep-dive-1">7a. Deep dive: the geospatial index</a> ★★ — this is the interview</li>
+      <li><a href="#deep-dive-2">7b. Deep dive: the write firehose</a> ★★ — what makes Uber ≠ Yelp</li>
+      <li><a href="#deep-dive-3">7c. Deep dive: matching &amp; dispatch</a> ★ — tutorial 14's problem again</li>
+      <li><a href="#scaling">8. Scaling &amp; bottlenecks</a> — Friday night in Manhattan</li>
+      <li><a href="#tradeoffs">9. Trade-offs</a></li>
+      <li><a href="#followups">10. Follow-ups you should expect</a> — moving cars on the map, surge, ETA, three-sided markets</li>
+      <li><a href="#qa">Interview Q&amp;A</a></li>
+      <li><a href="#takeaways">What to remember</a></li>
+    </ul>
+  </div>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="prompt">1. The prompt</h2>
+
+    <p>The interviewer says:</p>
+
+<pre><code>  "Design Uber. A rider opens the app, sees nearby drivers, requests
+   a ride, and gets matched to one."
+</code></pre>
+
+    <p>
+      Or, at a less flashy company, the same question in a duller coat: <em>"Design Yelp's nearby-restaurant search."</em>
+      <em>"Design a store locator."</em> <em>"How would you find all delivery drivers within 2km of a restaurant?"</em> They are the
+      same archetype and you should say so — but they are <strong>not</strong> the same difficulty, and knowing exactly why is the
+      thing being tested.
+    </p>
+
+    <p>
+      There are <strong>two distinct problems</strong> hiding inside "design Uber," and a candidate who conflates them will produce a
+      mush of a design:
+    </p>
+
+    <ul>
+      <li>
+        <strong>(A) Static nearby search — the Yelp problem.</strong> You have a few million pins on a map. They basically never
+        move. Reads dominate massively. The whole question is: <em>what index answers "within 2km of this point" fast?</em> That is a
+        pure geospatial-indexing problem, and it's solved.
+      </li>
+      <li>
+        <strong>(B) Dynamic matching — the Uber problem.</strong> Every pin is a car, and <em>every car reports a new position every
+        four seconds.</em> Now the index isn't a static structure you build once and query a billion times — it's being rewritten
+        continuously, under you, while you query it. <strong>The write volume is the hard part.</strong> That, and only that, is what
+        makes Uber a genuinely different system from Yelp.
+      </li>
+    </ul>
+
+    <p>
+      Everything on this page hangs off that contrast. §7a solves (A) — the index. §7b solves (B) — the firehose. §7c solves the
+      thing neither of them solves: actually <em>claiming</em> a driver without giving him to two riders at once.
+    </p>
+
+    <div class="senior">Open like this: <em>"Sure. Before I draw anything — there are really two problems in here. One is the geospatial search: find entities near a point, which is hard because a B-tree indexes one dimension and location is two, so I'll need a spatial index. The other is that in Uber, unlike Yelp, the entities move — every driver pings a new location every few seconds, so I'm rewriting the index constantly. I suspect the write rate is the actual constraint, so let me do requirements and estimation, and I'll expect the numbers to tell us whether the location data can live in a database at all."</em> You have just named the archetype, named the twist, and predicted where the design will break — before drawing a single box. That is a 7-YOE opening.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="requirements">2. Requirements</h2>
+
+    <p>
+      Ask, but <strong>always propose the answer with the question</strong> — make their job to correct you, not to teach you. The
+      exchange as it actually goes:
+    </p>
+
+    <table>
+      <thead><tr><th>You ask</th><th>They answer</th><th>What it just forced</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><em>"Are the things I'm searching for static or moving? Restaurants that never move, or drivers that move constantly?"</em></td>
+          <td>Drivers. They move.</td>
+          <td><strong>The single most important question on the page.</strong> If they'd said "static," this is Yelp and I reach for PostGIS and go home. "Moving" means the index is under continuous rewrite and the write path is the design.</td>
+        </tr>
+        <tr>
+          <td><em>"How often does a driver report location? I'd assume every 3–5 seconds — call it 4."</em></td>
+          <td>Every 4 seconds, yes.</td>
+          <td>This is the number that generates the firehose in §3. Get it early; every later decision is downstream of it.</td>
+        </tr>
+        <tr>
+          <td><em>"Scale — 1 million drivers online at peak, roughly 1 million rides a day?"</em></td>
+          <td>Sounds right.</td>
+          <td>Anchors QPS on both sides. Note the asymmetry already: 1M rides/<em>day</em>, but 1M drivers pinging every 4 <em>seconds</em>.</td>
+        </tr>
+        <tr>
+          <td><em>"Do we need the driver's full historical trail, or only where they are right now?"</em></td>
+          <td>Right now, for matching. Trails are needed for billing and support disputes, but not in real time.</td>
+          <td><strong>Enormous.</strong> This is the interviewer's permission to <em>not durably persist every ping on the hot path</em>. Ask it explicitly — most candidates never do, and then spend the rest of the interview defending a write rate that Postgres cannot survive.</td>
+        </tr>
+        <tr>
+          <td><em>"Do I need to guarantee the matched driver is <strong>the</strong> nearest, or just a good one, fast?"</em></td>
+          <td>A good one, fast.</td>
+          <td>Kills the temptation to build a globally-correct nearest-neighbour system. Approximation is <em>allowed</em>, and that is what makes the whole thing tractable.</td>
+        </tr>
+        <tr>
+          <td><em>"Am I building the map/routing/ETA engine, or can I treat routing as an existing service?"</em></td>
+          <td>Treat it as a black box.</td>
+          <td><strong>The best scoping cut available.</strong> Road-graph shortest path is a whole other 45-minute question. Say you'll call <code>RoutingService.eta(a, b)</code> and move on.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>Functional requirements</h3>
+    <ul>
+      <li><strong>Driver reports location</strong> — high-frequency, fire-and-forget, from a mobile client.</li>
+      <li><strong>Rider sees nearby drivers</strong> — "show me available cars within ~2km of me," refreshed as they pan the map.</li>
+      <li><strong>Rider requests a ride</strong> → system finds candidate drivers nearby, ranks them, offers the ride, and one driver is <em>exclusively</em> matched to that rider.</li>
+      <li><strong>Driver accepts or declines</strong> — decline must re-match to the next candidate, quickly.</li>
+      <li>Once matched, both sides track each other live until pickup.</li>
+    </ul>
+
+    <h3>Explicitly out of scope (say this out loud)</h3>
+    <p>
+      Pricing and payments (that's tutorial 13 — an Uber ride ends in a payment, and I'd reuse the idempotent-charge design there),
+      routing/ETA internals, driver onboarding, ratings, the map tile rendering itself, and fraud. <strong>Naming what you're cutting
+      is worth as much as covering what you keep</strong> — it shows you know the surface area and chose deliberately rather than
+      forgetting.
+    </p>
+
+    <h3>Non-functional requirements — and these are the ones that decide the design</h3>
+    <table>
+      <thead><tr><th>Requirement</th><th>Target</th><th>Why it changes what you build</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Low read latency</strong></td>
+          <td>Nearby search &lt; 100ms; match assigned in a few seconds.</td>
+          <td>A rider is staring at a spinner with their thumb over the "cancel" button. This forbids a full-table scan and forbids a synchronous cross-shard fan-out on every keystroke of the map. It's why the index in §7a has to be genuinely good.</td>
+        </tr>
+        <tr>
+          <td><strong>Very high write throughput</strong></td>
+          <td>Hundreds of thousands of location writes/sec.</td>
+          <td>The defining constraint. It is what pushes location out of the durable database and into memory. §3 does the arithmetic; §7b does the design.</td>
+        </tr>
+        <tr>
+          <td><strong>Availability &gt; strong consistency</strong></td>
+          <td>Stale-by-a-few-seconds driver positions are fine.</td>
+          <td><strong>Say this sentence: "A driver's position is stale the instant I read it anyway — the car is still moving. Chasing strong consistency on a value that is <em>physically</em> obsolete on arrival is wasted effort. Nobody dies if I show a car 40 metres from where it really is."</strong> That single line buys you Redis, replication lag, eventual consistency, and no consensus protocol — an enormous amount of design freedom, purchased with one sentence of judgment.</td>
+        </tr>
+        <tr>
+          <td><strong>…except at the moment of matching</strong></td>
+          <td>Exactly one rider per driver. No exceptions.</td>
+          <td>The one place eventual consistency is unacceptable. Two riders assigned the same car is a product-destroying bug. This is <em>inventory contention</em> — tutorial 14's problem — and it gets §7c.</td>
+        </tr>
+        <tr>
+          <td><strong>Geographic locality</strong></td>
+          <td>A ride in Bangalore never touches a US datacenter.</td>
+          <td>Wonderfully, this problem <em>shards itself</em>. Nobody hails a cab across an ocean. That is a gift most systems don't get, and you should call it out.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="senior">The gift worth naming out loud: <em>"Notice this workload has perfect geographic partitioning built into the domain — a rider in Delhi will never be matched with a driver in Chicago. So unlike a social feed, where any user can interact with any user and the graph is global, my shard key is handed to me by physics. Almost every query is local to one region."</em> Compare that with tutorial 10, where the follow graph makes clean partitioning nearly impossible. Recognizing when a domain <em>gives</em> you a shard key — and when it refuses to — is exactly the judgment being graded.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="estimation">3. Estimation</h2>
+
+    <p>
+      Round aggressively and say you're rounding. The point of this section is not accuracy to two decimal places — it is to
+      <strong>derive a constraint that eliminates an entire class of designs</strong>. On this page, one number does that, and it does
+      it violently.
+    </p>
+
+    <h3>The write firehose</h3>
+
+<pre><code>  Active drivers at peak            1,000,000
+  Location ping interval            every 4 seconds
+
+  Location writes/sec  =  1,000,000 / 4  =  250,000 writes/sec
+</code></pre>
+
+    <p>
+      <strong>250,000 writes per second.</strong> Stop and stare at that. Then say what it means, because the number is worthless
+      until you draw the conclusions:
+    </p>
+
+    <ul>
+      <li>
+        <strong>(a) You are not writing this to Postgres.</strong> A well-tuned single Postgres instance does maybe 10k–20k simple
+        writes/sec — and these aren't simple: each one would have to update a <em>spatial index</em>, which means index churn,
+        page splits, WAL amplification, and vacuum pressure on every single row, forever. You'd need ~25+ shards doing nothing but
+        absorbing pings, and they'd still be the most miserable machines in the fleet. It's not a tuning problem; it's a category
+        error.
+      </li>
+      <li>
+        <strong>(b) Location is hot, ephemeral, in-memory state — not a durable record.</strong> A driver's position is a
+        <em>current value</em>, like a gauge, not a <em>fact to be preserved</em>, like a ledger entry. It's overwritten every 4
+        seconds and it's worthless 30 seconds later. That's a Redis-shaped object, not a Postgres-shaped one. 250k writes/sec across
+        a modest Redis cluster is comfortable — each shard does tens of thousands of ops/sec and you need a handful of shards, not
+        dozens.
+      </li>
+      <li>
+        <strong>(c) You may not need to persist every ping at all.</strong> Nobody asked for a real-time historical trail. If the
+        product needs trails for billing or disputes, that's an <em>offline</em> requirement served by an <em>asynchronous</em> path.
+        The hot path does not owe it anything.
+      </li>
+    </ul>
+
+    <div class="senior">Deriving "therefore I do not persist the pings" <em>from the arithmetic</em> is the strongest move available on this page, and almost nobody makes it. Say: <em>"250k writes/sec into a durable, spatially-indexed store isn't a scaling problem I want to solve — it's a requirement I want to delete. The location isn't a business record, it's a cache of where a car currently is. So I'll hold it in memory in Redis, overwrite it in place, and if we ever need the trail for billing I'll stream pings to Kafka and land them in cold storage asynchronously, completely off the hot path."</em> You just turned the hardest number in the problem into a non-problem by <strong>reclassifying the data</strong>, which is a far more senior move than sharding harder.</div>
+
+    <h3>The read side (and the asymmetry that defines the system)</h3>
+
+<pre><code>  Rides per day                     1,000,000
+  Ride requests/sec (avg)  =  1,000,000 / 86,400  ≈  12/sec
+  Peak (5× average)                 ≈ 60/sec
+
+  Riders browsing the map (open app, see cars, don't book).
+  Say 5× the number of bookers, each polling every ~5s:
+       ~5M sessions/day → tens of thousands of nearby-queries/sec at peak.
+       Call it  ~30k nearby-reads/sec.
+</code></pre>
+
+    <table>
+      <thead><tr><th>Path</th><th>Peak rate</th><th>Reaction</th></tr></thead>
+      <tbody>
+        <tr><td>Location writes (drivers)</td><td><strong>~250,000/sec</strong></td><td>The design driver. Everything bends around this.</td></tr>
+        <tr><td>Nearby reads (riders browsing)</td><td>~30,000/sec</td><td>Large but ordinary. Cache-and-index territory.</td></tr>
+        <tr><td>Ride requests (matching)</td><td><strong>~60/sec</strong></td><td><em>Trivially small.</em> Sixty per second. You could match rides on a laptop.</td></tr>
+      </tbody>
+    </table>
+
+    <p>
+      That table is the whole system in three rows, and the shape of it is deeply counter-intuitive — <strong>say the punchline out
+      loud</strong>:
+    </p>
+
+    <div class="note"><strong>The write:read ratio is inverted from every other system in this course.</strong> A URL shortener is 100:1 read-heavy. A news feed is read-heavy. Uber is the rare system where <em>writes outnumber reads by ~8:1</em> — and where the <em>business-critical</em> operation (matching a ride) is the <em>rarest</em> thing that happens. 250,000 telemetry writes/sec exist purely to support 60 matches/sec. That means: <strong>spend your engineering on making the writes cheap, not on making the matches fast.</strong> Candidates who spend twenty minutes optimizing a matching algorithm that runs 60 times a second have optimized the wrong thing, and the interviewer will notice.</div>
+
+    <h3>Storage &amp; memory</h3>
+
+<pre><code>  Current-location state, per driver:
+    driverId (8B) + lat (8B) + lng (8B) + heading/status/ts (~16B)
+    ≈ 40 bytes of payload; call it ~100 B with Redis overhead
+
+  1M drivers × 100 B  ≈  100 MB    ← the entire live world fits in RAM.
+
+  If you DID persist every ping (don't, but price it so you can say why):
+    250k/sec × 50 B  = 12.5 MB/sec
+                     ≈ 1 TB/day
+                     ≈ 400 TB/year   ← of data nobody reads.
+</code></pre>
+
+    <p>
+      Those two numbers next to each other are the argument, and they're brutal. <strong>The entire live state of every driver on
+      Earth is ~100 MB — it fits in the RAM of a laptop.</strong> The <em>history</em> of that same state is a terabyte a day.
+      Presenting both is how you make "keep it in memory, don't persist it" land as obvious rather than lazy. And if you're forced to
+      keep trails: compress them (store a polyline per trip, not 900 independent points), tier them to S3/object storage, and expire
+      them per your retention policy.
+    </p>
+
+    <h3>Bandwidth</h3>
+<pre><code>  Inbound pings:  250k/sec × ~200 B (HTTP/gRPC framing included)
+                  ≈ 50 MB/sec  ≈ 400 Mbps  — fine.
+
+  Outbound to riders watching cars move on the map:
+      THIS is the one that can hurt. See §10 — you do NOT
+      stream every driver's every ping to every nearby rider.
+</code></pre>
+
+    <p>
+      Inbound is comfortable. The naive <em>outbound</em> — push every driver's position to every rider watching that area — is a
+      fan-out multiplier that can dwarf the inbound firehose, and it's a favourite follow-up. Flag it here, kill it in §10.
+    </p>
+
+    <div class="pitfall">The candidate who reports "250k writes/sec" and then moves on to draw boxes has wasted the number. An estimate you don't <em>use</em> is theatre. Every single figure you compute must immediately be followed by "…therefore." 250k writes/sec → <em>therefore</em> not a durable DB → <em>therefore</em> in-memory → <em>therefore</em> Redis → <em>therefore</em> I need to talk about what happens when Redis loses a node. That chain <strong>is</strong> the design, and it's the difference between reciting an architecture and deriving one.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="api">4. API design</h2>
+
+    <p>
+      Three endpoints carry the product. What's interesting is how <em>wildly</em> their traffic profiles differ — 250,000/sec,
+      30,000/sec, and 60/sec — and how differently you therefore treat them. Point that out; it's free credit.
+    </p>
+
+    <h3>1. Driver reports location — the firehose</h3>
+
+<pre><code>POST /v1/drivers/location
+Authorization: Bearer &lt;driver_jwt&gt;
+
+{
+  <span class="str">"lat"</span>: 37.7749,
+  <span class="str">"lng"</span>: -122.4194,
+  <span class="str">"heading"</span>: 138,          <span class="com">// degrees; lets the client draw the car facing right</span>
+  <span class="str">"speed"</span>: 12.4,           <span class="com">// m/s</span>
+  <span class="str">"ts"</span>: 1752480000123,     <span class="com">// client clock; server records its own too</span>
+  <span class="str">"status"</span>: <span class="str">"AVAILABLE"</span>  <span class="com">// AVAILABLE | ON_TRIP | OFFLINE</span>
+}
+
+→ <span class="num">202</span> Accepted     <span class="com">// no body. Nothing to say. Don't make it read.</span>
+</code></pre>
+
+    <p>Design notes worth saying out loud, because each one is a small piece of judgment:</p>
+    <ul>
+      <li>
+        <strong>Fire-and-forget.</strong> <code>202</code>, empty body, no round-trip payload. At 250k/sec, even 200 bytes of
+        response body is 50 MB/sec of egress bought for nothing.
+      </li>
+      <li>
+        <strong>Don't retry a stale ping.</strong> If a ping fails, the client should <em>drop it</em>, not retry — four seconds later
+        there's a fresher one, and a retried ping is by definition out-of-date. This is the opposite instinct from tutorial 12
+        (notifications), where every message must eventually land. <strong>Say the contrast explicitly:</strong> <em>"Location is
+        last-write-wins telemetry, not a durable event — retrying a stale one actively makes things worse, because an out-of-order
+        arrival could overwrite a newer position with an older one."</em> Which leads directly to…
+      </li>
+      <li>
+        <strong>Guard against out-of-order arrival with the timestamp.</strong> Two pings in flight on a flaky mobile network can
+        arrive backwards. Write only if <code>incoming.ts &gt; stored.ts</code>. This is exactly the version-check /
+        compare-and-set discipline from tutorial 05 — the same idea as an optimistic-locking version column, applied to a Redis key.
+      </li>
+      <li>
+        <strong>Consider a persistent connection.</strong> At one HTTP request every 4 seconds per driver, TLS handshakes and
+        connection setup become a real cost. Production Uber uses a long-lived connection (they built a protocol on it) rather than a
+        fresh HTTP POST per ping. Mentioning it — <em>"in production I'd hold a persistent gRPC or WebSocket connection per driver and
+        stream pings over it, since re-establishing TLS 250,000 times a second is absurd"</em> — is a strong callback to tutorial 02
+        and costs you one sentence.
+      </li>
+    </ul>
+
+    <h3>2. Rider searches nearby drivers — the read</h3>
+
+<pre><code>GET /v1/drivers/nearby?lat=37.7749&amp;lng=-122.4194&amp;radius=2000&amp;limit=20
+                                                  <span class="com">// radius in metres</span>
+
+→ <span class="num">200</span> OK
+{
+  <span class="str">"drivers"</span>: [
+    { <span class="str">"id"</span>: <span class="str">"d_8812"</span>, <span class="str">"lat"</span>: 37.7761, <span class="str">"lng"</span>: -122.4180,
+      <span class="str">"heading"</span>: 90, <span class="str">"distanceM"</span>: 210, <span class="str">"etaSec"</span>: 120 },
+    ...
+  ],
+  <span class="str">"cachedFor"</span>: 5   <span class="com">// tell the client how long it may reuse this</span>
+}
+</code></pre>
+
+    <p>
+      Note what is <em>not</em> in that response: the driver's name, phone number, photo, or rating. <strong>Before a match, a rider
+      has no business knowing who any of those cars are</strong> — those are dots on a map, not people. Leak identity here and you've
+      built a stalking tool. Say that; privacy-by-design in an API shape is a genuinely senior instinct and interviewers remember it.
+    </p>
+
+    <div class="note"><strong>The cars on the rider's map are cosmetic.</strong> Uber has admitted this publicly: the little cars you see circling before you book are approximate, sometimes decorative. They exist to communicate "there is supply here," not to be a truthful real-time census. That means the nearby-read can be <em>heavily cached</em> (5–10 seconds is invisible to a human eye watching a car crawl across a map) and served slightly stale with zero product harm. <strong>Recognizing which reads are cosmetic and which are load-bearing is a cache-design superpower</strong> — you spend consistency where it buys something and nowhere else.</div>
+
+    <h3>3. Rider requests a ride — the rare, precious write</h3>
+
+<pre><code>POST /v1/rides/request
+Idempotency-Key: 7f3c2a91-...      <span class="com">// tutorial 13. A double-tap must not</span>
+                                   <span class="com">// create two rides.</span>
+{
+  <span class="str">"pickup"</span>:  { <span class="str">"lat"</span>: 37.7749, <span class="str">"lng"</span>: -122.4194 },
+  <span class="str">"dropoff"</span>: { <span class="str">"lat"</span>: 37.8044, <span class="str">"lng"</span>: -122.2712 },
+  <span class="str">"productType"</span>: <span class="str">"UBERX"</span>
+}
+
+→ <span class="num">202</span> Accepted
+{ <span class="str">"rideId"</span>: <span class="str">"r_5521"</span>, <span class="str">"status"</span>: <span class="str">"MATCHING"</span> }
+
+<span class="com">// Matching is ASYNC. The rider then watches for the result over a</span>
+<span class="com">// WebSocket / SSE stream — this is the spinner they stare at.</span>
+GET /v1/rides/r_5521/events   (SSE)
+   → { <span class="str">"status"</span>: <span class="str">"MATCHING"</span> }
+   → { <span class="str">"status"</span>: <span class="str">"DRIVER_ASSIGNED"</span>, <span class="str">"driver"</span>: {...}, <span class="str">"etaSec"</span>: 240 }
+</code></pre>
+
+    <p>
+      <strong>Do not make this endpoint synchronous.</strong> Matching involves offering the ride to a driver and waiting for them to
+      tap "accept" — a <em>human</em> is in the loop, and humans take seconds. You cannot hold an HTTP request open across a person's
+      reaction time, and if the first driver declines you need to loop to a second. So: accept the request, return a
+      <code>rideId</code> immediately, and push the outcome over a stream (tutorial 11's machinery — you already have a persistent
+      connection to both apps for live tracking, so reuse it). This is one of those design choices that looks like a small API detail
+      and is actually a statement about the whole architecture: <em>the human is the slow component, so the protocol must be
+      asynchronous.</em>
+    </p>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="data-model">5. Data model</h2>
+
+    <p>
+      The single most important sentence in this section, and you should lead with it: <strong>this system has two kinds of data with
+      almost nothing in common, and the entire design depends on refusing to store them the same way.</strong>
+    </p>
+
+    <table>
+      <thead><tr><th></th><th>Hot / ephemeral state</th><th>Cold / durable records</th></tr></thead>
+      <tbody>
+        <tr><td><strong>What</strong></td><td>Where every driver is <em>right now</em>. Who is available.</td><td>Rides, riders, drivers, fares, ratings, receipts.</td></tr>
+        <tr><td><strong>Write rate</strong></td><td>250,000/sec</td><td>~60/sec</td></tr>
+        <tr><td><strong>Lifetime</strong></td><td>4 seconds, then overwritten</td><td>Forever (7 years, in some jurisdictions)</td></tr>
+        <tr><td><strong>If you lose it</strong></td><td>Drivers re-ping in 4 seconds and it heals itself.</td><td><strong>You are in a courtroom.</strong></td></tr>
+        <tr><td><strong>Store</strong></td><td><strong>Redis</strong> (in-memory, geo-indexed)</td><td><strong>Postgres</strong> (ACID, relational, boring, correct)</td></tr>
+      </tbody>
+    </table>
+
+    <div class="senior">That "if you lose it" row is the whole argument, and it's the sentence to deliver: <em>"Driver locations are self-healing — if I drop the entire Redis cluster, every driver re-pings within four seconds and the system reconstructs itself from nothing. So I don't need durability there at all; I need speed. Ride records are the opposite: I lose one and there's no way to reconstruct it, and it's a financial and legal record. Same product, opposite storage requirements — so they get opposite databases."</em> <strong>Deriving the storage choice from the recovery story, rather than from a "SQL vs NoSQL" checklist, is exactly the reasoning senior interviews are trying to surface.</strong></div>
+
+    <h3>Hot state — Redis</h3>
+
+<pre><code><span class="com"># One geo-indexed sorted set per region/city. This is the live index.</span>
+GEOADD  drivers:available:sf   -122.4194  37.7749   d_8812
+GEOADD  drivers:available:sf   -122.4010  37.7900   d_9134
+
+<span class="com"># Query: everyone within 2km of the rider, nearest first</span>
+GEOSEARCH drivers:available:sf
+          FROMLONLAT -122.4194 37.7749
+          BYRADIUS 2 km ASC COUNT 20
+
+<span class="com"># A driver's full current state (a hash, so fields update independently)</span>
+HSET driver:d_8812  lat 37.7749  lng -122.4194  heading 138
+                    status AVAILABLE  ts 1752480000123  rideId ""
+EXPIRE driver:d_8812 30    <span class="com"># TTL = automatic offline detection.</span>
+                           <span class="com"># No ping for 30s (7 missed pings) → the key</span>
+                           <span class="com"># evaporates → the driver is gone. You get</span>
+                           <span class="com"># failure detection for free, with no heartbeat</span>
+                           <span class="com"># service and no reaper job. Say this — it's a</span>
+                           <span class="com"># small piece of design elegance and it lands.</span>
+</code></pre>
+
+    <p>
+      Redis <code>GEOADD</code>/<code>GEOSEARCH</code> are not magic: under the hood a geo set <em>is</em> a plain sorted set whose
+      score is the <strong>52-bit geohash of the point</strong>. That's it. Redis is doing precisely the 2D→1D reduction this page is
+      about, and then leaning on the ordinary sorted-set range scan it already had. <strong>Knowing that Redis GEO is "just a sorted
+      set keyed by geohash" is the exact detail that proves you understand §7a rather than having memorized a command name</strong> —
+      and it's a fantastic thing to volunteer unprompted.
+    </p>
+
+    <h3>Cold records — Postgres</h3>
+
+<pre><code><span class="kw">CREATE TABLE</span> rides (
+  id             <span class="typ">BIGINT</span> <span class="kw">PRIMARY KEY</span>,
+  rider_id       <span class="typ">BIGINT</span> <span class="kw">NOT NULL REFERENCES</span> riders(id),
+  driver_id      <span class="typ">BIGINT</span>          <span class="kw">REFERENCES</span> drivers(id),  <span class="com">-- null until matched</span>
+  status         <span class="typ">TEXT</span> <span class="kw">NOT NULL</span>,   <span class="com">-- MATCHING|ASSIGNED|ON_TRIP|DONE|CANCELLED</span>
+  pickup_lat     <span class="typ">DOUBLE PRECISION</span> <span class="kw">NOT NULL</span>,
+  pickup_lng     <span class="typ">DOUBLE PRECISION</span> <span class="kw">NOT NULL</span>,
+  dropoff_lat    <span class="typ">DOUBLE PRECISION</span>,
+  dropoff_lng    <span class="typ">DOUBLE PRECISION</span>,
+  fare_cents     <span class="typ">BIGINT</span>,
+  requested_at   <span class="typ">TIMESTAMPTZ</span> <span class="kw">NOT NULL DEFAULT</span> now(),
+  idempotency_key <span class="typ">TEXT</span> <span class="kw">UNIQUE</span>       <span class="com">-- tutorial 13</span>
+);
+
+<span class="kw">CREATE TABLE</span> drivers (
+  id             <span class="typ">BIGINT</span> <span class="kw">PRIMARY KEY</span>,
+  name           <span class="typ">TEXT</span>,
+  vehicle        <span class="typ">JSONB</span>,
+  rating         <span class="typ">NUMERIC</span>(<span class="num">2</span>,<span class="num">1</span>),
+  acceptance_rate <span class="typ">NUMERIC</span>(<span class="num">3</span>,<span class="num">2</span>),   <span class="com">-- used by ranking in §7c</span>
+  current_ride_id <span class="typ">BIGINT</span>          <span class="com">-- the exclusivity claim; see §7c</span>
+);
+
+<span class="com">-- Note what is NOT here: a location column, and no index on one.</span>
+<span class="com">-- Location never touches this database. That absence is the design.</span>
+</code></pre>
+
+    <div class="pitfall">The instinctive answer — <code>ALTER TABLE drivers ADD COLUMN location GEOGRAPHY</code>, add a GiST index, <code>UPDATE</code> it every 4 seconds — is the trap this entire question is built to catch. It's not that it's slow; it's that <strong>you'd be re-indexing a million rows every four seconds in a B-tree-descended structure designed for data that mostly sits still.</strong> Index maintenance, WAL amplification, page splits, dead tuples, autovacuum falling permanently behind. Postgres is a superb database being asked to do something it was never designed for. <strong>Say that out loud rather than just quietly not doing it</strong> — the interviewer wants to know you <em>considered and rejected</em> it, not that you never thought of it.</div>
+
+    <h3>The trail (only if asked for)</h3>
+<pre><code>  Driver pings ──▶ Kafka topic "driver.location"  (fire and forget)
+                        │
+                        ├──▶ [hot path]  Redis GEO   ← matching reads this
+                        │
+                        └──▶ [cold path] batch consumer ──▶ S3 / Cassandra
+                                     (compressed polyline per trip,
+                                      partitioned by day; nobody reads
+                                      it except billing disputes)
+</code></pre>
+    <p>
+      The trail is a <em>by-product</em>, never a prerequisite. If the cold consumer is down for an hour, rides still match perfectly —
+      it catches up from Kafka's retention later. That decoupling (tutorial 06, tutorial 18) is what buys you the ability to have
+      durable history <em>and</em> a 250k/sec hot path that never blocks on a disk.
+    </p>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="hld">6. High-level design</h2>
+
+    <p>
+      Draw the two paths <strong>separately</strong>. They share almost nothing, they have wildly different traffic profiles, and
+      forcing them into one diagram is how you end up with an unreadable box-and-arrow spaghetti that hides the actual insight. Two
+      clean diagrams beat one heroic one — and drawing them apart is itself the argument that they're different systems.
+    </p>
+
+    <h3>Path 1 — the location write path (250k/sec)</h3>
+
+<pre><code>  1M Driver apps
+       │  POST /drivers/location  every 4s (persistent conn)
+       ▼
+  ┌──────────────┐
+  │ Load Balancer│
+  └──────┬───────┘
+         ▼
+  ┌──────────────────┐   overwrite in place, keyed by driverId
+  │ Location Service │──────────────┬───────────────────────┐
+  │ (stateless, ~100 │              │                       │
+  │  small pods)     │              ▼                       ▼
+  └──────────────────┘     ┌──────────────────┐    ┌────────────────┐
+                           │ Redis GEO cluster│    │ Kafka          │
+                           │ sharded by region│    │ driver.location│
+                           │ ~100MB total     │    │ (async, cold)  │
+                           │ TTL 30s per key  │    └───────┬────────┘
+                           └──────────────────┘            │
+                             ▲ THE LIVE INDEX              ▼
+                             │ (matching reads this)   S3 / Cassandra
+                                                       (trails, billing)
+</code></pre>
+
+    <p><strong>Walk one ping through it, out loud:</strong></p>
+    <ol>
+      <li>Driver's phone emits <code>{lat, lng, ts, status}</code> over its persistent connection.</li>
+      <li>The Location Service — <strong>stateless, trivially horizontally scalable, the easiest tier in the system</strong> — receives it.</li>
+      <li>It checks <code>ts &gt; stored_ts</code> (drop out-of-order stragglers), then <code>GEOADD</code>s into the Redis set for that
+        driver's region and refreshes the 30-second TTL on their state hash.</li>
+      <li>It fires the ping into Kafka, <em>asynchronously and without waiting</em>. If Kafka is down, the ping is dropped and the
+        <strong>rider-facing system does not care at all</strong>. Only the billing trail gets a hole in it — and that's a
+        business-continuity conversation, not an outage.</li>
+      <li>Returns <code>202</code>. Total server work: two Redis ops and a buffered Kafka append. <strong>Sub-millisecond.</strong> That is
+        why 250k/sec is survivable — you made the unit of work almost nothing.</li>
+    </ol>
+
+    <div class="senior">Say this, because it reframes the scariest number in the problem: <em>"250k writes/sec sounds terrifying until you look at what one write actually costs: a single in-memory sorted-set insert and a buffered append. There's no transaction, no disk flush, no lock, no index rebuild, no downstream call in the critical path. The way you survive a firehose isn't a bigger pipe — it's making each drop weigh nothing."</em> <strong>Reducing the cost of the unit of work beats scaling the number of workers</strong>, and that principle generalizes far past this question.</div>
+
+    <h3>Path 2 — the read &amp; match path (60 rides/sec)</h3>
+
+<pre><code>  Rider app
+     │ GET /drivers/nearby            POST /rides/request
+     ▼                                       │
+  ┌────────────┐                             ▼
+  │ API Gateway│                    ┌──────────────────┐
+  └─────┬──────┘                    │ Matching Service │
+        ▼                           └────────┬─────────┘
+  ┌──────────────┐                           │ 1. who's near pickup?
+  │Nearby Service│◀──────────┐               ▼
+  └──────┬───────┘           │      ┌──────────────────┐
+         │ GEOSEARCH         └──────│ Redis GEO cluster│
+         ▼                          └────────┬─────────┘
+  ┌──────────────┐                           │ 2. rank by ETA
+  │ Redis GEO    │                           ▼    (call RoutingService)
+  └──────────────┘                  ┌──────────────────┐
+   (+5s edge cache — the cars       │ Offer to driver#1│──▶ push to driver app
+    on the map are cosmetic)        │ CLAIM atomically │    (WebSocket, 15s
+                                    └────────┬─────────┘     to accept)
+                                             │ 3. accepted
+                                             ▼
+                                    ┌──────────────────┐
+                                    │ Postgres: rides  │──▶ SSE to rider:
+                                    │ status=ASSIGNED  │    "DRIVER_ASSIGNED"
+                                    └──────────────────┘
+</code></pre>
+
+    <p><strong>Walk one ride request through it, out loud:</strong></p>
+    <ol>
+      <li><strong>Rider taps "Request."</strong> Gateway → Matching Service. A <code>rides</code> row is written with
+        <code>status=MATCHING</code> (durable from the first instant — if the matcher crashes mid-flight, a recovery job can pick this
+        row back up; an in-memory-only request would simply vanish and leave a rider staring at a dead spinner forever).</li>
+      <li><strong>Candidate lookup.</strong> <code>GEOSEARCH</code> the pickup point, radius 2km, <code>status=AVAILABLE</code>. Comes back
+        in ~1ms with, say, 30 cars. This is the geospatial index doing its one job — §7a is entirely about how this query is possible
+        at all.</li>
+      <li><strong>Rank.</strong> Not by straight-line distance — by <strong>ETA</strong> (call the routing black box for the top ~10
+        candidates), blended with acceptance rate and a few fairness signals. §7c.</li>
+      <li><strong>Offer &amp; claim.</strong> Push the offer to candidate #1 over their open connection. <strong>Atomically claim the
+        driver first</strong> so no concurrent match can also offer them — this is the race, and it's tutorial 14 wearing a new hat.
+        Give them ~15 seconds to accept.</li>
+      <li><strong>Accepted</strong> → remove the driver from the available geo set, write <code>rides.status=ASSIGNED</code>, push
+        <code>DRIVER_ASSIGNED</code> to the rider's stream, and both apps start live-tracking each other. <strong>Declined or timed
+        out</strong> → release the claim, move to candidate #2, repeat. The rider is still watching a spinner and knows nothing about
+        any of this, which is exactly right.</li>
+    </ol>
+
+    <div class="note">Notice how <strong>small</strong> the matching service is. Sixty requests per second, each doing one Redis query, ~10 routing calls, and a database write. This is the <em>business</em> — the thing the company actually sells — and it's a rounding error in load. All the engineering muscle in this design goes into the telemetry pipe that <em>feeds</em> it. That inversion is characteristic of the whole archetype: in "find things near me" systems, <strong>the plumbing is the hard part and the product is the easy part.</strong></div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="deep-dive-1">7a. Deep dive: the geospatial index</h2>
+
+    <p><strong>This is where the interview really happens.</strong> Everything above was setup. If you get pushed into exactly one
+      thing on this question, it's this, and there is a fixed script for it: show why the obvious thing fails, then show the family of
+      fixes, then pick one and defend it.</p>
+
+    <h3>Why the naive approach fails</h3>
+
+    <p>The instinct is a bounding box in SQL. Everyone writes this first:</p>
+
+<pre><code><span class="kw">SELECT</span> id, lat, lng <span class="kw">FROM</span> drivers
+<span class="kw">WHERE</span> lat <span class="kw">BETWEEN</span> <span class="num">37.757</span> <span class="kw">AND</span> <span class="num">37.793</span>      <span class="com">-- ±2km in latitude</span>
+  <span class="kw">AND</span> lng <span class="kw">BETWEEN</span> -<span class="num">122.442</span> <span class="kw">AND</span> -<span class="num">122.397</span>; <span class="com">-- ±2km in longitude</span>
+</code></pre>
+
+    <p>
+      It returns the right rows. It is also a <strong>poor index user</strong>, and explaining <em>precisely why</em> is the moment you
+      demonstrate that your Postgres phase actually stuck. Here's the reasoning, and it's worth being exact about:
+    </p>
+
+    <ul>
+      <li>
+        <strong>A B-tree sorts on one ordering key.</strong> An index on <code>lat</code> can find "all rows with latitude between
+        37.757 and 37.793" beautifully — but that band is <strong>a 4km-tall strip that wraps the entire circumference of the
+        Earth.</strong> It contains San Francisco, and also Seville, Athens, and Seoul. An index on <code>lng</code> gives you a
+        pole-to-pole strip through both hemispheres. Each index, on its own, is nearly useless — it eliminates one dimension and
+        leaves the other completely unconstrained.
+      </li>
+      <li>
+        <strong>A composite index <code>(lat, lng)</code> doesn't rescue you.</strong> A composite B-tree can only range-scan on its
+        <em>leading</em> column and then filter; the second column is only usable as a range once the first is fixed to a single
+        value. So it seeks to <code>lat = 37.757</code>, and from there it must walk <em>every</em> row in ascending
+        <code>(lat, lng)</code> order to <code>lat = 37.793</code> — scanning every longitude on Earth at each latitude in the band —
+        checking each one against the longitude predicate. You've read a hemisphere to find a neighbourhood.
+      </li>
+      <li>
+        <strong>Two separate indexes + intersection is worse than it sounds.</strong> Postgres <em>can</em> do a bitmap-AND across two
+        indexes. But it must materialize a bitmap of the horizontal strip (millions of rows) and a bitmap of the vertical strip
+        (millions of rows) and intersect them to find the few hundred in both. <strong>You did megabytes of work to answer a query
+        whose answer is 20 rows.</strong> The planner knows this, which is why it will often shrug and pick a sequential scan instead.
+      </li>
+      <li>
+        <strong>The box isn't a circle.</strong> Even when it works, a bounding box is a <em>square</em>, and "within 2km" is a
+        <em>circle</em>. The corners of the box are 2 × √2 ≈ <strong>2.83km</strong> away — up to 41% too far. The square has ~27% more
+        area than the inscribed circle, so roughly a quarter of your results are spurious. So <strong>you must always post-filter the
+        candidate set by true great-circle (haversine) distance.</strong> Every geospatial index has this property — <em>the index
+        gives you candidates, geometry gives you the answer.</em> Say that sentence; it's the general principle, not a detail.
+      </li>
+    </ul>
+
+    <div class="senior">The sentence that opens this deep dive and earns you the room: <em>"The core problem is that a B-tree is a one-dimensional structure and a location is two numbers. Indexing latitude gives me a strip around the whole planet; indexing longitude gives me a strip pole to pole; intersecting them means scanning both and throwing nearly all of it away. So every geospatial index — geohash, quadtree, S2, H3 — is doing the same one trick: <strong>mapping two dimensions down to one</strong>, in a way that keeps nearby points nearby in the 1D ordering. Once you've done that, an ordinary sorted index works again and the whole problem dissolves."</em> <strong>That single framing makes every technique below feel inevitable instead of arbitrary</strong> — and it is, verbatim, the thing the interviewer is hoping to hear.</div>
+
+    <h3>Approach 1 — Geohash</h3>
+
+    <p>
+      <strong>How it works.</strong> Recursively cut the world in half, alternating between longitude and latitude, and record each
+      binary choice as a bit.
+    </p>
+
+<pre><code>  Longitude, range [-180, 180]:  is -122.4 in the left half or right half?
+      Left  [-180,   0)  → bit 0    ✓  (-122.4 is here)
+      Right [   0, 180]  → bit 1
+
+  Latitude, range [-90, 90]:     is 37.77 in the bottom or top half?
+      Bottom [-90, 0)  → bit 0
+      Top    [  0, 90] → bit 1      ✓  (37.77 is here)
+
+  Now halve the surviving range and repeat, ALTERNATING axes.
+  You are INTERLEAVING the bits of longitude and latitude:
+
+      lng bits:   0   1   1   0   1 ...
+      lat bits:     1   0   1   1   0 ...
+      interleaved: 0 1 1 0 1 1 0 1 1 0 ...   ← ONE number. 2D → 1D.
+
+  Group into 5-bit chunks, encode each as one base32 character:
+
+      San Francisco (37.7749, -122.4194)  →  "9q8yyk8yuv"
+</code></pre>
+
+    <p>
+      <strong>The magic property — and it's the whole point:</strong> <strong>a shared string prefix means spatial proximity.</strong>
+      Each character you add subdivides the previous cell further, so every geohash starting with <code>9q8y</code> lies
+      <em>inside</em> the cell <code>9q8y</code>. <code>9q8yy</code> is a smaller box nested inside <code>9q8y</code>, which is nested
+      inside <code>9q8</code>, which is nested inside <code>9q</code>.
+    </p>
+
+<pre><code>  9q        ┌───────────────────────────┐   ~1250 km  (California-ish)
+            │  9q8   ┌──────────┐        │
+            │        │ 9q8y ┌──┐│        │   ~20 km  (the Bay Area)
+            │        │      │▓▓││        │   ~2.4 km (a few SF blocks)
+            │        │      └──┘│        │      ▓ = 9q8yy
+            │        └──────────┘        │
+            └───────────────────────────┘
+
+  Therefore:  "find everything near 9q8yy"
+              ≡  SELECT * FROM drivers WHERE geohash LIKE '9q8yy%'
+              ≡  a PREFIX RANGE SCAN on an ordinary B-tree.
+
+  You have turned a 2D proximity query into a 1D range scan.
+  A boring, hundred-year-old sorted index can now answer it.
+  THAT is the entire trick, and every other scheme is a variation on it.
+</code></pre>
+
+    <p><strong>Precision table</strong> — memorize the rough shape of this; interviewers ask "what length would you use?" and a
+      confident "6 characters, about a kilometre" is a good look:</p>
+
+    <table>
+      <thead><tr><th>Geohash length</th><th>Cell size (approx)</th><th>Use it for</th></tr></thead>
+      <tbody>
+        <tr><td>4</td><td>~39 km × 20 km</td><td>City / metro region. A shard key.</td></tr>
+        <tr><td>5</td><td>~5 km × 5 km</td><td>Neighbourhood. Coarse "nearby."</td></tr>
+        <tr><td><strong>6</strong></td><td><strong>~1.2 km × 0.6 km</strong></td><td><strong>The sweet spot for a 2km ride-hail radius</strong> — a handful of cells covers the query, each with a manageable number of drivers.</td></tr>
+        <tr><td>7</td><td>~150 m × 150 m</td><td>A city block. Precise "nearby" in a dense city.</td></tr>
+        <tr><td>8</td><td>~38 m × 19 m</td><td>A building. Deliveries, precise pickup.</td></tr>
+        <tr><td>9+</td><td>&lt; 5 m</td><td>Overkill; GPS itself is only accurate to ~5m.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="pitfall"><strong>The edge case interviewers love — say it before they ask.</strong> <strong>Two points can be metres apart and share no prefix at all.</strong> A cell boundary is a hard cliff: cross it and the string changes completely. The cleanest example is the equator — a point just north and a point just south differ in the <em>very first latitude bit</em>, so their geohashes diverge at character one, despite being 10cm apart. The same happens at every cell boundary at every level, and city-scale boundaries run straight through real neighbourhoods. <strong>A naive prefix query silently misses the closest driver, who is parked just across the invisible line.</strong> Silently, is the scary word.
+
+    <p style="margin-top:.6rem"><strong>The fix, which you volunteer unprompted:</strong> query the target cell <em>and all 8 of its neighbours</em> — the 3×3 block around you. Every geohash library ships a <code>neighbors()</code> function precisely because of this, which itself tells you how universal the problem is. Then post-filter all 9 cells' worth of candidates by true haversine distance. Cost: 9 index lookups instead of 1 — trivial, and they parallelize. Correctness: restored.</p>
+</div>
+
+<pre><code>   ┌──────┬──────┬──────┐    You are the ▓ in the centre cell.
+   │  NW  │  N   │  NE  │    A driver 50m away can be in ANY of
+   ├──────┼──────┼──────┤    the 8 neighbours with a totally
+   │  W   │  ▓▓  │  E   │    different geohash string.
+   ├──────┼──────┼──────┤
+   │  SW  │  S   │  SE  │    So: query all 9, then filter by
+   └──────┴──────┴──────┘    real distance. Never query just one.
+</code></pre>
+
+    <p>
+      <strong>Trade-offs.</strong> Dead simple, works on any B-tree, any KV store, any sorted set — it needs no special database
+      support whatsoever, which is why it's everywhere (and why Redis GEO is built on it). But: cells are <strong>fixed-size</strong>,
+      so a downtown cell may hold 5,000 drivers while a rural cell of identical size holds none — it does not adapt to density. It has
+      the <strong>boundary problem</strong> above. And cells get badly distorted near the poles (they're lat/lng rectangles on a
+      sphere, so a "square" at 60° latitude is nothing of the sort).
+    </p>
+
+    <h3>Approach 2 — Quadtree</h3>
+
+    <p>
+      <strong>How it works.</strong> Recursively subdivide a region into <strong>four</strong> quadrants (NW, NE, SW, SE). Keep
+      subdividing any quadrant that holds more than K points; stop when a leaf holds fewer than K. Points live in leaves.
+    </p>
+
+<pre><code>  Start: the whole world, one node.  Too many points → split into 4.
+  Any child with &gt; K points → split it into 4. Recurse.
+
+     ┌─────────────┬─────────────┐    Rural Nevada: nobody here.
+     │             │             │    One leaf. Depth 1. Done.
+     │   0 pts     │   3 pts     │
+     │  (leaf)     │  (leaf)     │
+     ├──────┬──────┼─────────────┤
+     │ ┌─┬─┐│      │             │    Manhattan: thousands of drivers.
+     │ ├─┼─┤│ 40   │   12 pts    │    Split, split, split, split...
+     │ └─┴─┘│ pts  │   (leaf)    │    Depth 9. Each leaf still
+     │ deep │      │             │    holds &lt; K points.
+     └──────┴──────┴─────────────┘
+
+  THE TREE IS DEEP WHERE THE DATA IS DENSE. Automatically.
+  Query "within 2km" = descend to the leaves overlapping your circle.
+</code></pre>
+
+    <p>
+      <strong>Its one great virtue: it adapts to density automatically.</strong> No tuning, no manual cell-size choice, no hot cell
+      full of 5,000 drivers. Dense Manhattan grows a deep subtree; the empty Pacific stays one shallow node. Every leaf holds roughly
+      the same <em>number</em> of points, which means every query does roughly the same <em>amount of work</em> — a genuinely lovely
+      property, and the exact thing a fixed geohash grid can't give you.
+    </p>
+
+    <p>
+      <strong>Its fatal flaw for Uber, and this is the punchline:</strong> it is an <strong>in-memory tree that must be
+      rebalanced</strong>. When a point moves across a leaf boundary you must remove it from one leaf and insert it into another — and
+      if that empties a leaf, you may need to <em>merge</em> nodes; if it overfills one, you must <em>split</em>. At 250,000 movements
+      per second, you are mutating tree structure constantly, which means locking subtrees, which means contention, which means the
+      thing falls over. <strong>A quadtree is a beautiful structure for data that sits still and a nightmare for data that
+      moves.</strong>
+    </p>
+
+    <div class="senior">Deliver the comparison as a single clean line, because it's the sharpest sentence available on this page: <em>"A quadtree is the right index for <strong>Yelp</strong> — restaurants don't move, so I build the tree once, it adapts perfectly to density, and I query it a billion times. It's the wrong index for <strong>Uber</strong>, because a driver crossing a leaf boundary forces a structural mutation of the tree, and at 250k location updates a second I'd spend my entire life rebalancing. <strong>Quadtrees index data; geohashes index space.</strong> When the data moves and the space doesn't, index the space."</em> <strong>That last sentence — <em>quadtrees index data, geohashes index space</em> — is the whole deep dive compressed into six words, and it's the thing the interviewer writes down.</strong></div>
+
+    <h3>Approach 3 — S2 (Google) and H3 (Uber): the production answers</h3>
+
+    <p>Awareness level — you will not implement these on a whiteboard. But <em>naming</em> them, and knowing <em>why they exist</em>,
+      is a genuine standout moment, and in an Uber interview specifically it's close to a cheat code.</p>
+
+    <h4>S2 — Google's library</h4>
+    <p>
+      S2 projects the sphere onto the six faces of an enclosing cube, then subdivides each face into a quadtree of cells, then numbers
+      the cells along a <strong>Hilbert curve</strong> — a space-filling curve that snakes through 2D space visiting every cell exactly
+      once. The resulting 64-bit cell ID is, again, a 2D→1D reduction — but a <em>better</em> one:
+    </p>
+    <ul>
+      <li><strong>Better locality than geohash.</strong> A Hilbert curve never makes long jumps; consecutive IDs are always physically
+        adjacent. The Z-order curve that geohash implicitly uses <em>does</em> jump (that's exactly the prefix-boundary problem).
+        Fewer discontinuities means fewer surprise neighbours.</li>
+      <li><strong>No pole/equator distortion.</strong> Cells are built on the sphere via the cube projection, so they stay near-uniform
+        in area everywhere. A geohash cell in Norway is a squashed sliver; an S2 cell isn't.</li>
+      <li>Cells nest hierarchically across 30 levels, so a cell ID's prefix still gives you the parent cell — you keep the property
+        that made geohash useful.</li>
+    </ul>
+
+    <h4>H3 — Uber's library, and <em>why hexagons</em></h4>
+    <p>
+      H3 tiles the world in <strong>hexagons</strong>. Uber built it and open-sourced it, and the reason is genuinely interesting
+      rather than aesthetic:
+    </p>
+
+<pre><code>  SQUARE GRID                      HEXAGON GRID
+  ┌───┬───┬───┐                        ⬡   ⬡
+  │ d │ e │ d │   e = edge neighbour  ⬡  ▓  ⬡     All 6 neighbours
+  ├───┼───┼───┤       distance = 1     ⬡   ⬡      are the SAME distance
+  │ e │ ▓ │ e │                                   from the centre.
+  ├───┼───┼───┤   d = diagonal nbr    No corner-vs-edge ambiguity.
+  │ d │ e │ d │       distance = 1.41  Uniform adjacency, always.
+  └───┴───┴───┘
+
+  A square cell has TWO kinds of neighbour, and the diagonal one
+  is 1.41× farther away than the edge one. So "one cell over" means
+  two different distances depending on WHICH WAY you went.
+  For anything distance- or flow-shaped, that's a systematic bug.
+</code></pre>
+
+    <p>
+      Why does that matter for Uber specifically? Because Uber does not just ask "who is nearby" — it computes <strong>supply and
+      demand density per cell</strong> (for surge pricing), it <strong>smooths and diffuses those values across neighbouring
+      cells</strong>, and it reasons about <strong>movement between cells</strong>. Every one of those operations is corrupted by a grid
+      where "adjacent" means two different distances depending on direction. Hexagons give <strong>uniform adjacency</strong>: 6
+      neighbours, all equidistant, no corners. Surge heat-maps look right, spatial smoothing is unbiased, and flow between cells is
+      well-defined.
+    </p>
+
+    <div class="senior">In an <strong>Uber</strong> interview, this is the moment: <em>"For production I'd use a library rather than roll my own — S2 or H3. Uber actually built H3, and hexagons aren't a cosmetic choice: in a square grid your diagonal neighbour is 1.41× farther than your edge neighbour, so 'one cell over' means two different distances. Hexagons have six equidistant neighbours and no corners, which matters enormously once you're computing supply/demand density per cell for surge and smoothing it across neighbours — a square grid puts a systematic directional bias into your heat map."</em> <strong>You have just told an Uber interviewer why Uber built the thing Uber built.</strong> It takes twenty seconds and it is remembered.</div>
+
+    <h3>Approach 4 — just use the database's geo support (the boring, correct answer)</h3>
+
+    <p>
+      Now the deflating truth, and <strong>the willingness to say it is itself a senior signal</strong>: for most of these problems, you
+      should not build any of the above.
+    </p>
+
+<pre><code>  <span class="com">-- PostGIS: Postgres with a GiST index. Yelp-scale, this is IT.</span>
+  <span class="kw">CREATE EXTENSION</span> postgis;
+  <span class="kw">ALTER TABLE</span> restaurants <span class="kw">ADD COLUMN</span> geo <span class="typ">GEOGRAPHY</span>(POINT, <span class="num">4326</span>);
+  <span class="kw">CREATE INDEX</span> ON restaurants <span class="kw">USING</span> GIST (geo);   <span class="com">-- an R-tree, really</span>
+
+  <span class="kw">SELECT</span> id, name, ST_Distance(geo, :me) <span class="kw">AS</span> d
+  <span class="kw">FROM</span>   restaurants
+  <span class="kw">WHERE</span>  ST_DWithin(geo, :me, <span class="num">2000</span>)      <span class="com">-- 2km, true spherical distance</span>
+  <span class="kw">ORDER BY</span> d <span class="kw">LIMIT</span> <span class="num">20</span>;                     <span class="com">-- index-assisted, milliseconds</span>
+</code></pre>
+
+    <p>
+      A GiST index is an R-tree: bounding boxes nested in bounding boxes. It handles the circle-not-box problem, the boundary problem,
+      and the pole distortion <em>for you</em>, correctly, and it has been hardened for twenty years. Millions of static points, tens of
+      thousands of queries a second: <strong>this is finished work.</strong> Redis <code>GEOSEARCH</code> is the same story on the
+      in-memory side — and, as established, it's geohash-backed sorted sets underneath.
+    </p>
+
+    <div class="senior">Say this plainly, and say it <em>before</em> you show off: <em>"At Yelp's scale I would not build a custom spatial index at all — I'd put a GiST index on a PostGIS geography column and be done in an afternoon. Reaching for a hand-rolled quadtree when PostGIS solves it is over-engineering, and I'd flag it in code review. The reason Uber can't do that isn't the <strong>query</strong> — PostGIS answers the query fine. It's the <strong>250,000 updates per second</strong>, which destroys any disk-backed index no matter how good it is. So the write rate, not the query, is what forces me out of the database and into Redis."</em> <strong>Knowing when NOT to build the clever thing, and being precise about the one number that forces your hand, is worth more than knowing how to build it.</strong> Candidates lose points for over-engineering far more often than for under-engineering.</div>
+
+    <h3>Comparison table</h3>
+
+    <table>
+      <thead><tr><th>Approach</th><th>How it reduces 2D→1D</th><th>Adapts to density?</th><th>Handles movement?</th><th>Use when</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Bounding box SQL</strong><br>(no spatial index)</td>
+          <td>It doesn't — that's the problem</td>
+          <td>No</td>
+          <td>Badly</td>
+          <td><strong>Never</strong>, beyond a few thousand rows. Know it only so you can explain why it fails.</td>
+        </tr>
+        <tr>
+          <td><strong>Geohash</strong></td>
+          <td>Interleave lat/lng bits → base32 string; shared prefix = proximity</td>
+          <td>No — fixed grid; downtown cells overflow</td>
+          <td><strong>Yes, superbly</strong> — an update is just overwriting one string</td>
+          <td><strong>Moving objects.</strong> Uber-shaped. Works on any B-tree or sorted set; needs no special DB. <em>Must</em> query the 8 neighbours too.</td>
+        </tr>
+        <tr>
+          <td><strong>Quadtree</strong></td>
+          <td>Tree path from root to leaf is the 1D key</td>
+          <td><strong>Yes, automatically</strong> — its best feature</td>
+          <td>Poorly — movement forces splits/merges and rebalancing</td>
+          <td><strong>Static objects with wildly uneven density.</strong> Yelp-shaped. In-memory.</td>
+        </tr>
+        <tr>
+          <td><strong>R-tree / GiST</strong><br>(PostGIS)</td>
+          <td>Nested bounding boxes</td>
+          <td>Yes</td>
+          <td>Moderately — but disk-backed, so index churn hurts</td>
+          <td><strong>The default.</strong> Any moderate scale, static-ish data, and you already have Postgres. Boring and correct.</td>
+        </tr>
+        <tr>
+          <td><strong>S2</strong> (Google)</td>
+          <td>Cube projection + Hilbert curve → 64-bit cell ID</td>
+          <td>Hierarchical levels; better than plain geohash</td>
+          <td>Yes</td>
+          <td>Production, global scale. Better locality, no pole distortion.</td>
+        </tr>
+        <tr>
+          <td><strong>H3</strong> (Uber)</td>
+          <td>Hexagonal hierarchical grid → 64-bit cell ID</td>
+          <td>Hierarchical levels</td>
+          <td>Yes</td>
+          <td>Production, <strong>and you need uniform adjacency</strong> — density, smoothing, flow, surge. Say "hexagons" and say why.</td>
+        </tr>
+        <tr>
+          <td><strong>Redis GEO</strong></td>
+          <td>Geohash as the score of a sorted set (literally)</td>
+          <td>No</td>
+          <td><strong>Yes — in-memory, so churn is free</strong></td>
+          <td><strong>What you'd actually build here.</strong> Geohash's model with an in-memory store's write throughput.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>
+      <strong>The decision for this design, stated cleanly:</strong> <em>Redis GEO — which is geohash under the hood — sharded by city
+      region.</em> It gives you geohash's tolerance for constant movement, an in-memory store's write throughput, and no custom index
+      code to write or maintain. The two things it doesn't give you — density adaptation and boundary safety — you handle explicitly:
+      <strong>query the 9 cells, and split hot regions into finer shards.</strong> Naming your choice's weaknesses <em>and</em> your
+      mitigations, in the same breath, is the trade-off fluency being graded here.
+    </p>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="deep-dive-2">7b. Deep dive: the write firehose</h2>
+
+    <p>
+      <strong>This is the part that makes Uber a different problem from Yelp</strong>, and if you only had one deep dive to pick, a
+      strong interviewer would rather hear this one than the index — because the index is <em>known</em>, and this is <em>judgment</em>.
+      250,000 location writes per second. Four levers, in increasing order of cleverness.
+    </p>
+
+    <h3>Lever 1 — reclassify the data: it's state, not events</h3>
+
+    <p>
+      The single most important reframe on this page, and it is <em>free</em>:
+    </p>
+
+    <table>
+      <thead><tr><th></th><th>If location is an <strong>event</strong></th><th>If location is <strong>state</strong></th></tr></thead>
+      <tbody>
+        <tr><td>Semantics</td><td>"Driver 8812 was at X at time T" — a fact, forever true</td><td>"Driver 8812 <em>is</em> at X" — a value, replaced constantly</td></tr>
+        <tr><td>Storage</td><td>Append. 250k rows/sec. 1 TB/day. Forever.</td><td><strong>Overwrite one key.</strong> 1M keys total. 100 MB. Forever.</td></tr>
+        <tr><td>Durability</td><td>Must never lose one</td><td>Losing one is meaningless — a fresher one arrives in 4 seconds</td></tr>
+        <tr><td>Store</td><td>Kafka / Cassandra / a very unhappy Postgres</td><td><strong>Redis. A hash and a geo set.</strong></td></tr>
+      </tbody>
+    </table>
+
+    <p>
+      The naive design treats every ping as an event to be preserved. The correct design sees that <strong>a driver's position is a
+      gauge, not a ledger</strong> — the new value <em>replaces</em> the old one and the old one has no value to anyone. Overwrite in
+      place. Your storage stops growing at all: <strong>1 million drivers means 1 million keys, whether the system has been running
+      for a day or a decade.</strong>
+    </p>
+
+<pre><code>  EVENT model (wrong for the hot path):
+     ping ──▶ INSERT INTO locations (driver, lat, lng, ts)
+              250k INSERTs/sec · index maintenance on every row
+              · WAL · vacuum · 1 TB/day of data nobody reads   ✗
+
+  STATE model (right):
+     ping ──▶ GEOADD drivers:sf lng lat d_8812     ← overwrite
+              HSET driver:d_8812 ... ; EXPIRE 30   ← overwrite
+              Working set never grows. ~100 MB, forever.        ✓
+</code></pre>
+
+    <div class="senior">Say it exactly like this: <em>"I want to challenge the framing of the write. A driver's location isn't an event I need to record — it's a piece of state I need to overwrite. Every ping <strong>replaces</strong> the last one and makes it worthless. Once I see it as state, my storage stops growing entirely — a million drivers is a million keys, permanently, whether we've been live for a week or ten years. The 250k/sec becomes 250k in-memory overwrites, which Redis is genuinely happy to do."</em> <strong>Reclassifying data to make a hard requirement evaporate is a higher-order move than scaling to meet it</strong>, and interviewers grade it that way.</div>
+
+    <h3>Lever 2 — decouple the durable path (if you need the trail at all)</h3>
+
+    <p>
+      Sooner or later someone says: <em>"But billing disputes. A rider claims the route was padded. We need the trail."</em> Fine — but
+      that requirement <strong>does not belong on the hot path</strong>, and refusing to let it land there is the point.
+    </p>
+
+<pre><code>  Location Service
+        │
+        ├──▶ Redis GEO         ← SYNCHRONOUS. ~0.2ms. The match depends
+        │                        on this, so it's in the critical path.
+        │
+        └──▶ Kafka (async)     ← FIRE AND FORGET. Buffered, batched.
+               │                 If it fails, DROP IT and move on. The
+               │                 rider-facing product does not care.
+               ▼
+        Batch consumer (Flink / Spark / a plain consumer group)
+               │  · dedupe · compress a trip into ONE polyline
+               │  · aggregate: 900 points → ~2 KB of encoded path
+               ▼
+        S3 / Cassandra   (partition by day; read ~never)
+</code></pre>
+
+    <p>
+      This is precisely the pattern from tutorial 06 (queues as a shock absorber) and tutorial 18 (streaming aggregation): <strong>the
+      hot path writes to memory and returns; the durable path is a consumer of a log and is allowed to be slow, to lag, to fall over
+      and catch up.</strong> If the cold consumer is down for six hours, riders are matched flawlessly the entire time and the consumer
+      simply replays from Kafka's retention when it returns. <strong>Nobody notices.</strong> That is what decoupling buys, and it's why
+      you can have durable history <em>and</em> a hot path that never touches a disk.
+    </p>
+
+    <div class="note">Also compress properly on the cold side. A 30-minute trip at one ping per 4 seconds is 450 points. Stored as raw rows, that's tens of KB of mostly-redundant data (a car on a highway is generating hundreds of near-collinear points). Stored as an <strong>encoded polyline</strong> — deltas, quantized, run through something like Douglas-Peucker simplification — the same trip is ~1–2 KB. That's a 10–20× reduction on a corpus nobody ever reads, which is exactly where you want your compression ratios to be aggressive. <strong>Cheap data is data you're allowed to keep.</strong></div>
+
+    <h3>Lever 3 — don't make the write at all</h3>
+
+    <p>
+      The cheapest write in any system is the one that never happens. <strong>Attack the 250k at the source</strong> — this is the lever
+      almost no candidate reaches for, and it's the one that most impresses:
+    </p>
+
+    <table>
+      <thead><tr><th>Adaptive strategy</th><th>Saving</th><th>Why it's safe</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Stationary drivers ping less.</strong> A car parked at the airport queue for 40 minutes doesn't need to report the same coordinates 600 times. Drop to 30s or 60s when speed ≈ 0.</td>
+          <td>A large fraction of online drivers are idle at any moment — realistically <strong>30–50% of the firehose</strong> is a parked car re-reporting the same point.</td>
+          <td>The position hasn't changed. You're transmitting zero information at 250k/sec. (Extend the Redis TTL accordingly so they don't get reaped as offline.)</td>
+        </tr>
+        <tr>
+          <td><strong>No demand nearby → ping less.</strong> A driver in a rural area at 3am, with no rider within 20km, can report every 30 seconds. Nobody is searching for them.</td>
+          <td>Large in aggregate — most of the map is empty most of the time.</td>
+          <td>Server-controlled: the server pushes the ping interval down to the client based on local demand. It can always turn the rate back up in one message when a request appears nearby.</td>
+        </tr>
+        <tr>
+          <td><strong>On-trip drivers matter less.</strong> A driver mid-ride is not matchable — they're not in the available set. Their pings are only for the rider's tracking view.</td>
+          <td>Meaningful, and rising with utilization.</td>
+          <td>Route the ping straight to the one rider watching them; skip the matching index entirely.</td>
+        </tr>
+        <tr>
+          <td><strong>Batch pings on the client.</strong> Send 3 positions every 12s instead of 1 every 4s.</td>
+          <td>3× fewer <em>requests</em> (same data volume, but request overhead — TLS, headers, routing — dominates at this size).</td>
+          <td>Costs up to 12s of freshness, which is a real trade against match quality. <strong>Reach for this last</strong>; the others are free, this one isn't.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="senior"><em>"Before I scale to absorb 250k writes a second, I'd ask how many of them carry any information. A parked driver reporting identical coordinates 600 times in a row is pure waste, and a large fraction of online drivers are idle at any given moment. So I'd make the ping frequency adaptive and server-controlled — slow it down when the driver is stationary or when there's no demand nearby, and turn it back up instantly when a request appears. <strong>The cheapest write is the one you don't make.</strong> That's plausibly a 2–3× reduction before I've bought a single server."</em> <strong>Almost every candidate tries to survive the load. Very few try to delete it.</strong> Attacking a requirement at its source, rather than accepting it as immutable and engineering around it, is one of the clearest senior tells there is.</div>
+
+    <h3>Lever 4 — shard by region (and the hot-spot that immediately follows)</h3>
+
+    <p>
+      As established in §2, the domain hands you a shard key for free: <strong>geography</strong>. Nobody hails a cab across an ocean, so
+      every query is local. Shard the Redis cluster by region (a coarse geohash prefix, or an S2/H3 cell at a low level) and you get
+      near-perfect locality: a ride in SF touches only the SF shard.
+    </p>
+
+    <p>And then, immediately, the problem this creates — <strong>say it before the interviewer does</strong>:</p>
+
+<pre><code>  Shard: geohash-4 cell                      Load
+  ─────────────────────────────────────────────────────────────
+  9q8y  (downtown SF, Friday 8pm)   ████████████████████  100×
+  9q8v  (SF suburbs)                ███                     8×
+  9q9p  (rural Nevada)              ▏                       1×
+
+  ↑ Same-size cells. Wildly different load. ONE shard is on fire
+    and the rest are idle. This is the celebrity/hot-key problem
+    from tutorial 04 — but the "celebrity" is a PLACE.
+</code></pre>
+
+    <p>
+      Geography is a beautiful shard key with one ugly property: <strong>humans are not uniformly distributed.</strong> Downtown
+      Manhattan on a Friday night is one cell with a hundred times the load of a rural cell of identical area — and, worse, its load
+      <em>moves</em>: the hot cell at 8am (residential) is not the hot cell at 8pm (the bar district). This is exactly the hot-partition
+      problem from tutorial 04, except that here the celebrity is a <em>place</em>, and the celebrity <em>relocates on a schedule</em>.
+    </p>
+
+    <p><strong>The fixes, in order:</strong></p>
+    <ul>
+      <li>
+        <strong>Split dense cells further — variable-depth cells.</strong> Don't use one uniform geohash length everywhere. Manhattan
+        gets geohash-7 cells; Nevada gets geohash-4. <strong>And note what you just described: a cell that subdivides when it gets too
+        crowded is <em>exactly a quadtree.</em></strong> That's a lovely callback — the structure you rejected in §7a for being bad at
+        movement turns out to have precisely the property you now need at the <em>sharding</em> layer, where the boundaries change on
+        the timescale of weeks rather than seconds. <strong>The right structure at the wrong layer is the wrong structure; the same
+        structure one layer up can be perfect.</strong> Say that.
+      </li>
+      <li>
+        <strong>Replicate hot shards for reads.</strong> Nearby-reads are the bulk of the read load and they tolerate staleness
+        completely (the cars are cosmetic — §4). So put read replicas behind the hot shard and let them lag. Reads scale out; writes
+        stay on the primary.
+      </li>
+      <li>
+        <strong>Rebalance on a slow loop.</strong> Cell boundaries are configuration, not physics. Recompute them nightly from
+        yesterday's density. This is a <em>slow</em> control loop deliberately — you do not want shard boundaries thrashing in real
+        time, because a shard split is a data movement and moving data during a Friday-night peak is how you turn a hot shard into a
+        dead one.
+      </li>
+      <li>
+        <strong>Provision for the peak, and accept the waste.</strong> The honest engineering answer: Manhattan's shard simply gets
+        bigger machines than Nevada's. Uniform hardware across wildly non-uniform load is a choice, not a law.
+      </li>
+    </ul>
+
+    <div class="pitfall">The awkward consequence of geographic sharding, and you should raise it yourself: <strong>a query near a shard boundary must hit multiple shards.</strong> A rider standing on a bridge between two cells needs candidates from both — and it's exactly the 9-cell neighbour query from §7a, except now those 9 cells might live on 3 different Redis nodes. It's a scatter-gather, it's slower than a single-node read, and <strong>it means you can never make your cells too small</strong>, or every query becomes a distributed fan-out. That tension — <em>small cells give balanced load but more cross-shard queries; big cells give single-node queries but hot spots</em> — has no clean answer, and saying "there is no clean answer here, I'd tune the cell size against the boundary-query rate in production" is a <em>more</em> senior response than pretending there is one.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="deep-dive-3">7c. Deep dive: matching &amp; dispatch</h2>
+
+    <p>
+      Finding nearby drivers is <strong>necessary but not sufficient.</strong> A geospatial query hands you 30 candidates; the product
+      needs <em>one driver, exclusively yours</em>. And the moment you say "exclusively," you have walked straight back into a problem
+      you have already solved.
+    </p>
+
+    <h3>The race — and this is tutorial 14 again</h3>
+
+<pre><code>  Rider A ──▶ GEOSEARCH ──▶ [d_8812, d_9134, ...]  ← both see d_8812
+  Rider B ──▶ GEOSEARCH ──▶ [d_8812, d_7701, ...]  ← at the same instant
+
+  Both matchers pick d_8812 (he's nearest to both).
+  Both send him an offer. Both write rides.driver_id = 8812.
+
+  ONE CAR. TWO RIDERS. Someone is standing on a corner in the rain
+  watching "your driver is arriving" while the car drives away with
+  somebody else in it.
+</code></pre>
+
+    <p>
+      <strong>Stop and name this, because naming it is the highest-value sentence in this section:</strong> a driver is
+      <strong>inventory</strong>. Finite inventory. Contended inventory. This is <em>precisely</em> the overselling problem from tutorial
+      14 — two people buying the last seat at concert — and it is the <em>same</em> problem, not a similar one. A seat and a driver are
+      the same abstraction: a unit of finite supply that two concurrent transactions both believe is theirs. <strong>Which means you
+      already know the answer, and you should solve it the same way.</strong>
+    </p>
+
+    <div class="senior"><strong>This is the archetype-transfer moment, and it is worth more than any other sentence on the page.</strong> Say: <em>"This is the same problem as ticket booking. A driver is inventory — a finite, contended resource — and matching two riders to one driver is overselling a seat. So I'll solve it the way I'd solve overselling: <strong>an atomic conditional claim</strong>. I don't 'find and then assign' in two steps, because that's a check-then-act race. I claim the driver with a single compare-and-set — 'set driver 8812's state to CLAIMED_BY ride_5521 <em>only if</em> it's currently AVAILABLE' — and if that returns false, someone beat me to it and I move to the next candidate. One winner, by construction, with no distributed lock and no coordination."</em> <strong>An interviewer who watches you recognize a solved problem from a previous question, and transfer the solution rather than rediscover it, is watching seniority happen in real time.</strong> That is what these case studies are actually for.</div>
+
+    <h3>The atomic claim</h3>
+
+    <p>Two implementations, both correct, chosen by where you want the state to live:</p>
+
+<pre><code>  <span class="com">-- Option A: in Postgres. The conditional UPDATE.</span>
+  <span class="com">-- Optimistic concurrency: no lock, the WHERE clause IS the lock.</span>
+  <span class="kw">UPDATE</span> drivers
+     <span class="kw">SET</span> current_ride_id = :rideId, status = <span class="str">'CLAIMED'</span>
+   <span class="kw">WHERE</span> id = :driverId
+     <span class="kw">AND</span> current_ride_id <span class="kw">IS NULL</span>;    <span class="com">-- ← the whole game is this line</span>
+
+  <span class="com">-- 1 row updated → you won the driver.</span>
+  <span class="com">-- 0 rows updated → someone else claimed him. Next candidate.</span>
+  <span class="com">-- The DB serializes concurrent writers to the same row for free.</span>
+</code></pre>
+
+<pre><code>  <span class="com"># Option B: in Redis, where the driver's hot state already lives.</span>
+  <span class="com"># SET with NX = "set only if the key does not exist" = atomic claim.</span>
+
+  SET  claim:driver:8812  ride_5521  NX  EX 20
+
+  <span class="com"># OK   → you won. You have 20 seconds to get an accept.</span>
+  <span class="com"># nil  → already claimed. Try the next driver.</span>
+  <span class="com">#</span>
+  <span class="com"># The EX 20 TTL is doing crucial work: it is a SELF-HEALING LOCK.</span>
+  <span class="com"># If the matcher crashes holding the claim, the claim evaporates</span>
+  <span class="com"># and the driver returns to the pool automatically. Exactly the</span>
+  <span class="com"># seat-hold expiry from tutorial 14 — same mechanism, same reason.</span>
+</code></pre>
+
+    <p>
+      Note the symmetry with tutorial 14 all the way down: the <strong>seat hold</strong> becomes the <strong>driver claim</strong>; the
+      <strong>hold expiry</strong> becomes the <strong>offer timeout</strong>; the <strong>checkout</strong> becomes the <strong>driver
+      tapping accept</strong>. It is one archetype in two costumes, and once you have said so, the interviewer knows you're not
+      pattern-matching from memory — you're reasoning from a model.
+    </p>
+
+    <div class="pitfall">Do <strong>not</strong> reach for a distributed lock (Redlock, ZooKeeper) here. Candidates love to, because "distributed lock" sounds impressive. It's the wrong instinct and tutorial 05 explains why: distributed locks are hard to make correct under GC pauses and network partitions, they add a coordination service to your critical path, and <strong>you don't need one</strong> — you have a single-key atomic operation available in a store you're already using, and single-key atomicity is exactly what a claim requires. <strong>An atomic CAS on one key beats a distributed lock every time you can express the problem as one key</strong>, and here you trivially can. Reaching for the heavier tool when the lighter one is sufficient reads as inexperience, not sophistication.</div>
+
+    <h3>Matching isn't "nearest" — it's ETA</h3>
+
+    <p>
+      Now the part that separates a competent answer from a thoughtful one. Your <code>GEOSEARCH</code> returns candidates sorted by
+      <strong>straight-line distance</strong>. That is <em>not</em> the right ranking, and the counterexample is vivid:
+    </p>
+
+<pre><code>       Driver A: 500m away              Driver B: 1.2km away
+             ✕                                 ✕
+       ══════╪══════ RIVER ══════            ──┼── same road as rider
+             │                                 │
+             ▼                                 ▼
+       Nearest bridge: 4km upstream      Straight down the street
+       ETA: 18 minutes                   ETA: 4 minutes
+       ↑ geometrically closest           ↑ actually closest
+
+  Rivers. Motorways with no exit. One-way systems. A wall.
+  Being on the wrong side of a level crossing.
+  Euclidean distance is a LIE that the map does not tell.
+</code></pre>
+
+    <p>
+      So the pipeline is <strong>two-stage — and this shape recurs everywhere in ranking systems</strong>, which is worth saying:
+    </p>
+
+    <ol>
+      <li>
+        <strong>Retrieve (cheap, approximate, wide).</strong> <code>GEOSEARCH</code> for ~30 candidates within 2km. Straight-line
+        distance is a fine <em>filter</em> — it's a valid lower bound on travel distance, so a car 5km away in a straight line can
+        never be 2 minutes away by road. Use it to cut a million drivers down to thirty.
+      </li>
+      <li>
+        <strong>Rank (expensive, exact, narrow).</strong> Call the routing service for real road-network ETAs on those 30 — or, more
+        cheaply, on the top 10. This is a real network call and it costs tens of milliseconds, so you do it on <em>tens</em> of
+        candidates, never on <em>millions</em>.
+      </li>
+    </ol>
+
+    <div class="note">This <strong>retrieve-then-rank</strong> shape is the same one behind the news feed's ranking stage (tutorial 10), search result re-ranking (17), and every recommender ever built: <em>a cheap approximate filter narrows the universe to a shortlist, then an expensive precise model orders the shortlist.</em> You cannot afford the precise model on the universe, and the cheap filter is too crude to order by. Recognising the pattern by name and saying <em>"this is retrieve-then-rank, same as the feed"</em> is another free archetype-transfer point.</div>
+
+    <h3>The ranking function is a business decision, not a technical one</h3>
+
+<pre><code>  score(driver) =  w1 · (1 / eta)                <span class="com">// fast pickup — the rider's want</span>
+                +  w2 · acceptance_rate          <span class="com">// don't offer to a serial decliner</span>
+                +  w3 · idle_time                <span class="com">// fairness: he's waited 40 min</span>
+                +  w4 · rating
+                -  w5 · (driver is about to end shift / far from home)
+
+  Uber is a MARKETPLACE, and the matcher is its allocation policy.
+  Optimize purely for rider ETA and you burn out your supply side
+  by always giving rides to the same eager drivers in the hot zone.
+  The weights are a product decision. SAY THAT.
+</code></pre>
+
+    <p>
+      <strong>Acceptance rate deserves special mention</strong>, because it's the one with a feedback loop in it. Offering a ride to a
+      driver who declines 70% of offers wastes 15 seconds of the rider's spinner <em>and</em> forces a re-match. So you weight
+      candidates by their probability of accepting. But now you've built an incentive system: drivers with low acceptance rates get
+      fewer offers, get less work, and either shape up or leave. <strong>That's a product policy hiding in a sorting function</strong>,
+      and noticing that a technical ranking decision is really a marketplace-design decision is a sophisticated observation to make out
+      loud.
+    </p>
+
+    <h3>Handling rejection — the loop that must not stall</h3>
+
+<pre><code>  candidates = [d1, d2, d3, ... d10]   (ranked by score)
+
+  for driver in candidates:
+      if not CLAIM(driver):        continue   # someone else got him
+      OFFER(driver, ride, timeout=15s)
+      wait for response:
+          ACCEPTED  → confirm, RELEASE nothing, done.          ✓
+          DECLINED  → RELEASE(driver); continue to next.
+          TIMEOUT   → RELEASE(driver); continue; and DOCK his
+                      acceptance_rate — a silent non-answer is
+                      worse than a decline, because it cost the
+                      rider the full 15 seconds.
+
+  If the list is exhausted:  WIDEN THE RADIUS (2km → 5km) and re-search.
+  Still nothing:  tell the rider honestly. "No cars available" beats
+  a spinner that never resolves. A dishonest spinner is worse than a
+  clean failure — the rider could have walked to the subway.
+</code></pre>
+
+    <div class="senior">The variant question, asked constantly at Uber-adjacent companies: <em>"Why offer to one driver at a time? Why not broadcast to all 10 and let the fastest tap win?"</em> The answer is a real trade-off and you should present it as one: <em>"Broadcasting is faster for the rider — someone accepts in a second instead of potentially waiting through three 15-second timeouts. But it creates nine losers who tapped accept and got nothing, which is genuinely infuriating from the driver's seat and actively trains drivers to stop tapping. Sequential offers respect the supply side but risk a slow, serial match. In practice you tune between them: broadcast to a small batch of 2–3 when the pool is deep and the rider has been waiting, sequential when supply is scarce and you can afford the time. <strong>It's a marketplace-fairness decision dressed as a concurrency decision</strong>, and I'd want the product team in that conversation."</em> Recognising when a technical question is <em>secretly</em> a product question is exactly what "graded on judgment" means at 7 YOE.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="scaling">8. Scaling &amp; bottlenecks</h2>
+
+    <p>What breaks first at 10×, in the order it actually breaks:</p>
+
+    <h3>1. The hot region — <em>this is what breaks first, and it isn't close</em></h3>
+    <p>
+      Not the global load. <strong>One cell.</strong> Downtown Manhattan on a Friday night, New Year's Eve, the ten minutes after a
+      stadium empties. Your global write rate could go up 10× uniformly and you'd just add Redis shards and shrug; but a single cell
+      going 100× hot takes one shard down and, with it, the entire city — because that's the shard everyone in the city is querying.
+    </p>
+    <ul>
+      <li><strong>Symptom:</strong> p99 latency on one shard spikes; matching in that city stalls while the rest of the world is idle.</li>
+      <li><strong>Fix 1 — subdivide.</strong> Variable-depth cells: split the hot cell into finer geohash levels so its load spreads
+        across shards. (Again: <strong>you have just re-derived a quadtree</strong>, one layer up, at the sharding tier.)</li>
+      <li><strong>Fix 2 — read replicas.</strong> The nearby-reads are the volume and they tolerate staleness completely. Fan them out
+        to replicas; keep the writes and the claims on the primary.</li>
+      <li><strong>Fix 3 — degrade gracefully.</strong> Under extreme load, serve the cosmetic map from a 30-second cache and shed
+        those reads entirely if you must. <strong>Protect the 60 matches/sec at all costs; the 30,000 decorative reads/sec are
+        expendable.</strong> Knowing which traffic to throw overboard when the ship is sinking — and having decided <em>in advance</em> —
+        is a load-shedding instinct (tutorial 06) that interviewers reward heavily.</li>
+    </ul>
+
+    <h3>2. Redis memory and Redis failure</h3>
+    <p>
+      Memory isn't the worry — the whole live world is ~100 MB, and even at 10× it's 1 GB. That's nothing. The worry is
+      <strong>what happens when a Redis node dies.</strong> And here you get to deliver a genuinely reassuring answer:
+    </p>
+    <div class="note"><strong>Losing a Redis shard is a ~4-second outage that heals itself.</strong> The drivers whose state was on that node are invisible for as long as it takes them to send their next ping into a fresh replica. No data loss, because there was no <em>data</em> — only state, and the source of truth for that state is <strong>the driver's phone</strong>, which is going to tell you again in four seconds regardless. <strong>Contrast with tutorial 13, where losing a node mid-payment is a genuine crisis.</strong> Same infrastructure, wildly different blast radius — and the difference is entirely a consequence of the state-vs-event classification you made back in §5. <em>Design decisions made early determine how bad your worst day is.</em> That sentence, said out loud, is worth a lot.</div>
+    <p>
+      Still: run replicas (Redis Sentinel / Cluster) so failover is automatic and you don't even take the 4-second hit, and make sure
+      the Location Service's client reconnects and rehashes cleanly rather than hammering a dead node.
+    </p>
+
+    <h3>3. The matching service</h3>
+    <p>
+      At 60 rides/sec this is nearly free, and at 10× it's 600/sec — still small. But it is <strong>the only stateful-ish, latency-
+      sensitive, correctness-critical component you have</strong>, so protect it: keep it stateless (all state in Redis/Postgres so any
+      pod can pick up any ride), keep the routing-service call bulkheaded and circuit-broken (tutorial 06 — a slow routing service must
+      degrade you to straight-line ranking, not stall your matcher), and make sure a matcher crash mid-match is recoverable. That last
+      one is why <code>rides.status = MATCHING</code> is written to Postgres <em>before</em> any matching begins: a sweeper job finds
+      rides stuck in <code>MATCHING</code> for &gt; 60s and retries them. <strong>Without that row, a matcher crash means a rider stares
+      at a spinner until they close the app</strong> — the worst possible failure mode, because it's silent.
+    </p>
+
+    <h3>4. The boundary problem, at scale</h3>
+    <p>
+      Every nearby-query is really 9 cell-queries (§7a), and near a shard boundary those 9 cells span 2–4 Redis nodes. So a fraction of
+      your reads are scatter-gathers with a tail-latency profile set by the <em>slowest</em> node involved. As you shrink cells to fight
+      hot spots, <strong>that fraction grows</strong> — the two pressures are in direct opposition:
+    </p>
+<pre><code>  smaller cells ──▶ better load balance ──▶ MORE cross-shard queries ✗
+  larger cells  ──▶ fewer cross-shard queries ──▶ WORSE hot spots    ✗
+
+  There is no cell size that wins both. You TUNE, per city, and you
+  say so — the honest answer here scores higher than a fake clean one.
+</code></pre>
+    <p>
+      Mitigations that actually help: replicate boundary cells onto <em>both</em> adjacent shards (a little duplicated write traffic
+      buys you single-node reads for the common case), and hedge the requests — fire to all shards in parallel and return on the first
+      N, don't wait for the straggler.
+    </p>
+
+    <h3>5. The outbound fan-out (the one people forget)</h3>
+    <p>
+      Pushing every driver's every position to every rider watching that part of the map is an <em>N×M</em> multiplier that can dwarf
+      your 250k inbound. Ten thousand riders in Manhattan each watching fifty cars each moving every four seconds is <strong>125,000
+      messages/sec outbound in one city</strong>. Don't. See §10 — you interpolate on the client instead, and it's both cheaper
+      <em>and</em> better-looking.
+    </p>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="tradeoffs">9. Trade-offs</h2>
+
+    <table>
+      <thead><tr><th>Decision</th><th>What you chose</th><th>The alternative</th><th>When you'd flip</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Where location lives</strong></td>
+          <td><strong>Redis</strong> (in-memory, geo-indexed, overwritten in place)</td>
+          <td>Postgres + PostGIS/GiST</td>
+          <td><strong>Flip immediately if the objects are static</strong> (Yelp, store locator) or if the write rate is under a few thousand/sec. PostGIS is more capable, more correct, and less code. Only the 250k writes/sec forces you out of it — <em>and if that number weren't there, you'd be over-engineering.</em></td>
+        </tr>
+        <tr>
+          <td><strong>Spatial index</strong></td>
+          <td><strong>Geohash</strong> (via Redis GEO)</td>
+          <td>Quadtree; R-tree; S2; H3</td>
+          <td>Quadtree if data is <strong>static and density is wildly uneven</strong>. S2/H3 at real production scale, or when you need uniform adjacency for density/surge maths (H3). Geohash wins here only because it survives constant movement with zero structural churn.</td>
+        </tr>
+        <tr>
+          <td><strong>Persist every ping?</strong></td>
+          <td><strong>No.</strong> Overwrite in place; stream to Kafka only for the async cold path.</td>
+          <td>Durable append of every ping</td>
+          <td>Flip if there's a <strong>regulatory or real-time-audit</strong> requirement (fleet compliance, insurance telematics, hours-of-service enforcement). Then you eat the 1 TB/day — but you still keep it off the hot path.</td>
+        </tr>
+        <tr>
+          <td><strong>Consistency of positions</strong></td>
+          <td><strong>Eventual.</strong> Stale by seconds is fine.</td>
+          <td>Strong consistency on driver location</td>
+          <td><strong>Never.</strong> The value is physically obsolete on arrival — the car moved while the packet was in flight. Paying for consistency on data that is <em>inherently</em> stale is pure waste. This is the cleanest "eventual is not a compromise, it's correct" example in the whole course.</td>
+        </tr>
+        <tr>
+          <td><strong>Consistency of the match</strong></td>
+          <td><strong>Strong.</strong> Atomic conditional claim; exactly one rider per driver.</td>
+          <td>Optimistic assign + reconcile later</td>
+          <td><strong>Never flip.</strong> Two riders on one car is a product-destroying bug with no acceptable reconciliation. This is the <em>one</em> place in the system you spend on consistency — and knowing precisely where that one place is, is the point.</td>
+        </tr>
+        <tr>
+          <td><strong>Claim mechanism</strong></td>
+          <td><strong>Atomic CAS</strong> on a single key (<code>SET NX</code> / conditional <code>UPDATE</code>)</td>
+          <td>Distributed lock (Redlock, ZooKeeper)</td>
+          <td><strong>Basically never.</strong> Single-key atomicity is all a claim needs. A distributed lock adds a coordination service to your critical path and a set of correctness problems (tutorial 05) in exchange for nothing.</td>
+        </tr>
+        <tr>
+          <td><strong>Ranking</strong></td>
+          <td><strong>ETA</strong> (routing service) on a shortlist, blended with acceptance rate &amp; fairness</td>
+          <td>Straight-line distance, nearest wins</td>
+          <td>Straight-line is an acceptable <em>fallback</em> when the routing service is down (degrade, don't fail — circuit-break to it). It is not acceptable as the primary: rivers exist.</td>
+        </tr>
+        <tr>
+          <td><strong>Offer strategy</strong></td>
+          <td><strong>Sequential</strong> offers with a 15s timeout, claim before offer</td>
+          <td>Broadcast to N drivers, first accept wins</td>
+          <td>Flip toward broadcast when <strong>supply is deep and rider wait is the binding constraint</strong> (peak, dense city). It's a supply-side-fairness cost you pay for rider latency. A product call, not an engineering one.</td>
+        </tr>
+        <tr>
+          <td><strong>Matching API</strong></td>
+          <td><strong>Async</strong> — 202 + push over a stream</td>
+          <td>Synchronous request that blocks until matched</td>
+          <td>Never. There's a <em>human</em> in the loop tapping accept, and possibly several in sequence. You cannot hold an HTTP request open across human reaction time.</td>
+        </tr>
+        <tr>
+          <td><strong>Shard key</strong></td>
+          <td><strong>Geographic region</strong> (coarse geohash / S2 cell)</td>
+          <td>Hash of driver ID</td>
+          <td><strong>Never flip.</strong> Hashing by driver ID destroys the one thing that makes this problem tractable: a nearby-query would then have to hit <em>every</em> shard. Geography costs you hot spots, but it buys you locality, and locality is the whole ballgame. <strong>Accept the hot spot and fix it with subdivision.</strong></td>
+        </tr>
+        <tr>
+          <td><strong>Ping frequency</strong></td>
+          <td><strong>Adaptive</strong>, server-controlled (slower when idle / no demand)</td>
+          <td>Fixed 4s for everyone, always</td>
+          <td>Fixed is simpler and you'd start there. Flip to adaptive the moment the write rate is the binding constraint — which, per §3, is immediately.</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="followups">10. Follow-ups you should expect</h2>
+
+    <h3>"The rider's map shows cars moving smoothly. Are you streaming every ping to every rider?"</h3>
+    <p>
+      <strong>Absolutely not, and this one should be easy for you</strong> — it's a frontend problem wearing a backend costume, and it
+      lands directly in your wheelhouse.
+    </p>
+<pre><code>  NAIVE:  every driver ping ──▶ pushed to every rider watching
+          10k riders × 50 visible cars × 1 ping/4s
+          = 125,000 msgs/sec  IN ONE CITY, to make dots move.  ✗
+
+  ACTUAL: send each rider a SPARSE update — the visible cars'
+          positions every ~5-10 seconds — and INTERPOLATE ON THE
+          CLIENT between them. You know the car's position, heading,
+          and speed; animate it along that vector with requestAnimation-
+          Frame / a CSS transform, and correct it when the next real
+          position arrives.
+          → ~10× less traffic AND a SMOOTHER animation, because you're
+            rendering 60fps motion instead of a dot teleporting every
+            4 seconds.                                            ✓
+</code></pre>
+    <p>
+      <strong>Say this out loud, because it's the rare answer where the cheap option is also the better product:</strong> <em>"Streaming
+      every position would be both expensive and ugly — the client would render a car teleporting every four seconds. Instead I send
+      sparse updates and interpolate client-side using the heading and speed I already ship in the payload. It's an order of magnitude
+      less bandwidth and it looks better, because I'm animating at 60fps between known points rather than snapping between them. The
+      cars you see on the Uber map are a client-side animation, not a live feed."</em> Your seven years of frontend experience is a
+      genuine asset in a backend interview at exactly this moment — <strong>use it, and let them see you use it.</strong>
+    </p>
+
+    <h3>"How does surge pricing work?"</h3>
+    <p>
+      Surge is a <strong>function of supply and demand per cell</strong>, and it drops out of the infrastructure you have already built —
+      which is the nice part of the answer:
+    </p>
+<pre><code>  For each cell (an H3 hex, say), over a sliding window:
+      demand = ride requests in the last N minutes
+      supply = AVAILABLE drivers currently in the cell
+
+      surge_multiplier = f(demand / supply)   -- clamped, smoothed,
+                                                 and floored at 1.0
+
+  You ALREADY have both numbers: supply is a ZCARD on the geo set;
+  demand is a counter you bump on every ride request. This is a
+  streaming windowed aggregation — tutorial 18, verbatim.
+</code></pre>
+    <p>
+      Three things to add, and each is a point:
+      <strong>(a)</strong> <em>smooth it across neighbouring cells</em>, or you get an absurd cliff where crossing the street changes the
+      price by 2× — <strong>and this is precisely why Uber wanted hexagons</strong> (§7a): smoothing over a square grid is
+      directionally biased because the diagonal neighbour is 1.41× farther. The callback writes itself.
+      <strong>(b)</strong> <em>Damp it over time</em> — surge that oscillates every 30 seconds is a broken product; use a longer window
+      and rate-limit the change.
+      <strong>(c)</strong> <em>It's a feedback loop</em>: surge is meant to pull drivers into the cell, which reduces surge. Feedback
+      loops oscillate if you don't damp them, and saying "this is a control system, and control systems need damping" is a lovely,
+      unexpected note to hit.
+    </p>
+
+    <h3>"How do you compute the ETA?"</h3>
+    <p>
+      <strong>Awareness only — and say so.</strong> It's a shortest-path search (Dijkstra/A*, or in production a contraction-hierarchy
+      or hub-labelling scheme for sub-millisecond queries) over a road graph whose edge weights are <em>live</em> — updated from real
+      traffic, which is itself derived from... the location pings you're already collecting. That's a satisfying loop to point out.
+    </p>
+    <div class="note"><strong>Scope this ruthlessly.</strong> Say: <em>"ETA is a road-graph shortest path with live traffic weights — Dijkstra or A* conceptually, with contraction hierarchies in production so it answers in under a millisecond. But honestly it's a whole separate 45-minute design and I'd treat it as a black-box service here, unless you want me to go into it."</em> Then <strong>stop</strong>. Volunteering a shallow ten minutes on graph algorithms in an Uber design interview is how you run out of clock before you've defended your index. <strong>Knowing what NOT to go deep on is a time-management skill, and the interview is timed.</strong></div>
+
+    <h3>"What changes for food delivery — DoorDash?"</h3>
+    <p>
+      It becomes a <strong>three-sided market</strong>: restaurant + courier + customer. Everything above still holds, and then:
+    </p>
+    <ul>
+      <li><strong>The match is against a time, not a place.</strong> The courier should arrive when the food is <em>ready</em>, not as
+        soon as possible. Arrive early and the courier waits (wasted supply); arrive late and the food is cold (bad product). So you're
+        matching on a <strong>predicted food-ready time</strong>, which means you now need a model of the restaurant's kitchen.
+        <strong>That's the genuinely new hard problem</strong>, and it's not geospatial at all — it's forecasting.</li>
+      <li><strong>Batching.</strong> One courier can carry three orders from nearby restaurants along a compatible route. Now you're
+        solving a small vehicle-routing / bin-packing problem, not a nearest-neighbour lookup. The matching gets combinatorially harder
+        even though the index doesn't change at all.</li>
+      <li><strong>The geospatial layer is unchanged.</strong> Same geohash, same Redis, same claim. Point this out —
+        <strong>"the index is identical; what changed is the objective function"</strong> — because it demonstrates that you know which
+        part of your design was the archetype and which part was the costume.</li>
+    </ul>
+
+    <h3>"A driver goes into a tunnel and stops pinging. What happens?"</h3>
+    <p>
+      The 30-second TTL on their Redis key expires and they silently drop out of the available pool. When they emerge and ping again,
+      they're back. <strong>You get offline-detection for free from the TTL</strong> — no heartbeat service, no reaper job, no failure
+      detector. The nuance worth adding: if they were <em>mid-offer</em> when they vanished, the claim TTL expires too and the ride
+      re-matches to the next candidate; if they were <em>mid-trip</em>, do <strong>not</strong> cancel anything — the trip continues, the
+      rider's app shows "reconnecting," and the phone buffers pings locally and uploads the gap when signal returns. <strong>Different
+      states, different tolerances for silence.</strong>
+    </p>
+
+    <h3>"How do you test / simulate this?"</h3>
+    <p>
+      Worth 30 seconds because almost nobody mentions it, and it signals someone who has actually shipped something: you cannot load-test
+      this with real drivers. You need a <strong>simulator</strong> that replays or synthesizes a million drivers moving along real road
+      geometry at realistic speeds, with realistic density (Manhattan heavy, Nevada empty), so you can find the hot-shard cliff
+      <em>before</em> a Friday night finds it for you. <strong>Uber famously runs exactly this.</strong> Systems whose failure mode is a
+      geographic hot spot cannot be validated with uniform synthetic load — the uniformity is precisely what hides the bug.
+    </p>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="qa">Interview Q&amp;A</h2>
+
+    <details class="qa">
+      <summary>Why can't you just put a B-tree index on latitude and longitude and be done?</summary>
+      <div class="answer">
+        <p>
+          Because a B-tree is a <strong>one-dimensional</strong> structure and a location is <strong>two</strong> numbers. An index on
+          latitude can efficiently give you "everything in this latitude band" — but that band is a strip that wraps the entire planet:
+          it contains San Francisco <em>and</em> Seville <em>and</em> Seoul. An index on longitude gives you a pole-to-pole strip. Each
+          one eliminates a single dimension and leaves the other completely unconstrained.
+        </p>
+        <p>
+          A composite <code>(lat, lng)</code> index doesn't save you either: a B-tree can only range-scan on its leading column, so it
+          seeks to the start of the latitude band and then walks every longitude on Earth at every latitude in that band, filtering as
+          it goes. Two separate indexes with a bitmap-AND is better but still requires materializing two enormous bitmaps (millions of
+          rows each) to intersect down to a few hundred. <strong>You do megabytes of work to answer a query whose answer is twenty
+          rows</strong> — which is why the planner often just gives up and sequential-scans.
+        </p>
+        <p>
+          <strong>The one-sentence version:</strong> <em>"Every geospatial index exists to reduce two dimensions to one in a way that
+          preserves locality, so that an ordinary sorted index works again."</em> That's geohash, quadtrees, S2, and H3 in one sentence.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Explain geohash to me like I've never heard of it.</summary>
+      <div class="answer">
+        <p>
+          Recursively cut the world in half, alternating between longitude and latitude, and write down each choice as a bit. Is the
+          longitude in the left half of the world or the right? That's one bit. Is the latitude in the bottom half or the top? Another
+          bit. Halve the surviving range and repeat, alternating axes. You're <strong>interleaving the bits of longitude and
+          latitude</strong> into a single number. Chunk that number into groups of 5 bits and encode each as a base32 character:
+          <code>9q8yyk8yuv</code>.
+        </p>
+        <p>
+          <strong>The magic property is that a shared prefix means spatial proximity.</strong> Because each character subdivides the
+          previous cell, everything starting with <code>9q8y</code> is <em>inside</em> the box <code>9q8y</code>, and
+          <code>9q8yy</code> is a smaller box nested inside it. So "find everything near me" becomes
+          <code>WHERE geohash LIKE '9q8yy%'</code> — <strong>a prefix range scan on an ordinary B-tree.</strong> You have turned a 2D
+          proximity query into a 1D range scan, which is the entire point.
+        </p>
+        <p>
+          The cost: fixed-size cells that don't adapt to density, and the boundary problem below.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>What's the geohash boundary problem, and how do you fix it? ★ (Ask yourself this until it's reflex.)</summary>
+      <div class="answer">
+        <p>
+          <strong>Two points can be metres apart and share no prefix at all.</strong> A cell boundary is a hard cliff — cross it and the
+          string changes completely. The cleanest example is the equator: a point just north and a point just south differ in the
+          <em>very first latitude bit</em>, so their geohashes diverge at character one despite being ten centimetres apart. The same
+          happens at every boundary at every zoom level, and those boundaries run straight through real neighbourhoods.
+        </p>
+        <p>
+          The consequence is nasty because it's <strong>silent</strong>: a naive prefix query returns plausible-looking results while
+          quietly missing the closest driver, who is parked just across an invisible line. Nothing errors. The numbers look fine.
+        </p>
+        <p>
+          <strong>The fix: query the target cell AND all 8 of its neighbours</strong> — the 3×3 block — then post-filter the union by
+          true haversine distance. Nine index lookups instead of one, they parallelize, and the cost is trivial. Every geohash library
+          ships a <code>neighbors()</code> function for exactly this reason, which tells you how fundamental the problem is.
+        </p>
+        <p>
+          <strong>Volunteer this before you're asked.</strong> It's the single most reliable "this person has actually thought about it"
+          signal on the whole question.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Geohash or quadtree — which one, and why?</summary>
+      <div class="answer">
+        <p><strong>It depends entirely on whether the objects move.</strong> That's the whole answer, and it's the question you should ask before choosing.</p>
+        <ul>
+          <li><strong>Quadtree for static data (Yelp).</strong> Its killer feature is that it <em>adapts to density automatically</em> —
+            dense Manhattan grows a deep subtree, the empty Pacific stays one shallow node, and every leaf holds roughly the same number
+            of points, so every query does roughly the same amount of work. Build it once, query it a billion times.</li>
+          <li><strong>Geohash for moving data (Uber).</strong> A quadtree is a <em>structure</em>, and moving a point across a leaf
+            boundary forces a structural mutation — remove, insert, possibly split, possibly merge, and lock the subtree while you do
+            it. At 250,000 movements per second you'd spend your whole life rebalancing. A geohash update is just <em>overwriting a
+            string</em>. No structure changes at all.</li>
+        </ul>
+        <p>
+          <strong>The compressed version, and it's the line worth memorizing:</strong> <em>"Quadtrees index the data; geohashes index
+          the space. When the data moves and the space doesn't, index the space."</em>
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Why does Uber's H3 use hexagons instead of squares?</summary>
+      <div class="answer">
+        <p>
+          <strong>Uniform adjacency.</strong> In a square grid you have two kinds of neighbour: the four edge-neighbours at distance 1,
+          and the four diagonal neighbours at distance √2 ≈ 1.41. So "one cell over" means <em>two different distances</em> depending on
+          which direction you went. A hexagon has <strong>six neighbours, all equidistant</strong>, and no corners at all.
+        </p>
+        <p>
+          That matters because Uber doesn't only ask "who's nearby." It computes <strong>supply and demand density per cell</strong> for
+          surge pricing, <strong>smooths those values across neighbouring cells</strong> so the price doesn't jump 2× when you cross the
+          street, and reasons about <strong>flow between cells</strong>. Every one of those operations is corrupted by a grid where
+          adjacency means different distances in different directions — you bake a systematic directional bias into your heat map.
+          Hexagons remove it.
+        </p>
+        <p>
+          <strong>In an Uber interview, saying "hexagons, because a square's diagonal neighbour is 1.41× farther than its edge
+          neighbour, and that biases any density or smoothing computation" is a twenty-second answer that people remember.</strong>
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>250,000 location writes per second. Talk me through it.</summary>
+      <div class="answer">
+        <p>1M active drivers ÷ a ping every 4 seconds = 250k writes/sec. Then the four moves, in order:</p>
+        <ol>
+          <li><strong>Reclassify the data.</strong> A driver's location is <em>state</em>, not an <em>event</em> — the new value replaces
+            the old and the old one is worthless. So you <strong>overwrite one key</strong> rather than appending a row. Your storage
+            stops growing entirely: a million drivers is a million keys, forever. That's ~100 MB, and it's why this lives in
+            <strong>Redis</strong> and not Postgres. Writing it to a durable, spatially-indexed store would mean re-indexing a million
+            rows every four seconds — index churn, WAL amplification, autovacuum permanently behind. It's not a tuning problem, it's a
+            category error.</li>
+          <li><strong>Decouple durability.</strong> If billing needs the trail, stream pings to Kafka and batch them to cold storage
+            asynchronously. The hot path writes to memory and returns; the durable path is allowed to lag, fail, and catch up. Nobody
+            notices.</li>
+          <li><strong>Delete the writes.</strong> Adaptive, server-controlled ping frequency — a parked driver re-reporting identical
+            coordinates 600 times carries zero information, and a large fraction of online drivers are idle at any moment. Ping slower
+            when stationary or when there's no demand nearby. <strong>The cheapest write is the one you don't make.</strong> Plausibly
+            2–3× off the top before you buy a single server.</li>
+          <li><strong>Shard by geography</strong> — the domain hands you the key for free — and then deal with the hot cell it creates.</li>
+        </ol>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Two riders request a ride at the same instant and both matchers pick the same driver. How do you prevent it?</summary>
+      <div class="answer">
+        <p>
+          <strong>Name it first: this is tutorial 14's problem. A driver is inventory.</strong> Finite, contended inventory. Matching two
+          riders to one car is <em>overselling a seat</em> — the same abstraction wearing a different costume — so you solve it the same
+          way.
+        </p>
+        <p>
+          <strong>An atomic conditional claim.</strong> Never "find, then assign" in two steps — that's a check-then-act race with a
+          window between the check and the act. Instead, claim in a single atomic operation:
+        </p>
+        <ul>
+          <li>In Redis: <code>SET claim:driver:8812 ride_5521 NX EX 20</code> — set only if not already set. <code>OK</code> means you
+            won; <code>nil</code> means someone beat you and you move to the next candidate.</li>
+          <li>In Postgres: <code>UPDATE drivers SET current_ride_id = :rideId WHERE id = :d AND current_ride_id IS NULL</code> — one row
+            updated means you won, zero rows means you lost. <strong>The WHERE clause is the lock.</strong></li>
+        </ul>
+        <p>
+          The TTL is doing real work: it's a <strong>self-healing lock</strong>. If the matcher crashes holding a claim, the claim
+          evaporates and the driver returns to the pool automatically — exactly the seat-hold expiry from tutorial 14.
+        </p>
+        <p>
+          <strong>Do not reach for a distributed lock.</strong> You have single-key atomicity available in a store you're already using,
+          and single-key atomicity is precisely what a claim needs. Redlock/ZooKeeper adds a coordination service to your critical path
+          and a family of correctness problems (tutorial 05) in exchange for nothing.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Why not just match the rider to the geographically nearest driver?</summary>
+      <div class="answer">
+        <p>
+          <strong>Because straight-line distance is a lie that the map doesn't tell.</strong> A driver 500m away on the far side of a
+          river, with the nearest bridge 4km upstream, is <em>eighteen minutes</em> away. A driver 1.2km away on the same street is
+          <em>four minutes</em> away. The geometrically closest car is frequently not the soonest car — rivers, motorways with no exit,
+          one-way systems, level crossings, walls.
+        </p>
+        <p>
+          So the pipeline is <strong>two-stage: retrieve then rank.</strong> <em>Retrieve</em> ~30 candidates with the cheap approximate
+          geo query (straight-line distance is a valid <em>lower bound</em> on travel distance, so it's a sound filter). Then
+          <em>rank</em> that shortlist by true road-network ETA from the routing service, blended with acceptance rate, idle time, and
+          fairness signals. The expensive precise computation runs on tens of candidates, never on millions.
+        </p>
+        <p>
+          Worth adding: <strong>this is the same retrieve-then-rank shape as the news feed's ranking stage and any search re-ranker.</strong>
+          And the weights are a <em>marketplace</em> decision — optimize purely for rider ETA and you burn out your supply side by
+          feeding every ride to the same eager drivers.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Where's the hot spot, and what do you do about it?</summary>
+      <div class="answer">
+        <p>
+          <strong>Downtown Manhattan on a Friday night.</strong> Geography is a beautiful shard key with one ugly property: humans are
+          not uniformly distributed. Equal-area cells carry wildly unequal load — one cell can have 100× the traffic of another the same
+          size — and worse, <strong>the hot cell moves</strong>: it's residential at 8am and the bar district at 8pm. It's the hot-partition
+          problem from tutorial 04, except the celebrity is a <em>place</em> and it relocates on a schedule.
+        </p>
+        <p>The fixes:</p>
+        <ul>
+          <li><strong>Variable-depth cells</strong> — Manhattan gets geohash-7, Nevada gets geohash-4. And notice what that is: <strong>a
+            cell that subdivides when it gets crowded is exactly a quadtree.</strong> The structure you rejected for the index layer
+            (because it's bad at movement) is perfect at the <em>sharding</em> layer, where boundaries change weekly, not per-second.</li>
+          <li><strong>Read replicas on hot shards</strong> — the nearby-reads are the volume and they tolerate staleness completely.</li>
+          <li><strong>Rebalance on a slow loop</strong> — recompute boundaries nightly from yesterday's density. Deliberately slow: you
+            do not want to be moving data during a Friday-night peak.</li>
+          <li><strong>Shed load intelligently</strong> — protect the 60 matches/sec, throw the 30,000 cosmetic map-reads overboard if you
+            must.</li>
+        </ul>
+        <p>
+          And the tension to name honestly: <strong>smaller cells balance load but multiply cross-shard boundary queries; bigger cells
+          give single-node reads but hot spots.</strong> No cell size wins both. You tune per city, and saying "there's no clean answer
+          here" scores better than inventing one.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Redis loses a node. What breaks?</summary>
+      <div class="answer">
+        <p>
+          <strong>Almost nothing, and that's a designed-in property rather than luck.</strong> The drivers whose state lived on that node
+          are invisible for as long as it takes them to send their next ping — <strong>about four seconds</strong> — and then they're
+          back. There is no data loss, because there was no <em>data</em>: only state, and <strong>the source of truth for that state is
+          the driver's phone</strong>, which is going to tell you again in four seconds regardless of what your infrastructure is doing.
+          The system reconstructs itself from nothing.
+        </p>
+        <p>
+          You'd still run replicas (Redis Cluster / Sentinel) so failover is automatic and you don't even eat the four seconds. But the
+          point to make is the <em>contrast</em>: <strong>compare this to tutorial 13, where losing a node mid-payment is a genuine
+          crisis.</strong> Same infrastructure, completely different blast radius — and the difference traces entirely back to the
+          state-vs-event classification you made in the data model. <strong>Decisions you make in minute fifteen determine how bad your
+          worst day is.</strong>
+        </p>
+        <p>
+          The genuinely dangerous failure is elsewhere: a matcher crashing mid-match, leaving a rider on a spinner that never resolves.
+          That's why <code>rides.status = MATCHING</code> is written to Postgres <em>before</em> matching begins, and a sweeper retries
+          anything stuck there. <strong>Silent failures are the worst kind.</strong>
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>How do the cars move smoothly on the rider's map?</summary>
+      <div class="answer">
+        <p>
+          <strong>Client-side interpolation. You do not stream every ping to every rider.</strong> That naive fan-out is 10,000 riders ×
+          50 visible cars × one ping per 4 seconds = <strong>125,000 messages/sec in a single city</strong>, purely to make dots move.
+        </p>
+        <p>
+          Instead: push each rider a <em>sparse</em> update of the visible cars every 5–10 seconds, and <strong>interpolate on the
+          client</strong>. You already ship heading and speed in the payload, so the client animates each car along that vector at 60fps
+          and corrects when the next real position arrives.
+        </p>
+        <p>
+          <strong>The kicker, and the reason this answer is so satisfying: it's an order of magnitude cheaper AND it looks better.</strong>
+          Streaming every ping would render a car <em>teleporting</em> every four seconds. Interpolating renders smooth motion. The cars
+          on the Uber map are a client-side animation, not a live feed — and, as Uber has admitted, they're partly decorative anyway. Which
+          means the whole nearby-read path can be heavily cached, because <strong>a cosmetic read has no consistency requirement at all.</strong>
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Yelp asks you the same question. What changes?</summary>
+      <div class="answer">
+        <p>
+          <strong>Nearly everything gets easier, and you should say so immediately rather than reflexively producing the Uber answer.</strong>
+        </p>
+        <ul>
+          <li><strong>The objects don't move.</strong> Which deletes the entire hard part — there is no 250k writes/sec, no firehose, no
+            ephemeral state, no Redis, no Kafka trail, no adaptive ping frequency. A restaurant's location changes approximately never.</li>
+          <li><strong>So: Postgres + PostGIS, with a GiST index on a geography column.</strong> <code>ST_DWithin</code> for the radius
+            query. Done. It handles the circle-not-a-box problem, the boundary problem, and pole distortion correctly, and it's been
+            hardened for two decades. Millions of static points, tens of thousands of QPS — this is <em>finished work</em>.</li>
+          <li><strong>Add a cache.</strong> Reads dominate overwhelmingly and the data is stale-tolerant (a restaurant's hours changed
+            yesterday, not this second). Cache aggressively by cell.</li>
+          <li><strong>The new hard part is filtering and ranking, not geometry:</strong> "Thai food, open now, 4+ stars, under $30, and
+            near me." That's a <em>search</em> problem — Elasticsearch with a geo filter — not a geospatial-indexing problem. The geo
+            query is one filter clause among five.</li>
+        </ul>
+        <p>
+          <strong>And say the meta-point:</strong> <em>"Reaching for a hand-rolled quadtree here when PostGIS solves it in an afternoon
+          would be over-engineering, and I'd flag it in review. The <strong>only</strong> reason Uber can't use PostGIS isn't the query —
+          PostGIS answers the query fine — it's the write rate."</em> <strong>Candidates lose points for over-engineering far more often
+          than for under-engineering.</strong>
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Do you need strong consistency anywhere in this system?</summary>
+      <div class="answer">
+        <p><strong>In exactly one place, and knowing precisely where is the point of the question.</strong></p>
+        <p>
+          <strong>Driver locations: no, and not as a compromise — eventual consistency is genuinely <em>correct</em> here.</strong> The
+          value is physically obsolete the instant you read it, because the car kept moving while the packet was in flight. Paying
+          coordination costs to be strongly consistent about a number that is <em>inherently</em> stale is pure waste. Showing a car 40
+          metres from where it really is harms nobody. This is the cleanest example in the whole course of eventual consistency being the
+          right answer rather than a concession.
+        </p>
+        <p>
+          <strong>The match: yes, absolutely.</strong> Exactly one rider per driver, no exceptions. Two riders assigned the same car is a
+          product-destroying bug with no acceptable reconciliation — you cannot apologize your way out of a driver arriving for the wrong
+          person. So you spend consistency <em>there</em>, via an atomic conditional claim, and nowhere else.
+        </p>
+        <p>
+          <strong>The senior framing:</strong> <em>"Consistency is a budget, not a virtue. I spend it at the one point where a race
+          produces an unacceptable outcome — the claim — and I refuse to spend it anywhere else. Most of this system is telemetry about a
+          physical world that has already changed, and there's nothing to be consistent about."</em>
+        </p>
+      </div>
+    </details>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="takeaways">What to remember</h2>
+
+    <ul>
+      <li>
+        <strong>The one sentence that unlocks the whole page:</strong> a B-tree indexes one dimension; a location is two. Indexing
+        latitude gives you a strip around the planet, longitude gives you a strip pole to pole, and intersecting them means scanning
+        both. <strong>Every geospatial index — geohash, quadtree, S2, H3 — exists to reduce 2D to 1D while preserving locality, so that
+        an ordinary sorted index works again.</strong> Say this first and everything after it sounds inevitable.
+      </li>
+      <li>
+        <strong>Geohash:</strong> interleave the bits of lat and lng, encode base32. <strong>A shared prefix means spatial
+        proximity</strong>, so a prefix scan on a plain B-tree finds neighbours. Length 6 ≈ 1km cells — the right choice for a 2km
+        radius. Redis GEO <em>is</em> this, under the hood: a sorted set scored by 52-bit geohash.
+      </li>
+      <li>
+        <strong>The boundary problem, volunteered unprompted:</strong> two points can be metres apart and share no prefix (think either
+        side of the equator). It fails <em>silently</em>. <strong>Fix: query the cell and all 8 neighbours, then post-filter by true
+        haversine distance.</strong> And remember the general rule it illustrates — <em>the index gives you candidates; geometry gives
+        you the answer.</em> A bounding box is a square; "within 2km" is a circle; always post-filter.
+      </li>
+      <li>
+        <strong>Quadtrees index the data; geohashes index the space.</strong> A quadtree adapts to density automatically — perfect for
+        <strong>Yelp</strong>. But a moving point forces structural rebalancing, which is fatal for <strong>Uber</strong>. When the data
+        moves and the space doesn't, index the space.
+      </li>
+      <li>
+        <strong>H3 uses hexagons</strong> because a square's diagonal neighbour is <strong>1.41× farther</strong> than its edge
+        neighbour, which biases any density, smoothing, or flow computation — and Uber does all three, for surge. Six equidistant
+        neighbours, no corners. Twenty seconds, and it's remembered.
+      </li>
+      <li>
+        <strong>PostGIS/GiST is the boring correct answer at moderate scale</strong> — and reaching for a hand-rolled quadtree when
+        PostGIS would do is over-engineering. <strong>The only thing that forces Uber out of Postgres is the write rate, not the
+        query.</strong> Say that explicitly; it proves you rejected the simple option for a reason rather than never considering it.
+      </li>
+      <li>
+        <strong>1M drivers ÷ 4s = 250,000 writes/sec</strong> — and then <em>use</em> the number. It forbids a durable spatially-indexed
+        store, forces location into memory, and licenses you not to persist the pings at all. Deriving "don't persist" from the
+        arithmetic is the strongest move on the page.
+      </li>
+      <li>
+        <strong>Location is <em>state</em>, not an <em>event</em>.</strong> Overwrite one key; don't append a row. Storage stops growing
+        entirely — 1M drivers is 1M keys, ~100 MB, forever, versus 1 TB/day of history nobody reads. <strong>Reclassifying data to make a
+        hard requirement evaporate beats scaling to meet it.</strong>
+      </li>
+      <li>
+        <strong>The cheapest write is the one you don't make.</strong> Adaptive, server-controlled ping frequency — slower when the driver
+        is parked or when there's no demand nearby. A parked car re-reporting identical coordinates 600 times carries zero information.
+        2–3× off the firehose before buying a single server. Almost nobody tries to <em>delete</em> the load; everybody tries to survive it.
+      </li>
+      <li>
+        <strong>A driver is inventory. This is tutorial 14 again.</strong> Two riders matched to one car is overselling a seat. Solve it
+        identically: an <strong>atomic conditional claim</strong> (<code>SET NX</code> with a TTL, or a conditional <code>UPDATE</code>
+        where the WHERE clause <em>is</em> the lock) — never a distributed lock, never check-then-act. The TTL makes it a self-healing
+        lock. <strong>Recognizing a solved problem in a new costume, and transferring the solution, is what these case studies are
+        for.</strong>
+      </li>
+      <li>
+        <strong>Matching is ETA, not distance</strong> — a driver 500m away across a river is 18 minutes away. <strong>Retrieve then
+        rank:</strong> cheap geo filter for 30 candidates, expensive routing call on the shortlist. Same shape as feed ranking and search
+        re-ranking.
+      </li>
+      <li>
+        <strong>Consistency is a budget, not a virtue.</strong> Spend it on the claim, where a race is unacceptable. Refuse to spend it on
+        driver positions, where the data is <em>physically obsolete on arrival</em> and eventual consistency isn't a compromise — it's
+        correct.
+      </li>
+      <li>
+        <strong>The hot spot is a place, and it moves.</strong> Downtown Manhattan on a Friday night is one shard with 100× the load.
+        Fix by subdividing dense cells — <strong>which is exactly a quadtree, one layer up at the sharding tier.</strong> And accept the
+        tension honestly: smaller cells balance load but multiply cross-shard boundary queries. No cell size wins both.
+      </li>
+      <li>
+        <strong>Don't stream every ping to the rider's map.</strong> Send sparse updates and <strong>interpolate client-side</strong> from
+        heading and speed. 10× less bandwidth <em>and</em> smoother animation — the rare case where cheap is also better. Your frontend
+        experience is a real asset in a backend interview at exactly this moment; use it.
+      </li>
+      <li>
+        <strong>The archetype transfers everywhere:</strong> Uber, Lyft, Yelp, DoorDash, Tinder, Pokémon Go, "nearest ATM," "nearest
+        in-stock warehouse," "which technician is within 30 minutes of this outage," "find in-network providers near this member's ZIP."
+        Same problem. <strong>The only question that changes the answer is: <em>do the objects move?</em></strong> Ask it first, every
+        time.
+      </li>
+    </ul>
+  </section>
+
+  <nav class="page-nav">
+    <a href="14-ticket-booking.html">← 14 — Design Ticket Booking</a>
+    <a href="16-video-streaming.html">16 — Design Video Streaming →</a>
+  </nav>
+
+</main>
+</body>
+</html>

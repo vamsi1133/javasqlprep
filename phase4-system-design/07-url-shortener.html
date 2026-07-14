@@ -1,0 +1,1584 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>07 — Design a URL Shortener | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <div class="breadcrumb"><a href="index.html">← Course Home</a></div>
+    <h1>07 — Design a URL Shortener</h1>
+    <p>The canonical warm-up, done properly. Archetype: <strong>read-heavy key-value</strong> — and once you see it, you've seen a quarter of the question bank.</p>
+  </div>
+</header>
+
+<main class="container">
+
+  <section>
+    <h2>Why this matters in the interview</h2>
+    <p>
+      This is the most-asked distributed design question in existence, and that cuts both ways. It means you <em>will</em> get
+      it — as the 45-minute round at a mid-size company, as the warm-up before something harder at a FAANG loop, as the phone
+      screen. It also means your interviewer has heard four hundred answers to it, most of them recited. The memorised answer
+      is worth nothing here; the bar isn't "can you produce an architecture for TinyURL," it's "can you <em>derive</em> one,
+      defend the key-generation scheme against three alternatives, and tell me what breaks first." A candidate who has read a
+      blog post and a candidate who has actually reasoned about it produce the same diagram and completely different
+      transcripts. The diagram is not the artifact being graded.
+    </p>
+    <p>
+      More importantly, this page is the first case study, so it's teaching you two things at once: the design, and <em>how to
+      read a case study</em>. Every one of 07–18 is <a href="01-the-method.html">tutorial 01</a>'s six-step method run on a
+      different problem, and every one is an <strong>archetype</strong> wearing a costume. This one's archetype is read-heavy
+      key-value: a tiny immutable value, looked up by an exact key, read far more often than it's written. That is also a
+      pastebin. That is also an image host. That is also a feature-flag service, a short-code coupon system, a DNS resolver, an
+      object store's metadata layer. Same skeleton every time — generate a key, store a blob, serve it from cache. If you leave
+      this page knowing only the URL shortener, you got 5% of the value. If you leave knowing the <em>shape</em>, you can walk
+      into "design a pastebin" or "design an image-hosting service" and reuse 80% of this answer verbatim, out loud, with
+      confidence. That transfer is the entire point of doing case studies at all.
+    </p>
+  </section>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ul>
+      <li><a href="#prompt">1. The prompt</a></li>
+      <li><a href="#requirements">2. Requirements</a> — and the questions that get you there</li>
+      <li><a href="#estimation">3. Estimation</a> — the 100:1 ratio is the whole design ★</li>
+      <li><a href="#api">4. API design</a> — including the 301-vs-302 trap</li>
+      <li><a href="#data-model">5. Data model</a> — and an honest SQL-vs-NoSQL call</li>
+      <li><a href="#hld">6. High-level design</a> — write path and read path, end to end</li>
+      <li><a href="#deep-dive-1">7a. Deep dive: key generation</a> ★ — this is where the interview happens</li>
+      <li><a href="#deep-dive-2">7b. Deep dive: the read path &amp; caching</a> ★</li>
+      <li><a href="#scaling">8. Scaling &amp; bottlenecks</a> — what breaks first</li>
+      <li><a href="#tradeoffs">9. Trade-offs</a></li>
+      <li><a href="#followups">10. Follow-ups you should expect</a></li>
+      <li><a href="#qa">Interview Q&amp;A</a></li>
+      <li><a href="#takeaways">What to remember</a> — including the archetype transfer</li>
+    </ul>
+  </div>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="prompt">1. The prompt</h2>
+
+    <p>The interviewer says, and this is the entire prompt:</p>
+
+<pre><code>  "Design a URL shortener. Something like bit.ly or TinyURL."
+</code></pre>
+
+    <p>
+      That's it. It's deliberately underspecified, and the vagueness is the first test. There is no read:write ratio in that
+      sentence, no scale, no latency target, no word about analytics or expiry or custom aliases — and every one of those
+      changes the design. The candidate who starts drawing a load balancer has already answered a question nobody asked.
+    </p>
+
+    <p>
+      Notice also what the prompt is <em>secretly</em> about. Every classic question has a hard core (see
+      <a href="01-the-method.html#scoping">01 §4</a>), and this one's is not "where does the cache go." It's
+      <strong>key generation</strong> — how do you mint short, unique, non-colliding identifiers at thousands per second across
+      many machines without a single point of coordination — and <strong>the read:write ratio</strong>, which is what justifies
+      every caching decision downstream. Everything else in the design is standard plumbing. Budget your 45 minutes so that
+      those two things get the time.
+    </p>
+
+    <div class="senior">Open with this, before anything else: <em>"Sure. Before I draw anything, let me pin down scope and scale — this problem changes a lot depending on the read:write ratio and whether you want analytics, so I'd rather spend four minutes on requirements than design the wrong thing beautifully."</em> You've now named the two hinges of the design in your first sentence, and you haven't touched the pen. That reads as someone who has seen this problem before <em>and understood it</em>, which is different from having memorised it.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="requirements">2. Requirements</h2>
+
+    <p>
+      Ask, don't assume — but <strong>propose an answer with every question</strong> so the interviewer's job is to correct you
+      rather than to teach you. Here's the exchange, roughly as it goes:
+    </p>
+
+    <table>
+      <thead><tr><th>You ask</th><th>They answer</th><th>What it just forced</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><em>"Scale — I'll assume something like 100 million new URLs a day. Is that the right ballpark, or are we smaller?"</em></td>
+          <td>Yes, 100M/day.</td>
+          <td>Sets the write QPS and, multiplied by a retention horizon, the storage number. Both get computed in §3.</td>
+        </tr>
+        <tr>
+          <td><em>"Read:write ratio? I'd guess this is heavily read-skewed — people create a link once and it gets clicked many times. Something like 100:1?"</em></td>
+          <td>100:1 is right.</td>
+          <td><strong>The single most important answer in the round.</strong> 100:1 means the read path <em>is</em> the system. Cache everything; the write path can be comparatively slow and nobody will notice.</td>
+        </tr>
+        <tr>
+          <td><em>"Latency target on the redirect?"</em></td>
+          <td>As fast as possible — it's on the critical path of someone loading a page. Call it p99 under 100ms.</td>
+          <td>No synchronous work on the redirect path. Analytics cannot be a blocking DB write. A cache hit must be the common case.</td>
+        </tr>
+        <tr>
+          <td><em>"Availability vs consistency? If we're down, every shortened link on the internet is broken, so I'd guess availability wins."</em></td>
+          <td>Correct — the redirect must basically never fail.</td>
+          <td>AP over CP for reads. Stale is fine (links are immutable anyway — see below). Multi-region reads, aggressive caching, graceful degradation are all now <em>justified</em>, not assumed.</td>
+        </tr>
+        <tr>
+          <td><em>"Are links mutable? Can I edit where a short link points after creating it?"</em></td>
+          <td>No. Create once, then it's fixed.</td>
+          <td><strong>Enormous.</strong> Immutable values mean cache invalidation is a non-problem — the hardest thing in caching just evaporated. You can cache for a very long TTL, at every layer, including a CDN. <em>Say this out loud.</em></td>
+        </tr>
+        <tr>
+          <td><em>"Custom aliases? Expiry? Analytics? I'd treat all three as optional — tell me which you care about."</em></td>
+          <td>Support custom aliases and optional expiry. Basic click analytics would be nice.</td>
+          <td>Custom alias → a uniqueness race (§10). Expiry → a cleanup story. Analytics → must be async, or it destroys your redirect latency <em>and</em> forces you off 301s (§4).</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>Functional requirements</h3>
+    <ul>
+      <li><strong>Shorten:</strong> given a long URL, return a short one. Short code ≈ 7 characters.</li>
+      <li><strong>Redirect:</strong> <code>GET /{shortCode}</code> sends the user to the original URL.</li>
+      <li><strong>Custom alias</strong> (optional): the user may propose their own code, e.g. <code>/black-friday</code>.</li>
+      <li><strong>Expiry</strong> (optional): a link may have a TTL, after which it 404s.</li>
+      <li><strong>Analytics</strong> (optional): click counts, roughly. Not real-time, not exact.</li>
+    </ul>
+
+    <h3>Non-functional requirements</h3>
+    <ul>
+      <li><strong>Read:write ≈ 100:1.</strong> This is <em>the</em> number. Everything downstream hangs off it.</li>
+      <li><strong>Redirect latency: p99 &lt; 100ms.</strong> A redirect is a tax on someone else's page load; it must be invisible.</li>
+      <li><strong>Availability &gt; consistency.</strong> Target ~99.99% on the read path. A failed redirect is a broken link on somebody's website, forever, in a tweet from 2019.</li>
+      <li><strong>Links are immutable.</strong> Which makes staleness a non-issue and caching nearly free.</li>
+      <li><strong>Codes are short.</strong> 7 characters. That's a product requirement, not an engineering one — and it's exactly what makes key generation interesting.</li>
+    </ul>
+
+    <h3>Explicitly out of scope</h3>
+    <div class="senior"><em>"I'm going to cut auth and user accounts, spam and malicious-link detection, rich analytics dashboards, and link previews. They're all real — a production bit.ly spends serious effort on phishing detection — but they're orthogonal to the architecture and they'd eat the clock. I want to spend the time on key generation and the read path, because that's where I think the actual difficulty is. Does that scope work for you?"</em> Naming what you're cutting is what separates "triaged it" from "forgot it." Same diagram, opposite grade.</div>
+
+    <div class="pitfall">Do not skip the mutability question because it sounds trivial. "Can a link be edited?" is the question that decides whether you get to cache with a one-day TTL at the CDN edge or whether you need an invalidation story on every layer. It takes six seconds to ask and it hands you a free simplification that most candidates never claim — and if the interviewer <em>does</em> say "yes, links are editable," you have just discovered a whole deep dive that the memorised answer would have walked straight past.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="estimation">3. Estimation</h2>
+
+    <p>
+      Do this out loud, on the board, rounding hard and <em>saying</em> that you're rounding. Nobody wants to watch you do long
+      division; they want to see that you can get to the right order of magnitude in ninety seconds and then <em>use</em> the
+      number. An estimation you compute and never refer to again scores approximately zero.
+    </p>
+
+    <h3>Traffic</h3>
+
+<pre><code>Seconds in a day:  86,400  →  I'll call it 100,000. (Round up; it makes
+                              the arithmetic trivial and I'll say I did.)
+
+Writes:  100M new URLs / day
+         = 100,000,000 / 100,000 s
+         ≈ 1,000 writes/sec        (the honest figure is 100M/86,400
+                                    ≈ 1,160/s — call it ~1.2k/s)
+         Peak, say 2-3× average    ≈ 3,000 writes/sec
+
+Reads:   100:1 read:write
+         ≈ 100 × 1,160
+         ≈ 116,000 reads/sec       ← call it ~100k/s. THIS is the system.
+         Peak                      ≈ 200-300k/s
+</code></pre>
+
+    <h3>Storage</h3>
+
+<pre><code>Per row:  short_code   7 bytes
+          long_url     ~200-500 bytes (URLs get ugly — tracking params)
+          created_at, expires_at, owner, flags…
+          ≈ 500 bytes/row  (round up; it's the right order of magnitude)
+
+Per day:  100M × 500 B      = 50 GB/day
+Per year: 50 GB × 365       ≈ 18 TB/year
+5 years:  18 TB × 5         ≈ 90 TB          ← the number that matters
+</code></pre>
+
+    <h3>Bandwidth</h3>
+
+<pre><code>Writes:  1,160/s × 500 B   ≈ 0.6 MB/s     — nothing.
+Reads:   116,000/s × 500 B ≈ 58 MB/s      — also not scary. A redirect is
+                                            a tiny 302 with a Location
+                                            header; there's no payload.
+</code></pre>
+
+    <p>
+      Bandwidth is a non-issue and you should say so in one sentence and move on. This is not a media system
+      (<a href="16-video-streaming.html">tutorial 16</a> is where bandwidth becomes the driving constraint). Declining to
+      dwell on a number that doesn't matter is itself a signal.
+    </p>
+
+    <h3>Now the senior move: which number drives the design?</h3>
+
+    <p>Two of them, and they push in different directions. Name both, explicitly:</p>
+
+    <div class="senior"><em>"Two numbers matter here and they force two different things. First, <strong>116,000 reads a second against 1,160 writes</strong> — a hundred to one. That means this is not a database problem, it's a <strong>cache</strong> problem. My job is to make sure the vast majority of those 116k reads never touch persistent storage at all. Second, <strong>90 terabytes over five years</strong> — that does not fit on one machine, so I'm going to shard, and I should pick a key scheme that shards cleanly from day one rather than retrofitting it. Everything else in my design falls out of those two facts."</em></div>
+
+    <p>
+      Look at what that sentence bought you. You have just pre-justified, from arithmetic, the two components a weaker
+      candidate will draw on faith: the cache and the sharded store. When the interviewer asks "why Redis?", your answer is a
+      number, not a slogan. That's the difference the rubric is measuring.
+    </p>
+
+    <div class="note">Sanity-check the write number against reality and say the check out loud, because it shows judgment about your own estimate: 100M new links a day is <em>enormous</em> — bigger than the real bit.ly by a wide margin. The interviewer picked it to force a distributed answer. It's fine to note that: <em>"I'll take 100M/day since you gave it to me, though I'd point out that at, say, 1M a day this is genuinely one Postgres box and a Redis, and I'd build that instead. The design only earns its complexity at the number you gave me."</em> Knowing when the complexity <em>isn't</em> warranted is the same skill as knowing when it is.</div>
+
+    <div class="pitfall">Don't do the 90 TB calculation and then draw a single database box anyway. Half of candidates compute a storage number, say "wow, that's a lot," and then produce an architecture that quietly ignores it. The numbers exist to <em>force</em> decisions. If you're not going to let 90 TB force sharding, don't compute it.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="api">4. API design</h2>
+
+    <p>Two endpoints. Genuinely two. Resist the urge to invent a management API nobody asked for.</p>
+
+<pre><code>POST /api/v1/urls
+  Authorization: Bearer &lt;api-key&gt;          <span class="com">// who's creating it (out of scope, but noted)</span>
+  body: {
+    "longUrl":   "https://example.com/some/very/long/path?utm=…",
+    "customAlias": "black-friday",         <span class="com">// optional</span>
+    "expiresAt":   "2027-01-01T00:00:00Z"  <span class="com">// optional, null = never</span>
+  }
+
+  201 → { "shortUrl": "https://sho.rt/aB3xY9z",
+          "shortCode": "aB3xY9z",
+          "expiresAt": null }
+  409 → custom alias already taken        <span class="com">// see §10 — this is a race</span>
+  400 → malformed / non-http(s) URL
+  429 → rate limited                       <span class="com">// → tutorial 09</span>
+
+GET /{shortCode}
+  302 → Location: https://example.com/some/very/long/path?utm=…
+  404 → unknown code, or expired
+  410 → optionally: "this link expired" (nicer, but leaks existence)
+</code></pre>
+
+    <p>
+      Two things worth voicing as you write that. The redirect endpoint lives at the <strong>root path</strong>, not under
+      <code>/api/</code> — those seven characters are the product, and every wasted character in the domain is a character the
+      user pays for in a tweet. And notice the redirect endpoint takes <em>no auth</em>: it's public, it's cacheable, and that
+      is precisely what lets you put a CDN in front of it later.
+    </p>
+
+    <h3>301 vs 302 — the favourite gotcha on this question</h3>
+
+    <p>
+      The interviewer will ask this, roughly nine times out of ten, and they are not testing whether you can recite the HTTP
+      spec. They are testing whether you understand that <strong>a caching decision at the HTTP layer silently deletes a
+      product feature.</strong> Here's the whole thing:
+    </p>
+
+    <table>
+      <thead><tr><th></th><th>301 Moved Permanently</th><th>302 Found (temporary)</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Browser behaviour</strong></td>
+          <td>Caches the redirect, often <em>aggressively</em> and sometimes indefinitely. The next time the user clicks that link, the browser goes straight to the target — <strong>your server is never contacted again.</strong></td>
+          <td>Not cached by default. Every click comes back to you.</td>
+        </tr>
+        <tr>
+          <td><strong>Your traffic</strong></td>
+          <td>Massively reduced. Repeat clicks are free. Your 116k reads/sec drops by whatever fraction of clicks are repeats.</td>
+          <td>Full load. You serve every single click.</td>
+        </tr>
+        <tr>
+          <td><strong>Analytics</strong></td>
+          <td><strong>Broken.</strong> You literally cannot count clicks you never see. Your dashboard undercounts and you cannot fix it retroactively.</td>
+          <td>Accurate. You see every click, so you can count them.</td>
+        </tr>
+        <tr>
+          <td><strong>Can you change the target later?</strong></td>
+          <td>Effectively no. Browsers that cached the 301 will keep going to the old target for a long time, and you have no way to invalidate them.</td>
+          <td>Yes, immediately.</td>
+        </tr>
+        <tr>
+          <td><strong>SEO</strong></td>
+          <td>Passes link equity to the target — the "right" semantic for a permanent move.</td>
+          <td>Signals the redirect is temporary; search engines keep the short URL as canonical.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>
+      So it is a straight trade: <strong>301 buys you load reduction and costs you analytics. 302 buys you analytics and costs
+      you load.</strong> There is no free option, and the answer depends on a requirement, which is exactly why you asked about
+      analytics in §2.
+    </p>
+
+    <div class="senior">The answer that lands: <em>"I'll use <strong>302</strong>. A 301 gets cached in the browser, which means the second time someone clicks the link I never see the request — and since you asked for click analytics, that permanently and invisibly breaks the feature. 302 costs me traffic, but traffic is the thing I'm good at solving: I've got a Redis cache and a CDN in front of this and a redirect is a couple of hundred bytes. Analytics is the thing I <em>can't</em> solve after the fact, because the data was never collected. If you told me you didn't care about analytics at all and just wanted the cheapest possible redirect service, I'd flip to 301 immediately."</em> That last clause is the whole game — you've named the condition under which you'd change your mind, which is what "understanding a trade-off" actually means.</div>
+
+    <div class="note">If you want to be precise, and it's worth one sentence: <strong>307</strong> and <strong>308</strong> are the method-preserving versions of 302 and 301 respectively (a 302 may legally turn a POST into a GET; a 307 must not). For a link redirect, where the request is always a GET from a browser address bar, it doesn't matter — but knowing why they exist reads well and costs you eight seconds. Also note you can soften 302's cost with an explicit short <code>Cache-Control: max-age=60</code>: some repeat-click absorption, bounded analytics loss. That's a genuinely nice middle answer and almost nobody gives it.</div>
+
+    <div class="pitfall">The wrong version of this answer is "301, because the redirect is permanent." It's <em>semantically</em> defensible and it's an interview loss, because it shows you're reasoning about HTTP verbs in the abstract instead of about the consequences for a system you were just asked to build. The interviewer's follow-up is "so how do you count clicks?" and there is no recovery from there.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="data-model">5. Data model</h2>
+
+    <p>
+      Start from the <strong>access patterns</strong>, not from the schema. This is the habit that makes the SQL-vs-NoSQL
+      argument write itself:
+    </p>
+
+    <table>
+      <thead><tr><th>Access pattern</th><th>Frequency</th><th>Shape</th></tr></thead>
+      <tbody>
+        <tr><td><code>GET</code> by <code>short_code</code> → long URL</td><td>~116,000/s</td><td><strong>Point lookup by exact primary key.</strong> No range scan, no filter, no join.</td></tr>
+        <tr><td><code>INSERT</code> a new mapping</td><td>~1,160/s</td><td>Single-row write, no dependency on any other row.</td></tr>
+        <tr><td>Delete expired rows</td><td>Batch, background</td><td>Range scan on <code>expires_at</code>, or lazy-on-read. See §10.</td></tr>
+        <tr><td>List a user's links (if you had accounts)</td><td>Rare, and out of scope</td><td>Secondary lookup by <code>owner_id</code>. Noted and cut.</td></tr>
+      </tbody>
+    </table>
+
+    <p>
+      Read that first row again. <strong>99% of your traffic is a single point lookup by an exact key on an immutable value.</strong>
+      That sentence <em>is</em> the definition of a key-value workload. There is no relational structure here to exploit — no
+      joins, no multi-row transactions, no reporting queries, no foreign keys that matter.
+    </p>
+
+    <h3>The shape</h3>
+
+<pre><code>Key:    short_code       "aB3xY9z"          <span class="com">// 7 chars, base62, the partition key</span>
+
+Value:  {
+          longUrl:    "https://example.com/…",
+          createdAt:  1752451200,
+          expiresAt:  null,                  <span class="com">// or a unix ts</span>
+          ownerId:    "u_1234"               <span class="com">// out of scope, but keep the column</span>
+        }
+</code></pre>
+
+    <p>And in Postgres, if you went that way — which, read on, you might:</p>
+
+<pre><code><span class="kw">CREATE TABLE</span> urls (
+  short_code  <span class="typ">VARCHAR</span>(<span class="num">10</span>)  <span class="kw">PRIMARY KEY</span>,      <span class="com">-- base62; 10 leaves room for custom aliases</span>
+  long_url    <span class="typ">TEXT</span>         <span class="kw">NOT NULL</span>,
+  created_at  <span class="typ">TIMESTAMPTZ</span>  <span class="kw">NOT NULL</span> <span class="kw">DEFAULT</span> now(),
+  expires_at  <span class="typ">TIMESTAMPTZ</span>,                    <span class="com">-- NULL = never expires</span>
+  owner_id    <span class="typ">BIGINT</span>
+);
+
+<span class="com">-- ONLY for the expiry sweeper. Partial: most rows have no expiry,</span>
+<span class="com">-- so this index stays small and cheap to maintain on write.</span>
+<span class="kw">CREATE INDEX</span> idx_urls_expires <span class="kw">ON</span> urls (expires_at)
+  <span class="kw">WHERE</span> expires_at <span class="kw">IS NOT NULL</span>;
+</code></pre>
+
+    <p>
+      Notice what is <em>not</em> in that schema. No index on <code>long_url</code> — you never look up by it (unless you want
+      dedup; see §10, and the answer is usually "don't"). No <code>click_count</code> column — incrementing a counter on the
+      redirect path is a write on your hottest read, and it would be the single dumbest thing in the design. Analytics goes to
+      a queue (§10). Every column absent from a schema should be absent <em>on purpose</em>, and you should be able to say why.
+    </p>
+
+    <h3>The SQL-vs-NoSQL call, made honestly</h3>
+
+    <p>The case for a key-value store — Cassandra, DynamoDB, or similar — is genuinely strong here, and it's four specific facts:</p>
+
+    <ul>
+      <li><strong>No joins.</strong> The entire record is self-contained. There is nothing to normalise and nothing to join to.</li>
+      <li><strong>No multi-row transactions.</strong> One INSERT, one row. Nothing needs to be atomic across keys.</li>
+      <li><strong>Point lookups by key only.</strong> That is the <em>one</em> operation a KV store is optimised for, and it does it in a single hop.</li>
+      <li><strong>90 TB and 116k reads/sec.</strong> This exceeds one machine, so you need horizontal scale — and horizontal scale with automatic partitioning, replication and no-downtime node addition is precisely what these stores sell. Doing it yourself on top of Postgres means you're building a shard router, a rebalancer and a failover story by hand.</li>
+    </ul>
+
+    <p>
+      Add one more: writes are <strong>append-only inserts of immutable rows</strong>, never updates. That's an LSM-tree's
+      happiest possible workload (see <a href="03-data-storage.html">tutorial 03</a>) — sequential appends, no in-place updates,
+      no write amplification from random B-tree page splits.
+    </p>
+
+    <div class="senior">And then the sentence that separates you from the candidates who reflexively say "NoSQL, because scale": <em>"I want to be honest that Postgres would genuinely work fine here for a long time. A single-row lookup on a primary-key B-tree index is a couple of milliseconds, and with a read replica or two behind a Redis cache absorbing 95%+ of reads, one Postgres primary would comfortably serve this at a few million links a day. The reason I'm reaching for a KV store is specifically the <strong>90 terabytes</strong> — that's what I can't fit on one box, and hand-rolling sharding on Postgres to solve it means I've built a worse Cassandra. So the decision is driven by the storage number, not by the word 'scale'. If you'd told me this was ten million links a day, I'd build it on Postgres and I'd be right."</em></div>
+
+    <p>
+      That answer scores higher than "NoSQL because it's web scale" for a reason the rubric is explicit about: it shows you know
+      the <em>load at which the decision flips</em>. Anyone can name a database. Naming the threshold is judgment.
+    </p>
+
+    <div class="note">One real-world anchor worth having in your pocket: production URL shorteners have been built on both. Bitly ran on MySQL and Redis for a long stretch of its life; other shorteners run on DynamoDB or Cassandra. This is not a problem where one answer is right and the other is stupid — which is exactly why interviewers ask it. They want to hear the reasoning, not the verdict.</div>
+
+    <div class="pitfall">Watch out for the trap in the other direction too. If you pick Cassandra, be ready for "how do you enforce that a custom alias is unique?" — because Cassandra gives you no unique constraint. The honest answer is lightweight transactions (<code>INSERT … IF NOT EXISTS</code>, which is Paxos under the hood and therefore slow), or keeping custom aliases in a small separate Postgres table where a real unique constraint exists. Picking a store that can't express a constraint you need is a self-inflicted wound — see §10.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="hld">6. High-level design</h2>
+
+    <p>
+      Sketch this fast — ten minutes, not twenty — and narrate every box <em>as you draw it</em>, tying each one back to a
+      number from §3. The uncontroversial boxes (load balancer, stateless app tier) get ten seconds and a wave of the hand. The
+      interesting boxes get a sentence each.
+    </p>
+
+<pre><code>                      WRITE PATH  (~1.2k/s)
+  ┌────────┐   POST /api/v1/urls
+  │ Client │───────────────┐
+  └────────┘               ▼
+                    ┌──────────────┐        ┌──────────────────────┐
+                    │ Load balancer│        │  Key Generation Svc  │
+                    └──────┬───────┘        │  hands out blocks of │
+                           ▼                │  10,000 unused keys  │
+                    ┌──────────────┐  get   └──────────┬───────────┘
+                    │ Write service│◀──block──────────┘
+                    │ (stateless)  │  (once per 10k writes, NOT per write)
+                    └──────┬───────┘
+                           │ INSERT short_code → long_url
+                           ▼
+                  ┌──────────────────────┐
+                  │  KV store (sharded)  │   90 TB / 5 yrs
+                  │  partitioned by      │   → does not fit on one box
+                  │  hash(short_code)    │
+                  └──────────────────────┘
+
+
+                      READ PATH  (~116k/s)
+  ┌────────┐  GET /aB3xY9z
+  │ Client │──────────▶ ┌─────────┐  hit (hot links)   302 Location: …
+  └────────┘            │   CDN   │────────────────────────────────▶
+                        │  edge   │   never touches your infra
+                        └────┬────┘
+                             │ miss
+                             ▼
+                     ┌──────────────┐
+                     │ Load balancer│
+                     └──────┬───────┘
+                            ▼
+                     ┌──────────────┐   hit ~95%   ┌───────────────┐
+                     │ Read service │◀────────────▶│ Redis cluster │
+                     │ (stateless)  │  cache-aside │ code → longUrl│
+                     └──┬────────┬──┘              └───────────────┘
+                        │        │ miss (~5%)
+       click event      │        ▼
+       (fire &amp; forget)  │  ┌──────────────────────┐
+                        │  │  KV store (sharded)   │
+                        │  └──────────────────────┘
+                        ▼
+                   ┌─────────┐   ┌──────────────┐   ┌───────────┐
+                   │  Kafka  │──▶│ Stream/batch │──▶│   OLAP    │
+                   └─────────┘   │  aggregator  │   │ analytics │
+                                 └──────────────┘   └───────────┘
+                        ▲
+                        └── NOT on the critical path. The 302 is already
+                            on its way back to the client. → tutorial 18
+</code></pre>
+
+    <h3>Write path, end to end</h3>
+    <ol>
+      <li>Client <code>POST</code>s the long URL with an API key. LB → any write-service instance; the tier is stateless, so it doesn't matter which.</li>
+      <li>Validate: is it a well-formed <code>http(s)</code> URL? Is the caller within their rate limit (<a href="09-rate-limiter.html">tutorial 09</a>)?</li>
+      <li><strong>Get a short code.</strong> The service already holds a locally-cached block of 10,000 unused keys, so this is an in-memory pop — <em>no network call, no lock, no coordination.</em> It refills the block from the key-generation service roughly once every 10,000 writes. This is the deep dive; see §7a.</li>
+      <li>If a custom alias was supplied, use it instead — and let a <strong>unique constraint</strong> in the store decide the winner, rather than checking-then-writing (§10).</li>
+      <li><code>INSERT</code> the row into the KV store, partitioned by <code>hash(short_code)</code>. Single-shard write. One round trip.</li>
+      <li>Optionally warm the cache with the new mapping so the creator's own first click is a hit. Cheap, and it buys read-your-writes.</li>
+      <li>Return <code>201</code> with the short URL. Total: one memory op plus one write. Comfortably a few milliseconds.</li>
+    </ol>
+
+    <h3>Read path, end to end</h3>
+    <ol>
+      <li><code>GET /aB3xY9z</code> hits the <strong>CDN edge</strong> first. If this link is hot (and see §7b: a small minority of links are almost all of the traffic), the edge serves the 302 from its own cache in ~20ms and your infrastructure never learns the request happened.</li>
+      <li>On a CDN miss: LB → a read-service instance.</li>
+      <li><strong>Redis, cache-aside.</strong> <code>GET aB3xY9z</code>. At a ~95% hit rate this is where the overwhelming majority of your surviving traffic ends, in sub-millisecond time.</li>
+      <li>On a cache miss: read from the KV store shard that owns <code>hash(short_code)</code>. Single-key read, single hop.</li>
+      <li>Populate Redis with a long TTL — remember, <strong>the value is immutable</strong>, so there's no invalidation problem and the TTL exists only to bound memory, not to bound staleness. Say that out loud; it's a free point.</li>
+      <li>Check <code>expires_at</code>. If expired, or not found → <code>404</code>, and <strong>cache the negative result</strong> briefly so a bot hammering random codes can't turn every request into a database read.</li>
+      <li>Return <code>302 Location: &lt;longUrl&gt;</code>. <strong>The response is now on its way to the client.</strong></li>
+      <li><em>After</em> responding, fire a click event onto Kafka — user id if known, timestamp, referrer, geo, user-agent. Fire and forget. If Kafka is down, you drop analytics; you do <strong>not</strong> drop the redirect. (<a href="06-caching-queues-resilience.html">Tutorial 06</a>, and <a href="18-streaming-aggregation.html">18</a> for what happens downstream.)</li>
+    </ol>
+
+    <p>
+      Every box on that diagram traces to a number. The CDN and Redis exist because of <strong>116k reads/sec against 1.2k
+      writes</strong>. The sharded store exists because of <strong>90 TB</strong>. The key-generation service exists because
+      minting unique 7-character codes at 1,200/s across many stateless machines is the actual hard problem. Kafka exists
+      because analytics must not touch the critical path. There is nothing on the diagram that "real bit.ly probably has."
+    </p>
+
+    <div class="senior">Say this as you finish the diagram, and then <em>stop drawing</em>: <em>"That's the skeleton, and honestly most of it is standard — stateless tier, cache, sharded store. The two parts I think are actually interesting are <strong>how I mint the short codes without a coordination bottleneck</strong>, and <strong>how the read path survives 116k a second, including when one link goes viral</strong>. I'd like to go deep on key generation first unless you'd rather see something else."</em> You have just steered the round to the two topics you've prepared hardest for, and you did it while looking like you were being helpful. This is what "driving the room" means in practice.</div>
+
+    <div class="pitfall">The most common way to lose this question is to spend twenty-five minutes lovingly drawing this diagram — adding an API gateway, an auth service, a service mesh, a monitoring box — and then get asked "so how do you generate the keys?" with six minutes left. Nobody was going to challenge your load balancer. Sketch the uncontroversial parts in ten seconds and spend your minutes where the disagreement lives.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="deep-dive-1">7a. Deep dive: key generation</h2>
+
+    <p>
+      <strong>This is where the interview actually happens.</strong> Everything before this section is table stakes — a
+      competent mid-level candidate produces the same requirements, the same estimation and the same diagram. The next twenty
+      minutes are what your grade is made of, and the question is deceptively simple:
+    </p>
+
+    <p style="text-align:center"><strong><em>How do you mint a unique 7-character code, 1,200 times a second, across dozens of stateless machines, with no single point of coordination — and never collide?</em></strong></p>
+
+    <h3>First: why 7 characters? The base62 arithmetic</h3>
+
+    <p>
+      A short code is drawn from <code>[a-z][A-Z][0-9]</code> — 26 + 26 + 10 = <strong>62</strong> symbols. (You exclude
+      <code>+</code> and <code>/</code> from base64 because they're not URL-safe, and that's the whole reason base62 exists.)
+      So an <em>n</em>-character code addresses 62<sup>n</sup> distinct values:
+    </p>
+
+<pre><code>62^5 =            916,132,832   ≈ 0.9 billion   — not enough
+62^6 =         56,800,235,584   ≈ 57 billion    — ~1.5 years at 100M/day
+62^7 =      3,521,614,606,208   ≈ 3.5 TRILLION  ← 7 chars. This is the one.
+62^8 =    218,340,105,584,896   ≈ 218 trillion  — overkill, and one char longer
+
+At 100M new URLs/day:  3.5e12 / 1e8  =  35,000 days  ≈  96 years of keyspace.
+</code></pre>
+
+    <p>
+      That's the answer to "why seven?" — it is the smallest length whose keyspace outlives the business, at the scale you were
+      given. Say the number: <strong>62<sup>7</sup> ≈ 3.5 trillion, which is roughly 96 years at 100 million a day.</strong>
+      It takes four seconds and it demonstrates that the constant in your design came from arithmetic rather than from a blog
+      post. Also note the direction of the trade: every extra character multiplies your keyspace by 62 and makes the product
+      slightly worse. That's a product-vs-engineering trade-off, and naming it as one is a senior move.
+    </p>
+
+    <p>Now, three ways to actually mint the codes.</p>
+
+    <!-- ---------------------------------------------------------- -->
+    <h3>Option A — Hash the long URL</h3>
+
+    <p>
+      Take <code>MD5(longUrl)</code> or <code>SHA-256(longUrl)</code>, base62-encode the digest, and keep the first 7
+      characters.
+    </p>
+
+<pre><code>MD5("https://example.com/a/very/long/path")
+   = 9e107d9d372bb6826bd81d3542a419d6      <span class="com">// 128 bits</span>
+   → base62-encode → "4rIhCbUyIQxLDA9…"    <span class="com">// ~22 chars</span>
+   → take first 7  → "4rIhCbU"             <span class="com">// discarding ~100 bits</span>
+</code></pre>
+
+    <table>
+      <thead><tr><th>Pro</th><th>Con</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Stateless.</strong> Any machine can compute a code with zero coordination, zero network calls, zero shared state. This is genuinely attractive.</td>
+          <td><strong>Collisions are guaranteed.</strong> You truncated a 128-bit digest to ~42 bits. Distinct URLs <em>will</em> map to the same 7 characters — and unlike a hash-table collision, this one silently sends a stranger's traffic to the wrong website.</td>
+        </tr>
+        <tr>
+          <td><strong>Deduplication is free.</strong> The same long URL always produces the same code, so shortening it twice returns the same link and you store one row. (Whether you <em>want</em> that is a real question — see §10.)</td>
+          <td><strong>Collision handling costs you the statelessness you just bought.</strong> Every write must now check "does this code already exist, and if so does it point at <em>my</em> URL?" That's a read-before-write on the hot shard, and on collision you must salt-and-retry in a loop.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>
+      <strong>Do the birthday-problem arithmetic out loud</strong>, because this is where a strong candidate separates from a
+      hand-waving one. With a 42-bit effective space (≈ 3.5 × 10<sup>12</sup>) and just <em>one year</em> of writes (3.6 ×
+      10<sup>10</sup> URLs), collisions are not a remote possibility — by the birthday bound you expect them once you've stored
+      on the order of √(3.5 × 10<sup>12</sup>) ≈ <strong>1.9 million</strong> keys. That's <em>under two seconds</em> of your
+      write traffic. Collisions are not an edge case here; they are the normal operating condition, and any answer that says
+      "collisions are unlikely, I'll just retry" has not done the multiplication.
+    </p>
+
+    <div class="pitfall">The specific failure: a candidate says "I'll hash the URL and take the first 7 characters," the interviewer asks "what about collisions?", and the candidate says "they'd be rare." That answer is <em>numerically false</em> and the interviewer knows it. The recovery is to reach for the birthday bound immediately: <em>"Actually, let me check that — with 3.5 trillion slots I'd expect my first collision around two million keys, which is seconds of traffic. So collisions are routine, not rare, and I need a real handling strategy: read-before-write and salt-and-retry. That's a database round trip on every single write, which is exactly what I was trying to avoid by hashing. Let me look at a scheme that can't collide at all."</em> Catching your own error mid-sentence, with a number, scores <em>better</em> than never making it.</div>
+
+    <!-- ---------------------------------------------------------- -->
+    <h3>Option B — A global counter, base62-encoded</h3>
+
+    <p>
+      Maintain a single monotonically increasing integer. Every new URL takes the next one. Encode it in base62. Because the
+      counter never repeats, <strong>collisions are structurally impossible</strong> — not unlikely, <em>impossible</em>, and
+      that is a genuinely different kind of guarantee.
+    </p>
+
+<pre><code><span class="kw">public final class</span> <span class="typ">Base62</span> {
+
+    <span class="kw">private static final</span> <span class="typ">String</span> ALPHABET =
+        <span class="str">"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"</span>;
+    <span class="kw">private static final int</span> BASE = <span class="num">62</span>;
+
+    <span class="com">/** 125_000_000L → "8M0kX" — repeated divide-and-remainder. */</span>
+    <span class="kw">public static</span> <span class="typ">String</span> encode(<span class="kw">long</span> id) {
+        <span class="kw">if</span> (id == <span class="num">0</span>) <span class="kw">return</span> <span class="str">"0"</span>;
+        <span class="typ">StringBuilder</span> sb = <span class="kw">new</span> <span class="typ">StringBuilder</span>();
+        <span class="kw">while</span> (id &gt; <span class="num">0</span>) {
+            sb.append(ALPHABET.charAt((<span class="kw">int</span>) (id % BASE)));
+            id /= BASE;
+        }
+        <span class="kw">return</span> sb.reverse().toString();   <span class="com">// remainders come out backwards</span>
+    }
+
+    <span class="kw">public static long</span> decode(<span class="typ">String</span> code) {
+        <span class="kw">long</span> id = <span class="num">0</span>;
+        <span class="kw">for</span> (<span class="kw">char</span> c : code.toCharArray()) {
+            id = id * BASE + ALPHABET.indexOf(c);
+        }
+        <span class="kw">return</span> id;
+    }
+}
+</code></pre>
+
+    <p>
+      Two real problems, and the second one is the interesting one.
+    </p>
+
+    <p>
+      <strong>Problem 1: the counter is a single point of contention.</strong> Every write in the entire system must go through
+      one shared, strictly-increasing number. At 1,200 writes/sec that's a network round trip per write to whatever owns the
+      counter, and that thing is now on the critical path of every write, is a single point of failure, and is the first thing
+      that falls over under a traffic spike.
+    </p>
+
+    <p>
+      <strong>Problem 2, and this is the one that actually kills it: the keys are sequential, therefore enumerable.</strong>
+      If <code>sho.rt/8M0kX</code> exists, then <code>8M0kW</code> and <code>8M0kY</code> almost certainly exist too. Anyone can
+      write a twenty-line script that walks the entire keyspace and dumps every link anyone has ever shortened — including the
+      "private" Google Doc your CFO shortened, the unlisted YouTube video, the internal dashboard someone shared in Slack. This
+      is not hypothetical; it has been done to real shorteners, repeatedly, and it produced real breaches. Short links are
+      <em>security by obscurity</em> whether or not you intended them to be, and a sequential scheme removes the obscurity.
+    </p>
+
+    <div class="senior">The line that gets you the point: <em>"A pure counter gives me collision-freedom for free, which is genuinely valuable — but it makes the keyspace <strong>enumerable</strong>. Anyone can walk from <code>aaaaaab</code> to <code>aaaaaac</code> and scrape every link in the system, and people have done exactly that to real shorteners and found unlisted documents. So if I use a counter I want to <strong>decouple the counter value from the visible code</strong> — either by hashing/permuting the ID before encoding, or by interleaving random bits. I get the uniqueness guarantee of a counter and the unguessability of a random key."</em> This is the single highest-value thing you can say in this section, because 90% of candidates propose the counter and never notice the enumeration problem. Noticing it, and then <em>fixing it rather than abandoning the approach</em>, is exactly senior behaviour.</div>
+
+    <p>
+      The fix is cheap. Apply a reversible keyed permutation to the counter value before base62-encoding it — a Feistel network
+      or a simple multiply-by-a-large-odd-number-mod-2<sup>42</sup> trick. Sequential inputs produce uniformly-scattered
+      outputs, uniqueness is preserved exactly (it's a bijection), and the codes become unguessable. Or, simplest of all: take
+      the counter's uniqueness and append a few random characters. Either way you have separated the two properties — the
+      counter provides <em>uniqueness</em>, the permutation provides <em>unpredictability</em> — and being able to say that
+      sentence is the deep-dive answer.
+    </p>
+
+    <h4>Where does the counter actually live? Four options.</h4>
+
+    <table>
+      <thead><tr><th>Mechanism</th><th>How it works</th><th>Trade-off</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Redis <code>INCR</code></strong></td>
+          <td>Single atomic command; Redis is single-threaded so it's genuinely serialised. Handles 100k+ ops/sec easily.</td>
+          <td>Fast and simple. But it's a <strong>single point of failure</strong> on the write path, and Redis replication is asynchronous — so on a failover you can <em>lose the tip of the counter and re-issue IDs you already handed out</em>. That's a silent duplicate-key bug. Fixable (persist the high-water mark, or leap the counter forward by a safety margin on restart), but you must know the flaw exists.</td>
+        </tr>
+        <tr>
+          <td><strong>Database sequence</strong> (Postgres <code>SEQUENCE</code> / auto-increment)</td>
+          <td>The DB hands out the next value transactionally.</td>
+          <td>Durable and correct, which Redis isn't. But it puts a synchronous DB round trip on every write and doesn't scale past one primary. Good enough at moderate scale; genuinely fine at 1,200/s if you use <code>CACHE 1000</code> on the sequence — which, notice, is just range allocation (Option C) in disguise.</td>
+        </tr>
+        <tr>
+          <td><strong>Snowflake-style IDs</strong></td>
+          <td>Compose an ID from bits: <code>[41-bit timestamp | 10-bit machine id | 12-bit per-ms sequence]</code>. Each machine generates locally, coordination-free.</td>
+          <td>No coordination at all, and IDs are roughly time-ordered. But it's <strong>64 bits</strong>, which base62-encodes to ~11 characters — <em>too long</em>. You'd have to truncate, and truncating reintroduces collisions. Snowflake is the right answer for a distributed primary key; it is the wrong answer for a <em>short</em> code. Knowing <em>why</em> it doesn't fit here is worth more than knowing what it is.</td>
+        </tr>
+        <tr>
+          <td><strong>Range allocation</strong> ★</td>
+          <td>See Option C. Coordinate once per 10,000 keys instead of once per key.</td>
+          <td>The answer.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <!-- ---------------------------------------------------------- -->
+    <h3>Option C — Pre-generated key ranges via a key-generation service ★</h3>
+
+    <p>
+      Here is the insight, and it's the transferable one: <strong>you do not need coordination per key. You need coordination
+      per <em>block</em> of keys.</strong> Amortise the expensive shared operation over ten thousand cheap local ones and the
+      bottleneck disappears.
+    </p>
+
+    <p>
+      A tiny <strong>Key Generation Service (KGS)</strong> owns the counter. When an app server starts — or when its local
+      supply runs low — it checks out a <strong>range</strong>: "you own 3,000,000 through 3,009,999." It records that
+      checkout durably (in ZooKeeper, etcd, or a single row in Postgres). The app server then hands out keys from that range
+      <em>entirely from local memory</em>, with no network call, no lock, no contention.
+    </p>
+
+<pre><code>  ┌─────────────────────────────────────────────┐
+  │  KGS  (durable counter: next_range = 3,020,000) │
+  │  a single row:  UPDATE counters                │
+  │                 SET v = v + 10000              │
+  │                 RETURNING v;    ← atomic       │
+  └────────┬─────────────┬─────────────┬───────────┘
+           │             │             │
+      checkout      checkout      checkout      ← ONCE per 10,000 writes
+           ▼             ▼             ▼
+   ┌────────────┐ ┌────────────┐ ┌────────────┐
+   │ App srv 1  │ │ App srv 2  │ │ App srv 3  │
+   │ 3,000,000– │ │ 3,010,000– │ │ 3,020,000– │
+   │ 3,009,999  │ │ 3,019,999  │ │ 3,029,999  │
+   └────────────┘ └────────────┘ └────────────┘
+    pops keys      pops keys      pops keys
+    from LOCAL     from LOCAL     from LOCAL    ← zero coordination
+    memory         memory         memory           in the hot path
+</code></pre>
+
+    <p>Run the numbers on what that buys you, because the numbers are the argument:</p>
+
+<pre><code>Without ranges:  1,160 writes/sec  →  1,160 coordination ops/sec
+With 10k ranges: 1,160 / 10,000    →  ONE coordination op every ~9 seconds
+
+  The contention problem didn't get optimised. It got DELETED.
+</code></pre>
+
+    <p>And now walk the failure modes, unprompted, because that's the part the interviewer is waiting for:</p>
+
+    <table>
+      <thead><tr><th>Failure</th><th>What happens</th><th>Is it OK?</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>An app server crashes holding 6,000 unused keys.</strong></td>
+          <td>Those 6,000 keys are lost forever. Nobody ever issues them.</td>
+          <td><strong>Completely fine, and say so confidently.</strong> You have 3.5 trillion keys. Burning a few thousand on every crash is free. <em>"I'm choosing to leak keys on crash rather than build a reclamation protocol — the keyspace is 3.5 trillion and the complexity isn't worth it."</em> Deliberately accepting a small, quantified loss instead of engineering it away is a very senior noise to make.</td>
+        </tr>
+        <tr>
+          <td><strong>Two servers get the same range.</strong></td>
+          <td>Duplicate keys. Real corruption.</td>
+          <td>Cannot happen, <em>provided</em> the checkout is atomic. That's the one thing the KGS must get right — a single atomic <code>UPDATE … RETURNING</code>, or a ZooKeeper sequential znode. This is the entire correctness burden of the design, and it's confined to one line.</td>
+        </tr>
+        <tr>
+          <td><strong>The KGS is down.</strong></td>
+          <td>Nobody can check out a new range.</td>
+          <td>Survivable for a long time, and this is the elegant part: every app server still has thousands of keys in local memory, so <strong>writes keep working</strong> while the KGS is down. Have servers refill at 20% remaining rather than at zero, and a KGS outage is a page, not an incident. Contrast this with Redis <code>INCR</code>, where the counter dying means writes stop <em>immediately</em>.</td>
+        </tr>
+        <tr>
+          <td><strong>The KGS becomes a bottleneck.</strong></td>
+          <td>At one op per nine seconds?</td>
+          <td>It won't. And if it somehow did, make the range bigger. The range size is a dial: bigger ranges = less coordination but more keys leaked per crash. State the dial and what it trades.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>The verdict, and how to say it</h3>
+
+    <table>
+      <thead><tr><th>Scheme</th><th>Collisions</th><th>Coordination in hot path</th><th>Guessable?</th><th>Free dedup?</th></tr></thead>
+      <tbody>
+        <tr><td>Hash + truncate</td><td><strong>Yes</strong> — routinely, by the birthday bound</td><td>Yes (read-before-write to detect them)</td><td>No</td><td>Yes</td></tr>
+        <tr><td>Global counter</td><td>None, structurally</td><td><strong>Yes</strong> — every single write</td><td><strong>Yes</strong> — enumerable, a real breach vector</td><td>No</td></tr>
+        <tr><td>Snowflake IDs</td><td>None</td><td>None</td><td>Partly (time-ordered)</td><td>No</td></tr>
+        <tr><td><em>…but 64 bits ≈ 11 chars — too long for a short code.</em></td><td colspan="4"></td></tr>
+        <tr><td><strong>Range allocation (KGS)</strong> ★</td><td><strong>None</strong></td><td><strong>None</strong> (1 op per 10k writes)</td><td>Fixable — permute the ID before encoding</td><td>No (see §10 — you probably don't want it)</td></tr>
+      </tbody>
+    </table>
+
+    <div class="senior">The full answer, delivered as one paragraph: <em>"I'd use <strong>range allocation</strong>. Hashing the URL is stateless and gives me free dedup, but truncating a 128-bit digest to 42 bits means collisions by the birthday bound at around two million keys — seconds of my write traffic — so every write becomes a read-before-write, and I've paid for the statelessness twice. A global counter gives me guaranteed uniqueness, but it puts a coordination hop on every write and it makes the keyspace enumerable, which is a real security problem — people have scraped shorteners this way and found private documents. Range allocation gets me both: each app server checks out ten thousand IDs at a time, so uniqueness is guaranteed by the counter but coordination happens once every nine seconds instead of 1,200 times a second, and I permute the ID before base62-encoding it so the codes aren't sequential. The cost is that I leak a few thousand keys whenever a server dies — and out of 3.5 trillion, I'll take that trade every time."</em> That is a complete deep-dive answer: three options, each rejected for a specific stated reason, a winner, and the winner's cost named without being asked.</div>
+
+    <div class="note">The pattern you just learned generalises far beyond this question and is worth stating as a principle, because interviewers love hearing principles: <strong>when a shared resource is a bottleneck, don't make it faster — make it needed less often.</strong> The same move is why databases hand out sequence values in cached blocks, why Snowflake pushes ID generation to the machine, why Kafka producers batch, and why HikariCP holds a connection pool instead of dialling Postgres per query. Amortise the coordination. You'll use this again in <a href="09-rate-limiter.html">tutorial 09</a>, where the same trick turns a per-request Redis hit into a per-batch one.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="deep-dive-2">7b. Deep dive: the read path &amp; caching</h2>
+
+    <p>
+      Back to the number that drives everything: <strong>116,000 reads per second against 1,160 writes.</strong> At a 100:1
+      ratio, the cache is not an optimisation bolted onto the design — <strong>the cache <em>is</em> the design</strong>, and
+      the database is the thing that catches what falls through. Internalise that inversion. It's what "read-heavy archetype"
+      actually means, and it's why the same skeleton reappears in a pastebin, an image host and a feature-flag service.
+    </p>
+
+    <h3>Why caching works so well here — three properties, all rare, all present</h3>
+
+    <ul>
+      <li><strong>The values are immutable.</strong> A short code's target never changes, so there is <em>no invalidation problem</em>. The hardest thing in caching is not present in this system. TTLs exist only to bound memory, not to bound staleness.</li>
+      <li><strong>The values are tiny.</strong> ~500 bytes. You can hold an enormous number of them in memory for very little money (arithmetic below).</li>
+      <li><strong>The access distribution is brutally skewed.</strong> Roughly <strong>20% of links generate 80% of clicks</strong> — and honestly it's worse than that: a link's traffic is overwhelmingly concentrated in the first days after it's created, and a handful of viral links dwarf everything else. Skew is the cache's best friend.</li>
+    </ul>
+
+    <h3>Do the hit-ratio arithmetic — and the memory arithmetic</h3>
+
+<pre><code>Assume the hot set = links created in the last ~7 days, plus the long-tail
+of older links that still get clicked.
+
+  7 days × 100M links/day  =  700M links
+  700M × 500 bytes         =  350 GB      ← too big for one Redis node,
+                                            but trivially a small cluster
+                                            (or: cache only what's ACTUALLY
+                                            been read — LRU does this for
+                                            free, and the hot set is far
+                                            smaller than the created set)
+
+Realistic: cache the top ~20% by traffic. LRU converges there on its own.
+
+Hit rate 90%:  116,000 × 0.10  =  11,600 reads/sec hit the database
+Hit rate 95%:  116,000 × 0.05  =   5,800 reads/sec
+Hit rate 99%:  116,000 × 0.01  =   1,160 reads/sec   ← DB load == write load
+
+  ↑ Look at that last line. At 99% hit rate, the read traffic reaching your
+    database is the same magnitude as your write traffic. The cache has
+    made a 100:1 read-heavy system look BALANCED to the database.
+    THAT is what the cache is buying, and it's worth saying in those words.
+</code></pre>
+
+    <div class="senior">Say this explicitly, because it reframes the whole design: <em>"The point of the cache isn't 'reads are faster.' It's that at a 95–99% hit rate the database only ever sees single-digit-thousands of reads a second — which is the same order as my write load. The cache converts a read-heavy system into a balanced one <strong>from the storage layer's point of view</strong>, and that's what lets me pick a boring, sharded KV store instead of an exotic read-scaling architecture. The cache is what makes the rest of the design boring, and boring is the goal."</em></div>
+
+    <h3>Cache-aside, and why not the alternatives</h3>
+
+<pre><code>READ:
+  1. value = redis.get(code)
+  2. if hit  → return 302 immediately.               ← ~99% of the time
+  3. if miss → value = db.get(code)
+  4.           redis.setex(code, TTL, value)         ← populate on the way back
+  5.           return 302
+  6. if not in DB → cache a NEGATIVE entry (short TTL) → 404
+
+WRITE:
+  1. INSERT into the KV store        ← source of truth first, always
+  2. redis.setex(code, TTL, value)   ← optional warm; the creator's own
+                                       first click is then a hit
+</code></pre>
+
+    <p>
+      <strong>Cache-aside</strong> (lazy loading) is right here, and you should be able to say why the other two patterns lose
+      (<a href="06-caching-queues-resilience.html">tutorial 06</a> has the full taxonomy):
+    </p>
+
+    <ul>
+      <li><strong>Write-through</strong> (write to cache and DB synchronously on every write) would populate the cache with <em>every</em> link — including the 80% that are never clicked again. You'd be paying memory for cold data. The only reason to warm on write here is the creator's own first click, and that's a cheap, optional nicety, not a pattern commitment.</li>
+      <li><strong>Write-behind</strong> (write to cache, flush to DB asynchronously) risks losing writes if the cache dies before the flush. For an immutable link that someone has already been handed and pasted into a tweet, losing it is unacceptable. <strong>Never write-behind data you've already acknowledged to a user.</strong></li>
+      <li><strong>Cache-aside</strong> populates only what's actually read, which — given that 80% of links are barely clicked — is exactly the subset worth holding. The data's own access pattern does your eviction for you.</li>
+    </ul>
+
+    <p>
+      Eviction: <strong>LRU</strong>, and it's the natural fit rather than a default. Link popularity decays with age, LRU
+      approximates "recently clicked," and recently-clicked is a very good predictor of about-to-be-clicked. TTL as a backstop
+      to bound memory, but — say it again — <em>not</em> for staleness, because the value can't go stale.
+    </p>
+
+    <h3>What happens when the cache misses en masse</h3>
+
+    <p>
+      This is the follow-up, and it comes in two flavours. Have both answers ready, because "what if Redis goes down?" is the
+      most predictable question in caching.
+    </p>
+
+    <table>
+      <thead><tr><th>Scenario</th><th>What actually happens</th><th>The fix</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Cache stampede / thundering herd.</strong> A hot key's TTL expires and 5,000 concurrent requests all miss simultaneously and all hit the same DB row.</td>
+          <td>Five thousand identical reads for one row, all in flight at once, all doing the same work. Worse, they can trigger a queue backup that cascades into timeouts elsewhere.</td>
+          <td><strong>Single-flight / request coalescing:</strong> a per-key lock so exactly one request repopulates and the rest wait on it. Plus <strong>jittered TTLs</strong> (never expire keys at identical instants) and <strong>probabilistic early refresh</strong> (a request has a small chance of refreshing the entry <em>before</em> it expires, proportional to how close to expiry it is). → <a href="06-caching-queues-resilience.html">tutorial 06</a>.</td>
+        </tr>
+        <tr>
+          <td><strong>Cold-start / cache-loss storm.</strong> The Redis cluster restarts. The cache is empty. 116,000 reads/sec all fall through simultaneously.</td>
+          <td><strong>Your database dies.</strong> Not "slows down" — dies. It was provisioned to handle 5,800 reads/sec and it just got 116,000, which is a 20× overload, and the resulting latency spike makes every client retry, which makes it worse.</td>
+          <td>Three layers, and name all three: <strong>(1)</strong> the CDN is still absorbing hot links, so it isn't really 116k. <strong>(2)</strong> A small in-process LRU on each app server (a few thousand entries) absorbs the hottest keys with no network hop at all — this is your last line of defence and it costs nothing. <strong>(3)</strong> Rate-limit / shed load at the app tier so the DB degrades gracefully instead of collapsing; and consider warming the cache before taking traffic on a cold node.</td>
+        </tr>
+        <tr>
+          <td><strong>Bot scraping random codes.</strong> Someone walks the keyspace. Every request is a guaranteed cache miss and a guaranteed DB read.</td>
+          <td>Every lookup misses the cache (the key doesn't exist), so every one is a database hit. An attacker has trivially bypassed your entire cache tier.</td>
+          <td><strong>Cache negative results</strong> (a short TTL "this doesn't exist" entry) so the second lookup of a nonexistent code is free. And/or a <strong>bloom filter</strong> of existing codes in front of the DB — a probabilistic membership test that says "definitely not present" in nanoseconds and never touches storage. This is one of the few places a bloom filter genuinely earns its place, and mentioning it here reads very well. → <a href="06-caching-queues-resilience.html">tutorial 06</a>.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>Why the CDN can serve redirects at the edge</h3>
+
+    <p>
+      This is the move most candidates miss entirely, and it's the biggest single win available on the read path.
+    </p>
+
+    <p>
+      A redirect is a <strong>tiny, cacheable, public, GET-only HTTP response.</strong> It has no auth, no personalisation, no
+      body worth speaking of — just a status line and a <code>Location</code> header. That is <em>exactly</em> the response
+      shape a CDN was built to cache. Put Cloudflare or CloudFront in front of <code>GET /{shortCode}</code>, return
+      <code>Cache-Control: public, max-age=3600</code> on the 302, and every hot link is now served from a POP a few
+      milliseconds from the user — <strong>and your origin never sees the request at all.</strong>
+    </p>
+
+    <p>What that buys, concretely:</p>
+    <ul>
+      <li><strong>Latency:</strong> ~20ms from an edge POP versus a cross-continent round trip to your origin region. On a redirect, which is pure added latency on someone else's page load, that is the difference between invisible and annoying.</li>
+      <li><strong>Load:</strong> the viral-link problem largely <em>disappears</em>. A link doing 50,000 clicks/sec is absorbed by hundreds of independent edge nodes, each of which fetched it from you exactly once. Your origin sees a handful of requests instead of 50,000.</li>
+      <li><strong>Availability:</strong> if your origin region is down, the edge keeps serving cached redirects. Your most-used links stay alive through an outage you're actively firefighting.</li>
+    </ul>
+
+    <p>
+      The cost, and you must name it: <strong>edge-cached redirects mean you don't see those clicks either</strong> — the same
+      analytics hole as a 301, arriving through a different door. The clean resolution is to have the edge report
+      asynchronously (Cloudflare Workers, CloudFront logs, Lambda@Edge) and feed those logs into the same Kafka pipeline the
+      origin uses. You accept a delay and a small loss in exchange for an enormous load reduction — and since your analytics
+      requirement was "roughly, not real-time, not exact," that is a trade you already have permission to make. Point back at
+      the requirement when you say it.
+    </p>
+
+    <div class="pitfall">The mistake is caching the redirect at the edge <em>and</em> promising exact click counts. Those two things are in direct conflict and you cannot have both. Pick, and say which you picked and why. A candidate who claims edge caching AND perfect analytics has not thought it through, and the interviewer will find the seam within one question.</div>
+
+    <div class="note">Connect this to what you already know from React: this is exactly the client-cache-vs-server-truth trade-off you live with every day in React Query or SWR — <code>staleTime</code>, cache-then-revalidate, and the fact that a cached UI can't observe a change it never fetched. Same tension, different layer. The reason it's <em>easy</em> here is the immutability requirement you got in §2. If links were editable, this entire section would need an invalidation story — a purge API at the CDN, a pub/sub invalidation channel to every Redis node — and the design would be meaningfully harder. That one clarifying question saved you a deep dive.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="scaling">8. Scaling &amp; bottlenecks</h2>
+
+    <p>
+      "What breaks first at 10×?" is not a question you should wait to be asked. Volunteer it. And answer it in
+      <strong>order</strong> — the ordering itself is the signal, because it proves you know where the pressure actually
+      accumulates rather than reciting a list of components.
+    </p>
+
+    <h3>The order things break</h3>
+
+    <table>
+      <thead><tr><th>#</th><th>What breaks</th><th>When</th><th>The fix</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>1</td>
+          <td><strong>The key counter.</strong> If you went with a naive global counter (Redis <code>INCR</code> or a DB sequence), every write in the system serialises through it.</td>
+          <td>Immediately, at any real write volume — and catastrophically on a Redis failover, which can silently re-issue IDs you already handed out.</td>
+          <td><strong>Already fixed by range allocation (§7a).</strong> This is why that was the deep dive: it's the first thing that breaks, and the design already anticipated it. Say exactly that — <em>"the counter would normally be my first bottleneck, which is why I removed it from the hot path up front."</em></td>
+        </tr>
+        <tr>
+          <td>2</td>
+          <td><strong>The database</strong>, on reads, if the cache hit rate drops or Redis goes cold.</td>
+          <td>The moment a cache tier restarts. Provisioned for ~5,800 reads/sec, suddenly handed 116,000.</td>
+          <td>In-process LRU on each app server as a last line of defence; load-shedding at the app tier; read replicas so at least reads spread; warm the cache before a node takes traffic. And <strong>shard</strong> — see below.</td>
+        </tr>
+        <tr>
+          <td>3</td>
+          <td><strong>The cache</strong>, on a single hot key. A viral link puts 50,000 requests/sec on one Redis key, which lives on exactly one node in the cluster.</td>
+          <td>The first time a shortened link lands on the front page of Reddit.</td>
+          <td>The CDN absorbs most of it before it ever reaches you. Behind that, an in-process LRU means each app server holds the hot value locally. Behind <em>that</em>, the standard hot-key remedies: replicate the key to multiple cache nodes, or key-suffix it across N shards and read a random one. → <a href="04-partitioning-hashing.html">tutorial 04</a>, hot keys &amp; celebrity partitions.</td>
+        </tr>
+        <tr>
+          <td>4</td>
+          <td><strong>Storage</strong>, at 90 TB and growing 18 TB/year.</td>
+          <td>Year one, and it never stops.</td>
+          <td>Sharding — which the design already assumed. Plus expiry and cleanup (§10), which is the only thing that ever makes the number go <em>down</em>.</td>
+        </tr>
+        <tr>
+          <td>5</td>
+          <td><strong>The analytics pipeline.</strong> 116,000 click events/sec into Kafka.</td>
+          <td>Under a traffic spike, when the aggregator lags.</td>
+          <td>Who cares — <em>and that's the point of putting it off the critical path.</em> If Kafka backs up or falls over, redirects keep working and you lose some counts. Design the coupling so the least important thing fails first. → <a href="18-streaming-aggregation.html">tutorial 18</a>.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>Sharding the store</h3>
+
+    <p>
+      <strong>Shard by <code>short_code</code></strong> — the primary key, and the only thing you ever look up by. That's not
+      an arbitrary choice; it's forced, and you should say why it's forced:
+    </p>
+
+    <ul>
+      <li><strong>Every read is a point lookup by <code>short_code</code>,</strong> so the shard key is also the lookup key. Every read touches exactly one shard. There are no scatter-gather queries, no cross-shard joins, no fan-out. This is the cleanest possible sharding story and it's a direct consequence of the archetype.</li>
+      <li><strong>Codes are uniformly distributed</strong> (random-looking base62, especially if you permuted the counter value), so <code>hash(short_code) → shard</code> spreads writes and storage almost perfectly evenly. No hot partition <em>by key</em>. Compare this to sharding a social graph by user id, where a celebrity blows up one shard — you don't have that problem, and you should notice out loud that you don't.</li>
+      <li><strong>Use consistent hashing</strong> so that adding a shard moves ~1/N of the keys rather than reshuffling everything. With a naive <code>hash(key) % N</code>, going from 10 to 11 shards remaps roughly 90% of your keys — which at 90 TB is a multi-week data migration and, more to the point, a cache-invalidation apocalypse. → <a href="04-partitioning-hashing.html">tutorial 04</a>, and note that <a href="08-distributed-cache.html">tutorial 08</a> is where you <em>build</em> this.</li>
+    </ul>
+
+    <div class="senior">The distinction worth drawing explicitly, because it's a genuinely senior observation: <em>"There's no hot <strong>partition</strong> here — the keys are uniform, so storage and writes spread evenly, and that's a nice property I get for free from the key scheme. But there absolutely is a hot <strong>key</strong>: one viral link can pull fifty thousand requests a second on a single code, and no amount of partitioning helps, because it's <em>one key</em> and it lives on <em>one node</em>. Those are different problems with different fixes. Partitioning solves data volume; replication and edge caching solve request concentration. The CDN is doing most of the work on the second one."</em> Most candidates conflate these two and try to solve a hot key by adding shards, which does precisely nothing.</div>
+
+    <h3>Multi-region</h3>
+
+    <p>
+      One sentence, unless they push. Reads are trivially multi-region: the values are immutable, so you can replicate them
+      everywhere with a completely relaxed consistency model — there is <em>no</em> conflict to resolve, ever, because nothing
+      is ever updated. Writes are far rarer (1,160/s), so keep a single write region, or shard writes by region and prefix the
+      code with a region identifier so a code is unambiguously owned by one region. Immutability makes what is normally the
+      hardest part of multi-region — conflicting concurrent writes — <em>vanish</em>. Say that; it's a direct payoff from a
+      clarifying question you asked in minute three.
+    </p>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="tradeoffs">9. Trade-offs</h2>
+
+    <p>
+      This table is the page. If you remember nothing else, remember that <em>every</em> row has a "when I'd flip" column,
+      because a decision you can't reverse under stated conditions is a decision you didn't actually make — you just repeated
+      one.
+    </p>
+
+    <table>
+      <thead><tr><th>Decision</th><th>Alternative</th><th>Why I chose it</th><th>When I'd flip</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>302</strong> redirect</td>
+          <td>301 (permanent)</td>
+          <td>301 is browser-cached, so I'd never see repeat clicks — analytics silently breaks and I can't recover the lost data.</td>
+          <td>If analytics didn't matter at all. 301 would cut my read traffic substantially, and traffic reduction is worth a lot when it's free.</td>
+        </tr>
+        <tr>
+          <td><strong>Range allocation</strong> for keys</td>
+          <td>Hash-and-truncate; global counter</td>
+          <td>Uniqueness guaranteed with zero coordination in the hot path. One coordination op per 10,000 writes.</td>
+          <td>At low scale (say &lt; 1M links/day) a DB sequence or even random-with-retry is simpler and I'd take the simplicity. Complexity you don't need is a bug.</td>
+        </tr>
+        <tr>
+          <td><strong>Permute the counter</strong> before base62-encoding</td>
+          <td>Encode it raw</td>
+          <td>Raw counter values are sequential, so the keyspace is enumerable and anyone can scrape every link in the system. That has caused real breaches.</td>
+          <td>Never, honestly — the permutation is nearly free. But if links were guaranteed public (a public news-link shortener), the enumeration risk goes away and I'd stop caring.</td>
+        </tr>
+        <tr>
+          <td><strong>KV store</strong> (Cassandra / DynamoDB)</td>
+          <td>Postgres</td>
+          <td>90 TB doesn't fit on one box, and the workload is pure point-lookup-by-key with no joins or transactions — exactly a KV shape.</td>
+          <td><strong>Any scale below ~10M links/day.</strong> Postgres genuinely handles this and gives me unique constraints, real transactions, and no operational learning curve. I'd build Postgres first and be right.</td>
+        </tr>
+        <tr>
+          <td><strong>Cache-aside</strong></td>
+          <td>Write-through / write-behind</td>
+          <td>Only ~20% of links are ever read much; write-through would fill the cache with cold data I'm paying memory for. Cache-aside caches what's actually hot, automatically.</td>
+          <td>If the read-after-create hit rate mattered a lot (say, links are almost always clicked immediately after creation), I'd add a write-through warm. That's a tweak, not a change of pattern.</td>
+        </tr>
+        <tr>
+          <td><strong>CDN at the edge</strong></td>
+          <td>Origin-only</td>
+          <td>A redirect is a tiny, public, cacheable GET. It's the perfect CDN payload, and it makes the viral-link problem mostly disappear.</td>
+          <td>If I needed exact, real-time click counts. Then I'd pull redirects back to the origin and eat the load — or use edge compute to log asynchronously and accept a delay.</td>
+        </tr>
+        <tr>
+          <td><strong>Async analytics</strong> (Kafka)</td>
+          <td>Synchronous <code>UPDATE … SET clicks = clicks + 1</code></td>
+          <td>A synchronous counter update on the redirect path turns my hottest read into a write, adds latency to the critical path, and creates a per-row hot-write contention point on exactly the viral links that need it least.</td>
+          <td>Never for this scale. At tiny scale, a synchronous increment is fine and simpler — and pretending otherwise is over-engineering.</td>
+        </tr>
+        <tr>
+          <td><strong>No dedup</strong> of identical long URLs</td>
+          <td>Hash-based dedup: same URL → same code</td>
+          <td>Two users shortening the same URL usually want <em>separate</em> links — separate analytics, separate expiry, separate ownership. Collapsing them silently entangles unrelated users.</td>
+          <td>If storage were the binding constraint, or if it were a single-tenant internal tool with no per-link analytics. Then dedup is free savings.</td>
+        </tr>
+        <tr>
+          <td><strong>Availability over consistency</strong></td>
+          <td>Strong consistency on reads</td>
+          <td>A broken redirect is a broken link on someone else's website, permanently. And since links are immutable, there's essentially nothing to be inconsistent <em>about</em>.</td>
+          <td>If links became editable, staleness would suddenly have real semantics — someone repointing a link away from a compromised target would need it to take effect <em>now</em> — and I'd need an invalidation path.</td>
+        </tr>
+        <tr>
+          <td><strong>Leak keys on server crash</strong></td>
+          <td>A reclamation protocol for unused ranges</td>
+          <td>3.5 trillion keys. Losing 10,000 per crash is arithmetically irrelevant and the protocol would be real complexity with real bugs.</td>
+          <td>If codes were 5 characters (916M keyspace) instead of 7, the leak would actually matter and I'd have to reclaim.</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="followups">10. Follow-ups you should expect</h2>
+
+    <p>
+      These are the real ones. If you have crisp answers to these five, you have covered essentially the entire follow-up
+      surface of this question.
+    </p>
+
+    <h3>10a. "How do custom aliases work?"</h3>
+
+    <p>
+      The user wants <code>sho.rt/black-friday</code>. Obvious, and it contains a race that most candidates walk straight into:
+    </p>
+
+<pre><code><span class="com">// WRONG — a check-then-act race. Two requests can both pass step 1.</span>
+<span class="kw">if</span> (!repo.existsById(alias)) {      <span class="com">// T1 checks: free. T2 checks: free.</span>
+    repo.save(<span class="kw">new</span> <span class="typ">Url</span>(alias, longUrl));  <span class="com">// T1 writes. T2 OVERWRITES.</span>
+}
+<span class="com">// One user's link now silently points at the other user's URL.</span>
+</code></pre>
+
+    <p>
+      That is the classic TOCTOU bug, and the fix is <em>not</em> a distributed lock, a Redis <code>SETNX</code>, or a retry
+      loop — those are all more machinery than the problem needs. <strong>Let the database's unique constraint decide.</strong>
+      It is the one component in your system that can arbitrate this atomically, it already exists, and it cannot be raced:
+    </p>
+
+<pre><code><span class="com">// RIGHT — one atomic operation. The DB is the arbiter of uniqueness.</span>
+<span class="kw">try</span> {
+    repo.insert(alias, longUrl);         <span class="com">// PRIMARY KEY / UNIQUE on short_code</span>
+    <span class="kw">return</span> <span class="typ">Response</span>.created(alias);
+} <span class="kw">catch</span> (<span class="typ">DuplicateKeyException</span> e) {
+    <span class="kw">return</span> <span class="typ">Response</span>.status(<span class="num">409</span>).body(<span class="str">"Alias already taken"</span>);
+}
+</code></pre>
+
+    <div class="senior">The principle, stated generally — and this is a sentence worth having permanently loaded, because it reappears in <a href="14-ticket-booking.html">tutorial 14</a> (don't oversell a seat) and <a href="13-payments-orders.html">13</a> (don't double-charge): <em>"Never read-then-write to enforce uniqueness in a concurrent system — that's a check-then-act race, and it <strong>will</strong> fire under load. Push the constraint down to the one layer that can enforce it atomically. A unique index is a distributed lock that someone else already debugged for you, and it's free."</em></div>
+
+    <p>
+      Two wrinkles worth mentioning: custom aliases must live in the <em>same</em> keyspace as generated codes (otherwise a
+      generated code could later collide with an alias), so either reserve a prefix or a length for aliases, or just let the
+      unique constraint catch it and have the generator retry. And you'll need a profanity/reserved-word blocklist —
+      <code>/admin</code>, <code>/api</code>, <code>/login</code> must never be claimable as aliases. That's a one-liner to
+      mention and it shows you're thinking about the actual product.
+    </p>
+
+    <p>
+      Note the store-choice consequence: if you picked Cassandra in §5, <em>you do not have a unique constraint.</em> You'd need
+      a lightweight transaction (<code>INSERT … IF NOT EXISTS</code>, Paxos under the hood, ~an order of magnitude slower), or
+      you keep custom aliases — which are rare, maybe 1% of links — in a small Postgres table where a real unique index exists.
+      That second answer is the pragmatic one and it reads as someone who has actually shipped something.
+    </p>
+
+    <h3>10b. "How do links expire, and who cleans them up?"</h3>
+
+    <table>
+      <thead><tr><th>Strategy</th><th>How</th><th>Trade-off</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Lazy deletion</strong></td>
+          <td>On read, check <code>expires_at &lt; now()</code>. If expired, return 404 and (optionally) delete the row.</td>
+          <td><strong>Correct immediately</strong> — an expired link is never served, from the first millisecond. But storage is never reclaimed for links nobody ever reads again, which is <em>most</em> of them. Your 90 TB keeps growing.</td>
+        </tr>
+        <tr>
+          <td><strong>TTL sweep</strong> (a reaper job)</td>
+          <td>A background job scans the partial index on <code>expires_at</code> and deletes in batches.</td>
+          <td><strong>Reclaims storage</strong>, which is the whole point. But it's an enormous scan at 90 TB, and it must be rate-limited so it doesn't compete with live traffic for IO. Run it off-peak, in small batches, with a cap.</td>
+        </tr>
+        <tr>
+          <td><strong>Native TTL</strong></td>
+          <td>Cassandra and DynamoDB both support per-row TTL; the store expires and compacts the row away for you.</td>
+          <td><strong>The best answer if your store supports it</strong> — it's free, it's the store's own job, and you write zero code. Naming this is a strong signal that you know the tools rather than just the concepts.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>
+      <strong>Use both lazy and sweep, and say why:</strong> lazy checking gives you <em>correctness</em> (an expired link is
+      never served, even if the reaper is hours behind), and the sweep gives you <em>storage reclamation</em>. They solve
+      different problems and neither substitutes for the other. A candidate who proposes only the sweep has a window in which
+      expired links still resolve; a candidate who proposes only lazy deletion has a disk-space problem. Proposing both, and
+      articulating that they're solving two different things, is the complete answer.
+    </p>
+
+    <div class="note">Don't hard-delete expired codes and then let the generator reissue them. If <code>sho.rt/aB3xY9z</code> expires and gets reassigned to a new URL, every old tweet, email and bookmark containing that link now points somewhere unexpected — potentially somewhere malicious, which is a genuine attack vector if an attacker can predict which codes are about to expire. <strong>Retire codes; don't recycle them.</strong> With 3.5 trillion of them you'll never need to, and saying this out loud is a nice little security instinct that costs you one sentence.</div>
+
+    <h3>10c. "How do you do analytics without wrecking the redirect?"</h3>
+
+    <p>
+      The wrong answer is a synchronous <code>UPDATE urls SET clicks = clicks + 1 WHERE short_code = ?</code> on the redirect
+      path. It is wrong three separate ways, and being able to enumerate them is the answer:
+    </p>
+    <ol>
+      <li>It adds a database <em>write</em> to your hottest <em>read</em> path, latency-taxing the one thing that must be fast.</li>
+      <li>It creates <strong>row-level write contention on exactly the viral links</strong> — the ones getting 50,000 clicks/sec are the ones whose single row now has 50,000 concurrent increments queued against it. The hottest link is the one that breaks hardest, which is precisely backwards.</li>
+      <li>It <strong>defeats your cache entirely.</strong> A read that must also write cannot be served from Redis or the CDN. You would have destroyed the central premise of the design (§7b) in order to increment a counter.</li>
+    </ol>
+
+    <p>The right answer, in one breath: <strong>fire an event, don't write a row.</strong></p>
+
+<pre><code>  Redirect service:
+    1. resolve code → longUrl        (cache hit, sub-millisecond)
+    2. return 302                    ← RESPONSE IS ALREADY GONE
+    3. kafka.send("click-events", {  ← fire and forget, off the hot path
+         code, ts, referrer, ip, ua, geo
+       })
+
+  Downstream (tutorial 18):
+    Kafka → stream processor (windowed aggregation)
+          → OLAP store / time-series DB
+          → dashboard reads pre-aggregated counts, never raw events
+</code></pre>
+
+    <p>
+      If Kafka is unavailable, you drop the event and <strong>the redirect still works</strong>. That coupling direction is
+      deliberate and you should name it: the least important part of the system is the part that's allowed to fail. Analytics
+      is eventually-consistent, approximate, and delayed by seconds — which is exactly what you established in requirements, so
+      point back at that. (<a href="06-caching-queues-resilience.html">Tutorial 06</a> for the queue and the failure semantics;
+      <a href="18-streaming-aggregation.html">18</a> for the aggregation pipeline, windowing, and approximate counting with
+      HyperLogLog when exact unique-visitor counts are too expensive.)
+    </p>
+
+    <h3>10d. "How do you stop someone creating ten million links?"</h3>
+
+    <p>
+      Rate limit the <em>write</em> path, per API key and per IP: a token bucket at the gateway, backed by Redis, returning
+      <code>429</code> with a <code>Retry-After</code> header. The write path is 100× cheaper than the read path, so it's
+      cheap to protect and it's the one an abuser will target — spammers want to mint links, not click them. Also worth one
+      sentence: shorteners are a <em>phishing-delivery mechanism</em>, which is why real ones scan target URLs against
+      blocklists (Google Safe Browsing) and show an interstitial for suspicious links. You cut that from scope in §2 — but
+      naming it as a deliberate cut, rather than never mentioning it, is what makes the cut read as triage.
+      → <a href="09-rate-limiter.html">tutorial 09</a>.
+    </p>
+
+    <h3>10e. "What if two users shorten the same long URL?"</h3>
+
+    <p>
+      A deceptively deep question, and the naive answer ("dedup it — hash the URL, return the existing code, save storage") is
+      usually <em>wrong</em>. Think about what a shared code actually implies:
+    </p>
+
+    <table>
+      <thead><tr><th>If you dedup…</th><th>The consequence</th></tr></thead>
+      <tbody>
+        <tr><td>User A sets a 30-day expiry; user B wants the link forever.</td><td><strong>Whose expiry wins?</strong> The link can only have one. Someone's link breaks, and they didn't do anything wrong.</td></tr>
+        <tr><td>Both want click analytics.</td><td><strong>The clicks are now merged.</strong> A's campaign report includes B's traffic. For a marketing tool — which is what bit.ly <em>is</em> — this is a product-destroying bug, not an optimisation.</td></tr>
+        <tr><td>A's link gets flagged as spam and blocked.</td><td>B's link, which they created independently and innocently, dies too. You've coupled two unrelated users' fates.</td></tr>
+        <tr><td>You save storage.</td><td>500 bytes. Against 90 TB. This is a rounding error, and it's the <em>only</em> thing you gained.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="senior">The answer: <em>"I wouldn't dedup — and I want to be clear that's a deliberate choice, not an oversight. Dedup saves 500 bytes and costs me per-link expiry, per-link analytics, and per-link ownership, because two users who happened to shorten the same URL would now be sharing one entangled object. The 500 bytes is a rounding error against 90 terabytes. The exception is a single-tenant internal tool with no per-link analytics — there, dedup is free savings and I'd take it. So: same URL, two codes, and I'll pay the storage."</em> This question is a trap that rewards the candidate who thinks about the <em>product</em> and not just the bytes — which at 7 YOE is exactly the distinction they're probing for.</div>
+
+    <p>
+      Nuance worth adding if they push: you might dedup <em>per user</em> — if the same user shortens the same URL twice with
+      identical options, returning the existing code is friendly and harmless, because there's no cross-user entanglement.
+      That's an idempotency property, not a storage optimisation, and framing it that way is the sharper answer.
+    </p>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="qa">Interview Q&amp;A</h2>
+
+    <details class="qa">
+      <summary>301 or 302? And why does the interviewer keep asking this?</summary>
+      <div class="answer">
+        <p>
+          <strong>302</strong>, if you want analytics — which the requirements said you do. A 301 is <em>Moved Permanently</em>
+          and browsers cache it, often for a very long time. That means the second time a user clicks that short link, the
+          browser goes straight to the target and <strong>your server never sees the request</strong>. You cannot count clicks
+          you never receive, and you cannot recover them later, because the data was never collected.
+        </p>
+        <p>
+          The trade is real and you should name both sides: 301 would cut your read traffic substantially (repeat clicks become
+          free) and it passes SEO link equity to the target. 302 costs you that traffic but it costs you traffic in the one
+          currency you have plenty of — you already have Redis and a CDN, and a redirect is a couple of hundred bytes.
+        </p>
+        <p>
+          They keep asking because it's the cheapest possible test of whether you understand that <strong>a caching decision at
+          the HTTP layer can silently delete a product feature.</strong> The candidate who says "301, because the redirect is
+          permanent" is reasoning about HTTP semantics in the abstract. The candidate who says "302, because 301 breaks
+          analytics, and I'd flip to 301 the moment you tell me you don't care about click counts" is reasoning about a system.
+          Middle ground worth mentioning: a 302 with an explicit short <code>Cache-Control: max-age=60</code> gets you some
+          repeat-click absorption with a bounded, known analytics loss.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Why is 7 characters the right length? Show the arithmetic.</summary>
+      <div class="answer">
+        <p>
+          Base62 = <code>[a-z][A-Z][0-9]</code> = 62 symbols (base64's <code>+</code> and <code>/</code> aren't URL-safe, which
+          is precisely why base62 exists). So an <em>n</em>-char code addresses 62<sup>n</sup> values:
+        </p>
+        <ul>
+          <li>62<sup>6</sup> ≈ <strong>57 billion</strong> — at 100M URLs/day, that's exhausted in about 1.5 years. Not enough.</li>
+          <li>62<sup>7</sup> ≈ <strong>3.5 trillion</strong> — about <strong>96 years</strong> at 100M/day. This is the one.</li>
+          <li>62<sup>8</sup> ≈ 218 trillion — overkill, and it costs you a character the user has to type or tweet.</li>
+        </ul>
+        <p>
+          Seven is the smallest length whose keyspace outlives the business at the given scale. Note the shape of the trade:
+          each extra character multiplies capacity by 62 and makes the product marginally worse. That's a product-versus-
+          engineering trade-off, and naming it as one — rather than treating 7 as a magic constant — is the senior read.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Walk me through key generation. Which scheme, and why not the other two?</summary>
+      <div class="answer">
+        <p><strong>Range allocation.</strong> Here's the full comparison, which is the actual answer:</p>
+        <p>
+          <strong>Hash the URL (MD5/SHA → base62, first 7 chars).</strong> Stateless, and dedup comes free. But you truncated a
+          128-bit digest to ~42 bits, and by the birthday bound you expect your first collision at roughly √(3.5×10<sup>12</sup>)
+          ≈ <strong>1.9 million keys — under two seconds of write traffic</strong>. Collisions aren't an edge case, they're the
+          normal operating condition, so every write becomes a read-before-write plus salt-and-retry. You've paid for the
+          statelessness twice over.
+        </p>
+        <p>
+          <strong>Global counter → base62.</strong> Collisions are structurally impossible, which is a genuinely valuable
+          guarantee. But (a) every write serialises through one shared counter — a coordination hop, a SPOF, and the first thing
+          to fall over under load; and (b) the codes are <strong>sequential and therefore enumerable</strong>. Anyone can walk
+          the keyspace and scrape every link in the system, and that has been done to real shorteners and surfaced private
+          documents.
+        </p>
+        <p>
+          <strong>Range allocation.</strong> Each app server checks out a block of 10,000 unused IDs from a key-generation
+          service (atomic <code>UPDATE … RETURNING</code>, or ZooKeeper) and then serves keys from local memory with zero
+          coordination. Uniqueness is inherited from the counter; contention drops from 1,160 coordination ops/sec to
+          <strong>one every nine seconds</strong>. Permute the ID before base62-encoding it (a Feistel network, or multiply by a
+          large odd number mod 2<sup>42</sup>) and the codes stop being guessable, so you get the counter's uniqueness
+          <em>and</em> the hash's unpredictability.
+        </p>
+        <p>
+          Cost, named unprompted: a crashing server leaks up to 10,000 unused keys. Out of 3.5 trillion, that's arithmetically
+          irrelevant, and I'd take that over building a reclamation protocol.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Your key-generation service goes down. What happens?</summary>
+      <div class="answer">
+        <p>
+          <strong>Nothing, for a while — and that's the point of the design.</strong> Every app server is holding thousands of
+          unused keys in local memory, so writes keep flowing while the KGS is unavailable. Configure servers to refill their
+          block at ~20% remaining rather than at zero, and a KGS outage becomes a page rather than an incident. You have hours,
+          not seconds.
+        </p>
+        <p>
+          Contrast that with a Redis <code>INCR</code> counter, where the counter dying means writes stop <em>immediately</em>.
+          The KGS is a soft dependency; a per-write counter is a hard one. That difference is worth stating explicitly, because
+          "what happens when it's down" is the question that separates a design you've thought about from one you've drawn.
+        </p>
+        <p>
+          The one thing the KGS must get exactly right is that range checkout is <strong>atomic</strong> — two servers must
+          never receive the same block. A single <code>UPDATE counters SET v = v + 10000 RETURNING v</code> gives you that, or a
+          ZooKeeper sequential znode. That single line is the entire correctness burden of the scheme, which is a nice property:
+          the risk is concentrated somewhere you can reason about it.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>What's your cache hit rate, and what does the database actually see?</summary>
+      <div class="answer">
+        <p>
+          Target 95–99%. The access distribution is brutally skewed — roughly 20% of links generate 80% of clicks, and traffic
+          is heavily concentrated in the days right after a link is created — so LRU converges on a hot set that's a small
+          fraction of total links.
+        </p>
+        <p>Run the numbers, because the conclusion is the interesting bit:</p>
+        <ul>
+          <li>90% hit rate → 11,600 reads/sec reach the DB</li>
+          <li>95% → 5,800/sec</li>
+          <li>99% → <strong>1,160/sec — the same magnitude as your write load</strong></li>
+        </ul>
+        <p>
+          That last line is the answer to "why the cache." It's not "reads are faster." It's that the cache <strong>converts a
+          100:1 read-heavy system into something that looks balanced to the storage layer</strong>, which is what lets you use a
+          boring sharded KV store instead of an exotic read-scaling architecture. The cache is what makes the rest of the design
+          boring — and boring is the goal.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Redis restarts and the cache is completely empty. Now what?</summary>
+      <div class="answer">
+        <p>
+          Be blunt about the failure before you fix it: <strong>your database dies.</strong> Not degrades — dies. It was sized
+          for ~5,800 reads/sec and it's about to receive 116,000, a 20× overload, and the resulting latency spike makes every
+          client retry, which makes it worse. This is the cold-start storm and it is the single most dangerous failure mode in
+          any cache-dependent design.
+        </p>
+        <p>Three layers of defence, and name all three:</p>
+        <ol>
+          <li><strong>The CDN is still serving hot links.</strong> Edge caches don't restart in sympathy with your Redis cluster, so the real number hitting you is well below 116k.</li>
+          <li><strong>An in-process LRU on every app server</strong> — even a few thousand entries absorbs the hottest keys with no network hop at all. It costs almost nothing and it's your genuine last line of defence.</li>
+          <li><strong>Shed load at the app tier.</strong> Better to serve 60% of requests correctly and 429 the rest than to flatten the database and serve 0%. And warm a cache node before it takes traffic, rather than putting an empty one straight into rotation.</li>
+        </ol>
+        <p>
+          If they push further: replicate Redis so a single node loss doesn't empty the whole tier, and enable persistence
+          (AOF/RDB) so a restarted node reloads warm rather than cold.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>A link goes viral — 50,000 requests/sec on one short code. Does sharding help?</summary>
+      <div class="answer">
+        <p>
+          <strong>No, and understanding <em>why not</em> is the whole point of the question.</strong> Sharding distributes
+          <em>keys</em> across nodes. A viral link is <em>one key</em>. It lives on exactly one shard and one cache node, and
+          adding a hundred more shards leaves it exactly where it was. Partitioning solves data volume; it does nothing for
+          request concentration on a single key.
+        </p>
+        <p>Distinguish the two problems out loud — most candidates conflate them:</p>
+        <ul>
+          <li><strong>Hot partition:</strong> one shard holds disproportionate data or traffic. Fixed by better partitioning. <em>You don't have this</em> — your codes are uniformly distributed, so hash-sharding spreads perfectly. Say that you checked.</li>
+          <li><strong>Hot key:</strong> one <em>key</em> takes disproportionate traffic. Fixed by <strong>replication and caching</strong>, never by partitioning.</li>
+        </ul>
+        <p>
+          The fixes, in the order they engage: the <strong>CDN</strong> absorbs the great majority at the edge (hundreds of POPs,
+          each fetching the value from you exactly once); an <strong>in-process LRU</strong> on each app server means even a CDN
+          miss is served from local memory; and if it's still hot, <strong>replicate the key</strong> across several cache nodes
+          (or write it under N suffixed keys and read a random one) so the load spreads. → <a href="04-partitioning-hashing.html">tutorial 04</a>.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Two users request the custom alias "black-friday" at the same instant. What happens?</summary>
+      <div class="answer">
+        <p>
+          If you wrote <code>if (!exists(alias)) save(alias)</code>, both requests pass the check, both write, and one user's
+          link silently points at the other user's URL. Classic check-then-act TOCTOU race, and it <em>will</em> fire under
+          load — races are not rare, they're just rare in testing.
+        </p>
+        <p>
+          The fix is not a distributed lock, not Redis <code>SETNX</code>, not a retry loop. <strong>Push the constraint down to
+          the database and let a unique index arbitrate.</strong> <code>INSERT</code>, catch the duplicate-key exception, return
+          <code>409 Conflict</code>. One atomic operation, no race possible, no extra machinery.
+        </p>
+        <p>
+          The general principle — and it recurs in <a href="14-ticket-booking.html">14</a> (don't oversell a seat) and
+          <a href="13-payments-orders.html">13</a> (don't double-charge): <em>never read-then-write to enforce uniqueness in a
+          concurrent system. A unique index is a distributed lock that someone else already debugged for you.</em>
+        </p>
+        <p>
+          Consequence worth pre-empting: if you chose Cassandra as your store, <strong>you don't have a unique constraint.</strong>
+          You'd need a lightweight transaction (<code>IF NOT EXISTS</code> — Paxos, an order of magnitude slower), or you keep
+          custom aliases (maybe 1% of links) in a small Postgres table where a real unique index exists. That second answer is
+          the pragmatic one.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Why not just increment a click counter on the redirect?</summary>
+      <div class="answer">
+        <p>Because it's wrong in three separate ways, and the interviewer wants all three:</p>
+        <ol>
+          <li>It puts a database <strong>write</strong> on your hottest <strong>read</strong> path, taxing the latency of the one thing that must be fast.</li>
+          <li>It creates <strong>row-level write contention on exactly the viral links</strong>. The link getting 50,000 clicks/sec now has 50,000 concurrent increments queued against a single row. The hottest link breaks hardest — precisely backwards.</li>
+          <li>It <strong>defeats the cache entirely.</strong> A read that must also write can't be served from Redis or the CDN. You'd have destroyed the central premise of the design to increment an integer.</li>
+        </ol>
+        <p>
+          Instead: return the 302 first, <em>then</em> fire a click event to Kafka, fire-and-forget. A stream processor
+          aggregates it into an OLAP store. If Kafka is down you lose analytics and <strong>the redirect still works</strong> —
+          which is the correct coupling direction: the least important component is the one allowed to fail.
+          → <a href="18-streaming-aggregation.html">tutorial 18</a>.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>SQL or NoSQL? Defend it — and defend the option you didn't pick.</summary>
+      <div class="answer">
+        <p>
+          <strong>A sharded KV store</strong> (Cassandra / DynamoDB), driven by exactly one number: <strong>90 TB over five
+          years</strong>. That doesn't fit on one machine, so I need horizontal scale, and the workload is the purest possible
+          KV shape — point lookups by exact primary key, no joins, no multi-row transactions, no ad-hoc queries, and
+          append-only immutable rows (an LSM tree's happiest workload).
+        </p>
+        <p>
+          <strong>And here's the honest half, which is the half that scores:</strong> Postgres would genuinely work fine here for
+          a long time. A primary-key B-tree lookup is a couple of milliseconds; with Redis absorbing 95%+ of reads and a read
+          replica or two, one Postgres primary comfortably serves several million links a day — and it gives me unique
+          constraints (which I need for custom aliases), real transactions, and no operational learning curve. The decision is
+          driven by the storage number, <em>not</em> by the word "scale." Below roughly 10M links/day I'd build it on Postgres
+          and I'd be right.
+        </p>
+        <p>
+          Being able to name the load at which the decision flips is the whole answer. Anyone can name a database. "NoSQL because
+          it's web scale" is a slogan; "KV because 90 TB exceeds one box, and Postgres until then" is judgment.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Two users shorten the same long URL. One code or two?</summary>
+      <div class="answer">
+        <p><strong>Two</strong> — and dedup is a trap that looks like an optimisation.</p>
+        <p>Dedup saves you 500 bytes. It costs you:</p>
+        <ul>
+          <li><strong>Expiry:</strong> A wants 30 days, B wants forever. The shared link can only have one expiry. Someone's link breaks through no fault of their own.</li>
+          <li><strong>Analytics:</strong> the click counts merge. A's campaign report now includes B's traffic. For a marketing product — which is what a shortener <em>is</em> — that's not a bug, it's the destruction of the core feature.</li>
+          <li><strong>Blast radius:</strong> A's link gets flagged as spam and blocked; B's independently-created link dies with it.</li>
+        </ul>
+        <p>
+          500 bytes against 90 TB is a rounding error. The exception is a single-tenant internal tool with no per-link analytics
+          — there, dedup is free savings and I'd take it. A sharper nuance: dedup <em>per user</em> is fine and even desirable —
+          same user, same URL, same options → return the existing code. That's an <em>idempotency</em> property, not a storage
+          optimisation, and framing it that way is the better answer.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>This felt easy. What are you actually being tested on?</summary>
+      <div class="answer">
+        <p>
+          Four things, and the architecture is not one of them. Everyone produces the same boxes.
+        </p>
+        <ul>
+          <li><strong>Did you derive the design or recall it?</strong> Every component must trace back to a number: the cache to 100:1, the shards to 90 TB, the KGS to 1,160 writes/sec across many stateless machines. A box you can't trace is a box you memorised.</li>
+          <li><strong>Key generation depth.</strong> Three schemes, each rejected for a <em>specific, quantified</em> reason — the birthday bound for hashing, enumeration and contention for the counter. This is the deep dive and it's where the round is won.</li>
+          <li><strong>Unprompted trade-offs.</strong> The 301/302 call, the dedup call, the leaked-keys-on-crash call. Every one of them stated with its cost <em>and</em> the condition under which you'd flip.</li>
+          <li><strong>Did you see the archetype?</strong> This is a read-heavy key-value system. So is a pastebin, an image host, and a feature-flag service. A candidate who names the archetype has demonstrated the thing the whole interview is a proxy for: that they'll recognise the shape again on a problem they haven't seen.</li>
+        </ul>
+        <p>
+          The question is easy. The <em>answer</em> is not, and that gap is exactly why it stays on the list.
+        </p>
+      </div>
+    </details>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="takeaways">What to remember</h2>
+
+    <p><strong>The numbers, memorised.</strong> You should be able to produce these in ninety seconds on a whiteboard:</p>
+
+<pre><code>  100M new URLs/day  ÷ 86,400 s   ≈  1,160 writes/sec   (call it ~1.2k)
+  × 100:1 read ratio               ≈  116,000 reads/sec  ← THE number
+  100M × 500 B × 365 × 5 yrs       ≈  90 TB              ← forces sharding
+  62^7                             ≈  3.5 trillion       ≈ 96 yrs of keys
+  99% cache hit → DB sees ~1,160 reads/sec = write load. That's the point.
+</code></pre>
+
+    <p><strong>The two facts that drive everything else:</strong></p>
+    <ul>
+      <li><strong>100:1 read:write</strong> → the cache <em>is</em> the design. The database is what catches what falls through.</li>
+      <li><strong>90 TB &gt; one machine</strong> → you will shard, by <code>short_code</code>, with consistent hashing.</li>
+    </ul>
+
+    <p><strong>The decisions, with their costs:</strong></p>
+    <ul>
+      <li><strong>302, not 301.</strong> 301 is browser-cached, so you never see the second click, so analytics silently dies. Flip to 301 only if analytics doesn't matter.</li>
+      <li><strong>Range allocation for keys.</strong> Hashing collides by the birthday bound at ~1.9M keys (seconds of traffic). A raw counter is a contention point <em>and</em> enumerable — a real breach vector. Ranges give you uniqueness with one coordination op per 10,000 writes; permute the ID before encoding so the codes aren't guessable. Cost: leak ~10k keys per crash, out of 3.5 trillion. Take that trade.</li>
+      <li><strong>KV store because of 90 TB</strong> — but Postgres is genuinely fine below ~10M links/day, and saying so is the mature answer.</li>
+      <li><strong>Cache-aside + LRU + CDN.</strong> Immutable values mean <em>no invalidation problem at all</em>. That's a gift; claim it out loud.</li>
+      <li><strong>Analytics off the critical path.</strong> Return the 302, <em>then</em> fire an event to Kafka. Never increment a counter on a redirect.</li>
+      <li><strong>Custom aliases: unique constraint, not read-then-write.</strong> A unique index is a distributed lock someone else already debugged.</li>
+      <li><strong>No dedup.</strong> It saves 500 bytes and costs per-link expiry, analytics and ownership.</li>
+    </ul>
+
+    <p><strong>What breaks first, in order:</strong> the key counter (fixed by range allocation before it ever bites) → the database on a cold cache (in-process LRU, load shedding) → a hot key from a viral link (CDN, then key replication — <em>sharding does not help</em>) → storage growth (sharding + expiry) → analytics (and that one is <em>allowed</em> to break).</p>
+
+    <h3>The archetype — this is the part that transfers</h3>
+
+    <p>
+      <strong>A URL shortener is a read-heavy key-value system.</strong> Strip the costume off and the problem is: <em>generate a
+      unique key, store a small immutable value against it, and serve it by exact-key lookup far more often than you write
+      it.</em> That is not a URL-shortener problem. That is a <em>shape</em>, and here is what else wears it:
+    </p>
+
+    <table>
+      <thead><tr><th>Question</th><th>What changes</th><th>What stays identical</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Design a pastebin</strong></td>
+          <td>The value is a KB of text instead of a URL, so above ~1 MB you split blob (S3) from metadata (DB). And keys should be <em>random</em>, not counter-derived — pastes are private-by-obscurity, so enumerability is a real hole. (<a href="01-the-method.html#worked">01 §9</a> works this one.)</td>
+          <td>Key generation. The read:write ratio. Cache-aside. The CDN. Expiry and cleanup. The 404-on-expired. Roughly 80% of this page.</td>
+        </tr>
+        <tr>
+          <td><strong>Design an image-hosting service</strong></td>
+          <td>The value is megabytes, so it lives in blob storage and the KV store holds only the metadata pointer. Bandwidth becomes the dominant cost, so the CDN is now mandatory rather than clever.</td>
+          <td>Key generation. The 100:1 ratio. Immutability. Edge caching. Hot-object handling. Same skeleton.</td>
+        </tr>
+        <tr>
+          <td><strong>Design a feature-flag service</strong></td>
+          <td>Values are mutable (that's the point of a flag), so invalidation comes <em>back</em> — you need pub/sub push or short TTLs. Read ratio is even more extreme, maybe 10,000:1.</td>
+          <td>Point lookup by key. Cache-is-the-design. Client-side caching. The whole read path.</td>
+        </tr>
+        <tr>
+          <td><strong>Design a coupon/short-code system</strong></td>
+          <td>Codes must be human-typeable (drop ambiguous characters: <code>0/O</code>, <code>1/l/I</code>), and redemption needs a uniqueness constraint under contention.</td>
+          <td>Base62-ish encoding. Keyspace arithmetic. Key generation with no collisions. Range allocation.</td>
+        </tr>
+        <tr>
+          <td><strong>Design a distributed cache</strong> (<a href="08-distributed-cache.html">tutorial 08</a>)</td>
+          <td>You're now <em>building</em> the box you drew here, rather than using it.</td>
+          <td>Consistent hashing on the key. Point lookups. The same partitioning logic, one layer down.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="senior">And this is the sentence that turns a good answer into a memorable one — say it near the end, once the design stands up: <em>"Worth naming what this actually is: it's a <strong>read-heavy key-value system</strong>. Tiny immutable values, exact-key lookups, reads dwarfing writes. That's the same shape as a pastebin, an image host, or a feature-flag service — so the interesting decisions are always the same three: how you mint keys without a coordination bottleneck, how the cache absorbs the read skew, and what you do about the one key that goes viral. That's what I've spent the time on."</em> An interviewer who hears that knows, immediately, that you will recognise the shape again on a problem you've never seen — and that recognition is <em>the entire thing the interview is a proxy for</em>.</div>
+
+    <p>
+      That transfer is why you do case studies at all. There are maybe a dozen archetypes in all of distributed design. You just
+      learned the first one, and about a quarter of the question bank is now partially answered. Next up:
+      <a href="08-distributed-cache.html">tutorial 08</a>, where you stop <em>using</em> the KV store and go build one.
+    </p>
+  </section>
+
+  <nav class="page-nav">
+    <a href="06-caching-queues-resilience.html">← 06 — Caching, Queues, Resilience &amp; Observability</a>
+    <a href="08-distributed-cache.html">08 — Design a Distributed Cache →</a>
+  </nav>
+
+</main>
+</body>
+</html>

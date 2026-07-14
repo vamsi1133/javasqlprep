@@ -1,0 +1,1871 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>17 — Design a Web Crawler &amp; Search Index | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <div class="breadcrumb"><a href="index.html">← Course Home</a></div>
+    <h1>17 — Design a Web Crawler &amp; Search Index</h1>
+    <p>Archetype: <strong>crawl → index → query</strong>. Large-scale batch ingestion feeding an inverted index. And underneath all of it: <em>a breadth-first search you already know how to write, run on a graph that doesn't fit on one machine.</em></p>
+  </div>
+</header>
+
+<main class="container">
+
+  <section>
+    <h2>Why this matters in the interview</h2>
+    <p>
+      This question looks enormous. "Design Google" is the intimidation play, and most candidates react to it by
+      trying to remember things — PageRank, MapReduce, some half-recalled blog post about Bigtable — and end up
+      reciting nouns. Here is the reframe that makes the whole page easy, and it is the single most valuable thing
+      you will take away: <strong>a web crawler is BFS on a graph.</strong> The graph is the web. The nodes are URLs.
+      The edges are <code>&lt;a href&gt;</code> links. You pop a URL off a queue, you visit it, you discover its
+      neighbours, you push the unvisited ones back onto the queue, and you keep a visited-set so you don't loop
+      forever. You wrote that exact function in <a href="../phase3-dsa/10-graphs.html">Phase 3 tutorial 10</a>. It was
+      twelve lines.
+    </p>
+    <p>
+      Everything that makes this a hard <em>system design</em> problem is a consequence of scaling those twelve lines
+      beyond one machine. The frontier (the BFS queue) doesn't fit in memory — so it becomes a distributed queue. The
+      visited-set doesn't fit in memory — so it becomes a <strong>bloom filter</strong>, and you accept a false-positive
+      rate. Visiting a node isn't a pointer dereference, it's <strong>200ms of network I/O</strong> — so you need
+      thousands of concurrent workers. The graph is <strong>adversarial and effectively infinite</strong> — so you need
+      trap detection and depth limits. And you are not allowed to visit a node's neighbours as fast as you like, because
+      hammering one web server with 1,000 concurrent requests is a denial-of-service attack — so
+      <strong>politeness</strong>, of all things, becomes the constraint that dictates your partitioning scheme. Every
+      hard part of this problem falls out of one familiar algorithm meeting physics. Say that out loud in minute two and
+      you have converted an intimidating question into a familiar one.
+    </p>
+    <p>
+      And the archetype is far more common than "design Google" suggests. <em>Crawl → index → query</em> is: a
+      code-search tool over your monorepo, a "search documents" feature in an enterprise app, product-catalogue search on
+      an e-commerce site, log indexing in Elasticsearch, a legal-discovery system, the search box on your own company's
+      website. All of them ingest a corpus in bulk, build an inverted index, and serve ranked keyword queries. The scale
+      differs by nine orders of magnitude; <strong>the shape does not</strong>. Learn the shape here and you can answer
+      "design search over our 10M internal documents" — which, at Optum or JPMC, is the version you will actually get.
+    </p>
+  </section>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ul>
+      <li><a href="#prompt">1. The prompt</a> — and the scoping question that must come first</li>
+      <li><a href="#requirements">2. Requirements</a> ★ — two systems, one interview · politeness as a hard constraint</li>
+      <li><a href="#estimation">3. Estimation</a> ★ — why your crawl rate is capped by <em>manners</em>, not hardware</li>
+      <li><a href="#api">4. API design</a> — the internal crawler contract + the public query endpoint</li>
+      <li><a href="#data-model">5. Data model</a> — frontier, doc store, inverted index</li>
+      <li><a href="#hld">6. High-level design</a> — the crawl loop and the query path, end to end</li>
+      <li><a href="#deep-dive-1">7a. Deep dive: the crawler</a> ★ — <strong>frontier · politeness · bloom filters · traps · freshness</strong></li>
+      <li><a href="#deep-dive-2">7b. Deep dive: the inverted index</a> ★ — <strong>posting lists · sharding · ranking · query serving</strong></li>
+      <li><a href="#scaling">8. Scaling &amp; bottlenecks</a> — DNS is the one nobody sees coming</li>
+      <li><a href="#tradeoffs">9. Trade-offs</a></li>
+      <li><a href="#followups">10. Follow-ups you should expect</a></li>
+      <li><a href="#qa">Interview Q&amp;A</a></li>
+      <li><a href="#takeaways">What to remember</a></li>
+    </ul>
+  </div>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="prompt">1. The prompt</h2>
+
+    <p>The interviewer says:</p>
+
+    <blockquote style="border-left:4px solid #cbd5e1; margin:1.2rem 0; padding:.4rem 1.1rem; color:#374151;">
+      <em>"Design a web crawler and a search engine. Users type keywords, we return relevant pages."</em>
+    </blockquote>
+
+    <p>
+      That single sentence contains <strong>two entirely different systems</strong> that share almost nothing but a
+      storage bucket:
+    </p>
+
+    <ul>
+      <li><strong>The crawler</strong> — an offline, batch, write-heavy, I/O-bound pipeline. Its problems are politeness,
+        deduplication, hostile input, and freshness. Nobody is waiting on it. It can be down for an hour and no user
+        notices.</li>
+      <li><strong>The search service</strong> — an online, read-heavy, latency-critical query system. Its problems are the
+        inverted index, sharding, fan-out, ranking, and p99 latency. If it's down for an hour, the product is down.</li>
+    </ul>
+
+    <p>
+      Their <em>only</em> coupling is the artefact in the middle: the crawler produces documents, an indexer turns those
+      documents into an index, and the search service reads it. That's it. They have different failure modes, different
+      scaling axes, different consistency needs, and in a real company they'd be owned by different teams.
+    </p>
+
+    <div class="senior">The first thing out of your mouth: <em>"This is really two systems — an offline crawling and
+      indexing pipeline, and an online query-serving system. They're coupled only through the index artefact. In
+      45 minutes I can't do both justice, so let me sketch both in five minutes and then go deep on whichever one you
+      care about. If you don't have a preference, I'll go deep on the crawler, because the politeness and dedup
+      constraints there are the more interesting engineering."</em> Two things just happened. You demonstrated that you
+      can decompose an ambiguous prompt, and you handed the interviewer the steering wheel — which is exactly what they
+      want, because they usually have a specific deep-dive in mind and are waiting to see if you'll ask.</div>
+
+    <p>
+      Do not skip that. Candidates who try to cover both systems at equal depth cover neither, run out of time in the
+      inverted index, and leave the interviewer with no signal on anything. <strong>Breadth first, then depth on one
+      thing, chosen collaboratively.</strong> That is tutorial <a href="01-the-method.html">01</a>'s method applied to a
+      prompt that is deliberately twice as large as the time allows — and the oversized prompt is itself the test.
+    </p>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="requirements">2. Requirements</h2>
+
+    <h3>The clarifying questions to ask first</h3>
+
+    <table>
+      <thead><tr><th>Ask</th><th>Assume, if they shrug</th><th>Why it changes the design</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>"Crawler, search service, or both?"</strong></td>
+          <td>Both at a sketch, then deep-dive the crawler.</td>
+          <td><strong>The most important question on the page.</strong> These are two systems. Committing to one is what buys you the depth that gets you hired.</td>
+        </tr>
+        <tr>
+          <td>"Scale? The open web, or a bounded corpus?"</td>
+          <td>1 billion pages. The open web.</td>
+          <td>1B pages is what forces bloom filters, a distributed frontier and a sharded index. 10M internal documents forces none of it — the honest answer there is "install Elasticsearch."</td>
+        </tr>
+        <tr>
+          <td>"Text only, or images/video/PDFs too?"</td>
+          <td>HTML text only.</td>
+          <td>Cut it. Multi-modal indexing is a different problem and a time sink.</td>
+        </tr>
+        <tr>
+          <td>"Do I need to render JavaScript?"</td>
+          <td>No — parse static HTML. Flag it as a real gap.</td>
+          <td>A headless browser costs ~50–100× more CPU per page than an HTML parse. This decision alone changes your fleet size by two orders of magnitude. See <a href="#followups">follow-ups</a>.</td>
+        </tr>
+        <tr>
+          <td>"How fresh must the index be?"</td>
+          <td>Days for the long tail; hours for news.</td>
+          <td>Freshness dictates the re-crawl budget, and re-crawling competes with new discovery for the same finite polite bandwidth.</td>
+        </tr>
+        <tr>
+          <td>"How good must ranking be?"</td>
+          <td>Reasonable keyword relevance. Not Google.</td>
+          <td>Scope this <em>hard</em> and say so. Ranking is a decade of ML research; you have four minutes for it.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>Functional requirements</h3>
+    <ul>
+      <li><strong>Crawl</strong> — start from a seed set of URLs, fetch pages over HTTP, extract text and outbound links,
+        follow the links. Repeat, forever.</li>
+      <li><strong>Index</strong> — turn the fetched text into a structure that can answer "which documents contain the word
+        <em>kafka</em>?" in milliseconds, over a billion documents.</li>
+      <li><strong>Query</strong> — accept a keyword query, return a ranked list of matching pages with titles, URLs and
+        snippets.</li>
+      <li><strong>Re-crawl</strong> — pages change and pages die. The index must not decay into a museum.</li>
+    </ul>
+
+    <p><strong>Explicitly out of scope</strong>, and say so: personalisation, ads, images/video, spelling correction,
+      query understanding and synonyms, the ML ranking model itself, and the crawler's legal-compliance/takedown
+      machinery. Each is real; none is <em>this</em> system.</p>
+
+    <h3>Non-functional requirements — and one of them is a hard constraint</h3>
+
+    <table>
+      <thead><tr><th>Requirement</th><th>Target</th><th>What it really means</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Politeness</strong></td>
+          <td><strong>Hard constraint. Non-negotiable.</strong></td>
+          <td>You must not take down the sites you crawl. Respect <code>robots.txt</code>; cap concurrency and request rate <em>per domain</em>. This is not a "nice to have" — it is an <em>ethical and legal</em> boundary, and a crawler that ignores it is indistinguishable from a distributed denial-of-service attack. <strong>It is also, remarkably, the constraint that shapes your entire architecture.</strong></td>
+        </tr>
+        <tr>
+          <td>Scale</td>
+          <td>1B pages, growing</td>
+          <td>Rules out anything that assumes a data structure fits in one machine's RAM. Including — especially — the visited-set.</td>
+        </tr>
+        <tr>
+          <td>Robustness</td>
+          <td>Survive a hostile web</td>
+          <td>Malformed HTML, 10GB responses, infinite redirect chains, calendars with a "next month" link stretching to the year 3000, deliberately adversarial pages. <strong>Your input is written by people who want to hurt you.</strong> This is unusual — most systems in this course get their input from their own clients.</td>
+        </tr>
+        <tr>
+          <td>Freshness</td>
+          <td>Adaptive: hours→months</td>
+          <td>A news homepage changes hourly. A blog post from 2009 will never change again. Crawling both at the same interval is a waste of your scarcest resource.</td>
+        </tr>
+        <tr>
+          <td>Crawler availability</td>
+          <td><strong>Low. Genuinely.</strong></td>
+          <td>Nobody is waiting on the crawler. If it dies for an hour, you resume from the frontier and lose an hour of throughput. It must be <em>fault-tolerant</em> (no work lost) but it does not need to be <em>highly available</em>. Saying this out loud shows you can tell those two apart, which most candidates cannot.</td>
+        </tr>
+        <tr>
+          <td>Query latency</td>
+          <td>p99 &lt; 300ms</td>
+          <td>Online, user-facing, read-heavy. Opposite profile to the crawler in every dimension. Hence: two systems.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="senior">The line that separates you from every other candidate on this question: <em>"The interesting
+      thing about a crawler is that its throughput ceiling isn't set by my hardware — it's set by politeness. I could
+      fetch a million pages a second from one site with enough machines, but doing that would be an attack. So the real
+      constraint is: a bounded request rate <strong>per domain</strong>, multiplied by how many distinct domains I can
+      work on in parallel. That single sentence determines how I partition the frontier, how I route work to fetchers,
+      and why I can't just round-robin URLs across a worker pool."</em> Most candidates mention <code>robots.txt</code>
+      as a checkbox. You are treating politeness as the <em>load-bearing constraint of the architecture</em> — because
+      it is.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="estimation">3. Estimation</h2>
+
+    <p>Round aggressively, say you're rounding, and drive at the number that changes the design.</p>
+
+    <h3>Crawl rate</h3>
+    <pre><code>Target:            1,000,000,000 pages in 30 days
+30 days            ≈ 2.6M seconds  (30 × 86,400 = 2,592,000 — call it 2.5M)
+
+Pages per second   = 1e9 / 2.5e6  ≈ <strong>400 pages/sec sustained</strong>
+</code></pre>
+
+    <p>
+      400/sec sounds trivially small. It is not, and here is why — this is the arithmetic that actually matters:
+    </p>
+
+    <pre><code>One fetch = DNS + TCP + TLS + request + response  ≈ <strong>200ms</strong>, and it is
+            almost entirely <strong>waiting</strong>. Near-zero CPU.
+
+By Little's Law:  concurrency = throughput × latency
+                              = 400/sec × 0.2 sec
+                              = <strong>80 fetches in flight at all times — minimum</strong>
+</code></pre>
+
+    <p>
+      80 concurrent sockets is nothing; a single machine with async I/O (or 80 threads — this is the textbook case for
+      the I/O-bound thread pool from <a href="../phase1-java-spring-postgres/04-java-concurrency-jvm.html">Phase 1</a>)
+      handles it. <strong>So why does Google run tens of thousands of crawler machines?</strong> Three reasons, and
+      naming them is the senior move:
+    </p>
+
+    <ol>
+      <li><strong>Politeness caps per-domain throughput.</strong> If you allow yourself 1 request/sec to any single
+        domain, then hitting 400 pages/sec requires you to be actively working on <strong>at least 400 distinct
+        domains simultaneously</strong>. The number that matters isn't your concurrency — it's your <em>domain</em>
+        concurrency.</li>
+      <li><strong>Real fetches are worse than 200ms.</strong> Slow servers, timeouts (you'll wait 10s to learn a host is
+        dead), retries. Your effective average latency is more like 1–2s, which multiplies the required concurrency by
+        5–10×.</li>
+      <li><strong>Parsing isn't free.</strong> HTML parse, text extraction, link extraction, dedup hashing — call it
+        50–100ms of CPU per page. At 400 pages/sec that's ~40 cores just to parse, before you index anything. And if
+        you <em>render JavaScript</em>, it's 1–5 <em>seconds</em> of CPU per page, and your fleet grows by 50×.</li>
+    </ol>
+
+    <h3>Storage</h3>
+    <pre><code>Raw HTML:      1e9 pages × 100 KB   = <strong>100 TB</strong>   (compresses ~5× → ~20 TB stored)
+Extracted text: 1e9 pages ×  10 KB   = <strong>10 TB</strong>    (the useful part; ~10% of the page)
+Inverted index: roughly 20–30% of the text corpus after compression
+                                     ≈ <strong>2–3 TB</strong>
+Link graph:    1e9 pages × 50 links × 8 bytes ≈ <strong>400 GB</strong> (for PageRank)
+</code></pre>
+
+    <p>
+      100TB of raw HTML is a blob-storage problem, not a database problem — S3/GCS, exactly as in
+      <a href="16-video-streaming.html">16</a>. The index is 2–3TB, which is the number that drives the online system:
+      <strong>2–3TB does not fit on one machine's RAM, and you want the index in RAM.</strong> At ~64GB of usable index
+      RAM per box, that's on the order of <strong>50–100 index shards</strong>, which is precisely why
+      <a href="#deep-dive-2">sharding the index</a> is the deep dive on the search side.
+    </p>
+
+    <h3>The visited-set — the number that forces the interesting decision</h3>
+    <pre><code>URLs seen (not just crawled — <em>seen</em>, including all the links you found):
+   easily <strong>10× the page count</strong> → ~10 billion URLs. Take 1e9 for the arithmetic.
+
+A HashSet&lt;String&gt; of 1e9 URLs:
+   avg URL ~60 bytes + Java object/entry overhead (~40–60 bytes)
+   ≈ 100+ bytes/entry × 1e9 = <strong>~100 GB of RAM</strong>   ← and that's the optimistic version
+
+A bloom filter for 1e9 items at 1% false positives:
+   ≈ 10 bits per item → 1e9 × 10 bits = <strong>~1.2 GB</strong>
+</code></pre>
+
+    <div class="note"><strong>100GB versus 1.2GB.</strong> That ratio — nearly two orders of magnitude — is the entire
+      reason bloom filters exist, and it is why <a href="06-caching-queues-resilience.html">tutorial 06</a> promised you
+      this page as one of the three places they earn their keep. Hold that number; we spend it in
+      <a href="#deep-dive-1">deep dive 1</a>.</div>
+
+    <h3>Query side</h3>
+    <pre><code>Assume 100M queries/day  → 100e6 / 86,400 ≈ 1,200 QPS average
+Peak ≈ 3× average        → <strong>~3,500 QPS</strong>
+Each query fans out to all ~100 index shards (see deep dive 2)
+   → internal QPS = 3,500 × 100 = <strong>350,000 shard-reads/sec</strong>
+</code></pre>
+
+    <p>
+      That last line is the one to say out loud. <strong>The fan-out multiplies your internal load by the shard
+      count.</strong> It's also why the query p99 is governed by your <em>slowest</em> shard, not your average one — a
+      classic tail-latency-amplification problem, and the reason caching popular queries matters so much.
+    </p>
+
+    <div class="senior">Land the estimation with the punchline: <em>"The number that drives this design isn't QPS or
+      storage — it's that <strong>my crawl throughput is bounded by politeness, not by hardware</strong>. I need 400
+      pages/sec, and at one request per second per domain, that means I must be working on 400+ distinct domains at any
+      instant. So my frontier can't be a single FIFO queue — it has to be <em>partitioned by domain</em>, with each
+      partition rate-limited independently. That constraint, not scale, is what makes the architecture what it
+      is."</em> Deriving the architecture from an estimate is the whole point of doing the estimate. Most candidates
+      compute numbers and then design as if they hadn't.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="api">4. API design</h2>
+
+    <p>
+      Note something unusual before you draw endpoints: <strong>the crawler has almost no API.</strong> It is not a
+      request/response service. Its "API" is a pipeline contract — messages on queues — plus a thin admin surface. Saying
+      that is a small, cheap credibility win, because it shows you understand that not every box in a system design is a
+      REST service.
+    </p>
+
+    <h3>The public query API (this is the one that matters)</h3>
+    <pre><code><span class="kw">GET</span> /search?q=distributed+systems&amp;page=1&amp;limit=10
+
+<span class="com">// 200 OK</span>
+{
+  <span class="str">"query"</span>: <span class="str">"distributed systems"</span>,
+  <span class="str">"totalHits"</span>: <span class="num">1284000</span>,          <span class="com">// approximate, and say so — exact counts are expensive</span>
+  <span class="str">"tookMs"</span>: <span class="num">42</span>,
+  <span class="str">"results"</span>: [
+    {
+      <span class="str">"url"</span>:     <span class="str">"https://example.com/dist-sys"</span>,
+      <span class="str">"title"</span>:   <span class="str">"An Introduction to Distributed Systems"</span>,
+      <span class="str">"snippet"</span>: <span class="str">"...the core problem in &lt;em&gt;distributed systems&lt;/em&gt; is that..."</span>,
+      <span class="str">"score"</span>:   <span class="num">18.4</span>
+    }
+  ],
+  <span class="str">"cursor"</span>: <span class="str">"eyJvZmZzZXQiOjEwfQ"</span>   <span class="com">// cursor, not offset — see 10 and 20</span>
+}
+
+<span class="kw">GET</span> /autocomplete?prefix=distr      <span class="com">// backend = a trie. See tutorial 21.</span>
+</code></pre>
+
+    <p>
+      Two details worth naming out loud. <strong><code>totalHits</code> is approximate</strong> — computing an exact count
+      means fully materialising the intersection of two enormous posting lists, which defeats the early-termination
+      optimisations that make search fast. Google shows "About 1,280,000 results" for exactly this reason. And
+      <strong>pagination is cursor-based, not offset-based</strong>: <code>offset=10000</code> forces every shard to
+      rank and discard 10,000 results, so deep pagination is quadratic. In practice you cap the reachable depth
+      (Google gives you ~1,000 results and then stops), which is a lovely piece of pragmatism to mention.
+    </p>
+
+    <h3>The crawler's internal contract</h3>
+    <pre><code><span class="com">// Frontier → Fetcher (a message on a per-domain-sharded queue)</span>
+{ <span class="str">"url"</span>: <span class="str">"https://example.com/page"</span>, <span class="str">"domain"</span>: <span class="str">"example.com"</span>,
+  <span class="str">"priority"</span>: <span class="num">0.82</span>, <span class="str">"depth"</span>: <span class="num">3</span>, <span class="str">"discoveredAt"</span>: <span class="str">"2026-07-14T09:00:00Z"</span> }
+
+<span class="com">// Fetcher → Parser (raw page landed in blob storage; queue carries the pointer)</span>
+{ <span class="str">"url"</span>: <span class="str">"..."</span>, <span class="str">"blobKey"</span>: <span class="str">"raw/2026/07/14/ab12cd34"</span>,
+  <span class="str">"status"</span>: <span class="num">200</span>, <span class="str">"contentHash"</span>: <span class="str">"sha256:..."</span>, <span class="str">"fetchedAt"</span>: <span class="str">"..."</span> }
+
+<span class="com">// Parser → Frontier (newly discovered links, to be deduped and enqueued)</span>
+{ <span class="str">"sourceUrl"</span>: <span class="str">"..."</span>, <span class="str">"links"</span>: [<span class="str">"https://a.com/x"</span>, <span class="str">"..."</span>], <span class="str">"depth"</span>: <span class="num">4</span> }
+
+<span class="com">// Admin surface — small, but real</span>
+<span class="kw">POST</span> /admin/seeds        { <span class="str">"urls"</span>: [...] }      <span class="com">// inject seed URLs</span>
+<span class="kw">POST</span> /admin/blocklist    { <span class="str">"domain"</span>: <span class="str">"..."</span> }     <span class="com">// stop crawling a domain, now</span>
+<span class="kw">POST</span> /admin/recrawl      { <span class="str">"url"</span>: <span class="str">"..."</span> }        <span class="com">// force a refresh</span>
+</code></pre>
+
+    <div class="note">That blocklist endpoint isn't padding. Real crawlers get abuse complaints, legal takedowns and
+      "your bot is killing my server" emails, and you need a lever you can pull in <em>seconds</em> without a redeploy.
+      Mentioning an operational kill-switch is the kind of detail that reads as "this person has run something in
+      production."</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="data-model">5. Data model</h2>
+
+    <p>Four stores, and each one is a different technology <em>because each has a different access pattern</em>. Making
+      that reasoning explicit — rather than defaulting everything to Postgres or everything to Cassandra — is what
+      <a href="03-data-storage.html">03</a> was for.</p>
+
+    <table>
+      <thead><tr><th>Store</th><th>Holds</th><th>Access pattern</th><th>Choice</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Frontier</strong></td>
+          <td>URLs waiting to be crawled, with priority</td>
+          <td>Enqueue heavy; dequeue by <em>domain partition</em>, highest priority first</td>
+          <td><strong>Kafka</strong> (partitioned by domain hash) or a sharded priority queue in Redis. <em>Not</em> a relational table — you'd be doing 400 <code>SELECT … ORDER BY … FOR UPDATE SKIP LOCKED</code> per second forever.</td>
+        </tr>
+        <tr>
+          <td><strong>Seen-URL filter</strong></td>
+          <td>"Have I ever seen this URL?"</td>
+          <td>Membership test, ~10k/sec, must be O(1) and tiny</td>
+          <td><strong>Bloom filter</strong>, sharded, in memory. Backed by a durable set (RocksDB/Cassandra) if you can't tolerate loss on restart.</td>
+        </tr>
+        <tr>
+          <td><strong>Document store</strong></td>
+          <td>Raw HTML + extracted text, 100TB</td>
+          <td>Write once, read in bulk by the indexer. Never point-queried by users.</td>
+          <td><strong>Blob storage</strong> (S3/GCS/HDFS). Cheap, sequential, infinitely scalable. This is not a database question.</td>
+        </tr>
+        <tr>
+          <td><strong>Metadata / URL table</strong></td>
+          <td>Per-URL crawl state, timestamps, content hash, change rate</td>
+          <td>Point read/write by URL hash. 1B rows, no joins.</td>
+          <td><strong>Wide-column KV</strong> (Cassandra/Bigtable/DynamoDB). Classic LSM-tree write-heavy workload — the exact case <a href="03-data-storage.html">03</a> said to pick Cassandra over Postgres for.</td>
+        </tr>
+        <tr>
+          <td><strong>Inverted index</strong></td>
+          <td>term → posting list</td>
+          <td>Read-only at serve time; rebuilt in batch. Latency-critical.</td>
+          <td><strong>Immutable segment files</strong>, memory-mapped, document-sharded. This is what Lucene/Elasticsearch is.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>The URL metadata row</h3>
+    <pre><code><span class="com">-- Cassandra-shaped. Partition key = url_hash. No joins, no scans.</span>
+<span class="kw">CREATE TABLE</span> url_meta (
+  url_hash        <span class="typ">blob</span>       <span class="kw">PRIMARY KEY</span>,   <span class="com">-- md5(normalized_url), 16 bytes</span>
+  url             <span class="typ">text</span>,
+  domain          <span class="typ">text</span>,
+  last_crawled_at <span class="typ">timestamp</span>,
+  last_status     <span class="typ">int</span>,                     <span class="com">-- 200 / 404 / 500 / timeout</span>
+  content_hash    <span class="typ">blob</span>,                    <span class="com">-- for content-level dedup</span>
+  simhash         <span class="typ">bigint</span>,                  <span class="com">-- for NEAR-duplicate detection</span>
+  etag            <span class="typ">text</span>,                    <span class="com">-- conditional GET → free freshness check</span>
+  change_freq_est <span class="typ">double</span>,                  <span class="com">-- drives the adaptive re-crawl schedule</span>
+  page_rank       <span class="typ">double</span>,                  <span class="com">-- drives frontier priority AND query ranking</span>
+  depth           <span class="typ">int</span>                      <span class="com">-- BFS depth from seed — the trap defence</span>
+);
+</code></pre>
+
+    <p>
+      Three fields there are load-bearing and each earns a mention. <code>etag</code> lets you issue a conditional
+      <code>GET</code> with <code>If-None-Match</code> and get back a <strong>304 Not Modified</strong> — a re-crawl that
+      costs you almost no bandwidth and tells you the page is unchanged. That is free freshness, straight out of HTTP
+      caching (<a href="02-networking-delivery.html">02</a>), and it is the cheapest optimisation in the entire system.
+      <code>depth</code> is not decoration — it is your defence against infinite crawler traps. And
+      <code>page_rank</code> is used in <em>two</em> places, which surprises people: it ranks results at query time, and
+      it prioritises the frontier at crawl time, because you'd rather crawl an important page first.
+    </p>
+
+    <h3>URL normalisation — small, boring, and it prevents a catastrophe</h3>
+    <p>
+      Before <em>any</em> dedup check, normalise. Lowercase the scheme and host; strip the fragment
+      (<code>#section</code> is client-side and never changes the document); remove default ports; sort query
+      parameters; strip known tracking junk (<code>utm_*</code>, <code>fbclid</code>, <code>sessionid</code>); resolve
+      <code>.</code> and <code>..</code>; decide on the trailing slash and be consistent.
+    </p>
+
+    <div class="pitfall">Skip normalisation and <code>example.com/p?a=1&amp;b=2</code>,
+      <code>example.com/p?b=2&amp;a=1</code>, <code>EXAMPLE.com/p?a=1&amp;b=2#top</code> and
+      <code>example.com/p?a=1&amp;b=2&amp;utm_source=twitter</code> are <strong>four distinct URLs</strong> to your
+      crawler and one page to the world. Your seen-set silently stops working. Now add a site that appends a fresh
+      session ID to every internal link, and you have a URL generator: one page produces infinite unique URLs, your
+      frontier grows without bound, and you crawl a single site forever while the rest of the web starves.
+      <strong>Normalisation isn't a hygiene detail; it's the first line of defence against the frontier
+      exploding.</strong></div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="hld">6. High-level design</h2>
+
+    <h3>Start from the twelve lines you already know</h3>
+
+    <p>Before you draw a single box, write this on the board. It costs you thirty seconds and it buys you the whole page:</p>
+
+    <pre><code><span class="kw">void</span> <span class="typ">crawl</span>(Set&lt;String&gt; seeds) {
+  Queue&lt;String&gt; frontier = <span class="kw">new</span> ArrayDeque&lt;&gt;(seeds);   <span class="com">// the BFS queue</span>
+  Set&lt;String&gt;   seen     = <span class="kw">new</span> HashSet&lt;&gt;(seeds);      <span class="com">// the visited-set</span>
+
+  <span class="kw">while</span> (!frontier.isEmpty()) {
+    String url  = frontier.poll();
+    String html = fetch(url);                            <span class="com">// ← 200ms of network I/O</span>
+    store(url, extractText(html));
+
+    <span class="kw">for</span> (String link : extractLinks(html)) {          <span class="com">// ← the neighbours</span>
+      <span class="kw">if</span> (seen.add(link)) frontier.add(link);        <span class="com">// ← enqueue if unvisited</span>
+    }
+  }
+}
+</code></pre>
+
+    <p>
+      <strong>That is a correct web crawler.</strong> It is also, line for line, the BFS from
+      <a href="../phase3-dsa/10-graphs.html">Phase 3 tutorial 10</a>. Every box in the architecture you are about to
+      draw is one of these four lines, broken because of scale:
+    </p>
+
+    <table>
+      <thead><tr><th>The line</th><th>What breaks at 1B pages</th><th>What it becomes</th></tr></thead>
+      <tbody>
+        <tr><td><code>Queue&lt;String&gt; frontier</code></td><td>Doesn't fit in RAM; one machine can't drain it</td><td><strong>A distributed, prioritised, domain-partitioned queue</strong></td></tr>
+        <tr><td><code>Set&lt;String&gt; seen</code></td><td>~100GB of RAM for 1B URLs</td><td><strong>A bloom filter</strong> (~1.2GB) — and you accept false positives</td></tr>
+        <tr><td><code>fetch(url)</code></td><td>200ms of blocking I/O; and you must not hammer one host</td><td><strong>Thousands of async fetchers + per-domain rate limiting</strong></td></tr>
+        <tr><td><code>while (!frontier.isEmpty())</code></td><td>It is <em>never</em> empty. The web is infinite and adversarial, and it changes.</td><td><strong>A perpetual loop with trap detection and a re-crawl scheduler</strong></td></tr>
+      </tbody>
+    </table>
+
+    <div class="senior">Say it exactly like this: <em>"At its core this is breadth-first search on a graph — the web is
+      the graph, URLs are nodes, links are edges. If the whole web fit in memory, this is a twelve-line function with a
+      queue and a visited-set. Everything hard about this problem is a consequence of the frontier not fitting in
+      memory, the visited-set not fitting in memory, a node visit costing 200 milliseconds instead of a pointer
+      dereference, and the graph being written by adversaries. So let me take those four things one at a time."</em>
+      That sentence structures your entire answer, proves you see the underlying algorithm rather than a memorised
+      diagram, and — not incidentally — makes the interviewer's job of grading you very easy. Give them a spine to hang
+      the answer on.</div>
+
+    <h3>The crawl pipeline</h3>
+
+    <pre><code>  Seeds
+    │
+    ▼
+┌──────────────────────────────────────────────────┐
+│  FRONTIER                                        │
+│  ┌──────────┐   ┌────────────────────────────┐   │
+│  │ Priority │──▶│ Domain queues (partitioned │   │
+│  │ selector │   │ by hash(domain))           │   │
+│  └──────────┘   └────────────────────────────┘   │
+└──────────────────────────────────────────────────┘
+    │  one worker owns a set of domains
+    │  and honours each domain's crawl delay
+    ▼
+┌───────────┐   robots.txt cache      ┌──────────────┐
+│  FETCHER  │◀──────────────────────▶ │ DNS resolver │
+│  workers  │   per-domain limiter    │  + cache     │
+└───────────┘                         └──────────────┘
+    │  raw HTML  ──────────────────────▶ Blob store (100 TB)
+    ▼
+┌───────────┐
+│  PARSER   │  extract text · extract links · content hash / simhash
+└───────────┘
+    │                              │
+    │ text + metadata              │ discovered links
+    ▼                              ▼
+┌───────────┐              ┌─────────────────┐
+│ Doc store │              │  URL DEDUP      │  ← bloom filter
+│ + URL meta│              │  seen? → drop   │
+└───────────┘              └─────────────────┘
+    │                              │ new URLs
+    │                              └──────▶ back to FRONTIER  (the BFS loop)
+    ▼
+┌───────────────────────────────────────────┐
+│  INDEXER  (MapReduce / Spark, batch)      │
+│  docs ──▶ inverted index segments         │
+└───────────────────────────────────────────┘
+                    │
+                    ▼  published index segments
+             ┌──────────────┐
+             │ SEARCH TIER  │
+             └──────────────┘
+</code></pre>
+
+    <h3>One page, end to end (the write path)</h3>
+    <ol>
+      <li><strong>Select.</strong> The frontier picks the next URL — not FIFO, but by priority (PageRank, freshness need,
+        depth) <em>within</em> a domain queue whose politeness clock says it's allowed to be hit right now.</li>
+      <li><strong>Route.</strong> The URL goes to the fetcher that owns <code>hash(domain)</code>. <strong>Always the same
+        fetcher for a given domain.</strong> This is the whole trick, and deep dive 1 explains why.</li>
+      <li><strong>Check robots.</strong> The fetcher looks up <code>example.com/robots.txt</code> in a local cache (TTL
+        ~24h). If the path is disallowed, drop the URL and record why. If the cache is cold, fetch robots first —
+        and that fetch itself counts against politeness.</li>
+      <li><strong>Resolve DNS.</strong> Almost certainly a cache hit. If not, this is a 50–200ms round trip, and it is
+        the sleeper bottleneck of the whole system (see <a href="#scaling">§8</a>).</li>
+      <li><strong>Fetch.</strong> Conditional <code>GET</code> with <code>If-None-Match</code> if you have an ETag. Cap
+        the response size (a 10GB "HTML" file is an attack, not a page). Cap redirects at ~5. Time out at 10s.</li>
+      <li><strong>Store raw.</strong> Blob storage. The queue message carries only the key, never the bytes — a rule
+        worth stating: <strong>queues carry pointers, not payloads.</strong></li>
+      <li><strong>Parse.</strong> Extract text. Extract links, resolve them to absolute URLs, normalise them. Compute a
+        content hash and a simhash.</li>
+      <li><strong>Dedup content.</strong> If the content hash is already known under a different URL, it's a mirror or a
+        session-ID duplicate: record the alias, don't index it twice.</li>
+      <li><strong>Dedup URLs.</strong> For each discovered link, ask the bloom filter. "Definitely not seen" → enqueue.
+        "Probably seen" → drop. That <em>drop</em> is where a false positive costs you a page you'd never crawled — and
+        you have to decide, out loud, whether that's acceptable. (It is. Deep dive 1.)</li>
+      <li><strong>Schedule the re-crawl.</strong> Write <code>next_crawl_at</code> into the URL metadata based on the
+        estimated change rate.</li>
+    </ol>
+
+    <h3>One query, end to end (the read path)</h3>
+    <pre><code>Query "distributed systems"
+  │
+  ▼
+[ Cache ]──hit──▶ return (popular queries are wildly skewed — huge hit rate)
+  │ miss
+  ▼
+[ Query parser ]  tokenize · lowercase · stem ("systems"→"system") · stopwords
+  │
+  ▼
+[ Scatter ]──▶ shard 1 ─┐
+      │   ──▶ shard 2 ─┤   each shard: fetch posting lists,
+      │   ──▶ ...      ├── intersect, score with BM25 + PageRank,
+      │   ──▶ shard N ─┘   return its OWN top 10
+  │
+  ▼
+[ Gather / merge ]  merge N×10 candidates → global top 10   ← a k-way merge (heap!)
+  │
+  ▼
+[ Snippet service ]  fetch the doc text, cut the passage around the matched terms
+  │
+  ▼
+Results
+</code></pre>
+
+    <div class="note">That gather step — merging the top-10 from each of N shards into a global top-10 — is
+      <strong>exactly the k-way merge with a heap</strong> from <a href="../phase3-dsa/08-heaps-top-k.html">Phase 3
+      tutorial 08</a>. And the intersection inside each shard is the <strong>two-pointer merge</strong> from
+      <a href="../phase3-dsa/02-two-pointers.html">tutorial 02</a>. Search is, structurally, a distributed top-k over
+      sorted lists. The DSA you did was not a separate subject; it was this.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="deep-dive-1">7a. Deep dive: the crawler</h2>
+
+    <p><strong>This is where the interview really happens</strong> — if the interviewer chose the crawler. Five things,
+      in the order they'll be pushed on: the frontier, politeness, URL dedup, content dedup and traps, and freshness.</p>
+
+    <h3>The frontier — BFS's queue, when the queue is a terabyte</h3>
+
+    <p>
+      Naively the frontier is a FIFO queue: pop the oldest URL, crawl it. Two things kill that immediately.
+    </p>
+
+    <p>
+      <strong>First, it doesn't fit in memory.</strong> Hundreds of millions of pending URLs at ~100 bytes each is tens
+      of gigabytes, and a single machine draining it is a single point of failure <em>and</em> a throughput ceiling. So
+      the frontier is a distributed queue — Kafka with many partitions, or a sharded Redis/Cassandra-backed priority
+      structure. Kafka is the natural fit: durable (a fetcher crash loses nothing — offsets aren't committed until the
+      page is stored), horizontally partitioned, and it gives you replay for free.
+    </p>
+
+    <p>
+      <strong>Second, FIFO is the wrong order.</strong> Plain BFS treats every URL as equally worth crawling. It is not.
+      You have a finite, politeness-capped crawl budget and an infinite web; the order you spend that budget in
+      <em>is</em> the quality of your index. So the frontier is really a <strong>priority queue</strong>, scored on:
+    </p>
+
+    <ul>
+      <li><strong>PageRank / inbound links</strong> — a page linked from 10,000 sites is worth crawling before a page
+        linked from one. (Chicken-and-egg: you need the link graph to compute PageRank, and the crawl to build the link
+        graph. In practice you use last iteration's PageRank, seeded by domain authority. Say that; the bootstrapping
+        question is a classic follow-up.)</li>
+      <li><strong>Freshness need</strong> — a re-crawl of a news homepage outranks the first crawl of a dead forum from
+        2007.</li>
+      <li><strong>Depth</strong> — shallow pages (near the homepage) tend to matter more, and depth is also your trap
+        cap.</li>
+    </ul>
+
+    <div class="pitfall">Don't say "I'll use a priority queue" and move on. The interviewer's next question is
+      <em>"a priority queue where? You have a billion URLs."</em> The real answer is a <strong>two-level structure</strong>:
+      a small number of priority <em>bands</em> (say 5 Kafka topics, or 5 queues per domain), and you dequeue from the
+      high band far more often than the low one. You get approximate priority ordering without ever needing a global
+      sorted structure over a billion items — and "approximate priority is fine here" is exactly the kind of judgment
+      call being graded. A globally-ordered distributed priority queue is a research project; a weighted band selector
+      is an afternoon.</div>
+
+    <h3>Politeness — the constraint that shapes the entire architecture</h3>
+
+    <p>
+      Here is the scenario. Your fetchers pull from a shared queue, round-robin. A large site — say
+      <code>wikipedia.org</code> — has ten million pages in your frontier. At any instant, several hundred of your
+      fetchers happen to be holding Wikipedia URLs. You now have 500 concurrent connections open to one server.
+    </p>
+
+    <p>
+      <strong>You have just DDoS'd Wikipedia.</strong> Not metaphorically. Their ops team sees a traffic spike from your
+      IP range, your user agent gets blocked, and if you're unlucky the conversation involves lawyers. This is the single
+      most common way a naive crawler design fails, and it is a <em>correctness</em> failure, not a performance one.
+    </p>
+
+    <p>The rules you must respect, in order of seriousness:</p>
+
+    <ol>
+      <li><strong><code>robots.txt</code></strong> — fetch <code>https://domain/robots.txt</code> before crawling any
+        domain, cache it (TTL ~24h; the cache is essential — you don't re-fetch it per URL), and obey both its
+        <code>Disallow</code> paths and its <code>Crawl-delay</code> directive. It's a voluntary standard with no
+        enforcement, which is exactly why respecting it is a signal about you.</li>
+      <li><strong>Rate limit per domain</strong> — at most 1 request every N seconds to a single host. A common default
+        is ~1/sec, adaptive: back off when you see 429s, 503s, or rising latency (the host is telling you it's
+        struggling). This is the <strong>token bucket</strong> from <a href="09-rate-limiter.html">tutorial 09</a>,
+        keyed by domain — except here you're the one being polite, not the one enforcing a quota. Same algorithm, the
+        other side of the table.</li>
+      <li><strong>Identify yourself</strong> — a real <code>User-Agent</code> with a URL and a contact address, so the
+        site owner can email you instead of blocking you.</li>
+      <li><strong>Back off on failure</strong> — exponential backoff with jitter (<a href="06-caching-queues-resilience.html">06</a>).
+        Retrying a struggling server aggressively is how you turn its bad day into an outage.</li>
+    </ol>
+
+    <h4>The architectural consequence — and this is what they're actually testing</h4>
+
+    <p>
+      Enforcing "1 request/sec to example.com" is <em>trivial</em> if exactly one worker is allowed to fetch
+      <code>example.com</code>. It is a distributed-consensus problem if any of 1,000 workers might. So:
+    </p>
+
+    <div class="senior"><strong>The line to say:</strong> <em>"Politeness means I can't round-robin URLs across my
+      fetcher pool. If any worker can pick up any URL, then enforcing a per-domain rate limit requires a distributed
+      counter that every worker checks on every fetch — that's a shared-state bottleneck and a race condition, and it's
+      the hard way to solve this. The easy way is to make it a <strong>partitioning</strong> problem instead:
+      <strong>route URLs to workers by <code>hash(domain)</code></strong>, so one worker owns all of example.com. Now
+      the rate limit is a <em>local variable</em> in that worker. No coordination, no locks, no shared counter. I've
+      turned a distributed-coordination problem into a data-partitioning problem — and I'd use consistent hashing
+      (<a href="04-partitioning-hashing.html">04</a>) so that adding or losing a fetcher only remaps 1/N of the domains
+      instead of reshuffling everything."</em> That paragraph is the single highest-value thing you can say on the
+      crawler side of this question. It shows you can eliminate coordination by choosing the right partition key —
+      which is, honestly, most of distributed systems.</div>
+
+    <pre><code>WRONG — shared queue, any worker takes any URL:
+
+  [ one big queue ] ──▶ W1  W2  W3 ... W1000
+                         ↓   ↓   ↓        ↓
+                    all hammering example.com at once
+                    → needs a distributed rate limiter → contention, races
+
+RIGHT — partition by domain:
+
+  hash("example.com") % N = 7     ─────▶ Worker 7  ── owns example.com
+  hash("wikipedia.org") % N = 42  ─────▶ Worker 42 ── owns wikipedia.org
+
+  Worker 7's politeness check is now a HashMap lookup in its own heap:
+      nextAllowedFetch.get("example.com")  →  is it 10:00:03 yet?
+  No coordination. No shared state. No race.
+</code></pre>
+
+    <p>
+      Two consequences to volunteer before you're asked, because they're the natural next questions:
+    </p>
+    <ul>
+      <li><strong>Hot domains.</strong> Wikipedia has millions of pages; a random blog has twelve. Domain-partitioning
+        gives you a <strong>skewed workload</strong> — the classic hot-partition problem from
+        <a href="04-partitioning-hashing.html">04</a>. Fix: a worker owns <em>many</em> domains and interleaves them, so
+        while it's waiting out Wikipedia's crawl delay it fetches from its 5,000 other domains. Politeness delay isn't
+        idle time; it's just a reason to work on something else. A worker with enough domains is never blocked.</li>
+      <li><strong>Sites behind one IP, and one site behind many.</strong> Politeness is really per-<em>server</em>, not
+        per-hostname. 10,000 domains on one shared host means "1 req/sec per domain" is 10,000 req/sec to that poor
+        machine. The rigorous fix is to rate-limit by <em>resolved IP</em>, not hostname. Mention it. Most candidates
+        never think of it, and it's a genuinely nice catch.</li>
+    </ul>
+
+    <h3>URL dedup at scale — where bloom filters earn their keep</h3>
+
+    <p>
+      <a href="06-caching-queues-resilience.html">Tutorial 06</a> taught you bloom filters and named three places they
+      genuinely pay for themselves. <strong>This is the best of the three.</strong> Here is the payoff.
+    </p>
+
+    <p>
+      Every page you parse yields ~50 links. At 400 pages/sec that's <strong>20,000 URLs per second</strong> arriving at
+      the question <em>"have I seen this one before?"</em> Get that wrong and BFS revisits nodes — which in a cyclic
+      graph (and the web is nothing <em>but</em> cycles: every page links back to the homepage) means you loop forever
+      and never make progress. The visited-set isn't an optimisation. It's what makes the algorithm terminate.
+    </p>
+
+    <p>The obvious implementations, and why each one dies:</p>
+
+    <table>
+      <thead><tr><th>Approach</th><th>Cost at 1B URLs</th><th>Verdict</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>HashSet&lt;String&gt;</code> in memory</td>
+          <td><strong>~100 GB RAM</strong> (60-byte URLs + object overhead)</td>
+          <td>Correct, and absurdly expensive. You are buying a 128GB machine to answer a yes/no question.</td>
+        </tr>
+        <tr>
+          <td>Store 16-byte hashes instead of URLs</td>
+          <td>~16–30 GB RAM</td>
+          <td>Better! Genuinely a valid answer, and worth saying. Still a big dedicated cluster, and it doesn't shrink as you grow.</td>
+        </tr>
+        <tr>
+          <td>A database lookup per URL</td>
+          <td>20,000 point-reads/sec, forever</td>
+          <td>Works, costs a Cassandra cluster, and adds a network round trip to the hottest path in the system. Now dedup is your bottleneck.</td>
+        </tr>
+        <tr>
+          <td><strong>Bloom filter</strong></td>
+          <td><strong>~1.2 GB RAM</strong> at 1% FP</td>
+          <td><strong>Fits in a corner of one machine's heap.</strong> O(k) hashes, no network, no allocation. The catch: it lies, occasionally, in one specific direction.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h4>What the bloom filter actually promises</h4>
+
+    <pre><code>bloom.mightContain(url):
+
+   returns FALSE  →  <strong>definitely never seen.</strong>  Guaranteed. No false negatives, ever.
+   returns TRUE   →  <strong>probably seen</strong> ... but maybe not (that's the ~1% false positive)
+
+So the crawler's logic is:
+
+   <span class="kw">if</span> (!seen.mightContain(url)) {   <span class="com">// definitely new</span>
+       seen.add(url);
+       frontier.enqueue(url);
+   }                                <span class="com">// else: probably seen → DROP IT</span>
+</code></pre>
+
+    <p>
+      Follow the consequence through, because <em>this is the judgment the question exists to test</em>. A false positive
+      means the filter says "probably seen" about a URL you have <strong>never actually crawled</strong>. You drop it.
+      That page never enters your index. <strong>You have silently lost a page.</strong>
+    </p>
+
+    <p>And the correct engineering response to that is: <em>so what?</em></p>
+
+    <div class="senior">Say this, and say it with conviction: <em>"A bloom filter gives me 'definitely new' or 'probably
+      seen' for a billion URLs in about a gigabyte, versus a hundred gigabytes for an exact hash set. The cost is that
+      roughly 1% of the time it tells me I've seen a URL I haven't, and I skip a page I've never crawled.
+      <strong>For a web crawler, that is a completely acceptable loss.</strong> I'm crawling a billion pages out of a web
+      that has trillions — I am <em>already</em> not crawling almost everything. Missing one page in a hundred, at
+      random, changes nothing about the quality of my index, and the page will almost certainly get rediscovered through
+      a different link anyway. I'm trading a 1% recall loss for a 100× reduction in memory. That trade is
+      obviously correct <em>here</em> — and I want to be precise that it's correct <em>because of what this system
+      is</em>, not because bloom filters are always fine."</em></div>
+
+    <h4>The contrast that proves you understand the tool — not just its name</h4>
+
+    <p>
+      Take the exact same data structure to <a href="14-ticket-booking.html">tutorial 14</a>, ticket booking. Use a bloom
+      filter to answer <em>"is seat 14C already sold?"</em> A false positive there means the filter says "sold" about a
+      seat that is free — you'd wrongly refuse a sale. Annoying, not fatal. But flip the polarity of the check, as an
+      unwary engineer easily might, and a false positive says "not sold" about a seat that <em>is</em> sold —
+      <strong>and you have just sold seat 14C twice.</strong> Two people, two valid tickets, one chair. That is an
+      incident, a refund, and at a fintech loop, a compliance conversation.
+    </p>
+
+    <table>
+      <thead><tr><th></th><th>Web crawler (this page)</th><th>Ticket booking (14)</th></tr></thead>
+      <tbody>
+        <tr><td>The question</td><td>"Have I seen this URL?"</td><td>"Is this seat taken?"</td></tr>
+        <tr><td>Cost of a false positive</td><td>Skip one page out of a billion</td><td>A double-booking, or a wrongly refused sale</td></tr>
+        <tr><td>Is the error <em>bounded</em>?</td><td>Yes — you lose ~1% of a corpus you were already sampling</td><td>No — one error is a full-blown business incident</td></tr>
+        <tr><td>Can you recover?</td><td>Yes, invisibly. Another link finds the page later.</td><td>No. The ticket is issued. Someone is standing in an aisle.</td></tr>
+        <tr><td><strong>Verdict</strong></td><td><strong>Use it. Textbook fit.</strong></td><td><strong>Never. Use the database's uniqueness constraint.</strong></td></tr>
+      </tbody>
+    </table>
+
+    <div class="note"><strong>Same tool, opposite verdict, and the difference is entirely in the domain — not the
+      technology.</strong> This is what "engineering judgment" actually means, and it's what a 7-YOE candidate is being
+      graded on that a 3-YOE candidate isn't. The junior answer is "bloom filters are memory-efficient." The senior
+      answer is "bloom filters trade a bounded, one-directional error for an enormous space saving, so the only question
+      that matters is <em>what does that specific error cost in this specific system?</em>" Never name a probabilistic
+      data structure without immediately naming the error it introduces and pricing it. That's the whole move.</div>
+
+    <div class="pitfall">Two things about bloom filters that interviewers love to probe.
+      <strong>(1) You cannot delete from a standard bloom filter</strong> — clearing bits would break other entries that
+      share them. If you need deletion, you need a <em>counting</em> bloom filter (4-bit counters instead of bits, so 4×
+      the space). For a crawler you almost never delete, so this doesn't bite — but know it.
+      <strong>(2) It's not durable.</strong> A restart with an empty filter means you re-crawl everything you've ever
+      seen. Fix: periodically snapshot the bit array to blob storage (it's only a gigabyte), and/or back the filter with
+      a durable KV store that you only consult on a "probably seen" hit — which converts your 1% false-positive rate
+      into a 1% rate of <em>cheap extra database lookups</em> and zero lost pages. <strong>That last variant is a very
+      strong answer to "how do you avoid losing pages at all?"</strong>: the bloom filter absorbs 99% of the traffic and
+      the database provides exactness for the remaining 1%. Bloom filter as a <em>cache in front of the truth</em>,
+      rather than as the truth itself.</div>
+
+    <p>
+      One more scaling note: at 10B+ URLs even 1.2GB grows, and a single filter is a single point of failure. Shard the
+      filter by <code>hash(url)</code> across the fetcher fleet — and if you've already partitioned by domain, the
+      natural move is for <strong>each worker to hold the bloom filter for its own domains</strong>. The dedup check
+      then never leaves the process. No network call in the hottest loop in the system. That's the design falling
+      pleasantly into place.
+    </p>
+
+    <h3>Content dedup — the same page at a thousand URLs</h3>
+
+    <p>
+      URL dedup catches <code>/a</code> arriving twice. It does <strong>nothing</strong> for the same content served at
+      different URLs, and the web is drowning in that: mirrors and CDN copies, <code>?sessionid=</code> and
+      <code>?utm_source=</code> variants, printer-friendly versions, HTTP and HTTPS versions, <code>www</code> and
+      bare-domain versions, and syndicated articles republished on forty sites. A large fraction of the crawlable web is
+      duplicate or near-duplicate content. Index it all and your results page shows the same article ten times, which is
+      a visibly broken product.
+    </p>
+
+    <ul>
+      <li><strong>Exact duplicates:</strong> hash the extracted text (SHA-256 of the normalised content). Same hash →
+        same page. Keep one canonical URL, record the others as aliases. Cheap, effective, do this always.</li>
+      <li><strong>Near duplicates</strong> (the same article with a different ad rail, timestamp, or comment count — so
+        the exact hash differs on every fetch): you need a hash where <em>similar documents produce similar
+        hashes</em>. That's <strong>SimHash</strong> — hash each word, weight it, sum the weighted vectors, take the
+        sign of each dimension to get a 64-bit fingerprint. Two documents that differ by 3% differ in only a few bits,
+        so "near-duplicate" becomes "<strong>Hamming distance ≤ 3</strong>" — and Hamming distance is a <code>popcount</code>
+        of an XOR, which is the bit manipulation from <a href="../phase3-dsa/14-tries-bits-math.html">Phase 3 tutorial
+        14</a>. (Shingling + MinHash is the other classic technique; same goal, different mechanism.)</li>
+    </ul>
+
+    <div class="note"><strong>SimHash is awareness-level and you should say so.</strong> Nobody expects you to derive it
+      at a whiteboard. The gradeable insight is one sentence: <em>"an exact content hash catches perfect duplicates but
+      breaks on a single changed byte, so for near-duplicates I'd use a locality-sensitive hash like SimHash where
+      similar documents land close together in Hamming distance — I know the shape of it, I'd read up before
+      implementing."</em> Naming the technique and honestly bounding your depth beats bluffing every single time, and
+      interviewers can always tell the difference.</div>
+
+    <h3>Crawler traps — the web is adversarial</h3>
+
+    <p>
+      This is the lesson that makes crawling <em>weird</em>, and it's worth stating explicitly because nothing else in
+      this course is like it: <strong>your input is written by people, some of whom want to hurt you.</strong> Your
+      React app's inputs come from your own frontend. A crawler's input comes from the open internet, including people
+      who profit from wasting your budget.
+    </p>
+
+    <table>
+      <thead><tr><th>Trap</th><th>What happens</th><th>Defence</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Infinite calendar</strong></td>
+          <td><code>/calendar?month=8&amp;year=2026</code> has a "next month" link. So does the next one. Forever. <strong>Infinite unique URLs, all real, all worthless.</strong></td>
+          <td><strong>Depth limit</strong> (BFS depth from seed, cap ~10–20) and a <strong>per-domain page cap</strong>.</td>
+        </tr>
+        <tr>
+          <td><strong>Session IDs in URLs</strong></td>
+          <td>Every link gets a fresh <code>?sid=</code>. Every crawl of the same page yields 50 "new" URLs. The frontier grows without bound and dedup can never fire.</td>
+          <td><strong>URL normalisation</strong> (strip known session params) + <strong>content-hash dedup</strong> to catch what normalisation misses.</td>
+        </tr>
+        <tr>
+          <td><strong>Deep faceted navigation</strong></td>
+          <td>E-commerce filters: colour × size × brand × price × sort = combinatorial explosion of URLs, all showing the same twelve products.</td>
+          <td>URL-length cap, query-parameter-count cap, per-domain budget, <code>rel="canonical"</code> if the site provides it.</td>
+        </tr>
+        <tr>
+          <td><strong>Zip bombs / giant responses</strong></td>
+          <td>A 10GB response, or 1KB of gzip that expands to 10GB and OOMs your fetcher.</td>
+          <td><strong>Hard cap on bytes read</strong> (~10MB), streaming decompression with a cap, kill the connection past it.</td>
+        </tr>
+        <tr>
+          <td><strong>Redirect loops / spider traps</strong></td>
+          <td>A → B → C → A, forever. Or dynamically generated link mazes designed specifically to trap bots.</td>
+          <td>Cap redirect chains at ~5. Cap total pages per domain. <strong>Monitor for a domain consuming a disproportionate share of the budget and auto-throttle it.</strong></td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="senior">The framing that lands: <em>"The defence against traps isn't a clever detector — the general case
+      is undecidable, you can't tell an infinite calendar from a large real site by inspection. The defence is
+      <strong>budgets</strong>. Every domain gets a finite page budget, every URL gets a depth cap and a length cap, and
+      I monitor for any domain consuming a disproportionate share of the crawl. Then the worst a trap can do is waste
+      one domain's budget instead of consuming my entire crawler. <strong>I don't try to be smart about a hostile
+      input; I bound the blast radius.</strong>"</em> That is the same instinct as a circuit breaker or a bulkhead from
+      <a href="06-caching-queues-resilience.html">06</a> — you cannot prevent every failure, so you contain what one
+      failure can cost you. Interviewers <em>love</em> seeing a foundations pattern reappear in a new costume, because
+      it proves you learned a principle rather than a recipe.</div>
+
+    <h3>Freshness &amp; re-crawl — the loop that never ends</h3>
+
+    <p>
+      <code>while (!frontier.isEmpty())</code> was a lie. The frontier is never empty, because a crawled page is not
+      done — it's just <em>currently accurate</em>. Pages change, pages 404, new pages appear. Your index decays from the
+      moment you write it.
+    </p>
+
+    <p>
+      The naive answer is "re-crawl everything every 30 days." That's wrong in both directions at once, and saying
+      <em>why</em> is the point:
+    </p>
+
+    <ul>
+      <li>A news site's homepage changes every few minutes. Crawling it monthly means your index is a month stale on the
+        content people search for <em>most</em>.</li>
+      <li>A blog post from 2009 has not changed in seventeen years and never will. Re-crawling it monthly burns
+        politeness budget — <em>your scarcest resource</em> — to fetch a byte-identical page.</li>
+    </ul>
+
+    <p><strong>So the re-crawl interval must be adaptive, per URL.</strong> Concretely:</p>
+
+    <pre><code>Track, per URL:  did the content_hash change between the last N crawls?
+
+   changed every time      → crawl more often   (interval ÷ 2, floor ~5 min)
+   never changed in 10x    → crawl less often   (interval × 2, cap ~90 days)
+
+Then:  next_crawl_at = last_crawled_at + interval
+
+The re-crawl scheduler = "give me all URLs where next_crawl_at &lt; now()",
+which is exactly the <strong>distributed scheduler</strong> from tutorial 12 — a time-bucketed
+scan that emits due work onto the frontier. Reuse it; don't reinvent it.
+</code></pre>
+
+    <p>
+      Two cheap wins to volunteer. <strong>Conditional GETs</strong>: send <code>If-None-Match: &lt;etag&gt;</code> or
+      <code>If-Modified-Since</code>; a <code>304 Not Modified</code> costs a few hundred bytes instead of 100KB and
+      still refreshes your "this page is alive" signal. You just did a re-crawl for ~1% of the bandwidth. And
+      <strong>sitemaps</strong>: many sites publish <code>/sitemap.xml</code> with <code>&lt;lastmod&gt;</code>
+      timestamps — the site is <em>telling you</em> what changed. Free freshness signal, and you should take it.
+    </p>
+
+    <div class="note">Notice that re-crawls and new discovery <strong>compete for the same politeness-capped
+      budget</strong>. That's a genuine, forced product trade-off, and naming it is worth real points:
+      <em>"Every re-crawl is a page I didn't discover. So freshness and coverage are in direct tension, and I'd split
+      the budget explicitly — say 70% discovery, 30% refresh — and tune the ratio from search-quality metrics rather
+      than pretending the trade-off doesn't exist."</em> A candidate who sees that two features of the same system are
+      fighting over one resource is thinking like an owner, not an implementer.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="deep-dive-2">7b. Deep dive: the search index</h2>
+
+    <p>
+      <strong>This is where the interview really happens</strong> — if the interviewer chose the search side. And this is
+      the half you're more likely to get in an enterprise loop, because "search over our documents" is a real thing your
+      team will build, whereas "crawl the open web" is not.
+    </p>
+
+    <h3>The inverted index — the single most important data structure in search</h3>
+
+    <p>
+      Derive it from first principles rather than naming it. Start with the naive approach so the interviewer sees you
+      understand <em>why</em> the answer is the answer.
+    </p>
+
+    <p>
+      You have a billion documents. A user searches for <code>kafka</code>. The obvious approach: scan every document,
+      check if it contains "kafka". That is a <strong>full-text scan of 10TB per query</strong> — hundreds of seconds if
+      you're lucky, and it does not get better with caching, because the next query is a different word. Dead on
+      arrival.
+    </p>
+
+    <p>
+      The problem is that your data is stored <strong>document → words</strong>, and your query asks <strong>word →
+      documents</strong>. You are querying against the grain. <strong>So invert it.</strong> That's the whole idea, and
+      the name is admirably literal:
+    </p>
+
+    <pre><code>FORWARD index (how documents naturally are):
+
+   doc1 → "the kafka broker stores the log"
+   doc2 → "a distributed log is a kafka concept"
+   doc3 → "the broker handles partitions"
+
+INVERTED index (what search needs):
+
+   term        posting list (sorted doc IDs)
+   ─────────────────────────────────────────
+   broker    → [1, 3]
+   concept   → [2]
+   distributed → [2]
+   kafka     → [1, 2]
+   log       → [1, 2]
+   partitions→ [3]
+   stores    → [1]
+</code></pre>
+
+    <p>
+      Now the query <code>kafka log</code> is not a scan. It is:
+    </p>
+
+    <pre><code>postings("kafka") = [1, 2]
+postings("log")   = [1, 2]
+
+AND query → <strong>intersect the two sorted lists</strong> → [1, 2]
+
+Query "broker log":
+   [1, 3] ∩ [1, 2] = [1]        ← doc1 only
+</code></pre>
+
+    <p>
+      Two sorted lists, walk both with two indices, advance whichever is smaller, emit on a match. <strong>That is
+      literally the two-pointer merge</strong> from <a href="../phase3-dsa/02-two-pointers.html">Phase 3 tutorial
+      02</a>, and it's O(n + m), not O(n × m):
+    </p>
+
+    <pre><code><span class="typ">List</span>&lt;<span class="typ">Integer</span>&gt; <span class="typ">intersect</span>(<span class="typ">List</span>&lt;<span class="typ">Integer</span>&gt; a, <span class="typ">List</span>&lt;<span class="typ">Integer</span>&gt; b) {
+  <span class="typ">List</span>&lt;<span class="typ">Integer</span>&gt; out = <span class="kw">new</span> ArrayList&lt;&gt;();
+  <span class="kw">int</span> i = <span class="num">0</span>, j = <span class="num">0</span>;
+  <span class="kw">while</span> (i &lt; a.size() &amp;&amp; j &lt; b.size()) {
+    <span class="kw">if</span>      (a.get(i).equals(b.get(j))) { out.add(a.get(i)); i++; j++; }
+    <span class="kw">else if</span> (a.get(i) &lt; b.get(j))        { i++; }   <span class="com">// advance the smaller</span>
+    <span class="kw">else</span>                                { j++; }
+  }
+  <span class="kw">return</span> out;
+}
+</code></pre>
+
+    <p>
+      Always intersect the <strong>shortest posting list first</strong> — "the" appears in 900M documents and "kafka" in
+      2M, so start from kafka's list and you do 2M comparisons instead of 900M. (Better still: <em>skip pointers</em>
+      inside posting lists let you binary-search forward instead of stepping one by one, which is Phase 3 tutorial 05
+      showing up uninvited. Awareness level; mentioning it is a nice flourish, not a requirement.)
+    </p>
+
+    <div class="senior">The sentence that shows you understand search rather than having memorised it: <em>"An inverted
+      index is just the recognition that your query direction and your storage direction are opposite. Documents are
+      stored doc→words; queries ask word→docs. So you precompute the transpose. Everything after that — intersecting
+      posting lists, ranking, sharding — is engineering on top of that one inversion."</em> Deriving the structure in
+      thirty seconds beats naming it in five, because naming it proves you read a blog post and deriving it proves you
+      could have invented it.</div>
+
+    <h4>What actually lives in a posting list</h4>
+
+    <p>Not just doc IDs. To rank and to support phrase queries you need more:</p>
+
+    <pre><code>"kafka" → [ (docId=1, tf=3, positions=[2, 17, 40]),
+            (docId=2, tf=1, positions=[7]),
+            ... ]
+
+  tf        = term frequency — how many times the word appears in that doc  → ranking
+  positions = where in the doc                                              → PHRASE queries
+</code></pre>
+
+    <p>
+      Positions are what let <code>"distributed systems"</code> in quotes mean <em>adjacent</em>, not merely
+      <em>both present</em>: intersect the doc lists, then check whether some position of "systems" equals a position of
+      "distributed" + 1. They roughly double index size, which is exactly the kind of cost/feature trade you should name
+      out loud rather than swallow.
+    </p>
+
+    <h3>Building it: this is a MapReduce, and you should say so</h3>
+
+    <pre><code>MAP    (runs over every crawled document, embarrassingly parallel):
+   for each doc:
+     for each term in tokenize(doc.text):
+        emit( term, (docId, position) )
+
+SHUFFLE  — the framework groups all emitted pairs by key (the term)
+
+REDUCE (one reducer per term-range):
+   for each term:
+     sort the (docId, position) pairs by docId
+     compress → write the posting list to an index segment
+</code></pre>
+
+    <p>
+      That is the canonical MapReduce example for a reason: the map is trivially parallel across a billion documents, the
+      shuffle does the transpose, and the reduce writes sorted, compressed segments. In 2026 you'd write it in Spark or
+      Flink, but the shape is unchanged. <strong>Segments are immutable</strong> — you never edit a posting list in
+      place. New documents go into new small segments, which are periodically merged into bigger ones.
+    </p>
+
+    <div class="note">Immutable segments + background merge is an <strong>LSM-tree</strong> in all but name — the same
+      structure <a href="03-data-storage.html">03</a> taught you for Cassandra's write path, and the same reason:
+      sequential writes are fast, in-place updates of a compressed sorted structure are miserable. Lucene (and therefore
+      Elasticsearch, and therefore most search you'll ever touch) is built exactly this way. Spotting that two
+      "different" systems are the same structure underneath is precisely the pattern-recognition being graded.</div>
+
+    <h4>Compression — awareness level, but a nice detail</h4>
+
+    <pre><code>Raw posting list:      [ 5, 12, 19, 40, 41, 60, ... ]   ← 4 bytes each
+
+<strong>Delta encoding</strong> (store gaps, not absolutes — the list is sorted, so gaps are small):
+                       [ 5,  7,  7, 21,  1, 19, ... ]
+
+<strong>Varint / VByte</strong> (small numbers take fewer bytes — 1 byte for values &lt; 128):
+                       most gaps now cost <strong>1 byte instead of 4</strong>
+
+Result: posting lists compress ~4×. On a 3 TB index that's 2+ TB of RAM
+you didn't have to buy — and since the whole game is keeping the index in
+memory, compression is not a micro-optimisation. It's capacity planning.
+</code></pre>
+
+    <p>Mention it in one sentence and move on. Nobody will ask you to implement varint, but knowing that posting lists
+      are delta-encoded and that this is <em>why</em> they must be sorted by doc ID is a real detail that separates
+      people who've looked inside Lucene from people who haven't.</p>
+
+    <h3>Sharding the index — a genuinely good interview question</h3>
+
+    <p>
+      3TB of index does not fit on one machine, and you want it in RAM. So you shard. There are exactly two ways, and
+      <strong>choosing between them, with reasons, is one of the highest-signal moments available on this page.</strong>
+    </p>
+
+    <pre><code><strong>DOCUMENT-PARTITIONED</strong>  (shard by docId — each shard holds a subset of DOCS,
+                        and the COMPLETE index for just those docs)
+
+   Shard 1: docs 1–10M   → its own full inverted index over those 10M docs
+   Shard 2: docs 10M–20M → its own full inverted index over those 10M docs
+   ...
+
+   Query "kafka log"  →  ask EVERY shard  →  each returns its local top-10
+                      →  merge N×10 into a global top-10
+
+<strong>TERM-PARTITIONED</strong>  (shard by term — each shard holds ALL docs for a subset of TERMS)
+
+   Shard 1: terms a–f  →  posting lists for "broker", "distributed", ...
+   Shard 2: terms g–m  →  posting lists for "kafka", "log", ...
+   ...
+
+   Query "kafka log"  →  both terms live on shard 2  →  ask ONLY shard 2
+   Query "kafka broker" → terms split across shards 1 and 2
+                        → must ship a whole posting list across the network to join
+</code></pre>
+
+    <table>
+      <thead><tr><th></th><th>Document-partitioned</th><th>Term-partitioned</th></tr></thead>
+      <tbody>
+        <tr><td>Query fan-out</td><td><strong>Every shard, every query.</strong> High.</td><td>Only shards holding the query's terms. Low.</td></tr>
+        <tr><td>Multi-term queries</td><td>Each shard intersects locally. Clean.</td><td><strong>Cross-shard join</strong> — ship posting lists over the network. Ugly.</td></tr>
+        <tr><td>Adding a document</td><td><strong>Touches one shard.</strong> Trivially incremental.</td><td><strong>Touches every shard holding any of its terms</strong> — i.e. most of them. Miserable.</td></tr>
+        <tr><td>Load balance</td><td><strong>Even.</strong> Docs distribute uniformly by hash.</td><td><strong>Catastrophically skewed.</strong> The shard holding "the" gets every query.</td></tr>
+        <tr><td>Tail latency</td><td>Governed by the <em>slowest of N</em> shards. Real cost.</td><td>Better in principle — fewer shards touched.</td></tr>
+        <tr><td>Failure of one shard</td><td>You lose some <em>documents</em> — results degrade gracefully.</td><td>You lose some <em>terms</em> — queries containing them return <strong>nothing</strong>.</td></tr>
+        <tr><td><strong>Used in practice</strong></td><td><strong>Yes. Essentially universally.</strong> Elasticsearch, Solr, Google.</td><td>Almost never, outside research papers.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="senior"><em>"On paper, term-partitioning looks better — a two-word query only touches one or two shards
+      instead of fanning out to a hundred. But it loses badly in practice for three reasons.
+      <strong>Hot keys</strong>: term frequency follows a Zipf distribution, so the shard holding common words is hit by
+      nearly every query while the shard holding rare words idles — it's the celebrity-partition problem from
+      <a href="04-partitioning-hashing.html">04</a>, in its purest form, and you can't fix it by adding shards.
+      <strong>Writes</strong>: adding one document means touching every shard that owns any word in it, so indexing
+      becomes a scatter-write across the entire cluster. And <strong>multi-term queries</strong> need cross-shard joins —
+      you either ship a posting list with millions of entries across the network, or you make two round trips.
+      Document-partitioning has real costs too: every query hits every shard, so my p99 is set by my slowest shard, not
+      my average one. But that cost is <em>bounded and fixable</em> — replicate shards, hedge requests, cache. So I'd
+      choose document-partitioning, and I'd budget for tail latency."</em> That answer names the alternative, gives three
+      concrete reasons, admits what its own choice costs, and says how it'd mitigate that. That is the complete
+      trade-off shape, and it is the shape every answer in this phase should have.</div>
+
+    <p>
+      Two consequences worth saying: <strong>replicate every shard</strong> (3×) — not just for durability but because
+      replicas cut tail latency (send to two replicas, take the first response — "hedged requests"). And a
+      <strong>shard is a unit of scaling</strong>: doubling your corpus means doubling shards, and because the index is
+      immutable and rebuilt in batch, resharding is <em>easy</em> here in a way it never is for a live OLTP database. A
+      rare case where the batch nature of the pipeline actually buys you something.
+    </p>
+
+    <h3>Ranking — be honest about scope</h3>
+
+    <p>
+      Intersection tells you <em>which</em> documents match. It says nothing about which are <em>good</em>. A query for
+      "kafka" matches ten million pages; the entire product is in choosing the ten to show.
+    </p>
+
+    <h4>TF-IDF, in one idea</h4>
+    <pre><code>score(term, doc) = TF × IDF
+
+  TF  (term frequency)          = how often the term appears IN THIS DOC
+                                  → "kafka" 40 times? This doc is probably about kafka.
+
+  IDF (inverse document frequency) = log( totalDocs / docsContainingTerm )
+                                  → "the" is in 900M docs → IDF ≈ 0 → worthless signal
+                                  → "kafka" is in 2M docs → IDF is high → strong signal
+</code></pre>
+
+    <p>
+      <strong>The one-sentence intuition, and this is the whole concept:</strong> <em>a term that is rare across the
+      corpus but frequent in this document is a strong signal that the document is about that term.</em> TF alone would
+      rank a page that says "the the the" at the top. IDF is what kills the stopwords — automatically, without a
+      hand-maintained stopword list. That's the elegance of it.
+    </p>
+
+    <p>
+      <strong>BM25</strong> is TF-IDF with two fixes, and it's what Lucene/Elasticsearch actually use, so it's worth
+      naming: <em>term-frequency saturation</em> (the 50th occurrence of "kafka" adds almost nothing over the 10th —
+      TF-IDF grows linearly, which is wrong) and <em>document-length normalisation</em> (a 10,000-word page shouldn't
+      outrank a focused 500-word one just for having more room to contain the word). Both are corrections for how
+      real documents behave. Awareness level: know what it fixes and why, not the formula.
+    </p>
+
+    <h4>PageRank, honestly, in one paragraph</h4>
+
+    <p>
+      TF-IDF is entirely about the page's own text — which means anyone can game it by stuffing keywords into their
+      page. PageRank's insight was to use a signal the page's author <em>doesn't control</em>:
+      <strong>treat a link as a vote.</strong> A page is important if important pages link to it — a recursive
+      definition, resolved by iterating to a fixed point (equivalently: the stationary distribution of a random surfer
+      clicking links forever). The link graph you built during the crawl is the input, it's a big sparse
+      matrix-vector multiply run to convergence, and it is <em>query-independent</em> — computed once in batch, stored
+      per URL, and mixed into the score at query time. Final score ≈ <code>BM25(query, doc) × f(PageRank(doc))</code>.
+    </p>
+
+    <div class="senior">Then close the topic deliberately, because knowing where to stop is itself a skill: <em>"In
+      reality, modern ranking is a learned model — hundreds of features (BM25, PageRank, click-through rate, dwell time,
+      freshness, page speed, spam scores) fed into a learning-to-rank model, retrained continuously, with a cheap
+      first-pass retrieval to get a thousand candidates and an expensive re-ranker on just those. I can't design
+      Google's ranker in a system design interview and I don't think anyone can. What I can do is get the retrieval
+      right, get BM25 plus a link-based prior as a baseline, and build the click-logging pipeline that a learned model
+      would need as training data — because <strong>the feedback loop is the actual moat</strong>, not the formula."</em>
+      That last clause is a genuinely senior observation, and being explicit that you're bounding the scope rather than
+      bluffing through it reads as confidence, not as a gap.</div>
+
+    <h3>Query serving</h3>
+
+    <ol>
+      <li><strong>Parse &amp; normalise.</strong> Tokenize, lowercase, stem ("running" → "run", so it matches "runs"),
+        drop stopwords, expand synonyms. <strong>The query must be processed with exactly the same pipeline as the
+        documents were</strong> — if you stemmed at index time you must stem at query time, or nothing matches. This is
+        a real bug people ship, and naming it is a nice detail.</li>
+      <li><strong>Cache.</strong> Query popularity is Zipf-distributed to an extreme degree — a small number of queries
+        are a huge fraction of traffic. A simple Redis cache of query → results, TTL of minutes to hours, absorbs a
+        large share of load. Cache the <em>rendered result page</em>, not just the doc IDs. See
+        <a href="06-caching-queues-resilience.html">06</a> — and mind the stampede on a newly-trending query, where a
+        million people search the same thing at the same instant and every one of them misses the cache.</li>
+      <li><strong>Scatter.</strong> Fan out to all N shards. Each shard fetches posting lists, intersects, scores, and
+        returns only its <em>own</em> top-10 — never its full match list. Sending 10 results instead of 2 million is the
+        difference between a working system and a melted network.</li>
+      <li><strong>Gather.</strong> Merge N×10 candidates into a global top-10 with a heap. Set a
+        <strong>deadline</strong>: if a shard hasn't answered in 100ms, return without it and serve slightly degraded
+        results. <em>Partial results beat a timeout</em> — and being willing to say that out loud is a real judgment
+        call, because it's an availability-over-completeness choice you should defend, not sneak past.</li>
+      <li><strong>Snippets.</strong> Fetch the matched documents' text and cut a passage around the query terms. This is
+        a separate service reading the doc store, and it's surprisingly expensive — you're doing 10 random reads into a
+        10TB corpus per query. Cache it hard.</li>
+    </ol>
+
+    <div class="note"><strong>Autocomplete</strong> is the other half of the query box, and it's a whole tutorial:
+      21 covers the frontend side — debounce vs throttle, out-of-order response
+      races, ARIA comboboxes. The backend is a <strong>trie</strong> over popular query prefixes, with the top-k
+      completions <em>precomputed and stored at each node</em> so a lookup is a walk down the prefix and a read, not a
+      subtree search. That's <a href="../phase3-dsa/14-tries-bits-math.html">Phase 3 tutorial 14</a>, and it is one of
+      the very few places a raw trie is genuinely the production answer rather than an interview curiosity. Note also
+      that autocomplete is ranked by <em>query</em> popularity (what people type), not document relevance — a different
+      corpus entirely, built from your query logs.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="scaling">8. Scaling &amp; bottlenecks</h2>
+
+    <p>What breaks first, and what you do about it.</p>
+
+    <table>
+      <thead><tr><th>Bottleneck</th><th>Why it breaks</th><th>The fix</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>DNS resolution</strong> <em>(the one nobody sees coming)</em></td>
+          <td>You are resolving <strong>millions of distinct hostnames</strong>. DNS is UDP, single-threaded in many client libraries, and a cold lookup is 50–200ms. At 400 fetches/sec against mostly-new hosts, <strong>DNS becomes a larger share of your latency than the actual page fetch</strong>, and you can trivially overwhelm your resolver — or your ISP's.</td>
+          <td><strong>Cache aggressively</strong> (a local resolver cache per fetcher, plus a shared one; honour TTLs but extend the floor). Run your <em>own</em> recursive resolvers. Prefetch DNS for a domain when you first enqueue its URLs, not when you fetch them. Batch and pipeline lookups.</td>
+        </tr>
+        <tr>
+          <td><strong>Politeness caps throughput</strong></td>
+          <td>You cannot crawl faster than (domains in flight × per-domain rate). Adding machines does <strong>nothing</strong> if you only have 100 domains queued.</td>
+          <td>The only real lever is <strong>domain diversity</strong>: keep tens of thousands of domains active simultaneously. This is why the frontier prioritiser must balance <em>across</em> domains, not just pick globally-highest-priority URLs — which would concentrate on a few big sites and starve you.</td>
+        </tr>
+        <tr>
+          <td><strong>The frontier</strong></td>
+          <td>Grows faster than you drain it (each page yields ~50 links, you consume 1). Unbounded growth, and traps make it worse.</td>
+          <td>It's fine for it to grow — the web is bigger than your budget. What matters is that it's <strong>prioritised</strong> (crawl the good stuff first) and <strong>bounded per domain</strong> (no single site eats it). Kafka handles the volume; the selection policy is the real design.</td>
+        </tr>
+        <tr>
+          <td><strong>Hot fetcher (skewed domains)</strong></td>
+          <td><code>hash(domain)</code> gives every worker ~equal <em>domains</em>, not equal <em>pages</em>. The worker owning Wikipedia has 10M pages queued; another has 400.</td>
+          <td>Consistent hashing with virtual nodes (<a href="04-partitioning-hashing.html">04</a>) to smooth it, plus dynamic rebalancing by <em>pending page count</em> rather than domain count. Very large domains can get their own dedicated worker — the "celebrity partition" fix, in a new costume.</td>
+        </tr>
+        <tr>
+          <td><strong>Index size</strong></td>
+          <td>3TB doesn't fit in one machine's RAM, and reading from disk is 100× slower.</td>
+          <td>Document-partition across ~100 shards, replicate 3×, keep it memory-mapped. Compress posting lists (delta + varint) — that's a 4× effective capacity win.</td>
+        </tr>
+        <tr>
+          <td><strong>Hot shard for common terms</strong></td>
+          <td>With document-partitioning this is <em>mostly</em> avoided — every shard gets every query, so load is even. But the <em>posting lists</em> for common terms are enormous within each shard, so a query for "the movie" does far more work than one for "kafka broker".</td>
+          <td>Intersect the shortest list first. Use skip pointers. Cache the hottest posting lists in RAM. And for truly worthless terms, consider not indexing them at all — a stopword list is the cheapest optimisation in search.</td>
+        </tr>
+        <tr>
+          <td><strong>Query tail latency</strong></td>
+          <td>Fan-out to 100 shards means your p99 is the p99 of the <em>slowest of 100</em> — a shard at p99=500ms drags the whole query there. <strong>Fan-out amplifies tails, brutally.</strong></td>
+          <td><strong>Hedged requests</strong> (send to 2 replicas, take the first answer). <strong>Deadlines</strong> (return partial results at 100ms rather than waiting). Cache popular queries so most never fan out at all.</td>
+        </tr>
+        <tr>
+          <td><strong>Indexing lag</strong></td>
+          <td>A full MapReduce rebuild over 1B docs takes hours. Fresh news is stale before it's searchable.</td>
+          <td><strong>Two-tier index</strong>: a large, immutable, periodically-rebuilt <em>base</em> index, plus a small, fast, in-memory <em>fresh</em> index for the last few hours' documents. Query both, merge the results. Periodically fold fresh into base. This is the <strong>LSM-tree pattern again</strong> — memtable + SSTables — and it is also exactly the lambda-architecture shape you'll meet in <a href="18-streaming-aggregation.html">18</a>.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="senior">If you get one "what breaks first?" question, answer <strong>DNS</strong>. <em>"The surprising
+      bottleneck in a crawler is DNS. Everyone budgets for HTTP fetch latency; almost nobody budgets for the fact that
+      you're resolving millions of unique hostnames, and a cold DNS lookup can cost as much as the page fetch itself. I'd
+      run my own recursive resolvers, cache aggressively with an extended TTL floor, and prefetch the resolution when a
+      URL enters the frontier rather than when a fetcher picks it up."</em> It's a real, specific, non-obvious answer, it
+      shows you've thought about the physics of the thing rather than the boxes, and it's the kind of detail interviewers
+      remember when they write up your feedback.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="tradeoffs">9. Trade-offs</h2>
+
+    <table>
+      <thead><tr><th>Decision</th><th>I chose</th><th>The alternative</th><th>When I'd flip</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>Frontier ordering</td>
+          <td>Priority bands (approximate)</td>
+          <td>Strict global priority queue; plain FIFO</td>
+          <td>FIFO is fine for a <em>bounded</em> corpus (an intranet crawl) where you'll get everything anyway, so order is irrelevant. Strict global priority is never worth it at this scale.</td>
+        </tr>
+        <tr>
+          <td>Work distribution</td>
+          <td><strong>Partition by <code>hash(domain)</code></strong></td>
+          <td>Shared queue + a distributed rate limiter</td>
+          <td>Never for the open web — politeness makes domain-affinity mandatory. But if you're crawling a <em>single</em> domain (a site-specific crawler), partition by URL hash instead and rate-limit centrally, since you only have one politeness clock anyway.</td>
+        </tr>
+        <tr>
+          <td>URL dedup</td>
+          <td><strong>Bloom filter</strong> (~1% FP)</td>
+          <td>Exact hash set (~30–100GB); a database lookup</td>
+          <td>Flip to exact if <strong>missing a page is unacceptable</strong> — a compliance/legal-discovery crawl where "we didn't index that document" is a real problem. Also flip when the corpus is small enough that exactness is free (10M docs = a 300MB hash set — just use the hash set).</td>
+        </tr>
+        <tr>
+          <td>Near-dup detection</td>
+          <td>SimHash / shingling</td>
+          <td>Exact content hash only</td>
+          <td>Exact-only is fine if your corpus doesn't have near-dups (an internal wiki). The open web is ~30%+ duplicated, so you need it there.</td>
+        </tr>
+        <tr>
+          <td>Index sharding</td>
+          <td><strong>Document-partitioned</strong></td>
+          <td>Term-partitioned</td>
+          <td>Essentially never flip. Term-partitioning only makes sense if your queries are overwhelmingly single-term <em>and</em> your corpus is static <em>and</em> you can somehow tolerate the hot-key skew. That combination doesn't occur in practice.</td>
+        </tr>
+        <tr>
+          <td>Index freshness</td>
+          <td>Batch rebuild + a small fresh tier</td>
+          <td>Fully incremental / real-time index</td>
+          <td>Go real-time (Elasticsearch-style near-real-time segments) if your product needs sub-minute freshness — log search, for instance, is useless if it's an hour behind. Batch is cheaper and simpler when hours of lag are fine.</td>
+        </tr>
+        <tr>
+          <td>Ranking</td>
+          <td>BM25 × PageRank prior</td>
+          <td>A learned (LTR) model</td>
+          <td>You'd flip the moment you have click logs to train on. But you must ship the BM25 baseline <em>first</em>, because it's what generates the logs. <strong>The baseline isn't a compromise, it's the bootstrap.</strong></td>
+        </tr>
+        <tr>
+          <td>JavaScript rendering</td>
+          <td>Static HTML parse only</td>
+          <td>Headless-browser rendering for every page</td>
+          <td>Render <em>selectively</em>: two-pass. Cheap-parse everything; if the page looks like an empty SPA shell (near-zero text, a lone <code>&lt;div id="root"&gt;</code>), queue it for the expensive render tier. See the follow-ups.</td>
+        </tr>
+        <tr>
+          <td>Build vs buy</td>
+          <td>Build (for 1B pages)</td>
+          <td><strong>Elasticsearch / OpenSearch / Vespa</strong></td>
+          <td><strong>At any corpus you can realistically imagine at work — flip to buy.</strong> If the answer to "how big?" is 10M documents, "I'd use Elasticsearch and spend my time on relevance tuning and the ingestion pipeline" is the <em>correct</em> senior answer, and building this from scratch would be a bad decision you should be able to identify as such.</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="followups">10. Follow-ups you should expect</h2>
+
+    <h3>"How do you crawl JavaScript-rendered pages?"</h3>
+    <p>
+      <strong>You will get this one, because you're a frontend engineer, and you should have a strong opinion.</strong>
+      Half the modern web renders its content client-side; <code>curl</code> on a React SPA returns
+      <code>&lt;div id="root"&gt;&lt;/div&gt;</code> and a script tag. Your parser extracts zero text and zero links, and
+      to the crawler that page — and everything reachable only through it — <strong>does not exist</strong>. This isn't
+      an edge case; it's a large fraction of the web, and it's a <em>graph reachability</em> problem, not just a content
+      problem: you lose whole subgraphs.
+    </p>
+    <p>
+      The fix is to render: run a headless browser (Puppeteer/Playwright over headless Chrome), execute the JS, wait for
+      the network to go idle, then read the resulting DOM. The catch is the cost. A static HTML parse is ~10ms of CPU
+      and a few MB. A headless render is <strong>1–5 seconds of CPU and 100–300MB of RAM per page</strong>. Call it
+      <strong>50–100× more expensive</strong>. You cannot render a billion pages; the fleet arithmetic simply doesn't
+      close.
+    </p>
+    <p>So you render <strong>selectively</strong>, and here's the pipeline that gets you the points:</p>
+    <ul>
+      <li><strong>Pass 1 — cheap.</strong> Fetch and parse the raw HTML for everything.</li>
+      <li><strong>Detect.</strong> Heuristics: is the text content near-empty? Is there a single root div and a big JS
+        bundle? Does the DOM look like a known SPA framework's shell?</li>
+      <li><strong>Pass 2 — expensive, on a separate fleet.</strong> Queue the suspects to a <em>much smaller</em> render
+        tier, budgeted and rate-limited independently. Prioritise by importance — render high-PageRank SPAs, skip the
+        long tail.</li>
+      <li><strong>Look for the cheap way out first.</strong> Many SPAs ship server-side rendering, prerendered
+        <code>__NEXT_DATA__</code> / hydration JSON, an <code>og:</code> meta description, or a sitemap. Sometimes the
+        content is sitting right there in a JSON blob in the HTML and you never need a browser at all. <em>Check for
+        that before you spin up Chrome.</em></li>
+    </ul>
+    <div class="senior">And the observation that only a frontend engineer makes: <em>"This is also why SSR and SSG exist
+      as SEO features, not just performance ones. When I chose Next.js with server-side rendering on a project, part of
+      the justification was exactly this — I was making the crawler's job cheap, because a crawler that has to spin up
+      Chrome to see my content might just decide I'm not worth the CPU. The economics of the crawler are the reason
+      SEO advice tells you to server-render."</em> That connects your actual career experience to the system you're
+      designing, from the other side of the wire. It is a genuinely distinctive thing to be able to say in this
+      interview, and almost no backend candidate can say it. <strong>Use it.</strong></div>
+
+    <h3>"How fresh is fresh enough?"</h3>
+    <p>
+      There is no universal answer, and the correct response is to <em>refuse the premise</em> and segment: news and
+      social — minutes to hours (and you'd special-case them: dedicated high-frequency crawlers, plus push-based
+      ingestion like RSS/sitemap pings/PubSubHubbub rather than polling). E-commerce prices and stock — hours.
+      Documentation and reference — days. The archival long tail — months, and you'd mostly rely on a cheap conditional
+      <code>GET</code> to confirm nothing changed. Then the honest close: <strong>"freshness costs politeness budget,
+      which is the same budget as discovery, so 'fresher' always means 'less coverage'. I'd set the split from
+      search-quality metrics — if users are clicking stale results, buy freshness; if they're getting no results, buy
+      coverage."</strong>
+    </p>
+
+    <h3>"How do you detect spam and SEO manipulation?"</h3>
+    <p>
+      Awareness level, and say so — this is an adversarial ML arms race, not a system design problem, and anyone who
+      claims to solve it in an interview is bluffing. But have the vocabulary: <em>keyword stuffing</em> and
+      <em>invisible text</em> (text the same colour as the background, <code>display:none</code> divs) are detectable
+      with content heuristics. <em>Link farms</em> — thousands of sites linking to each other to inflate PageRank — are
+      detectable as suspiciously dense subgraphs, and PageRank variants like TrustRank propagate trust from a
+      hand-vetted seed set to resist them. <em>Cloaking</em> — serving different content to Googlebot than to users — is
+      caught by crawling occasionally from an unlabelled IP with a browser user-agent and diffing. The structural point,
+      which is the actually gradeable one: <strong>any ranking signal the page's author controls will eventually be
+      gamed, which is precisely why link-based and behaviour-based signals (which they don't control) are worth so much
+      more than on-page ones.</strong>
+    </p>
+
+    <h3>"Scope this down: search over my company's 10 million documents."</h3>
+    <p>
+      <strong>This is the version you will actually be asked at an enterprise loop, and the answer that scores highest
+      is the one that refuses to build any of this.</strong>
+    </p>
+    <div class="senior"><em>"At 10 million documents, I'd use Elasticsearch or OpenSearch and I would not build a single
+      thing on this whiteboard. Ten million docs is maybe 50GB of index — that fits on a handful of nodes with room to
+      spare. There's no crawler, because there's no link graph: I'd ingest via connectors and CDC from the source
+      systems (<a href="05-coordination-consensus.html">05</a>'s outbox pattern, straight into a queue). There's no
+      politeness problem, because I own the servers. There's no bloom filter, because an exact hash set of 10M IDs is
+      300MB. Nearly every hard problem on this page is a <em>consequence of the open web</em>, and none of them exist
+      inside a company. What actually matters at that scale is relevance tuning, permissions filtering — <strong>the
+      genuinely hard part, because a user must never see a document they lack access to, and that means access control
+      has to live inside the query, not as a post-filter, or your pagination silently breaks</strong> — and the
+      ingestion pipeline's reliability. I'd spend my engineering budget there, not on rebuilding Lucene."</em>
+      <strong>Knowing when not to build is a senior skill, and interviewers grade it heavily.</strong> A candidate who
+      cheerfully designs a distributed frontier with bloom filters for 10M internal PDFs has just demonstrated
+      exactly the judgment failure that gets expensive in real jobs.</div>
+
+    <h3>"Incremental index updates vs full rebuilds?"</h3>
+    <p>
+      Full rebuild: simple, atomic (build the new index, then flip a pointer), and it lets you change the schema,
+      tokenizer or scoring model freely — every document gets reprocessed. But it's expensive and slow (hours), so your
+      freshness floor is your rebuild period. Incremental: new documents go into small new segments that are queryable
+      immediately; segments merge in the background; deletes are <em>tombstones</em> filtered at query time rather than
+      in-place edits. That's near-real-time, but it's more complex, segments fragment, and merge is a permanent
+      background cost. <strong>The real answer is both</strong>: incremental for freshness, plus a periodic full rebuild
+      to compact, to garbage-collect tombstones, and — crucially — because <em>changing your tokenizer or your ranking
+      features requires reprocessing every document anyway</em>. That reprocessing need is what forces a rebuild path to
+      exist no matter how good your incremental path is, and saying that shows you've thought past the happy case.
+    </p>
+
+    <h3>"What about the link graph and PageRank at 1B pages?"</h3>
+    <p>
+      The link graph (~400GB of edges) doesn't fit on one machine, so PageRank is a distributed iterative computation —
+      classically a series of MapReduce jobs, in practice a graph-processing framework (Pregel/Giraph/Spark GraphX)
+      because iterative graph algorithms in raw MapReduce re-read the entire graph from disk on every iteration, which is
+      brutal. It converges in ~20–50 iterations, it's run in batch (daily/weekly, not per-page), and the result is a
+      single float per URL. The bootstrapping question — <em>you need PageRank to prioritise the crawl, but you need the
+      crawl to compute PageRank</em> — is resolved the boring way: <strong>use last iteration's values, and seed new
+      domains with a prior from the domain's overall authority.</strong> It's a fixed-point iteration that never
+      finishes, which is fine, because neither does the crawl.
+    </p>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="qa">Interview Q&amp;A</h2>
+
+    <details class="qa">
+      <summary>What data structure is a web crawler, really?</summary>
+      <div class="answer">
+        <p><strong>A BFS on a graph.</strong> The web is the graph, URLs are nodes, <code>&lt;a href&gt;</code> links are
+        edges. The frontier is the BFS queue; the seen-set is the visited-set. That's it.</p>
+        <p>Every hard part of the system is one of those two structures breaking under scale: the queue doesn't fit in
+        memory (→ a distributed, domain-partitioned, prioritised queue), the visited-set doesn't fit in memory (→ a bloom
+        filter), visiting a node costs 200ms of network I/O instead of a pointer dereference (→ thousands of concurrent
+        fetchers), and the graph is infinite and adversarial (→ depth limits, budgets, trap detection). <strong>Say this
+        in the first two minutes.</strong> It gives your whole answer a spine and it tells the interviewer you see the
+        algorithm underneath the boxes.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Why can't you just round-robin URLs across your fetcher pool?</summary>
+      <div class="answer">
+        <p><strong>Politeness.</strong> If any worker can grab any URL, then at any instant hundreds of workers may
+        independently hold URLs for the same domain — and you've opened 500 concurrent connections to one web server.
+        That's a DDoS, and it will get you blocked or sued.</p>
+        <p>Enforcing "1 request/sec to example.com" across 1,000 independent workers requires a shared distributed
+        counter checked on every fetch: a coordination bottleneck and a race condition. <strong>The fix is to make it a
+        partitioning problem instead of a coordination problem: route by <code>hash(domain)</code>, so exactly one worker
+        owns all of example.com.</strong> The rate limit becomes a local variable in that worker's heap — no locks, no
+        shared state, no network call. Use consistent hashing (<a href="04-partitioning-hashing.html">04</a>) so that
+        adding or losing a fetcher remaps only 1/N of domains. <em>This is the key architectural consequence of
+        politeness, and it's the thing interviewers are listening for.</em></p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Why a bloom filter for URL dedup, and what does it cost you?</summary>
+      <div class="answer">
+        <p>An exact <code>HashSet</code> of 1B URLs is <strong>~100GB of RAM</strong> (60-byte URLs plus object
+        overhead). A bloom filter answering the same membership question at a 1% false-positive rate is
+        <strong>~1.2GB</strong> — roughly 10 bits per item, independent of how long the URLs are. Two orders of
+        magnitude.</p>
+        <p>The cost is precise and one-directional: <strong>no false negatives, but ~1% false positives.</strong> "Not in
+        the set" is a guarantee; "in the set" is a strong probability. So the crawler occasionally believes it has seen a
+        URL it has never crawled, and silently skips that page.</p>
+        <p><strong>For a web crawler that is an acceptable loss</strong>, and being able to say <em>why</em> is the whole
+        point: you're crawling a billion pages out of a web with trillions — you're already sampling. Dropping 1% at
+        random doesn't measurably change index quality, and the page will likely be rediscovered via another link. You've
+        traded 1% recall for 100× less memory.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>You said bloom filters are great here — but you rejected them for ticket booking. Why?</summary>
+      <div class="answer">
+        <p><strong>Because the tool didn't change; the cost of being wrong did.</strong> That's the entire lesson.</p>
+        <p>In a crawler, a false positive means <em>one page out of a billion doesn't get indexed</em>. Bounded, invisible,
+        self-healing (another link will find it).</p>
+        <p>In ticket booking (<a href="14-ticket-booking.html">14</a>), a probabilistic answer to "is this seat taken?"
+        can mean <strong>you sell seat 14C twice</strong>. Unbounded consequence — a refund, a furious customer, and at a
+        fintech loop a compliance conversation. One error is a full-blown incident. There you use the database's
+        uniqueness constraint, which cannot be wrong.</p>
+        <p><strong>Never name a probabilistic data structure without immediately pricing the error it introduces in that
+        specific domain.</strong> "Bloom filters save memory" is the junior answer. "Bloom filters trade a bounded,
+        one-directional error for an enormous space saving, so the only question is what that error costs <em>here</em>"
+        is the senior one — and it's the judgment being graded.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Explain an inverted index from scratch.</summary>
+      <div class="answer">
+        <p>Documents are naturally stored <strong>doc → words</strong>. Queries ask <strong>word → docs</strong>. You're
+        querying against the grain, so scanning is O(corpus) per query — 10TB, dead on arrival. <strong>So precompute the
+        transpose.</strong></p>
+        <p>For each term, store a <em>posting list</em>: the sorted list of doc IDs containing it (plus term frequency and
+        positions). <code>kafka → [1, 2, 17, 40]</code>. A query for <code>kafka log</code> becomes the
+        <strong>intersection of two sorted lists</strong> — the two-pointer merge from
+        <a href="../phase3-dsa/02-two-pointers.html">Phase 3 tutorial 02</a>, O(n+m). Always start with the shortest
+        list.</p>
+        <p>You build it with a MapReduce: <em>map</em> emits <code>(term, docId)</code> for every word in every document,
+        the <em>shuffle</em> groups by term (that's the transpose), and the <em>reduce</em> writes a sorted, compressed
+        posting list per term. Segments are immutable and merge in the background — which is an LSM-tree, and is exactly
+        what Lucene does.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Document-partitioned or term-partitioned index? Defend it.</summary>
+      <div class="answer">
+        <p><strong>Document-partitioned, essentially always.</strong> Each shard holds a subset of documents and the
+        complete index over just those; a query fans out to every shard, each returns its local top-10, and you merge.</p>
+        <p>Term-partitioning looks better on paper — a query only touches the shards holding its terms, so low fan-out.
+        It loses for three reasons:</p>
+        <ul>
+          <li><strong>Hot keys.</strong> Term frequency is Zipf-distributed. The shard holding "the" is hit by nearly
+          every query while the shard holding "kafka" idles. That's the celebrity-partition problem, and you cannot fix
+          it by adding shards.</li>
+          <li><strong>Writes are a scatter.</strong> Adding one document touches every shard owning any word in it — i.e.
+          most of them. Incremental indexing becomes a cluster-wide write.</li>
+          <li><strong>Multi-term queries need cross-shard joins.</strong> You'd ship a posting list with millions of
+          entries over the network to intersect it.</li>
+        </ul>
+        <p>Then admit the cost of your own choice: <strong>with document-partitioning, every query hits every shard, so
+        my p99 is set by my slowest shard, not my average one.</strong> Mitigate with replicas + hedged requests,
+        deadlines with partial results, and caching popular queries. Naming what your choice costs is what makes it an
+        answer rather than an opinion.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>What's TF-IDF, in one sentence — and what does BM25 fix?</summary>
+      <div class="answer">
+        <p><strong>A term that is rare across the corpus but frequent in this document is a strong signal that the
+        document is about that term.</strong> TF (how often it appears here) × IDF (<code>log(totalDocs /
+        docsContaining)</code>, which crushes "the" to near zero and rewards "kafka"). IDF is what kills stopwords
+        automatically, with no hand-maintained list.</p>
+        <p>BM25 fixes two ways TF-IDF misbehaves on real documents: <strong>term-frequency saturation</strong> (the 50th
+        occurrence of a word adds nearly nothing over the 10th, but TF-IDF grows linearly and rewards keyword stuffing)
+        and <strong>document-length normalisation</strong> (a 10,000-word page shouldn't outrank a focused 500-word one
+        merely for having more room). BM25 is what Lucene and Elasticsearch actually use. Awareness level — know what it
+        fixes, not the formula.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>What's a crawler trap and how do you defend against one?</summary>
+      <div class="answer">
+        <p>A page (or site) that generates unbounded unique URLs: an infinite calendar with a "next month" link running
+        to the year 3000; session IDs baked into every link so every crawl yields "new" URLs; faceted e-commerce
+        navigation with a combinatorial explosion of filter permutations; deliberately hostile bot mazes.</p>
+        <p><strong>The defence is not a clever detector — the general case is undecidable.</strong> You cannot reliably
+        distinguish an infinite calendar from a genuinely large site by inspection. <strong>The defence is
+        budgets:</strong> a depth limit from the seed, a URL-length and query-param-count cap, a hard per-domain page
+        budget, a byte cap on responses (zip bombs), a redirect-chain cap, and monitoring for any domain consuming a
+        disproportionate share of the crawl. Then the worst a trap can do is exhaust <em>one domain's</em> budget rather
+        than your entire crawler.</p>
+        <p>Say the principle: <em>"I don't try to be smart about hostile input; I bound the blast radius."</em> Same
+        instinct as a bulkhead or a circuit breaker.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>The same article is on 40 sites. How do you avoid indexing it 40 times?</summary>
+      <div class="answer">
+        <p>Two layers, because they catch different things:</p>
+        <ul>
+          <li><strong>Exact duplicates:</strong> SHA-256 of the normalised extracted text. Same hash → same document.
+          Keep one canonical URL, record the rest as aliases. Cheap; always do it.</li>
+          <li><strong>Near duplicates</strong> (same article, different ad rail / timestamp / comment count — so the
+          exact hash differs on every single fetch): you need a hash where similar documents produce
+          <em>similar hashes</em>. <strong>SimHash</strong> — a locality-sensitive hash producing a 64-bit fingerprint
+          where "near-duplicate" becomes "<strong>Hamming distance ≤ 3</strong>", which is a popcount of an XOR.
+          Shingling + MinHash is the other classic.</li>
+        </ul>
+        <p>SimHash is <strong>awareness level and you should say so</strong>: name it, describe the property that makes it
+        work (similar docs land close together in Hamming space), and be honest that you'd read up before implementing.
+        Bluffing depth you don't have is far more damaging than bounding it.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>What's the surprising bottleneck in a crawler?</summary>
+      <div class="answer">
+        <p><strong>DNS.</strong> Everybody budgets for HTTP fetch latency; almost nobody budgets for the fact that you're
+        resolving <em>millions of distinct hostnames</em>. DNS is UDP, often single-threaded in client libraries, and a
+        cold lookup costs 50–200ms — comparable to the page fetch itself. At scale you can overwhelm your resolver, or
+        your ISP's, and it silently becomes the dominant term in your latency budget.</p>
+        <p>Fixes: run your own recursive resolvers, cache aggressively with an extended TTL floor, cache per-fetcher
+        <em>and</em> in a shared tier, and prefetch the resolution when a URL <em>enters the frontier</em> rather than
+        when a fetcher picks it up.</p>
+        <p>The second, less surprising but more fundamental one: <strong>politeness caps your throughput</strong>. Adding
+        machines does nothing if you only have 100 domains queued. Your only real lever is domain diversity.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Half the web is client-rendered React. How does your crawler see it?</summary>
+      <div class="answer">
+        <p><code>curl</code> on an SPA returns <code>&lt;div id="root"&gt;&lt;/div&gt;</code> and a script tag: zero
+        text, zero links. Worse than losing one page — you lose every page reachable <em>only</em> through it. It's a
+        graph-reachability failure, not just a content failure.</p>
+        <p>To see it, you must render: headless Chrome via Puppeteer/Playwright, execute the JS, wait for network idle,
+        read the DOM. But that costs <strong>1–5 seconds of CPU and 100–300MB of RAM per page — 50–100× a static
+        parse</strong>. You cannot render a billion pages.</p>
+        <p><strong>So render selectively.</strong> Pass 1: cheap-parse everything. Detect SPA shells heuristically (near-zero
+        text + a lone root div + a large JS bundle). Pass 2: queue only those to a much smaller, separately-budgeted
+        render fleet, prioritised by page importance. And always look for the cheap escape first — SSR output, a
+        <code>__NEXT_DATA__</code> JSON blob, <code>og:</code> meta tags, a sitemap. Often the content is right there in
+        the HTML and you never need a browser.</p>
+        <p><em>And the thing only you can say:</em> this is precisely why SSR/SSG are pitched as SEO features and not
+        just performance features. When you reach for Next.js server rendering, part of what you're buying is making the
+        crawler's job cheap enough that it bothers with you at all.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"Build search over our 10 million internal documents." What do you do?</summary>
+      <div class="answer">
+        <p><strong>You use Elasticsearch, and you say so immediately.</strong> Almost every hard problem on this page is a
+        consequence of the <em>open web</em>, and none of them exist inside a company:</p>
+        <ul>
+          <li>No crawler — there's no link graph. Ingest via connectors / CDC / an outbox from the source systems.</li>
+          <li>No politeness problem — you own the servers.</li>
+          <li>No bloom filter — an exact hash set of 10M doc IDs is ~300MB. Just use the hash set.</li>
+          <li>No custom index — 10M docs is maybe 50GB, which fits comfortably on a few nodes.</li>
+        </ul>
+        <p>What <em>is</em> hard at that scale, and where your effort should go: relevance tuning, ingestion-pipeline
+        reliability, and <strong>permissions filtering — a user must never see a document they lack access to, which
+        means access control has to be part of the query itself, not a post-filter, or your result counts and pagination
+        silently break.</strong></p>
+        <p><strong>Knowing when not to build is a senior skill and it is graded.</strong> A candidate who happily designs
+        a distributed frontier with bloom filters for 10M internal PDFs has just demonstrated exactly the judgment
+        failure that gets expensive in a real job.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>How do you keep the index fresh without rebuilding 3TB every hour?</summary>
+      <div class="answer">
+        <p><strong>A two-tier index.</strong> A large, immutable <em>base</em> index rebuilt periodically in batch, plus a
+        small, in-memory <em>fresh</em> index holding the last few hours of documents. Query both and merge the results;
+        periodically fold fresh into base.</p>
+        <p>That is the <strong>LSM-tree pattern</strong> (memtable + SSTables) from
+        <a href="03-data-storage.html">03</a>, in a new costume — and also the lambda-architecture shape you'll meet
+        again in <a href="18-streaming-aggregation.html">18</a>. Deletes are handled as <em>tombstones</em> filtered at
+        query time, not in-place edits, because segments are immutable.</p>
+        <p>Note that you still need the full-rebuild path even with a great incremental one, and here's the reason people
+        miss: <strong>changing your tokenizer, your stemmer or your ranking features requires reprocessing every
+        document.</strong> The rebuild isn't legacy; it's the mechanism by which the index can ever change shape.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Your crawler dies mid-crawl. What have you lost?</summary>
+      <div class="answer">
+        <p><strong>Almost nothing, and this is a requirement you should state early:</strong> a crawler needs to be
+        <em>fault-tolerant</em>, not <em>highly available</em>. Nobody is waiting on it. Being down for an hour costs you
+        an hour of throughput and zero user-visible impact — which is a genuinely unusual profile in this course, and
+        telling the two properties apart is worth saying out loud.</p>
+        <p>Mechanically: the frontier is durable (Kafka, offsets committed only after the page is stored — so an
+        in-flight URL is simply redelivered), fetched pages land in blob storage before the offset commits, and URL
+        metadata is in a durable KV store. The one genuinely volatile thing is <strong>the bloom filter</strong>, which
+        lives in RAM: lose it and you re-crawl everything you've ever seen. Snapshot the bit array to blob storage
+        periodically (it's only ~1GB) and/or back it with a durable set.</p>
+        <p>Re-delivery means you may fetch the same URL twice. That's fine — crawling is <strong>idempotent</strong>.
+        You overwrite the same blob key and the same metadata row. <em>Design for at-least-once and make the operation
+        idempotent</em> is the same lesson as <a href="12-notifications-scheduler.html">12</a> and
+        <a href="13-payments-orders.html">13</a>; here it's free, because fetching a page has no side effects.</p>
+      </div>
+    </details>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="takeaways">What to remember</h2>
+
+    <ul>
+      <li><strong>A crawler is BFS on a graph.</strong> Web = graph, URLs = nodes, links = edges, frontier = the queue,
+        seen-set = visited. <strong>Every hard part of this problem is a consequence of scaling BFS beyond one
+        machine.</strong> Say this in the first two minutes and the question stops being intimidating.</li>
+      <li><strong>It's two systems.</strong> An offline, batch, write-heavy crawl+index pipeline, and an online,
+        read-heavy, latency-critical query service, coupled only by the index artefact. Sketch both, then <em>ask which
+        one to go deep on</em>. Trying to do both at depth in 45 minutes gives no signal on either.</li>
+      <li><strong>Politeness is a hard constraint, and it dictates the architecture.</strong> Your throughput ceiling is
+        set by manners, not hardware: (domains in flight × per-domain rate). Therefore you <strong>partition the
+        frontier by <code>hash(domain)</code></strong> so one worker owns a domain and the rate limit becomes a local
+        variable — turning a distributed-coordination problem into a data-partitioning one. This is the single
+        highest-value insight on the crawler side.</li>
+      <li><strong>Bloom filters earn their keep here:</strong> 1B URLs in ~1.2GB instead of ~100GB. The cost is ~1% false
+        positives → you occasionally skip a page you've never crawled. <strong>That's acceptable <em>because of what
+        this system is</em></strong> — you're already sampling a fraction of the web. In ticket booking the identical
+        error would be a double-booking. <strong>Same tool, opposite verdict; always price the error in the specific
+        domain.</strong></li>
+      <li><strong>The web is adversarial.</strong> Infinite calendars, session-ID URL generators, zip bombs, link mazes.
+        You cannot detect traps in general — so you <strong>bound the blast radius</strong>: depth caps, URL-length caps,
+        per-domain page budgets, response-size caps. Normalise URLs before anything else, or dedup silently stops
+        working.</li>
+      <li><strong>Freshness must be adaptive.</strong> A news homepage changes hourly; a 2009 blog post never will.
+        Estimate per-page change frequency from content-hash history and schedule accordingly. Use conditional GETs
+        (ETag → 304) for near-free re-crawls. And remember: <strong>re-crawls and discovery compete for the same
+        politeness budget</strong> — freshness is bought with coverage.</li>
+      <li><strong>The inverted index is the transpose.</strong> Documents are doc→words; queries are word→docs; so
+        precompute word→[docIds]. Query = <strong>intersecting sorted posting lists = the two-pointer merge</strong>.
+        Build it with a MapReduce. Segments are immutable and merged — i.e. an LSM-tree, i.e. Lucene.</li>
+      <li><strong>Shard the index by document, not by term.</strong> Term-partitioning has lower fan-out on paper but
+        dies on hot keys (Zipf: the "the" shard melts), on writes (adding one doc touches every shard), and on
+        cross-shard joins for multi-term queries. Document-partitioning costs you fan-out and tail latency — say so, and
+        mitigate with replicas, hedged requests, deadlines and query caching.</li>
+      <li><strong>Ranking: know the idea, bound the scope.</strong> TF-IDF = <em>rare in the corpus but frequent in this
+        doc = strong signal</em>. BM25 adds TF saturation and length normalisation. PageRank treats a link as a vote and
+        is query-independent, computed in batch. Then be honest: real ranking is a learned model, you can't design
+        Google's ranker in 45 minutes, and <strong>the click-log feedback loop is the actual moat</strong>.</li>
+      <li><strong>DNS is the bottleneck nobody predicts.</strong> Millions of unique hostnames, 50–200ms per cold lookup.
+        Run your own resolvers, cache hard, prefetch at enqueue time.</li>
+      <li><strong>Same archetype, everywhere:</strong> code search, document search, product-catalogue search, log
+        indexing (Elasticsearch), the search box on any site. Crawl → index → query. <strong>And at 10M internal
+        documents the right answer is "use Elasticsearch" — knowing when <em>not</em> to build is the most senior thing
+        you can say in this interview.</strong></li>
+    </ul>
+  </section>
+
+  <nav class="page-nav">
+    <a href="16-video-streaming.html">← 16 — Design Video Streaming</a>
+    <a href="18-streaming-aggregation.html">18 — Design an Ad-Click Aggregator →</a>
+  </nav>
+
+</main>
+</body>
+</html>

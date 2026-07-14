@@ -1,0 +1,1309 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>10 — Design a News Feed / Twitter Timeline | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <div class="breadcrumb"><a href="index.html">← Course Home</a></div>
+    <h1>10 — Design a News Feed / Twitter Timeline</h1>
+    <p>The one where a single write becomes a million writes. Archetype: <strong>fan-out</strong> — and the celebrity problem is its boss fight.</p>
+  </div>
+</header>
+
+<main class="container">
+
+  <section>
+    <h2>Why this matters in the interview</h2>
+    <p>
+      Along with the URL shortener, this is one of the two or three most-asked system design questions on earth. It is asked at
+      Meta because it <em>is</em> Meta; it is asked at Twitter-shaped startups because it's their product; it is asked at
+      enterprise loops because "activity stream" and "notification inbox" are the same problem with a duller name. You will get
+      some version of it. And unlike the shortener — which is genuinely simple once you see the read:write ratio — this one has a
+      real trap in it, and the trap is the point of the question. The naive design is not just suboptimal, it is
+      <em>catastrophically</em> wrong at one specific input, and the interviewer is going to steer you into that input on purpose.
+      Your entire grade rides on whether you see it coming or get driven into it.
+    </p>
+    <p>
+      The archetype is <strong>fan-out</strong>: many-to-many publish, then read a merged, personalized view. Say that phrase out
+      loud in the interview, because once you own it you own a whole family of questions. A Twitter timeline is fan-out. A Facebook
+      feed is fan-out. Instagram, a notification inbox, an activity stream ("Sarah commented on your doc"), a Slack channel's
+      unread state, a stock-ticker watchlist, an RSS reader, the "new episodes" row in a podcast app — all fan-out. Every one of
+      them asks the same question: <em>do I do the merge work when the item is published (write) or when the viewer looks (read)?</em>
+      And every one of them has the same answer: <strong>mostly at write, except for the pathological publishers, where you flip to
+      read.</strong> Learn the shape once here and you can walk into "design an activity feed for GitHub" and reuse 80% of this
+      transcript verbatim. That transfer is the entire reason case studies exist.
+    </p>
+  </section>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ul>
+      <li><a href="#prompt">1. The prompt</a> — and what it's secretly about</li>
+      <li><a href="#requirements">2. Requirements</a> — the follower-count question is the whole game ★</li>
+      <li><a href="#estimation">3. Estimation</a> — the fan-out number that makes this hard ★</li>
+      <li><a href="#api">4. API design</a> — cursor pagination, and why offset is a bug</li>
+      <li><a href="#data-model">5. Data model</a> — the graph needs both directions</li>
+      <li><a href="#hld">6. High-level design</a> — one post and one feed read, end to end</li>
+      <li><a href="#deep-dive-1">7a. Deep dive: fan-out on write vs on read</a> ★★ — this is the interview</li>
+      <li><a href="#deep-dive-2">7b. Deep dive: feed storage &amp; ranking</a> ★ — store references, not copies</li>
+      <li><a href="#scaling">8. Scaling &amp; bottlenecks</a> — what breaks first</li>
+      <li><a href="#tradeoffs">9. Trade-offs</a></li>
+      <li><a href="#followups">10. Follow-ups you should expect</a> — unfollow, deletes, staleness, Stories, A/B tests</li>
+      <li><a href="#qa">Interview Q&amp;A</a></li>
+      <li><a href="#takeaways">What to remember</a></li>
+    </ul>
+  </div>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="prompt">1. The prompt</h2>
+
+    <p>The interviewer says:</p>
+
+<pre><code>  "Design a news feed. Something like Twitter's timeline or the
+   Facebook home feed — you follow people, and you see their posts."
+</code></pre>
+
+    <p>
+      Two sentences, and both of them are lies of omission. Nothing about scale, nothing about ordering, nothing about who these
+      users are or how many followers they have. Nothing about whether "see their posts" means <em>all</em> of them in time order or
+      <em>the good ones</em> in some ranked order — which are wildly different systems. The candidate who starts drawing boxes has
+      already lost twenty points.
+    </p>
+
+    <p>
+      What this prompt is <strong>secretly about</strong> is the asymmetry between publishing and reading. A post is one row. A feed is
+      a merge of many people's rows, personalized per viewer, and it must render in under 200ms because it's the screen the user
+      opens forty times a day. So the system has to do the merge <em>somewhere</em>, and the only two places are "at write time, once
+      per follower" or "at read time, once per view." That single decision — and its collapse at the extreme, the
+      <strong>celebrity</strong> with 100 million followers — is 60% of the grade. Budget your 45 minutes accordingly: requirements and
+      estimation fast and tight, high-level design in five minutes, and then <em>park</em> in the fan-out deep dive, because that's the
+      part the interviewer actually came for.
+    </p>
+
+    <div class="senior">Open like this: <em>"Sure. Before I draw anything — the interesting thing about a feed is that it's a many-to-many merge, so the whole design comes down to whether I do the merge when someone posts or when someone reads. I want to nail down scale, follower distribution, and whether the feed is chronological or ranked, because those three answers decide it. Give me three or four minutes on requirements and then I'll design."</em> You have just told the interviewer that you know where the hard part is, before they've had to hint at it. That sentence alone separates you from most of the field.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="requirements">2. Requirements</h2>
+
+    <p>
+      Ask, but always <strong>propose an answer with the question</strong> — make their job to correct you, not to teach you. Here's the
+      exchange as it actually goes:
+    </p>
+
+    <table>
+      <thead><tr><th>You ask</th><th>They answer</th><th>What it just forced</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><em>"Scale — I'll assume something Twitter-shaped: ~300 million daily actives, a couple of posts per user per day. Sound right?"</em></td>
+          <td>Yes.</td>
+          <td>Gives write QPS. Cheap to ask, and it anchors every later number.</td>
+        </tr>
+        <tr>
+          <td><em>"How many followers can one user have? Is it capped, or can someone have 100 million?"</em></td>
+          <td>Uncapped. Some accounts have tens of millions.</td>
+          <td><strong>This IS the celebrity problem, and you just asked about it in minute two.</strong> An uncapped, heavy-tailed follower distribution is what makes a "simple" post into a ten-million-write storm. Everything in §7a exists because of this answer.</td>
+        </tr>
+        <tr>
+          <td><em>"Chronological or ranked? I'd like to build chronological first because the mechanics are the same, then talk about layering ranking on top — is that OK, or do you specifically want the ranking system?"</em></td>
+          <td>Chronological is fine; we can discuss ranking later.</td>
+          <td><strong>The single best scoping move on this page.</strong> Ranking is an ML system that could eat 45 minutes and is not the thing being tested. You've deferred it <em>explicitly</em>, with the interviewer's consent, and you've promised to come back — which you will, in §7b.</td>
+        </tr>
+        <tr>
+          <td><em>"Read:write ratio? I'd guess massively read-heavy — people post twice a day and check the feed ten times a day."</em></td>
+          <td>Yes, reads dominate by an order of magnitude.</td>
+          <td>Justifies precomputing the feed. If reads outnumber writes 5:1 at the user level, you want the expensive work on the write side. (Careful — the fan-out flips this at the <em>system</em> level. §3 shows the arithmetic.)</td>
+        </tr>
+        <tr>
+          <td><em>"Consistency — is it acceptable if my post takes a few seconds to show up in my followers' feeds?"</em></td>
+          <td>Totally fine.</td>
+          <td><strong>Enormous.</strong> Eventual consistency means the fan-out can be <em>asynchronous</em> — a queue, workers, retries. If it had to be synchronous, posting would take thirty seconds for a celebrity. Nobody dies if a tweet lands five seconds late. Claim this simplification out loud.</td>
+        </tr>
+        <tr>
+          <td><em>"Feed latency target?"</em></td>
+          <td>Fast. It's the app's home screen. p99 well under 200ms.</td>
+          <td>The feed read cannot be a scatter-gather across 500 users' post tables. It must be close to a single cache lookup.</td>
+        </tr>
+        <tr>
+          <td><em>"Media — images and video in posts?"</em></td>
+          <td>Assume text plus an optional image URL.</td>
+          <td>Media storage is a separate archetype (see <a href="16-video-streaming.html">16</a>). Blob store + CDN, one sentence, move on.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>Functional requirements</h3>
+    <ul>
+      <li><strong>Post:</strong> a user publishes a post (text, ≤280 chars, optional media reference).</li>
+      <li><strong>Follow / unfollow:</strong> a user follows another user. Asymmetric — following isn't friending; no approval needed.</li>
+      <li><strong>View feed:</strong> a user reads a feed containing posts from everyone they follow, newest first, paginated as they scroll.</li>
+      <li><strong>(Deferred, explicitly)</strong> ranking, replies/threads, likes, retweets, search, DMs, notifications.</li>
+    </ul>
+
+    <h3>Non-functional requirements</h3>
+    <ul>
+      <li><strong>The feed read must be FAST.</strong> p99 &lt; 200ms. This is the hot path — it's the screen a user hits every time they open the app, and it's the only screen that matters for engagement. Optimize for it at the expense of everything else.</li>
+      <li><strong>Eventual consistency is fine.</strong> A post appearing in followers' feeds within ~5 seconds is acceptable; a few seconds of skew between two users' views of the world harms nobody. <em>This is the permission slip for asynchronous fan-out.</em></li>
+      <li><strong>Massive read:write asymmetry</strong> at the user level — but see §3, where fan-out inverts it at the infrastructure level. That inversion is the surprise of this problem.</li>
+      <li><strong>Availability over consistency.</strong> A stale feed beats an error page. If the ranking service is down, serve chronological. If the feed cache is cold, serve a slower merged feed. Degrade, don't fail.</li>
+      <li><strong>Heavy-tailed follower distribution.</strong> Median user: a couple hundred followers. p99.999 user: tens of millions. The system must not fall over on the tail.</li>
+    </ul>
+
+    <div class="senior">Say the scoping cut out loud: <em>"I'm cutting likes, retweets, replies, search, and DMs. They're all real features but they're mostly independent services hanging off the same post store — they don't change the architecture, and they'd eat the clock. I want the time to go on fan-out and on how the feed is stored, because I think that's where this problem is actually hard. Does that scope work?"</em> Then <strong>do</strong> spend the time there. Nothing is worse than announcing where the hard part is and then not going there.</div>
+
+    <div class="pitfall">The mistake that quietly ruins this round is not asking about follower counts. If you assume every user has ~200 followers, you'll design fan-out-on-write, it'll look beautiful, and then the interviewer will say <em>"OK, now Cristiano Ronaldo posts"</em> — and you'll be redesigning under pressure with fifteen minutes left, which always looks worse than designing it right the first time. Ask about the follower distribution in minute two. That one question converts an ambush into a planned deep dive.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="estimation">3. Estimation</h2>
+
+    <p>
+      Round aggressively and say you're rounding. Nobody wants four significant figures; they want to see that you can turn a DAU
+      number into an infrastructure number in ninety seconds without stalling. Announce your rounding convention once — <em>"I'll use
+      100k seconds per day instead of 86,400, it's close enough and the arithmetic is cleaner"</em> — and go.
+    </p>
+
+    <h3>Writes (posting)</h3>
+<pre><code>  300M DAU × 2 posts/day  = 600M posts/day
+  600M / 100k sec         = 6,000 posts/sec   → call it <span class="num">~7k posts/sec</span>
+  Peak (×3 for spikes)    ≈ <span class="num">~20k posts/sec</span>
+</code></pre>
+
+    <p>7k writes/sec is <em>nothing</em>. A single well-tuned Postgres box can take that. If posting were the whole problem, this would be a 10-minute interview.</p>
+
+    <h3>Reads (viewing the feed)</h3>
+<pre><code>  300M DAU × 10 feed opens/day = 3B feed reads/day
+  3B / 100k sec                = <span class="num">~30-35k feed reads/sec</span>
+  Peak                         ≈ <span class="num">~100k reads/sec</span>
+</code></pre>
+
+    <p>
+      So the read:write ratio is about <strong>5:1</strong> at the request level. Read-heavy, sure, but not dramatically so — not the
+      100:1 of the URL shortener. If you stop here you'll conclude "read-heavy, cache the reads, done," and you'll have missed the
+      entire problem. Keep going.
+    </p>
+
+    <h3>The number that actually drives the design: average fan-out</h3>
+
+    <p>
+      Here is the arithmetic that makes this question non-obvious, and it is the single most important thing you will write on the
+      whiteboard. If you precompute each user's feed — the obvious way to make reads fast — then <em>one post</em> is not one write.
+      It's one write <em>per follower</em>:
+    </p>
+
+<pre><code>  Average followers per user   ≈ <span class="num">200</span>   (a reasonable social-graph assumption)
+
+  Feed-writes/sec = posts/sec × avg followers
+                  = 7,000 × 200
+                  = <span class="num">1,400,000 feed-writes/sec</span>     ← 1.4 MILLION per second
+
+  Versus  35,000 feed-reads/sec.
+
+  So the "read-heavy" system is actually doing <span class="num">40× more writes than reads</span>
+  at the storage layer. The asymmetry <span class="kw">inverted</span>.
+</code></pre>
+
+    <div class="senior">Say this out loud, slowly, while you write it: <em>"So here's the thing that makes this problem interesting. At the API level this is a read-heavy system — 35k reads to 7k writes. But if I precompute feeds, each post becomes 200 writes, so at the storage layer I'm doing 1.4 million writes per second against 35 thousand reads. The read-heavy system is secretly write-heavy. That inversion is the whole design, and it's why 'just cache it' isn't an answer here."</em> That paragraph is worth more than the next twenty minutes of diagram. It shows you derived the difficulty rather than recalling it.</div>
+
+    <p>
+      And that's the <em>average</em>. The average is a comforting lie about a heavy-tailed distribution. The tail is what kills you:
+    </p>
+
+    <table>
+      <thead><tr><th>User</th><th>Followers</th><th>Writes triggered by one post</th><th>Feasible to fan out?</th></tr></thead>
+      <tbody>
+        <tr><td>Median user</td><td>~100</td><td>100</td><td>Trivially, yes.</td></tr>
+        <tr><td>Average (skewed by the tail)</td><td>~200</td><td>200</td><td>Yes — this is the 1.4M/s baseline.</td></tr>
+        <tr><td>Popular account</td><td>~500k</td><td>500,000</td><td>Painful. Seconds of work, a burst on the queue.</td></tr>
+        <tr><td>Celebrity</td><td>~50M</td><td><strong>50,000,000</strong></td><td><strong>No.</strong> At 100k writes/sec of Redis capacity that's 500 seconds — over eight minutes — for <em>one tweet</em>. And they tweet in bursts, and there are hundreds of them.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Storage</h3>
+<pre><code>  Post row:  id(8) + userId(8) + text(280) + meta(~100)  ≈ <span class="num">400 bytes</span>
+  600M posts/day × 400B  = <span class="num">~240 GB/day</span>  → ~90 TB/year (round to 100 TB/yr)
+
+  Media: assume 10% of posts carry an image @ 200KB
+  60M × 200KB = <span class="num">~12 TB/day</span>  → blob store + CDN, NOT the database.
+
+  Timeline cache (Redis), IDs only:
+  300M users × 800 post-IDs × 8 bytes = 300M × 6.4KB ≈ <span class="num">~2 TB</span> of RAM
+  ...only for ACTIVE users. Cut inactive users and it's a fraction of that. (§7b)
+</code></pre>
+
+    <div class="note">Two TB of RAM sounds absurd until you price it: that's roughly a 30–50 node Redis cluster on large memory instances. Entirely ordinary at this scale. But notice how much the two design choices in §7b are already buying you: <strong>storing only IDs</strong> (8 bytes, not 400) and <strong>capping the timeline at 800 entries</strong>. Without those, this number is 100× bigger and the design doesn't exist.</div>
+
+    <h3>What the numbers told us</h3>
+    <ul>
+      <li><strong>Fan-out volume (1.4M writes/sec) is the driving constraint</strong>, not read QPS, not storage. State this explicitly.</li>
+      <li>The fan-out <strong>cannot be synchronous</strong> with the user's POST. It has to go on a queue.</li>
+      <li>The tail of the follower distribution <strong>breaks fan-out-on-write entirely</strong>. That's a design fork, not a tuning problem.</li>
+      <li>Media is a different system. Say "blob store, CDN, store the URL" and don't spend another second on it.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="api">4. API design</h2>
+
+    <p>Three endpoints carry the whole product. Keep it boring; the API isn't where the marks are, but a wrong pagination scheme is where you can <em>lose</em> them.</p>
+
+<pre><code>  <span class="com">// Publish</span>
+  POST /v1/posts
+  Authorization: Bearer &lt;jwt&gt;                <span class="com">// authorId comes from the token, never the body</span>
+  Idempotency-Key: &lt;client-uuid&gt;             <span class="com">// so a retry doesn't double-post (see 06)</span>
+  { "text": "...", "mediaUrl": "https://cdn/..." }
+  → <span class="num">202</span> Accepted  { "postId": "1892...", "createdAt": "..." }
+
+  <span class="com">// Read the feed — CURSOR pagination, not offset</span>
+  GET /v1/feed?limit=20&amp;cursor=eyJ0cyI6MTcxOTk5OTk5OSwiaWQiOiIxODkyIn0
+  → <span class="num">200</span> {
+      "items": [ { "postId": "...", "author": {...}, "text": "...",
+                   "createdAt": "...", "likeCount": 42 }, ... ],
+      "nextCursor": "eyJ0cyI6MTcxOTk5OTk4MCwiaWQiOiIxODc0In0"   <span class="com">// null = end</span>
+    }
+
+  <span class="com">// The graph</span>
+  POST   /v1/users/{id}/follow      → <span class="num">204</span>
+  DELETE /v1/users/{id}/follow      → <span class="num">204</span>
+</code></pre>
+
+    <p>
+      Two things on that <code>POST /posts</code> worth naming. <strong>202, not 201</strong> — you're accepting the post and doing the fan-out
+      asynchronously, and the status code should tell that truth. And the <strong>authorId is never in the request body</strong>; it comes
+      from the auth token, or I can post as you. That's a one-line remark that costs nothing and signals you've shipped real APIs.
+    </p>
+
+    <h3>Cursor pagination, and why offset is an actual bug here</h3>
+
+    <p>
+      You know this one from the frontend, which is exactly why you should be the person in the room who says it out loud. Offset
+      pagination (<code>?page=2&amp;size=20</code>, i.e. <code>LIMIT 20 OFFSET 20</code>) assumes the list is <em>stable</em> between requests. A feed
+      is the least stable list in software: new posts are being prepended at the head continuously while the user scrolls.
+    </p>
+
+<pre><code>  t=0   feed = [ P10 P9 P8 P7 P6 P5 P4 P3 P2 P1 ]
+        Client fetches OFFSET 0 LIMIT 5  → P10 P9 P8 P7 P6   ✅
+
+  t=1   Two new posts arrive. feed = [ P12 P11 P10 P9 P8 P7 P6 P5 ... ]
+
+  t=2   Client scrolls, fetches OFFSET 5 LIMIT 5
+        → P8 P7 P6 P5 P4
+             ^^^^^^^^
+             P8, P7, P6 are DUPLICATES — the user already saw them.
+        And if posts had been DELETED instead, items would be SKIPPED.
+</code></pre>
+
+    <p>
+      The window slid because the offset is measured from a head that moved. The fix is to paginate from a <strong>stable point in the
+      list</strong>, not a count from the top: the cursor encodes "give me items strictly older than <em>this</em> one."
+    </p>
+
+<pre><code>  cursor = base64({ "ts": &lt;createdAt of last item&gt;, "id": &lt;its postId&gt; })
+
+  <span class="kw">SELECT</span> * <span class="kw">FROM</span> posts
+   <span class="kw">WHERE</span> (created_at, id) &lt; (:cursorTs, :cursorId)   <span class="com">// tuple compare = stable tiebreak</span>
+   <span class="kw">ORDER BY</span> created_at <span class="kw">DESC</span>, id <span class="kw">DESC</span>
+   <span class="kw">LIMIT</span> <span class="num">20</span>;
+</code></pre>
+
+    <p>
+      New posts arriving at the head now change nothing about page 2 — the cursor points at a fixed item, so the next page is
+      always the 20 items immediately after it. (New arrivals surface via a separate <em>"12 new posts ↑"</em> pill at the top, which is
+      the correct product answer and the correct engineering one.) The <code>id</code> in the tuple is not decoration: two posts can
+      share a millisecond timestamp, and without a tiebreak your cursor becomes ambiguous and you're back to skipping items.
+      In the Redis implementation this is the same idea — the cursor is just an index or a score into the sorted timeline.
+    </p>
+
+    <div class="senior">Deliver it as a bug report, not a preference: <em>"I'd use cursor pagination rather than offset. With offset, new posts arriving at the head shift everything down, so page 2 re-serves items the user already saw — you get visible duplicates while scrolling, and skipped items if posts get deleted. It's not a performance nit, it's a correctness bug on any list that changes at the head. Cursors anchor to an item instead of a count, so the page boundary is stable. It's also faster: <code>OFFSET 100000</code> makes the database walk and discard 100,000 rows."</em> Two reasons — correctness <em>and</em> performance — is what makes this sound lived-in rather than recited. You've hit this exact bug in React. Say so; it's the rare place where your frontend background is a genuine credential.</div>
+
+    <div class="pitfall">Don't cursor on timestamp alone. Two posts in the same millisecond and your <code>WHERE created_at &lt; :ts</code> either skips one or loops forever. Always a compound cursor: <code>(timestamp, id)</code>, compared as a tuple. Interviewers who have actually built pagination will probe exactly this, and "what if two posts share a timestamp" is the probe.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="data-model">5. Data model</h2>
+
+    <p>Four things to store, and they want four different storage engines. Say what each one <em>is</em> before you say what technology it lives in.</p>
+
+    <h3>users — a boring relational table</h3>
+<pre><code>  <span class="kw">CREATE TABLE</span> users (
+    id            <span class="typ">BIGINT</span> <span class="kw">PRIMARY KEY</span>,      <span class="com">// Snowflake ID</span>
+    handle        <span class="typ">VARCHAR</span>(<span class="num">32</span>) <span class="kw">UNIQUE NOT NULL</span>,
+    display_name  <span class="typ">VARCHAR</span>(<span class="num">64</span>),
+    follower_count <span class="typ">INT</span> <span class="kw">NOT NULL DEFAULT</span> <span class="num">0</span>,  <span class="com">// DENORMALIZED — see below</span>
+    last_login_at <span class="typ">TIMESTAMPTZ</span>,                <span class="com">// DENORMALIZED — see below</span>
+    created_at    <span class="typ">TIMESTAMPTZ</span> <span class="kw">NOT NULL</span>
+  );
+</code></pre>
+
+    <p>
+      Those two denormalized columns are not laziness — they are load-bearing, and I'd point at them:
+      <code>follower_count</code> is how the fan-out service decides <em>in O(1)</em> whether this author is a celebrity (counting rows in
+      <code>follows</code> for every single post would itself be a 50-million-row scan), and <code>last_login_at</code> is how it decides whether
+      a follower is even worth fanning out to. Both are consulted on the hot path of every post. <strong>Denormalize what the hot path
+      needs to branch on.</strong>
+    </p>
+
+    <h3>posts — the source of truth, append-only</h3>
+<pre><code>  <span class="kw">CREATE TABLE</span> posts (
+    id          <span class="typ">BIGINT</span> <span class="kw">PRIMARY KEY</span>,          <span class="com">// Snowflake: time-sortable, no coordination</span>
+    author_id   <span class="typ">BIGINT</span> <span class="kw">NOT NULL</span>,
+    text        <span class="typ">VARCHAR</span>(<span class="num">280</span>) <span class="kw">NOT NULL</span>,
+    media_url   <span class="typ">TEXT</span>,                       <span class="com">// blob lives in S3, this is a pointer</span>
+    created_at  <span class="typ">TIMESTAMPTZ</span> <span class="kw">NOT NULL</span>,
+    deleted_at  <span class="typ">TIMESTAMPTZ</span>                 <span class="com">// soft delete — see §10</span>
+  );
+  <span class="com">// Shard by author_id (or by post id). Access pattern is</span>
+  <span class="com">// "give me posts by user X" and "give me post by id" — both point lookups.</span>
+  <span class="kw">CREATE INDEX</span> ON posts (author_id, created_at <span class="kw">DESC</span>);
+</code></pre>
+
+    <p>
+      <strong>Snowflake IDs</strong> earn their place here: a 64-bit ID that is <code>timestamp | machineId | sequence</code>, so it's globally
+      unique with zero coordination <em>and</em> roughly sortable by time. That means a timeline of post IDs is already in
+      chronological order without carrying timestamps around, and your cursor can be a bare ID. A UUIDv4 would give you uniqueness
+      but no ordering, and you'd be storing and comparing timestamps everywhere. Free win; take it and move on.
+    </p>
+
+    <h3>follows — the graph, and it needs BOTH directions</h3>
+
+    <p>This is the table people under-think, and there's a real insight in it.</p>
+
+<pre><code>  <span class="kw">CREATE TABLE</span> follows (
+    follower_id  <span class="typ">BIGINT</span> <span class="kw">NOT NULL</span>,   <span class="com">// the person doing the following</span>
+    followee_id  <span class="typ">BIGINT</span> <span class="kw">NOT NULL</span>,   <span class="com">// the person being followed</span>
+    created_at   <span class="typ">TIMESTAMPTZ</span> <span class="kw">NOT NULL</span>,
+    <span class="kw">PRIMARY KEY</span> (follower_id, followee_id)
+  );
+</code></pre>
+
+    <p>The system reads this graph in <strong>two opposite directions</strong>, on two different hot paths:</p>
+
+    <table>
+      <thead><tr><th>Query</th><th>Who asks it</th><th>How often</th><th>Needs index on</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><em>"Who do I follow?"</em> (out-edges)</td>
+          <td>The <strong>feed read</strong> path — to know whose celebrity posts to pull in, and for the cold-start fallback.</td>
+          <td>~35k/sec</td>
+          <td><code>(follower_id)</code></td>
+        </tr>
+        <tr>
+          <td><em>"Who follows me?"</em> (in-edges)</td>
+          <td>The <strong>fan-out</strong> path — the list of timelines to write into. Can return 50 million rows.</td>
+          <td>~7k/sec, but each is huge</td>
+          <td><code>(followee_id)</code></td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>
+      One table with a <code>(follower_id, followee_id)</code> primary key serves the first query perfectly and the second one <em>terribly</em>
+      — a query on the second column of a composite key can't use it. So you need the reverse index too. Concretely that means either:
+    </p>
+    <ul>
+      <li><strong>Two tables</strong> (or one table plus a secondary index / materialized reverse table): <code>follows_by_follower</code> and
+        <code>followers_by_followee</code>, both written on every follow. Two writes, kept consistent, cheap — a follow is a rare event
+        compared to a read. This is the standard Cassandra/DynamoDB move: <em>one table per access pattern</em>, and you accept the
+        duplication because storage is cheap and joins at this scale are not.</li>
+      <li><strong>A graph store</strong> (Neo4j, or Facebook's TAO) that indexes edges in both directions natively. Mention it, say it's the
+        right shape but that the operational cost only pays off when you need multi-hop traversals ("friends of friends," "people
+        you may know"), which we scoped out. Then move on.</li>
+    </ul>
+
+    <div class="senior">Name the asymmetry explicitly — most candidates don't notice it: <em>"The follow graph is read in both directions and they're very different queries. The read path asks 'who do I follow' — that's a couple hundred rows, cheap. The fan-out path asks 'who follows me' — and for a celebrity that's fifty million rows I have to stream, not load into memory. Same table, one is a point lookup and one is a batch job. So I'd store the edges twice, once per direction. Denormalized, but a follow is written once and read millions of times, so that's the right side to pay on."</em> The bit that lands is "stream, not load" — it says you've thought about what 50 million rows does to a JVM heap.</div>
+
+    <h3>timelines — the feed cache itself</h3>
+
+    <p>Not a table. This is the precomputed artifact, and it lives in <strong>Redis</strong>:</p>
+
+<pre><code>  Key:    timeline:{userId}
+  Type:   LIST (or ZSET scored by post-id, if you ever want to insert out of order)
+  Value:  [ postId, postId, postId, ... ]   ← IDs ONLY. No post content.
+  Capped: LTRIM to ~800 entries on every write.
+
+  <span class="com">// Push a new post onto a follower's timeline:</span>
+  LPUSH timeline:<span class="num">42</span> <span class="num">1892...</span>
+  LTRIM timeline:<span class="num">42</span> <span class="num">0</span> <span class="num">799</span>
+
+  <span class="com">// Read page 1 of the feed:</span>
+  LRANGE timeline:<span class="num">42</span> <span class="num">0</span> <span class="num">19</span>      → 20 post IDs, sub-millisecond
+</code></pre>
+
+    <p>
+      Two decisions in there that §7b will defend properly, but flag them now because they're the ones that make the memory
+      arithmetic work: <strong>IDs only, never copies of the post</strong>, and <strong>a hard cap of ~800</strong>.
+    </p>
+
+    <h3>The SQL-vs-NoSQL call, made explicitly</h3>
+
+    <table>
+      <thead><tr><th>Data</th><th>Store</th><th>Why — the access pattern</th></tr></thead>
+      <tbody>
+        <tr><td>users</td><td>Postgres (sharded) or DynamoDB</td><td>Point lookups by id/handle. Small. Relational is fine and the ops story is easy.</td></tr>
+        <tr><td>posts</td><td>Cassandra / DynamoDB (or sharded Postgres)</td><td>Append-only, never updated, enormous, no joins, always accessed by a key. That is <em>exactly</em> the LSM-tree / wide-column sweet spot (see <a href="03-data-storage.html">03</a>). Write-optimized storage for a write-only-then-read-by-key workload.</td></tr>
+        <tr><td>follows</td><td>Cassandra / DynamoDB, two access patterns = two tables</td><td>No transactions needed, no joins, huge, and you want cheap wide-row scans of "all followers of X."</td></tr>
+        <tr><td>timelines</td><td><strong>Redis</strong></td><td>It's a cache, not a database. It must serve 35k/sec at sub-ms latency, and it's fully <em>rebuildable</em> from posts + follows, which is what makes it safe to keep in volatile memory.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="note">"It's rebuildable" is the sentence that makes Redis defensible for the timeline. The interviewer's next question is <em>"what if Redis loses a node?"</em> and the answer is: you lose those users' precomputed timelines, they fall through to the slow path (pull-and-merge, §7a), it's a latency hit and not a data loss, and the cache warms back up. <strong>Never put the only copy of anything in a cache.</strong> The post store is the source of truth; the timeline is a derived view. Say "derived view" — it's the right mental model and it makes every subsequent failure question easy.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="hld">6. High-level design</h2>
+
+    <p>Draw this in about four minutes. Two paths, and they're almost independent systems — which is itself the point.</p>
+
+    <h3>The write path — posting</h3>
+
+<pre><code>                    ┌──────────────┐
+   POST /posts ───▶ │ Post Service │──▶ Post Store (Cassandra)  [source of truth]
+                    └──────┬───────┘
+                           │ publish {postId, authorId}   ← returns 202 to the
+                           │                                 user RIGHT HERE
+                           ▼
+                    ┌──────────────┐
+                    │    Kafka     │   topic: post-created
+                    └──────┬───────┘
+                           │
+                           ▼
+                  ┌─────────────────┐      "who follows me?"
+                  │ Fan-out Service │◀────▶ Graph Store (follows)
+                  │  (worker fleet) │
+                  └────────┬────────┘
+                           │ LPUSH postId into each active follower's list
+                           ▼
+                  ┌─────────────────┐
+                  │  Timeline Cache │   timeline:{userId} → [postId, ...]
+                  │     (Redis)     │
+                  └─────────────────┘
+</code></pre>
+
+    <p><strong>Walk it, step by step, out loud:</strong></p>
+    <ol>
+      <li>Client <code>POST /v1/posts</code>. Gateway authenticates, rate-limits (<a href="09-rate-limiter.html">09</a>), routes to the Post Service.</li>
+      <li>Post Service mints a Snowflake ID, writes one row to the post store. <strong>That's the durable commit.</strong></li>
+      <li>It publishes <code>{postId, authorId, createdAt}</code> to Kafka — <em>ideally via the outbox pattern</em> (<a href="05-coordination-consensus.html">05</a>) so the row and the event can't diverge — and returns <code>202 Accepted</code> to the client <strong>immediately</strong>. The user's tweet is "posted" in ~50ms.</li>
+      <li>The fan-out worker fleet consumes the event, looks up the author's followers, filters them, and <code>LPUSH</code>es the post ID onto each one's Redis timeline. This takes anywhere from 20ms to a few seconds. <em>Nobody is waiting on it.</em></li>
+    </ol>
+
+    <div class="senior">The step-3 boundary is the highest-value sentence in the section: <em>"The fan-out must not be synchronous with the POST. If I write into 200 followers' timelines inside the request, my p99 post latency is now a function of my follower count — and for a popular account the request would take thirty seconds and time out. So the post commits, emits an event, and returns 202. Fan-out is a consumer. That's also what buys me retries, backpressure, and the ability to scale the fan-out fleet independently of the post service."</em> This is <a href="06-caching-queues-resilience.html">06</a>'s async-decoupling lesson landing in a real design — <strong>the queue isn't there for throughput, it's there to keep an unbounded amount of work off a bounded-latency request.</strong> That's the general principle and it's worth saying in those words.</div>
+
+    <h3>The read path — loading the feed</h3>
+
+<pre><code>                    ┌──────────────┐   1. LRANGE timeline:{me} 0 19
+   GET /feed ─────▶ │ Feed Service │─────────────────▶ Timeline Cache (Redis)
+                    └──────┬───────┘                   → [postId × 20]
+                           │
+                           │ 2. "who do I follow that's a celebrity?"
+                           ├────────────────────▶ Graph / celeb cache
+                           │                      → pull their recent posts
+                           │
+                           │ 3. MERGE precomputed + celebrity posts, sort by id
+                           │
+                           │ 4. HYDRATE: mget the ~20 winning post IDs
+                           ├────────────────────▶ Post Cache (Redis) → Post Store
+                           │ 5. hydrate authors  ▶ User Cache
+                           │
+                           ▼
+                    20 fully-rendered items + nextCursor
+</code></pre>
+
+    <ol>
+      <li><strong>Read the precomputed list.</strong> One Redis <code>LRANGE</code>. Sub-millisecond. This is why the feed is fast.</li>
+      <li><strong>Pull the celebrities.</strong> You follow maybe 2–5 celebrities; fetch their last few posts from a small, extremely hot cache. Cheap. (This step is the answer to §7a — hold that thought.)</li>
+      <li><strong>Merge and sort.</strong> A few hundred IDs, merged in memory, sorted descending, truncated to 20. Microseconds.</li>
+      <li><strong>Hydrate.</strong> The 20 surviving IDs become 20 real posts via a batched <code>MGET</code> against the post cache. Near-100% hit rate — recent posts are exactly what everyone reads.</li>
+      <li><strong>Hydrate authors</strong> (name, handle, avatar) from a user cache, same batched pattern.</li>
+    </ol>
+
+    <div class="pitfall">Don't hydrate before you merge. The naive order — fetch 800 timeline IDs, hydrate all 800 into full posts, then sort and take 20 — does 40× more work than necessary and pulls megabytes across the wire to throw them away. <strong>Merge on IDs, hydrate the winners.</strong> Same instinct as fetching only the visible rows in a virtualized list: do the cheap filtering on the cheap representation.</div>
+
+    <p>
+      Notice the shape: the write path is a fire-hose that does enormous, invisible work behind a queue; the read path is a
+      handful of cache lookups. That's the whole architecture in one sentence, and it's the sentence you should say when you finish
+      drawing: <em>"We've moved essentially all of the cost off the read path and onto the write path, because reads are what the user
+      is waiting for."</em> The next section is about what happens when that trade goes catastrophically wrong.
+    </p>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="deep-dive-1">7a. Deep dive: fan-out on write vs fan-out on read</h2>
+
+    <p><strong>This is where the interview really happens.</strong> Everything before this was setup. If you have twenty minutes left, spend fifteen of them here.</p>
+
+    <p>
+      The question is simple to state and hard to answer: <em>a feed is a merge of N people's posts. When do you do the merge?</em>
+      There are exactly two moments available — when the post is written, or when the feed is read — and each one is a complete,
+      coherent, defensible design that fails badly in the opposite direction. The senior answer is not to pick one. It's to
+      understand precisely <em>why</em> each fails, and then to build the thing that uses each one where it wins.
+    </p>
+
+    <h3>Option A — fan-out on write ("push")</h3>
+
+    <p>
+      When you post, immediately push the post ID into the precomputed timeline of every one of your followers. The feed is
+      materialized ahead of time, sitting in Redis, waiting.
+    </p>
+
+<pre><code>  <span class="com">// The fan-out worker, in essence</span>
+  <span class="kw">void</span> onPostCreated(Post post) {
+      <span class="kw">for</span> (<span class="typ">Long</span> followerId : graph.followersOf(post.authorId())) {   <span class="com">// streams, not a List</span>
+          redis.lpush(<span class="str">"timeline:"</span> + followerId, post.id());
+          redis.ltrim(<span class="str">"timeline:"</span> + followerId, <span class="num">0</span>, <span class="num">799</span>);
+      }
+  }
+
+  Read path:   LRANGE timeline:{me} 0 19        → <span class="num">1</span> Redis call. Done. <span class="num">~1ms</span>.
+</code></pre>
+
+    <table>
+      <thead><tr><th></th><th>Fan-out on write</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Read cost</strong></td><td>One Redis <code>LRANGE</code>. Trivially fast, constant time, independent of how many people you follow. <em>The feed is already built.</em></td></tr>
+        <tr><td><strong>Write cost</strong></td><td>O(followers). Average 200. Celebrity: 50,000,000 writes for one tweet.</td></tr>
+        <tr><td><strong>Where the work happens</strong></td><td>Offline, async, on a queue, where nobody is waiting.</td></tr>
+        <tr><td><strong>Fails when</strong></td><td>Follower counts are huge (the celebrity), or when writes are bursty, or when most of the timelines you write into belong to people who will never log in.</td></tr>
+      </tbody>
+    </table>
+
+    <p>The three costs, honestly:</p>
+    <ul>
+      <li><strong>The celebrity blowup.</strong> One post → 50M Redis writes. At a generous 100k writes/sec that's 500 seconds — over eight minutes — during which that celebrity's followers see the tweet at wildly different times. Worse, the burst hammers the queue and starves everyone <em>else's</em> fan-out. One tweet degrades the entire platform.</li>
+      <li><strong>Wasted work for inactive users.</strong> If 70% of your registered users haven't opened the app in a month, 70% of every fan-out is writing into timelines nobody will ever read. You are burning most of your write budget on ghosts.</li>
+      <li><strong>Burstiness.</strong> Fan-out volume is not smooth. It spikes exactly when the platform is busiest (a big event, everyone posting at once), which is exactly when you have the least headroom.</li>
+    </ul>
+
+    <h3>Option B — fan-out on read ("pull")</h3>
+
+    <p>
+      Store nothing. When a user opens their feed, look up who they follow, fetch each of those users' recent posts, merge, sort,
+      truncate. Compute the feed on demand, every time.
+    </p>
+
+<pre><code>  <span class="kw">List</span>&lt;<span class="typ">Post</span>&gt; getFeed(<span class="typ">Long</span> me, Cursor c) {
+      <span class="kw">var</span> followees = graph.followeesOf(me);          <span class="com">// 300 users, say</span>
+      <span class="kw">var</span> all = <span class="kw">new</span> <span class="typ">ArrayList</span>&lt;<span class="typ">Post</span>&gt;();
+      <span class="kw">for</span> (<span class="typ">Long</span> u : followees)                        <span class="com">// 300 SCATTER-GATHER queries</span>
+          all.addAll(postStore.recentPostsOf(u, <span class="num">20</span>));  <span class="com">// ...per feed load</span>
+      all.sort(byIdDesc());                            <span class="com">// merge 6,000 posts</span>
+      <span class="kw">return</span> all.subList(<span class="num">0</span>, <span class="num">20</span>);                      <span class="com">// throw away 5,980 of them</span>
+  }
+</code></pre>
+
+    <table>
+      <thead><tr><th></th><th>Fan-out on read</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Write cost</strong></td><td>One row. That's it. A celebrity's tweet is one insert, same as anyone's. <em>The celebrity problem does not exist.</em></td></tr>
+        <tr><td><strong>Read cost</strong></td><td>O(followees) — a scatter-gather across hundreds of shards, then a merge, then throw away 99.7% of what you fetched. Hundreds of milliseconds, minimum, and the p99 is whatever your slowest of 300 shards did.</td></tr>
+        <tr><td><strong>Where the work happens</strong></td><td>Synchronously, with the user staring at a spinner.</td></tr>
+        <tr><td><strong>Fails when</strong></td><td>Always. Reads outnumber writes 5:1 and you've just put all the cost on the reads. It's the wrong side of the trade for the common case.</td></tr>
+      </tbody>
+    </table>
+
+    <p>
+      Pull is not <em>stupid</em> — it's elegant, it's cheap to write, it has no consistency lag, and it's what you'd build for a
+      product with 10,000 users. It is simply on the wrong side of the read:write ratio at scale. <strong>You do the expensive work
+      on the rare operation, not the common one.</strong> And here, reads are the common one.
+    </p>
+
+    <h3>The comparison, side by side</h3>
+
+    <table>
+      <thead><tr><th>Dimension</th><th>Fan-out on WRITE (push)</th><th>Fan-out on READ (pull)</th></tr></thead>
+      <tbody>
+        <tr><td>Feed read latency</td><td><strong>~1ms</strong> — one cache read</td><td>100s of ms — scatter-gather + merge</td></tr>
+        <tr><td>Post latency (user-visible)</td><td>Fast (async fan-out behind a queue)</td><td>Fast (one insert)</td></tr>
+        <tr><td>Total system work</td><td>O(posts × followers) = <strong>1.4M writes/sec</strong></td><td>O(reads × followees) = 35k × 300 = <strong>10M reads/sec</strong></td></tr>
+        <tr><td>Storage / memory</td><td>High — a materialized timeline per user (~2 TB Redis)</td><td>Near zero — nothing is precomputed</td></tr>
+        <tr><td>Celebrity post</td><td><strong>Catastrophic</strong> — 50M writes, minutes of lag, starves the queue</td><td>Free — one row</td></tr>
+        <tr><td>Inactive users</td><td><strong>Wasteful</strong> — you build feeds nobody reads</td><td>Free — you build nothing</td></tr>
+        <tr><td>Consistency lag</td><td>Seconds (async)</td><td>Zero — always current</td></tr>
+        <tr><td>Users who follow thousands</td><td>Free — read cost is constant regardless</td><td><strong>Terrible</strong> — read cost is linear in followees</td></tr>
+        <tr><td>New follow takes effect</td><td>Needs backfill or waits for their next post</td><td>Instantly</td></tr>
+      </tbody>
+    </table>
+
+    <p>
+      Read the last four rows again, because they contain the answer. <strong>Push fails exactly where pull is free, and pull fails
+      exactly where push is free.</strong> Push dies on users with many <em>followers</em>. Pull dies on users with many <em>followees</em>. These
+      are different populations. The failure modes are <em>complementary</em>, and whenever two designs have complementary failure modes,
+      the right answer is almost never to pick one — it's to route each case to the design that handles it well.
+    </p>
+
+    <h3>The real answer: the hybrid — and this IS the celebrity problem</h3>
+
+    <div class="senior">The sentence the whole page exists to give you: <em>"Neither pure design works, and they fail in opposite places — push dies on celebrities, pull dies on the read path. So I'd do a hybrid. For normal users — say under 100,000 followers — I fan out on write, so their followers' timelines are precomputed. For celebrities above that threshold, I explicitly do NOT fan out. Their posts go nowhere except the post store. Then at read time, the feed service takes the reader's precomputed timeline and merges in the recent posts of the handful of celebrities that reader follows. So a feed read is: one Redis list, plus a small pull for maybe two to five celebrity accounts, merged in memory. The expensive case for push — one author, fifty million followers — becomes cheap, because now the work is proportional to how many celebrities each reader follows, and that number is tiny."</em></div>
+
+    <p>Here is the hybrid, drawn:</p>
+
+<pre><code>  WRITE PATH
+  ──────────
+  Post by @normal_user (200 followers)
+      → Kafka → fan-out workers → LPUSH into 200 timelines   <span class="com">// push</span>
+
+  Post by @celebrity (50,000,000 followers)
+      → Kafka → fan-out worker sees followerCount &gt; 100k
+      → <span class="kw">SKIPS</span> fan-out entirely. Writes NOTHING to any timeline.
+      → post just sits in the post store + a hot celeb cache  <span class="com">// pull</span>
+
+
+  READ PATH — @reader opens their feed
+  ────────────────────────────────────
+   ┌── LRANGE timeline:{reader} 0 199 ────────▶ [200 post IDs]   (precomputed:
+   │                                                              all the normal
+   │                                                              people they follow)
+   │
+   ├── celebsFollowedBy(reader) → [@a, @b, @c]  (typically 0-5!)
+   │      for each: ZRANGE celeb_posts:{a} 0 19 ▶ [~20 recent IDs each]
+   │                                              (tiny, ultra-hot cache)
+   │
+   └── MERGE the two lists by post-id DESC, take top 20, hydrate.
+                                                    ▲
+                                    The merge is a few hundred IDs
+                                    in memory. Microseconds.
+</code></pre>
+
+    <h4>Why the hybrid actually works — the argument, not the assertion</h4>
+
+    <p>
+      Anyone can say "use a hybrid." What earns the points is explaining <em>why the two halves compose</em>, and it comes down to one
+      observation about the numbers:
+    </p>
+
+    <ul>
+      <li><strong>The expensive direction for push is followers.</strong> A celebrity has 50M of them. That's the number that explodes.</li>
+      <li><strong>The expensive direction for pull is followees.</strong> A reader follows maybe 300 people. That's fine-ish, but 300 scatter-gather calls per feed load × 35k feed loads/sec is 10M reads/sec — too much.</li>
+      <li><strong>But: how many <em>celebrities</em> does a given reader follow?</strong> If a celebrity is "over 100k followers," there are maybe a few thousand such accounts in the world, and a typical user follows <strong>zero to five of them</strong>. So the pull half of the hybrid isn't 300 scatter-gather calls — it's <em>three</em>. And those three are the hottest keys in the entire system, so they're a guaranteed cache hit.</li>
+    </ul>
+
+    <p>
+      That's the crux. <strong>The pull is only expensive when you pull for everyone; restricted to celebrities, it's nearly free — and
+      celebrities are exactly the accounts push cannot handle.</strong> The two techniques' cost functions are inverses of each other, and
+      the hybrid lands in the cheap corner of both. Say it that way and you've demonstrated the thing the question is testing:
+      that you can reason about a design from its cost model rather than recite an architecture.
+    </p>
+
+    <div class="note">This is the <strong>celebrity problem</strong> — the same hot-key / celebrity-partition pathology you met in <a href="04-partitioning-hashing.html#hot">04 §8</a>, now at full size. There, the fix for a read-hot key was "replicate it / cache it," and note that the hybrid is precisely that idea in a different coat: <em>we stopped copying the celebrity's post to 50 million places and instead kept one hot copy that readers come to.</em> Push = copy to every consumer. Pull = one shared copy the consumers visit. Once a thing has too many consumers, copying stops being cheaper than sharing. That trade — copy vs share, denormalize vs join, precompute vs compute — is the same trade under six different names, and recognizing it is most of what "distributed systems intuition" actually is.</div>
+
+    <h4>Where do you put the threshold?</h4>
+
+    <p>
+      Be honest: it's a tunable, not a truth. <em>"I'd start around 100,000 followers and tune it against real fan-out latency — it's a
+      config value, not an architectural constant."</em> But have the reasoning ready:
+    </p>
+    <ul>
+      <li><strong>Too low</strong> (say 1,000): you're pulling for far too many accounts. A reader might follow 50 "celebrities," so the read path
+        does 50 pulls and you've slid back toward fan-out-on-read.</li>
+      <li><strong>Too high</strong> (say 5,000,000): accounts with 2 million followers still trigger 2 million writes, still burst the queue,
+        still lag. You haven't solved anything, you've just moved the cliff.</li>
+      <li><strong>The right shape of answer:</strong> set it where <code>(number of accounts above the threshold) × (typical reader's overlap with them)</code>
+        stays small — a handful of pulls per feed load — while <code>(fan-out cost of the biggest account below the threshold)</code> stays
+        inside your latency budget. And you'd monitor both sides. That's an operations answer, and operations answers score at 7 YOE.</li>
+    </ul>
+
+    <div class="pitfall">A subtle asymmetry candidates miss: <strong>the threshold should be hysteretic, and the celebrity's own view is special.</strong> If an account hovers at exactly 100,000 followers, flapping between push and pull mode will produce genuinely weird feeds — posts published in push mode are in timelines, posts published in pull mode aren't, and the merge has to tolerate both. It does, because the merge is just "union two ID lists and dedupe" — but you must <em>say</em> the merge dedupes, because the interviewer is watching for whether you noticed that a post can arrive by both routes. Dedupe on post ID at merge time. One line, big signal.</div>
+
+    <h3>The second optimization: don't fan out to the dead</h3>
+
+    <p>
+      The hybrid fixes the celebrity. There's a second, cheaper, less-famous win that a lot of candidates never mention, and it
+      cuts more absolute work than the celebrity fix does:
+    </p>
+
+<pre><code>  <span class="kw">for</span> (<span class="typ">Long</span> followerId : graph.followersOf(post.authorId())) {
+      <span class="kw">if</span> (userCache.lastLoginAt(followerId).isBefore(now.minusDays(<span class="num">30</span>)))
+          <span class="kw">continue</span>;                    <span class="com">// ← skip. They won't read it.</span>
+      redis.lpush(<span class="str">"timeline:"</span> + followerId, post.id());
+  }
+</code></pre>
+
+    <p>
+      On a mature platform, most registered accounts are dormant. If 70% of followers haven't logged in for a month, this single
+      <code>if</code> deletes <strong>70% of all fan-out work and 70% of your Redis memory</strong> — which, at 1.4M writes/sec and 2 TB, is a
+      colossal saving for one branch. And the cost of being wrong is negligible: if a dormant user <em>does</em> come back, they hit a
+      cold or missing timeline, take the slow path once (pull-and-merge from their followees, rebuild the list, cache it), and
+      they're warm forever after. <strong>Lazy rebuild on return.</strong>
+    </p>
+
+    <div class="senior">Offer it as an optimization with its cost attached: <em>"I'd also skip fan-out to users who haven't logged in for, say, 30 days. On a mature platform that's most accounts, so it cuts both the write volume and the Redis footprint by a large fraction. The cost is that a returning user's first feed load is slow — we rebuild their timeline on demand and cache it. That's a good trade: I've made the common case cheaper and the rare case slower, which is the direction you always want to push cost."</em> That last clause — <em>"which is the direction you always want to push cost"</em> — is the transferable principle, and stating principles rather than tactics is what 7-YOE sounds like.</div>
+
+    <h3>The awkward third case, if they push you</h3>
+
+    <p>
+      A really good interviewer asks: <em>"What about a user who follows 20,000 accounts?"</em> Push handles them for free — their read is
+      still one <code>LRANGE</code>. But their timeline churns constantly (every one of 20,000 people posting pushes into their list, and the
+      <code>LTRIM</code> at 800 means most of it is evicted before they ever see it), so you're doing a lot of write work for a feed that
+      turns over faster than they can read it. It's not a correctness problem, it's a waste problem, and the honest answer is:
+      <em>"I'd notice it in the metrics as a hot timeline key, and if it mattered I'd rate-limit writes into their list or flip them to
+      pull as well. But I'd only do that if the data said it was a problem — I don't want to add a third mode to the system on a
+      hunch."</em> <strong>Refusing to over-engineer, out loud, with a reason, is itself a senior signal.</strong>
+    </p>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="deep-dive-2">7b. Deep dive: feed storage &amp; ranking</h2>
+
+    <p>
+      The second place the interviewer pushes. Two questions live here: <em>what exactly is in the timeline?</em> and <em>how do you order
+      it?</em> The first has a crisp, reusable answer that most candidates get wrong. The second is a trap, and the correct move is to
+      scope it honestly.
+    </p>
+
+    <h3>Store references, not copies</h3>
+
+    <p>The tempting design is to store the whole post in each follower's timeline, so the read needs no second hop:</p>
+
+<pre><code>  <span class="com">// ❌ The tempting version — denormalize the post into every timeline</span>
+  timeline:42 = [
+    { id: 1892, author: "@ada", text: "hello world", avatar: "...",
+      createdAt: "...", likeCount: 7 },     ← ~400+ bytes, COPIED
+    ...
+  ]
+  Read = one LRANGE, fully rendered, zero hydration. Tempting!
+</code></pre>
+
+    <p>It is a trap, for two reasons, and the second one is the interesting one.</p>
+
+    <ul>
+      <li><strong>Memory.</strong> 400 bytes × 800 entries × 300M users ≈ 100 TB of RAM instead of 2 TB. Fifty times the cluster. That alone kills it.</li>
+      <li><strong>Mutation.</strong> A post is not immutable in practice — the text can be edited, the like count changes every second, the
+        author renames themselves or changes their avatar, the post gets deleted. If the post is <em>copied</em> into 50 million
+        timelines, then <strong>a single edit is 50 million updates</strong>, and you have re-created the exact fan-out disaster you just spent
+        §7a escaping. A like on a popular post would trigger a million writes. It's absurd.</li>
+    </ul>
+
+    <p>So: <strong>the timeline stores post IDs only.</strong> Eight bytes. The content is hydrated at read time from a separate post cache.</p>
+
+<pre><code>  <span class="com">// ✅ IDs only. The timeline is an ORDERED LIST OF POINTERS.</span>
+  timeline:42 = [ 1892, 1891, 1888, 1885, ... ]     ← 8 bytes each
+
+  <span class="com">// Read: merge IDs (cheap) → hydrate only the 20 that survive</span>
+  MGET post:1892 post:1891 ...   → the ONE authoritative copy of each post
+</code></pre>
+
+    <div class="senior">The reusable insight, and it generalizes far beyond feeds: <em>"I'd store only post IDs in the timeline, not the post content, and hydrate at read time. The memory saving is nice, but the real reason is mutability: if I copy the post into fifty million timelines, then editing one post — or even just its like count changing — becomes fifty million writes. Storing a reference means there's exactly one copy of the truth and everyone points at it. The rule is: <strong>fan out references, never copies.</strong> Fan out the pointer, keep the payload in one place."</em> This is the same instinct as normalizing a Redux store by ID instead of embedding the same object into three component trees — one source of truth, everything else holds a key. You already know this pattern from the frontend; it is the identical trade at a different scale, and saying so out loud is genuinely persuasive.</div>
+
+    <div class="note">The <em>cost</em> of references is an extra hop and an N+1 risk: 20 IDs could become 20 round trips. It doesn't, because you batch (<code>MGET</code>) and because the post cache hit rate on <em>recent</em> posts is enormous — a post that's in someone's feed right now is, by definition, new and popular, which is exactly what a cache is good at. Hit rate above 95% is realistic. Say "batched hydration, and the hit rate is high because feeds only ever contain recent posts" and the follow-up dies on the spot.</div>
+
+    <h3>Cap the timeline — nobody scrolls to 5,000</h3>
+
+    <p>
+      An unbounded timeline is unbounded memory, and it's memory spent on posts no human will ever see. Cap it. <code>LTRIM</code> to
+      ~800 entries on every push (Redis makes this O(1)-ish for a list trimmed from the tail).
+    </p>
+
+    <ul>
+      <li>800 posts ≈ 40 pages of 20. Essentially nobody scrolls that far; the distribution of scroll depth is brutally short.</li>
+      <li>If someone <em>does</em> scroll past the cap, you don't error — you <strong>fall back to the slow path</strong>: pull-and-merge from the
+        post store for that cursor range, and serve it in 300ms instead of 20ms. The user who has scrolled 800 posts deep will
+        forgive you.</li>
+      <li>That fallback is the same code path as the cold-timeline rebuild for a returning inactive user, and the same path used
+        when a Redis node dies. <strong>One slow, correct, always-available path behind the fast one.</strong> Build it once, use it three ways
+        — and say that you're reusing it, because reuse of a degradation path is a design property, not an accident.</li>
+    </ul>
+
+    <h4>List or sorted set?</h4>
+    <table>
+      <thead><tr><th></th><th>Redis LIST (<code>LPUSH</code>/<code>LRANGE</code>)</th><th>Redis ZSET (<code>ZADD</code>/<code>ZREVRANGE</code>)</th></tr></thead>
+      <tbody>
+        <tr><td>Ordering</td><td>Insertion order. Fine if posts always arrive newest-first.</td><td>By score — post ID, timestamp, or a <strong>ranking score</strong>.</td></tr>
+        <tr><td>Out-of-order inserts</td><td>Awkward — a delayed fan-out lands in the wrong place.</td><td>Correct automatically; score decides position.</td></tr>
+        <tr><td>Dedupe</td><td>Manual.</td><td>Free — it's a set, re-adding updates the score.</td></tr>
+        <tr><td>Memory</td><td>Slightly less.</td><td>Slightly more.</td></tr>
+        <tr><td>Trim to N</td><td><code>LTRIM 0 799</code></td><td><code>ZREMRANGEBYRANK 0 -801</code></td></tr>
+      </tbody>
+    </table>
+    <p>
+      <strong>Use a ZSET.</strong> The dedupe is free (and you need it — see the push/pull merge in §7a), out-of-order arrival is a fact of
+      life with async workers and retries, and crucially <strong>the score is the seam where ranking plugs in later</strong>. Score by post ID
+      today (which is time-sortable, thanks to Snowflake); score by a ranking model tomorrow, and not one other line of the system
+      changes. Choosing the structure that makes the <em>next</em> requirement cheap is a design instinct worth naming out loud.
+    </p>
+
+    <h3>Ranking — and the honest scope</h3>
+
+    <p>
+      Now come back to the thing you deferred in §2 (you promised; keep the promise — interviewers notice). Ranking is a ladder, and
+      you should climb it out loud, saying where you'd stop and why.
+    </p>
+
+    <table>
+      <thead><tr><th>Level</th><th>How it works</th><th>Cost</th><th>Verdict</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>1. Chronological</strong></td>
+          <td>Score = post ID. Newest first. That's the whole algorithm.</td>
+          <td>Zero. It's already what you have.</td>
+          <td><strong>Ship this first.</strong> It's correct, explicable, debuggable, and a real product (Twitter's "Latest" tab). Nothing about the architecture depends on it, which is the point.</td>
+        </tr>
+        <tr>
+          <td><strong>2. Simple weighted signals</strong></td>
+          <td><code>score = w₁·recency + w₂·affinity(viewer, author) + w₃·engagement(post)</code>. Affinity = how much you interact with that author. Engagement = likes/replies, normalized.</td>
+          <td>Computable at read time over the ~200 merged candidates, or bakeable into the ZSET score at fan-out.</td>
+          <td>The right answer for a 45-minute interview. Hand-tuned weights, transparent, no ML infrastructure. This is genuinely what feeds looked like for years — EdgeRank was roughly this.</td>
+        </tr>
+        <tr>
+          <td><strong>3. ML-scored feed</strong></td>
+          <td>Two-stage: <em>candidate generation</em> (the merged timeline, a few hundred posts, plus out-of-network recommendations) → <em>ranking</em>, where a model scores each candidate on p(like), p(reply), p(dwell), and a business objective combines them.</td>
+          <td>A feature store, an online inference service in the read path with a strict latency budget, a training pipeline, a labelling pipeline, an experimentation platform.</td>
+          <td><strong>Awareness level.</strong> Describe the two-stage shape, note that inference must fit the feed's latency budget (hence <em>candidate generation first, score few</em>), and stop.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="senior">Scope it explicitly rather than bluffing: <em>"A real ranking system is an ML system — candidate generation, a feature store, an online inference service inside the feed's latency budget, and an experimentation platform to move the weights. That's a whole design round on its own, and I don't think I can do it justice in the time we have. What I'd build here is a scoring function over the candidates the fan-out already gave me: recency, affinity to the author, and engagement, with hand-tuned weights, written into the ZSET score. The architecture doesn't change — ranking is just what I put in the score field — which is exactly why I chose a sorted set rather than a list. Happy to go deeper on the ML side if that's where you want to spend the time."</em> Saying "I can't do this justice in the time we have" is not a weakness. Confidently bounding scope is a senior behavior; bluffing a feature store you've never operated is how you fail.</div>
+
+    <p>
+      One structural point that <em>is</em> worth making, because it's architecture and not ML: <strong>ranking forces the merge to happen at
+      read time, not write time.</strong> A score that depends on the <em>viewer</em> (affinity) or on <em>time since posting</em> (recency decay) can't be
+      baked in when the post is written — it's different for every reader and it changes every minute. So the fan-out gives you a
+      few hundred <em>candidates</em>, and the ranking happens per-request over that small set. That's why the industry converged on
+      "fan out to build candidates, rank at read." Notice this also means <strong>you should over-fetch</strong>: pull 200 candidates from the
+      timeline to return 20, because the ranker needs something to choose between.
+    </p>
+
+    <div class="pitfall">Don't claim you'd store a per-viewer ranking score in the timeline at fan-out time. It sounds efficient and it's incoherent: recency decays continuously, so any precomputed score is stale within minutes, and you'd be rewriting every timeline constantly to keep scores fresh. Precompute the <em>candidates</em>; compute the <em>score</em> at read time. This is the single most common way candidates trip themselves at the end of this question.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="scaling">8. Scaling &amp; bottlenecks</h2>
+
+    <p>
+      "What breaks first at 10×?" is a question you should answer before it's asked. Go through the components in order and name the
+      failure, the symptom, and the fix. Vague answers ("we'd add more servers") score nothing; a named failure mode with a named
+      symptom scores heavily.
+    </p>
+
+    <h3>1. The fan-out worker fleet</h3>
+    <p>
+      This is the component doing 1.4M writes/sec and it is where the system lives or dies.
+    </p>
+    <ul>
+      <li><strong>Symptom:</strong> Kafka consumer lag climbing. Posts take minutes to appear in feeds. Users complain the feed is "broken."</li>
+      <li><strong>Why:</strong> fan-out volume is spiky and correlated — a big event means everyone posts at once <em>and</em> everyone has more
+        followers online, so the burst is superlinear.</li>
+      <li><strong>Fixes:</strong> partition the Kafka topic by <code>authorId</code> and autoscale consumers on lag (not CPU — <strong>lag is the correct
+        scaling signal for a queue-driven fleet</strong>, and saying that specific thing lands well). Batch the Redis writes with pipelining
+        rather than one round trip per follower — that's often a 10× throughput win for one line of code. And crucially,
+        <strong>separate the queues</strong>: a high-priority topic for small fan-outs and a low-priority one for big ones, so that a
+        400k-follower account's slow grind can't starve the ordinary posts behind it. Head-of-line blocking is the failure you're
+        preventing, and naming it is worth a point.</li>
+    </ul>
+
+    <h3>2. Redis memory for timelines</h3>
+    <ul>
+      <li><strong>Symptom:</strong> eviction storms, or an OOM on a node, and suddenly a slice of users all fall through to the slow path at once.</li>
+      <li><strong>Fixes:</strong> the two you already made — <strong>cap timelines (~800)</strong> and <strong>don't fan out to inactive users</strong> — are worth more
+        than any amount of extra hardware. Beyond that: shard the Redis cluster by <code>userId</code> (the timeline key is a natural,
+        uniformly-distributed partition key — there is no hot timeline, because no single <em>reader</em> is hot), and set a TTL on
+        timelines for users who go dormant so memory is reclaimed automatically rather than by a batch job you'll forget to run.</li>
+    </ul>
+
+    <div class="note">Note the pleasing property: <strong>the timeline cache has no hot shard.</strong> Timelines are keyed by <em>reader</em>, and readers are uniform — nobody reads a billion feeds. The celebrity is hot as an <em>author</em>, not as a reader. That's why sharding the timeline cache is easy while sharding the post store is not. Point this out; it shows you're thinking about which key is skewed rather than reciting "shard by user ID."</div>
+
+    <h3>3. The thundering herd when a celebrity posts</h3>
+    <ul>
+      <li><strong>Symptom:</strong> a celebrity posts; ten million people open the app within a minute; every single feed read now tries to pull
+        that celebrity's recent posts. That key gets millions of reads per second. A single Redis node melts, or worse, the key
+        expires at that exact moment and a million requests stampede the post store simultaneously.</li>
+      <li><strong>Fixes:</strong> this is the classic <strong>hot key</strong> from <a href="04-partitioning-hashing.html#hot">04 §8</a> and <a href="06-caching-queues-resilience.html">06</a>'s cache-stampede material, so use their tools:
+        <ul>
+          <li><strong>Replicate the hot key.</strong> Celebrity posts are read-only and read by everyone: put them in every Redis replica, or
+            key-suffix them (<code>celeb_posts:{id}:{0..9}</code>) so the load spreads across ten shards. Reads pick a random suffix. Trivial
+            for immutable-ish data.</li>
+          <li><strong>Local in-process cache</strong> in the feed service (a few seconds' TTL). With hundreds of feed-service instances each
+            holding the top celebrity posts in a local map, the load on Redis drops by orders of magnitude. Bounded staleness of a
+            few seconds is <em>exactly</em> the consistency you already negotiated in §2. <em>Reuse the requirement you fought for.</em></li>
+          <li><strong>Never let the hot key expire under load</strong> — single-flight / request coalescing, or a probabilistic early refresh, so
+            one miss doesn't become a million concurrent misses.</li>
+        </ul>
+      </li>
+    </ul>
+
+    <h3>4. Hot shards in the post store</h3>
+    <ul>
+      <li><strong>Symptom:</strong> you sharded posts by <code>authorId</code>; the celebrity's shard takes a disproportionate share of all reads in
+        the system while its neighbours idle.</li>
+      <li><strong>Fixes:</strong> shard by <code>postId</code> instead of <code>authorId</code> (spreads one author's posts across all shards — at the cost of
+        making "all posts by X" a scatter-gather, which you now need for the celebrity pull... so it's a genuine trade, and
+        <em>saying that it's a genuine trade rather than pretending there's a free answer is the point</em>). Or keep authorId sharding and
+        lean on the celebrity read cache, which is what actually saves you: the celebrity's posts should essentially never reach the
+        database. Cross-reference <a href="04-partitioning-hashing.html#hot">04 §8</a> and move on — don't re-derive consistent hashing here.</li>
+    </ul>
+
+    <h3>5. The feed service itself</h3>
+    <ul>
+      <li>Stateless. Horizontally scale behind a load balancer. Genuinely boring, and you should say "this part is boring, it scales
+        horizontally" and spend the sentence you saved on something that matters. <strong>Knowing which components are uninteresting is
+        part of the skill.</strong></li>
+    </ul>
+
+    <h3>6. Multi-region</h3>
+    <ul>
+      <li><strong>Awareness level, one paragraph, only if they ask.</strong> Feeds are read-local: put a timeline cache and post cache in each
+        region, replicate posts asynchronously between regions, and accept cross-region lag (which you already accepted at §2 —
+        eventual consistency was the requirement). The follow graph replicates the same way. The one thing that hurts is a user who
+        follows people in another region, and the answer is: the post replicates in a couple of hundred milliseconds, which is well
+        inside your 5-second budget. Don't design a global consensus protocol for a feed. Nobody needs their tweets linearizable.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="tradeoffs">9. Trade-offs</h2>
+
+    <p>Every decision, the alternative, and the input that would make you flip. This table is the night-before revision sheet.</p>
+
+    <table>
+      <thead><tr><th>Decision</th><th>Alternative</th><th>Why this one</th><th>When you'd flip</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Hybrid fan-out</strong> (push for normal, pull for celebrities)</td>
+          <td>Pure push, or pure pull</td>
+          <td>Push alone dies on the celebrity (50M writes per tweet). Pull alone dies on the read path (reads are 5× writes). Their failure modes are complementary, so route each case to the one that handles it.</td>
+          <td><strong>Pure push</strong> if follower counts are capped and small (an internal corporate feed, a school app — nobody has 10M followers, so the celebrity never exists and you keep the simpler system). <strong>Pure pull</strong> if you're small, or if the graph is dense and everyone follows everyone.</td>
+        </tr>
+        <tr>
+          <td><strong>Asynchronous fan-out</strong> (Kafka + workers)</td>
+          <td>Fan out synchronously inside the POST</td>
+          <td>Post latency must not depend on follower count. Also buys retries, backpressure, and independent scaling.</td>
+          <td>Never, at this scale. Only if the feed must be strictly consistent — which is essentially never for a social feed, and if someone tells you it is, ask why, because they've probably misunderstood their own product.</td>
+        </tr>
+        <tr>
+          <td><strong>Store post IDs in timelines</strong></td>
+          <td>Store denormalized post content</td>
+          <td>50× less memory; and a post edit or a like doesn't become 50M writes. One copy of the truth.</td>
+          <td>If posts were truly immutable <em>and</em> tiny <em>and</em> memory were free — i.e. never. The hydration hop is cheap because you batch it and recent posts cache near-100%.</td>
+        </tr>
+        <tr>
+          <td><strong>Cap timelines at ~800</strong></td>
+          <td>Unbounded timelines</td>
+          <td>Bounded memory; nobody scrolls that far; deep scrolls fall back to the slow path.</td>
+          <td>Raise the cap if analytics show deep scrolling. Lower it if Redis is the budget constraint. It's a dial, not a decision.</td>
+        </tr>
+        <tr>
+          <td><strong>Skip fan-out to inactive users</strong></td>
+          <td>Fan out to everyone</td>
+          <td>Cuts a large fraction of all write work and memory for one <code>if</code> statement.</td>
+          <td>If your users are nearly all active (a young product), the check costs more than it saves. Measure before adding it.</td>
+        </tr>
+        <tr>
+          <td><strong>Redis ZSET</strong> for timelines</td>
+          <td>Redis LIST</td>
+          <td>Free dedupe (needed for the push/pull merge), tolerates out-of-order arrival from async workers, and the score field is where ranking plugs in later without an architecture change.</td>
+          <td>A LIST is fine if you're strictly chronological forever and can guarantee in-order arrival — which you can't, with retries.</td>
+        </tr>
+        <tr>
+          <td><strong>Cursor pagination</strong></td>
+          <td>Offset pagination</td>
+          <td>Offset duplicates and skips items on a list that changes at the head. It's a correctness bug, not a perf nit. Also, deep <code>OFFSET</code> is O(n) in the database.</td>
+          <td>Never for a feed. Offset is fine for a static, admin-facing, "jump to page 7" table. A feed is neither static nor page-addressable.</td>
+        </tr>
+        <tr>
+          <td><strong>Chronological first, ranking second</strong></td>
+          <td>Design the ML ranker up front</td>
+          <td>The architecture is identical either way — ranking is what goes in the score field. Scoping it out buys time for the part that's actually being tested.</td>
+          <td>If the interviewer says "assume ranking is the point of this question," then go there — but they'll almost never say that in a distributed-systems round; it's an ML-systems round if they do.</td>
+        </tr>
+        <tr>
+          <td><strong>Eventual consistency</strong> (feed lag of seconds)</td>
+          <td>Strong consistency</td>
+          <td>Cheap, and nobody notices. It's what makes async fan-out, caching, local caches, and multi-region all legal.</td>
+          <td>Never for a social feed. <em>Do</em> flip for the author's own view of their own post — see the read-your-writes follow-up in §10.</td>
+        </tr>
+        <tr>
+          <td><strong>Timelines in Redis (volatile)</strong></td>
+          <td>Timelines in a durable store (Cassandra)</td>
+          <td>Sub-ms reads at 35k/sec, and it's a <em>derived view</em> — fully rebuildable from posts + follows, so losing it costs latency, not data.</td>
+          <td>If rebuilding is too expensive or the slow path can't absorb a cold cache, persist timelines. Some real systems do exactly this and treat Redis as the front cache over a durable timeline store.</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="followups">10. Follow-ups you should expect</h2>
+
+    <p>
+      This question has the most predictable follow-up chain of any design in the bank, because once you've built precomputed
+      timelines, every follow-up is a variation on the same wonderful theme: <em>"you materialized a view; now something changed —
+      what do you do?"</em> And the answer is nearly always <strong>"don't rewrite the materialized view, fix it at read time."</strong> Internalize
+      that one sentence and you can improvise most of this section.
+    </p>
+
+    <h3>"What happens when I unfollow someone?"</h3>
+    <p>
+      The naive answer — and the wrong one — is "scan the unfollower's timeline and remove every post by that author." That's a
+      read-modify-write of an 800-element list on every unfollow, and if a celebrity is mass-unfollowed after a scandal, you've
+      just invented a second fan-out storm running in reverse.
+    </p>
+    <p>
+      <strong>Do it lazily.</strong> Delete the edge from the follow graph — that's the durable, correct state change, and it's one row. Then at
+      <em>read</em> time, when the feed service hydrates the timeline, it filters out posts whose author is no longer followed. The stale
+      IDs sit harmlessly in the Redis list and age out naturally as the <code>LTRIM</code> cap pushes them off the end. You over-fetch a
+      little (grab 30 candidates to return 20) to absorb the filtered ones.
+    </p>
+    <div class="senior"><em>"I wouldn't rewrite the timeline on unfollow. It's an expensive scan-and-purge, and a mass unfollow event would be a fan-out storm in reverse. I'd delete the graph edge — that's the source of truth — and filter at read time, over-fetching slightly to cover the removals. The stale IDs just age out of the capped list on their own. The general principle is: <strong>when a materialized view goes stale, prefer fixing it at read time over rewriting the view</strong> — reads are cheap and localized, rewrites are unbounded."</em> That principle sentence answers unfollow, deletes, blocks, mutes, and privacy changes all at once, which is why it's worth saying in exactly those words.</div>
+
+    <h3>"What about deleting a post?"</h3>
+    <p>
+      Identical move. Soft-delete the post row (<code>deleted_at</code>) and evict it from the post cache. Do <em>not</em> chase 50 million
+      timelines. When the feed service hydrates, a deleted post comes back as a tombstone and gets dropped from the response —
+      over-fetch covers the gap. Users see it disappear on their next feed load; the ID lingers as a harmless dangling pointer
+      until the cap evicts it. Same for blocked users, muted users, and posts that were made private after the fact:
+      <strong>the timeline is a list of candidates, and the read path is where the filter lives.</strong>
+    </p>
+
+    <h3>"A user says their feed is stale / they missed a post. What's your diagnosis?"</h3>
+    <p>An operational question, and you should answer it like an on-call engineer, walking the pipeline in order:</p>
+    <ol>
+      <li><strong>Fan-out lag.</strong> Check Kafka consumer lag on the fan-out topic. If it's climbing, workers are behind — that's the usual
+        suspect and the metric you'd alert on. Scale consumers.</li>
+      <li><strong>They were classified inactive</strong> and got skipped by the <code>lastLogin</code> check, so their timeline is cold. Their first load
+        should have triggered a rebuild — did it? If not, the rebuild path is broken.</li>
+      <li><strong>The author is a celebrity</strong> and the read-time pull is failing or serving a stale local cache. Check the celeb-cache TTL.</li>
+      <li><strong>A fan-out worker crashed mid-post</strong> and the message wasn't reprocessed (or the fan-out is <em>not</em> idempotent and got
+        partially applied). This is why the fan-out must be idempotent — a ZSET <code>ZADD</code> of the same post ID twice is a no-op, which
+        is another reason to prefer the sorted set over the list. <strong>At-least-once delivery plus an idempotent write equals
+        effectively-once</strong>, and that's the only "exactly once" that exists (see <a href="05-coordination-consensus.html">05</a>).</li>
+      <li><strong>A Redis node was lost</strong> and their timeline went with it. Slow path should have covered it.</li>
+    </ol>
+    <div class="note">The reason this follow-up appears so often is that it's a stealth test of whether you built <em>observable</em> systems or just drew them. Naming <em>consumer lag</em> as the first metric you'd look at — rather than "I'd check the logs" — tells the interviewer you've been paged at 3am. That is a very cheap point to score.</div>
+
+    <h3>"Read-your-own-writes: I post a tweet and don't see it in my own feed. Bug?"</h3>
+    <p>
+      Yes, and it's the one place eventual consistency is <em>not</em> acceptable. Not seeing a stranger's tweet for five seconds is
+      invisible; not seeing <em>your own</em> post immediately feels like the app ate it, and users retry, and now you have duplicate posts.
+      Two fixes, and offer both:
+    </p>
+    <ul>
+      <li><strong>Fan out to yourself first, synchronously.</strong> Before returning 202, write the post into the author's own timeline. One
+        extra Redis call on the write path; the other 200 stay async. Cheap and complete.</li>
+      <li><strong>Client-side optimistic insert</strong> — the app already has the post, it just renders it at the top immediately and
+        reconciles when the server confirms. You know this pattern intimately from the frontend; say so, and say that in practice
+        you'd do <em>both</em>, because the optimistic UI handles the instant and the synchronous self-fan-out handles the refresh.</li>
+    </ul>
+
+    <h3>"How would you add Stories / ephemeral content?"</h3>
+    <p>
+      It looks like a new feature and it's actually a <em>simplification</em>, which is the fun of this follow-up. Stories are: (a)
+      short-lived — 24-hour TTL, which Redis gives you for free and which means the data volume is bounded and small; (b) displayed
+      as <em>"which of the people I follow have unseen stories"</em>, not as a merged chronological list. So it's a much smaller merge over a
+      much smaller set — you don't need a materialized timeline at all. <strong>Fan-out on read is correct for Stories</strong>: at read time, ask
+      "of the 300 people I follow, who posted a story in the last 24h?" That's a single query against a small, hot, TTL'd set, and
+      the celebrity problem never arises because you're not fanning out to anyone.
+    </p>
+    <div class="senior"><em>"I'd actually use fan-out on read for Stories, not push. The set is bounded by a 24-hour TTL so it's small, and the read is 'who that I follow has an unseen story' rather than a merged timeline — so the pull is cheap and I skip the whole fan-out apparatus. It's a good illustration that push-vs-pull isn't a company-wide religion; it's a per-feature decision driven by the cost model. Same platform, opposite answer."</em> Applying the archetype's <em>reasoning</em> to reach the opposite conclusion — rather than pattern-matching the archetype's <em>answer</em> — is exactly the thing being graded.</div>
+
+    <h3>"How does this change for a purely chronological feed?"</h3>
+    <p>
+      Barely, and that's the point worth making. The fan-out machinery, the hybrid, the timeline cache, the cursor pagination, the
+      hydration — all identical. What you drop is the ranking service and the over-fetching of candidates (you can fetch exactly 20,
+      since there's nothing to choose between). What you <em>gain</em> is that the merge becomes trivially correct: both the precomputed
+      list and the celebrity pull are sorted by Snowflake ID, so the merge is a two-pointer walk. <em>"Chronological is the same
+      architecture with the ranker removed"</em> — say that, and you've retroactively justified doing chronological first.
+    </p>
+
+    <h3>"How would you A/B test a ranking change?"</h3>
+    <p>
+      A question that catches people out, because it's half product and half infrastructure, and at 7 YOE you're expected to have
+      opinions on both:
+    </p>
+    <ul>
+      <li><strong>Bucket deterministically</strong> by user ID hash into control and treatment, so a user gets a stable experience across
+        sessions and devices. A user flip-flopping between rankers between refreshes both ruins the experiment and looks like a bug.</li>
+      <li><strong>Ranking is a read-time function</strong>, which is what makes this easy — you don't need a parallel fan-out pipeline or a
+        second set of timelines. Both variants read the same candidates and score them differently. <em>The architecture in §7b was
+        already designed to make this cheap; point that out — it's the payoff for having put ranking in the score field.</em></li>
+      <li><strong>Pick the metric before you run it</strong>, and pick a guardrail alongside it. Engagement (dwell time, clicks) is the obvious
+        target and it's also the easiest thing in the world to Goodhart — a ranker that surfaces rage-bait wins on engagement and
+        loses on retention. So: primary metric plus counter-metrics (session frequency next week, report/mute rate, unfollows).</li>
+      <li><strong>Run it long enough for novelty to decay.</strong> Any feed change spikes engagement for a few days simply because it's
+        different. A three-day A/B test on a ranker measures novelty, not quality.</li>
+      <li><strong>Log the candidates and the scores</strong>, not just the outcome, or you'll be unable to explain <em>why</em> the treatment won.</li>
+    </ul>
+    <div class="pitfall">Don't bucket by session or by request. It's the same bug as offset pagination — a boundary that moves under the user. Bucket on a stable identity (user ID hash), and hold the bucket for the life of the experiment, or your treatment group is a different population every day and your significance test is measuring noise.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="qa">Interview Q&amp;A</h2>
+
+    <p>Cover the answer, say yours out loud, then compare. Reading these silently is worth about a tenth of saying them.</p>
+
+    <details class="qa">
+      <summary>Fan-out on write or fan-out on read — which do you use, and why?</summary>
+      <div class="answer">
+        <p><strong>Neither, purely — a hybrid, and here's the derivation.</strong> Push (fan out on write) precomputes each follower's timeline, so a read is one Redis call — but one celebrity post becomes 50 million writes, which is minutes of lag and a queue that starves everyone else. Pull (fan out on read) stores nothing and computes the feed on demand — writes are one row, but reads become a 300-way scatter-gather, and reads outnumber writes 5:1, so you've put all the cost on the wrong side.</p>
+        <p>The key observation is that <em>they fail in complementary places</em>: push dies on accounts with many <strong>followers</strong>; pull dies on readers with many <strong>followees</strong>. Different populations. So: push for normal users, and for celebrities (say &gt;100k followers) skip fan-out entirely and merge their posts in at read time. A feed read = one precomputed list + a tiny pull for the 0–5 celebrities you follow. The expensive case for push becomes cheap because the work is now proportional to how many celebrities <em>each reader</em> follows, which is a very small number.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>What is "the celebrity problem" and how do you solve it?</summary>
+      <div class="answer">
+        <p>An account with tens of millions of followers. Under fan-out-on-write, one of their posts triggers 50 million timeline writes — eight-plus minutes of work at realistic Redis throughput, during which their followers see the post at wildly different times, and the burst starves the fan-out queue so <em>everyone's</em> posts lag. It's a hot-key / hot-partition problem (<a href="04-partitioning-hashing.html#hot">04 §8</a>) expressed as a write storm.</p>
+        <p><strong>The fix is to stop copying and start sharing.</strong> Don't fan out celebrity posts at all. Keep them in one hot, heavily replicated cache and have readers pull them at feed-read time, merging into their precomputed timeline. Copying to 50M consumers is only sensible when there aren't 50M consumers; past some threshold, one shared copy that everyone reads is strictly cheaper. Add hot-key defenses on top: replicate the key across shards or suffix it, cache celebrity posts locally in the feed-service instances for a few seconds, and single-flight the misses so an expiry doesn't stampede the database.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Walk me through the arithmetic. Why is a "read-heavy" system actually write-heavy?</summary>
+      <div class="answer">
+        <p>300M DAU × 2 posts/day ÷ 100k sec = ~7k posts/sec. 300M × 10 feed opens/day ÷ 100k = ~35k feed reads/sec. So at the API level it's 5:1 read-heavy — which suggests precomputing feeds.</p>
+        <p>But if you precompute, each post becomes one write <em>per follower</em>. At an average of 200 followers: <strong>7,000 × 200 = 1.4 million feed-writes per second</strong>, against 35 thousand reads. The storage layer is doing 40× more writes than reads. <strong>The fan-out multiplier inverts the ratio</strong>, and that inversion is what makes the problem interesting — it's why "just cache it" is not an answer, and it's why the fan-out must be asynchronous and must be skipped for celebrities and inactive users. If you can only put one number on the whiteboard, put that one.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Why must the fan-out be asynchronous? What does the queue actually buy you?</summary>
+      <div class="answer">
+        <p>Because otherwise <strong>post latency becomes a function of follower count.</strong> Writing into 200 timelines inside the request is survivable; writing into 500,000 means the user's POST takes 30 seconds and times out. You cannot let an unbounded amount of work sit inside a bounded-latency request — that's the general principle, and it's the real reason for the queue, not throughput.</p>
+        <p>So: the post commits to the durable store, emits a <code>post-created</code> event (via the outbox pattern, so the row and the event can't diverge), and returns <code>202 Accepted</code> in ~50ms. A worker fleet consumes the event and does the fan-out. The queue also buys retries on failure, backpressure when the fleet is behind, and the ability to scale fan-out capacity independently of the post API. The permission slip for all of this is the requirement you negotiated up front: eventual consistency is fine — nobody dies if a tweet takes five seconds to land.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>What exactly do you store in a user's timeline, and why not the posts themselves?</summary>
+      <div class="answer">
+        <p><strong>Post IDs only</strong> — 8 bytes each — in a capped Redis sorted set, hydrated into full posts at read time. Two reasons. Memory: 400-byte posts × 800 entries × 300M users is ~100 TB of RAM versus ~2 TB for IDs. And mutation, which is the real reason: if the post content is <em>copied</em> into 50 million timelines, then editing a post — or its like count ticking up, or the author changing their avatar — becomes 50 million updates. You'd have recreated the celebrity fan-out disaster on the edit path.</p>
+        <p><strong>Fan out references, never copies.</strong> One authoritative copy of the post; everything else holds a pointer. It's exactly why you normalize a Redux store by ID instead of embedding the same object in three places. The cost is an extra hop at read time, which is fine: you batch the hydration (<code>MGET</code>) and the hit rate is very high, because feeds contain only recent posts and recent posts are the hottest things in the cache.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Why cursor pagination instead of offset? Be specific about the bug.</summary>
+      <div class="answer">
+        <p>Offset pagination assumes the list is stable between requests. A feed is prepended to continuously. Fetch <code>OFFSET 0 LIMIT 5</code> and you get P10–P6. Two new posts arrive. Fetch <code>OFFSET 5 LIMIT 5</code> and the window has slid down by two — you get P8, P7, P6 again. <strong>The user sees duplicates while scrolling</strong>, and if posts are deleted instead of added, they see <em>skipped</em> items. It's a correctness bug, not a performance nit. (It's also slow: deep <code>OFFSET</code> makes the database walk and discard every skipped row.)</p>
+        <p>A cursor anchors to an <em>item</em> rather than a count: <code>WHERE (created_at, id) &lt; (:ts, :id) ORDER BY created_at DESC, id DESC LIMIT 20</code>. New posts at the head can't move that boundary. Use a compound <code>(timestamp, id)</code> cursor — timestamp alone is ambiguous when two posts share a millisecond, and that ambiguity is exactly how you skip an item. New arrivals surface separately, as a "12 new posts ↑" pill.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>How do you handle unfollow? Do you go clean the timelines?</summary>
+      <div class="answer">
+        <p><strong>No. Lazily, at read time.</strong> Delete the edge from the follow graph — that's one row and it's the source of truth — and then have the feed service filter out posts from unfollowed authors during hydration, over-fetching slightly (grab 30 candidates to return 20) to cover the removals. The stale IDs age out of the capped timeline on their own.</p>
+        <p>Scanning and purging every affected timeline is an unbounded read-modify-write, and a mass unfollow after some celebrity scandal would be a fan-out storm running in reverse. The general principle, which also answers deletes, blocks, mutes and privacy changes: <strong>when a materialized view goes stale, fix it at read time rather than rewriting the view.</strong></p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>What's the fastest way to cut fan-out cost, other than the celebrity fix?</summary>
+      <div class="answer">
+        <p><strong>Don't fan out to inactive users.</strong> Check <code>lastLoginAt</code> in the fan-out worker and skip anyone dormant for 30+ days. On a mature platform most accounts are dormant, so this one <code>if</code> statement can delete a majority of your write volume <em>and</em> a majority of your Redis memory — a bigger absolute saving than the celebrity fix, and vastly simpler.</p>
+        <p>The cost is bounded and lands on the right person: a returning user hits a cold timeline, takes the slow path once (pull-and-merge from their followees, rebuild, cache), and is warm from then on. You've made the common case cheaper and the rare case slower, which is always the direction you want to push cost. And that slow path isn't new code — it's the same fallback you already need for deep scrolls past the cap and for a lost Redis node.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>How would you rank the feed instead of showing it chronologically?</summary>
+      <div class="answer">
+        <p>Three rungs, and I'd say where I'm stopping. <strong>(1) Chronological:</strong> score = post ID. Ship this first. <strong>(2) Weighted signals:</strong> <code>score = w₁·recency + w₂·affinity(viewer, author) + w₃·engagement(post)</code>, hand-tuned, computed at read time over the few hundred candidates the fan-out produced. This is the right depth for a 45-minute round and it's roughly what real feeds did for years. <strong>(3) ML:</strong> two-stage — candidate generation, then a model scoring p(like)/p(reply)/p(dwell) — with a feature store, an online inference service inside the latency budget, and an experimentation platform. That's awareness level; I'd describe the shape and say it's a design round of its own.</p>
+        <p>The architectural point that matters: <strong>ranking is a read-time function, not a write-time one.</strong> Any score that depends on the viewer (affinity) or on elapsed time (recency decay) is different per reader and stale within minutes, so it can't be baked into the timeline at fan-out. So the fan-out produces <em>candidates</em>, and you score them per request. That's also why the timeline is a sorted set — the score field is the seam ranking plugs into, with no other change to the system.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Why cap the timeline at ~800 posts? What happens if someone scrolls past it?</summary>
+      <div class="answer">
+        <p>Because memory is the binding constraint on the Redis fleet and essentially nobody scrolls 40 pages deep — an uncapped timeline spends most of its bytes on posts no human will ever load. <code>LTRIM</code> (or <code>ZREMRANGEBYRANK</code>) on every push keeps it bounded, and the cap is what makes the ~2 TB memory estimate work at all.</p>
+        <p>If someone <em>does</em> scroll past it, you don't error — you fall through to the <strong>slow path</strong>: pull their followees' posts for that cursor range from the post store, merge, serve in ~300ms instead of ~20ms. Someone 800 posts deep will forgive you. And note that this is the <em>same</em> slow path you use for a returning inactive user's cold timeline and for a lost Redis node. One degradation path, three uses — which is worth pointing out, because "I have a correct, slow, always-available fallback behind the fast path" is a design property interviewers are specifically listening for.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Redis loses a node. What happens to the users on it?</summary>
+      <div class="answer">
+        <p>Their precomputed timelines vanish — and that's <em>fine</em>, because <strong>the timeline is a derived view, not a source of truth.</strong> It's fully rebuildable from posts + follows. Those users fall through to the slow path (pull-and-merge), which is slower but correct, and their timelines re-materialize and get cached as they browse. It's a latency incident, not a data-loss incident. Meanwhile replication and a cluster failover shorten the window.</p>
+        <p>The general rule: <strong>never put the only copy of anything in a cache.</strong> The reason it's safe to hold a 2 TB feed structure in volatile memory is precisely that you can regenerate it. If you couldn't, you'd need a durable timeline store (Cassandra) with Redis as a front cache — which some real systems do, and which is a legitimate flip if a cold cache would overwhelm your slow path.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>A user posts and doesn't see their own tweet in their feed. Acceptable?</summary>
+      <div class="answer">
+        <p><strong>No.</strong> This is the one place eventual consistency isn't OK. A stranger's post arriving five seconds late is invisible; <em>your own</em> post not appearing feels like the app ate it, so users retry and you get duplicate posts. It's a read-your-own-writes requirement hiding inside an eventually-consistent system.</p>
+        <p>Two fixes, and I'd do both: <strong>fan out to yourself synchronously</strong> before returning the 202 — one extra Redis write on the write path, the other 200 stay async — and <strong>optimistic insert on the client</strong>, since the app already has the post text and can render it immediately, reconciling when the server confirms. The optimistic UI covers the instant; the synchronous self-write covers the refresh.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Where else does this exact design show up?</summary>
+      <div class="answer">
+        <p>Everywhere there's a many-to-many publish followed by a merged, personalized read. <strong>Notification inbox:</strong> identical — events fan out into per-user inboxes, and a "system announcement to all users" is the celebrity problem wearing a hat. <strong>Activity streams</strong> (GitHub, Jira, "Sarah commented on your doc"): identical, and the publishers are usually low-fan-out so pure push is often fine. <strong>Instagram / TikTok:</strong> identical, plus heavier ranking and out-of-network candidate generation. <strong>Slack channel unreads:</strong> fan-out with a per-user read cursor; a channel with 50,000 members is the celebrity. <strong>A stock-ticker watchlist:</strong> a price tick fans out to everyone watching that ticker — and a hugely-watched ticker like AAPL is, once again, the celebrity, so you pull it at read time instead.</p>
+        <p>Say this transfer out loud when you finish. <em>"This is the fan-out archetype — the same shape as a notification inbox or an activity stream — and the question in all of them is whether you merge at write or at read."</em> It tells the interviewer you learned a <strong>class</strong> of problem, not an answer to one.</p>
+      </div>
+    </details>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="takeaways">What to remember</h2>
+
+    <p>If you have five minutes before the interview, read only this.</p>
+
+    <h3>The one-line summary</h3>
+    <p>
+      <strong>Precompute every user's feed at write time (push), except for celebrities, whose posts you merge in at read time (pull) —
+      because push's cost explodes on followers and pull's cost explodes on followees, and those are different people.</strong>
+    </p>
+
+    <h3>The numbers</h3>
+    <ul>
+      <li>300M DAU × 2 posts/day → <strong>~7k posts/sec</strong>. Trivial.</li>
+      <li>300M DAU × 10 opens/day → <strong>~35k feed reads/sec</strong>. Also fine.</li>
+      <li><strong>7k × 200 avg followers = 1.4M feed-writes/sec.</strong> ← This is the number. The "read-heavy" system is 40× write-heavy at the storage layer. Write it on the board.</li>
+      <li>A 50M-follower celebrity = <strong>50M writes for one tweet</strong> ≈ 8+ minutes. That's the cliff.</li>
+      <li>Timeline cache: 300M × 800 IDs × 8B ≈ <strong>2 TB of Redis</strong> — only because you store IDs and cap the list.</li>
+    </ul>
+
+    <h3>The decisions, compressed</h3>
+    <ul>
+      <li><strong>Hybrid fan-out.</strong> Push under ~100k followers; pull above it; merge and dedupe at read time. This is the celebrity problem and its answer.</li>
+      <li><strong>Fan-out is async</strong> (Kafka + worker fleet). Post commits, emits an event, returns <code>202</code>. Never let unbounded work sit inside a bounded-latency request.</li>
+      <li><strong>Skip inactive users</strong> in fan-out (<code>lastLogin</code> check). Deletes a majority of the work for one <code>if</code>.</li>
+      <li><strong>Store post IDs, not posts.</strong> Fan out references, never copies — or one edit becomes 50M writes. Hydrate the 20 winners at read time, batched.</li>
+      <li><strong>Cap timelines at ~800</strong> in a Redis ZSET. Deeper scrolls, cold timelines, and lost Redis nodes all fall through to the same slow pull-and-merge path.</li>
+      <li><strong>Cursor pagination, always.</strong> Offset duplicates and skips on a list that grows at the head. Compound cursor <code>(timestamp, id)</code>.</li>
+      <li><strong>Chronological first, ranking as a score function at read time.</strong> The ZSET score is the seam. Scope the ML out loud and honestly.</li>
+      <li><strong>Fix stale materialized views at read time</strong> — unfollow, delete, block, mute all filter on read. Never rewrite 50M timelines.</li>
+      <li><strong>Fan out to yourself synchronously.</strong> Read-your-own-writes is the one place eventual consistency isn't acceptable.</li>
+    </ul>
+
+    <h3>The archetype transfer</h3>
+    <p>
+      <strong>Fan-out = many-to-many publish, then read a merged personalized view.</strong> Twitter, Facebook, Instagram, a notification
+      inbox, an activity stream, Slack unreads, an RSS reader, a stock-ticker watchlist. Every one asks: <em>merge at write or merge at
+      read?</em> Every one answers: <em>at write, except for the pathological publishers.</em> And underneath it is a trade you'll meet under a
+      dozen different names for the rest of your career — <strong>copy vs share, denormalize vs join, precompute vs compute on demand.</strong>
+      Copying is faster to read until there are too many copies; then sharing wins. That sentence is most of distributed systems
+      intuition, and this page is where you earn it.
+    </p>
+
+    <div class="senior">The three sentences that carry this round, in order: <em>(1) "How many followers can one user have?"</em> — asked in minute two, which turns the ambush into a planned deep dive. <em>(2) "Seven thousand posts a second times two hundred followers is 1.4 million writes a second — this read-heavy system is secretly write-heavy."</em> — the derivation that shows you didn't memorize it. <em>(3) "Push and pull fail in complementary places, so I'd hybridize: push for normal users, pull for celebrities."</em> — the answer. If you say only those three things and draw a competent diagram, you pass.</div>
+  </section>
+
+  <nav class="page-nav">
+    <a href="09-rate-limiter.html">← 09 — Design a Rate Limiter</a>
+    <a href="11-chat-system.html">11 — Design a Chat System →</a>
+  </nav>
+
+</main>
+</body>
+</html>

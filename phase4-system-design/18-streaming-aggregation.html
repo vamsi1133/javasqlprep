@@ -1,0 +1,2102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>18 — Design an Ad-Click Aggregator / Metrics Pipeline | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <div class="breadcrumb"><a href="index.html">← Course Home</a></div>
+    <h1>18 — Design an Ad-Click Aggregator / Metrics Pipeline</h1>
+    <p>The one where counting turns out to be hard. Archetype: <strong>streaming aggregation</strong> — a firehose of events in, a trickle of numbers out.</p>
+  </div>
+</header>
+
+<main class="container">
+
+  <section>
+    <h2>Why this matters in the interview</h2>
+    <p>
+      <strong>Counting is trivial until the events arrive out of order, arrive twice, arrive late, or arrive a billion times a
+      second.</strong> Memorise that sentence — it is the entire page. Every hard part of this system is one of those four words, and
+      if you organise your 45 minutes around them you will sound like someone who has run a pipeline in production rather than
+      someone who has read about one. Adding <code>1</code> to a number is not an engineering problem. Adding <code>1</code> to the
+      <em>right</em> number, exactly once, when the event that justifies it was generated on a phone in a tunnel thirty-seven seconds
+      ago and arrived after you already published the total, is an engineering problem — and a well-paid one.
+    </p>
+    <p>
+      The archetype is enormous and almost nobody names it out loud, so name it: <strong>ad-click counting, YouTube view counts,
+      analytics dashboards, real-time leaderboards, IoT telemetry, log and metrics pipelines, fraud detection, "trending now,"
+      and every top-K problem you have ever seen are all the same system.</strong> Ingest immutable events at a rate no database
+      would tolerate, reduce them into aggregates that are tiny by comparison, and serve the aggregates. Learn the shape once and
+      you have pre-answered a very large slice of the question bank. And this particular costume has teeth the others don't:
+      <strong>advertisers are billed on these counts.</strong> A double-counted click is not a rounding error, it is billing fraud;
+      a dropped click is revenue you never invoiced. That drags this squarely into the correctness posture you built in
+      <a href="13-payments-orders.html">tutorial 13</a> — which is exactly why it plays as well at JPMC and Optum as it does at
+      Google. It is a FAANG question and a fintech question at the same time, which almost nothing else on this list is.
+    </p>
+    <p>
+      It is also the <strong>last backend case study</strong>, and it is deliberately the one that reuses everything: Kafka and
+      delivery semantics from <a href="06-caching-queues-resilience.html">06</a>, the exactly-once honesty of
+      <a href="05-coordination-consensus.html">05</a>, hot partitions from <a href="04-partitioning-hashing.html">04</a>, bloom
+      filters from <a href="17-web-crawler-search.html">17</a>, the immutable-log instinct from <a href="13-payments-orders.html">13</a>.
+      Treat it as the capstone. The last section of this page collects the eight ideas that have recurred across all twelve case
+      studies, because by now you should be able to see them coming.
+    </p>
+  </section>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ul>
+      <li><a href="#prompt">1. The prompt</a> — and the four words that are the whole problem</li>
+      <li><a href="#requirements">2. Requirements</a> — one system, two consumers, contradictory needs ★★</li>
+      <li><a href="#estimation">3. Estimation</a> — 100 GB in, a few MB out: the asymmetry is the design ★</li>
+      <li><a href="#api">4. API design</a> — the dumbest possible write path</li>
+      <li><a href="#data-model">5. Data model</a> — OLTP vs OLAP, and why columnar wins ★★</li>
+      <li><a href="#hld">6. High-level design</a> — one click and one dashboard query, end to end</li>
+      <li><a href="#deep-dive-1">7a. Deep dive: windowing, event time &amp; late data</a> ★★ — the heart</li>
+      <li><a href="#deep-dive-2">7b. Deep dive: exactly-once counting</a> ★★ — because it's money</li>
+      <li><a href="#deep-dive-3">7c. Deep dive: batch vs stream (lambda vs kappa)</a> ★★</li>
+      <li><a href="#approx">7d. Approximate algorithms</a> — HLL, count-min sketch, and knowing when error is fine ★</li>
+      <li><a href="#scaling">8. Scaling &amp; bottlenecks</a> — what melts first</li>
+      <li><a href="#tradeoffs">9. Trade-offs</a></li>
+      <li><a href="#followups">10. Follow-ups you should expect</a> — bots, backfills, testing, sub-second dashboards</li>
+      <li><a href="#qa">Interview Q&amp;A</a></li>
+      <li><a href="#takeaways">What to remember</a> — plus the eight ideas behind all twelve case studies</li>
+    </ul>
+  </div>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="prompt">1. The prompt</h2>
+
+    <p>The interviewer says:</p>
+
+<pre><code>  "Design an ad-click aggregator. When a user clicks an ad we get an
+   event. Advertisers need to see how many clicks their campaigns got,
+   and we need to bill them for it."
+</code></pre>
+
+    <p>
+      Deliberately vague, and deliberately boring-sounding. The trap is that it <em>sounds</em> like a counter. Junior candidates
+      hear "count clicks," draw a service, draw a Postgres table with a <code>count</code> column, write
+      <code>UPDATE campaigns SET clicks = clicks + 1</code>, and are done in four minutes with a system that would fall over at
+      1% of the stated load, bill advertisers wrong, and lose data on every deploy. There is nowhere to go from there. The design
+      is over before the interview starts.
+    </p>
+
+    <p>
+      What you should hear instead is <strong>four separate hard problems, none of which is addition</strong>:
+    </p>
+
+    <ul>
+      <li><strong>Out of order.</strong> Clicks do not arrive in the order they happened. Ever. Different phones, different networks,
+        different retries, different Kafka partitions. So "clicks in the 10:00 minute" is a question about the past that you can
+        only answer approximately at 10:01.</li>
+      <li><strong>Twice.</strong> Every pipe in this system is at-least-once (<a href="06-caching-queues-resilience.html">06</a>).
+        Duplicates are not an edge case, they are the steady state. And a duplicate here is a false charge.</li>
+      <li><strong>Late.</strong> The user's phone was in a tunnel. The mobile SDK batches events and flushes on app resume — three
+        hours later. Do you drop that click, or do you go back and change a number you already published and possibly already
+        invoiced?</li>
+      <li><strong>A billion times a second.</strong> Or near enough. No OLTP database on earth accepts a billion increments a day
+        against a few thousand rows — that's a hot-row lock convoy, not a design.</li>
+    </ul>
+
+    <p>
+      Each of those maps to a section below. §7a is <em>out of order</em> and <em>late</em>. §7b is <em>twice</em>. §7c and §8 are
+      <em>a billion times a second</em>. Say this decomposition out loud in the first two minutes and you have framed the entire
+      interview on your own terms — the interviewer now has to follow your structure rather than probe you at random.
+    </p>
+
+    <div class="senior">Open like this: <em>"Sure. I want to flag up front that the interesting thing here isn't the counting — it's that the events arrive out of order, arrive more than once, arrive late, and arrive very fast. Those four properties are where all the design pressure is. The other thing I want to establish early is who consumes the numbers, because I suspect there are two consumers with opposite requirements: a dashboard that wants sub-minute freshness and doesn't mind a 1% error, and a billing system that wants exactness and doesn't mind waiting an hour. If that's true, the design has to serve both, and that will drive most of my architecture."</em> You have just named the archetype, named the four failure modes, and predicted the lambda architecture <em>from requirements</em> instead of pattern-matching your way into it. That is the difference between a 7-YOE answer and a memorised one.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="requirements">2. Requirements</h2>
+
+    <p>
+      Ask, but propose the answer with the question — make their job to correct you, not to teach you. The exchange as it actually
+      goes:
+    </p>
+
+    <table>
+      <thead><tr><th>You ask</th><th>They answer</th><th>What it just forced</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>"Who reads these numbers — the advertiser's live dashboard, or the billing run, or both?"</td>
+          <td>"Both."</td>
+          <td><strong>The whole architecture.</strong> Two consumers, two different tolerances. See below — this is the question.</td>
+        </tr>
+        <tr>
+          <td>"What's the finest granularity anyone queries — per minute, per hour, per day?"</td>
+          <td>"Per minute for the dashboard; billing rolls up to the day."</td>
+          <td>Minute is the base aggregation unit. Everything coarser is a rollup <em>of</em> minutes, computed once, not on read.</td>
+        </tr>
+        <tr>
+          <td>"What dimensions do they slice by? Region, device, creative?"</td>
+          <td>"Region, device type, and campaign. Maybe more later."</td>
+          <td>Multi-dimensional aggregation → this is an OLAP cube, not a counter. And "more later" means the store must take new dimensions without a rewrite.</td>
+        </tr>
+        <tr>
+          <td>"How fresh must the dashboard be? Seconds, or is a minute fine?"</td>
+          <td>"Under a minute is fine."</td>
+          <td>You do <em>not</em> need sub-second streaming. That relaxation is worth a lot — take it, and say you're taking it.</td>
+        </tr>
+        <tr>
+          <td>"Is a 1% error acceptable on the dashboard?"</td>
+          <td>"On the dashboard, yes. On the invoice, absolutely not."</td>
+          <td>The single most valuable answer you will get. It licenses approximation in one layer and forbids it in the other.</td>
+        </tr>
+        <tr>
+          <td>"Scale? Say a billion clicks a day?"</td>
+          <td>"Sure, a billion a day."</td>
+          <td>~12k/sec average, ~50k/sec peak. Kills the OLTP counter immediately.</td>
+        </tr>
+        <tr>
+          <td>"Do we need to detect fraudulent / bot clicks?"</td>
+          <td>"Assume a separate team does that."</td>
+          <td>Scope cut — but come back to it in §10, because <em>where</em> it sits in the pipeline is a real design question.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>Functional</h3>
+    <ul>
+      <li><strong>Ingest click events</strong> — <code>(ad_id, campaign_id, user_id, timestamp, region, device)</code> — at very high volume, and never lose one.</li>
+      <li><strong>Serve aggregated counts</strong> per ad and per campaign, bucketed per minute / hour / day.</li>
+      <li><strong>Filter and group by dimensions</strong> — region, device, and whatever they add next quarter.</li>
+      <li><strong>Power a near-real-time dashboard</strong> (advertiser opens the app, sees today's clicks ticking up).</li>
+      <li><strong>Power billing</strong> — an exact, auditable, defensible number per campaign per day.</li>
+    </ul>
+
+    <h3>Non-functional — and here is the whole interview</h3>
+
+    <p>
+      Almost every candidate writes one column of non-functional requirements: "low latency, high availability, accurate." That
+      column is <strong>self-contradictory</strong>, and by failing to notice, they end up designing one system that compromises in
+      the middle: a bit slow for the dashboard, a bit wrong for billing, and therefore useless to both. Write <em>two</em> columns.
+    </p>
+
+    <table>
+      <thead><tr><th></th><th>Consumer A — the dashboard</th><th>Consumer B — billing</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Wants</strong></td><td>Freshness. "Is my new campaign working <em>right now</em>?"</td><td>Correctness. A number that survives an audit.</td></tr>
+        <tr><td><strong>Latency</strong></td><td>Seconds to a minute. Non-negotiable.</td><td>Hours is fine. Nobody invoices in real time.</td></tr>
+        <tr><td><strong>Accuracy</strong></td><td>~1–2% error is invisible and irrelevant.</td><td>Exact. Off-by-one is a legal problem.</td></tr>
+        <tr><td><strong>Late data</strong></td><td>Ignore it. Nobody notices.</td><td>Must be included. You <strong>restate</strong>.</td></tr>
+        <tr><td><strong>Duplicates</strong></td><td>Tolerable in the noise.</td><td>Fraud. Must be deduped.</td></tr>
+        <tr><td><strong>Therefore</strong></td><td>A <strong>streaming</strong> path: approximate, fast, revisable.</td><td>A <strong>batch</strong> path: exact, slow, recomputed from raw.</td></tr>
+      </tbody>
+    </table>
+
+    <p>
+      Read the bottom row again. <strong>You have just derived the lambda architecture from the requirements table, not from a
+      textbook.</strong> This matters enormously in how it lands. Most candidates who mention lambda architecture do it as a name
+      they dropped — "and then we'd have a speed layer and a batch layer" — and the interviewer cannot tell whether they understand
+      it or memorised it. You will arrive at it because you noticed that one system has two consumers whose requirements <em>cannot
+      both be met by one pipeline</em>. That is the honest motivation, it's the actual historical motivation, and it is the single
+      strongest move available to you on this page.
+    </p>
+
+    <ul>
+      <li><strong>Availability of ingest is sacred.</strong> If the aggregation pipeline is down, fine, the dashboard is stale. If
+        <em>ingest</em> is down, the clicks are gone forever — there is no retry from a user who already navigated away. The write
+        path must accept events even when everything downstream is on fire.</li>
+      <li><strong>Durability &gt; latency on the write path.</strong> We would rather add 5ms to the click handler than lose an event.</li>
+      <li><strong>Scale:</strong> 1B clicks/day, ~50k/sec at peak, spiky (Super Bowl ad, product launch, timezone waves).</li>
+    </ul>
+
+    <h3>Explicitly out of scope</h3>
+    <p>
+      Say what you're cutting, so they know it's a choice and not an oversight: <strong>ad serving and targeting</strong> (which ad
+      to show is a whole separate ML system), <strong>the bidding auction</strong>, <strong>fraud/bot detection</strong> (§10 covers
+      where it plugs in), and <strong>the advertiser-facing UI</strong> itself.
+    </p>
+
+    <div class="senior">The sentence to say, out loud, slowly, because it re-frames everything after it: <em>"I want to split the non-functional requirements by consumer rather than listing them globally, because I think they conflict. The dashboard wants low latency and can tolerate approximation. Billing wants exactness and can tolerate delay. Those are opposite requirements, and if I build one pipeline I'll compromise into something that serves neither well. So I'm going to build a fast approximate path and a slow exact path over the same immutable event log, and let each consumer read the one that matches its tolerance."</em> An interviewer hearing that at minute six knows how the rest of the hour is going to go.</div>
+
+    <div class="pitfall">The <em>opposite</em> failure is also common and just as fatal: building only the exact batch path because "it's money, it has to be right," and then being unable to answer "so why does the advertiser's dashboard take four hours to show a click?" Both consumers are real. Serving only one of them is not a trade-off you get credit for — it's a requirement you dropped.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="estimation">3. Estimation</h2>
+
+    <p>Round aggressively, say that you're rounding, and — the part everyone forgets — <strong>use every number you compute</strong>.</p>
+
+    <h3>Ingest rate</h3>
+<pre><code>  1B clicks/day
+    ÷ 86,400 sec  ≈  11,600/sec     → call it ~12k/sec average
+    peak ≈ 3-4× average             → ~50k/sec peak
+
+  (Traffic is not flat: US evening + a Super Bowl spot can be 10×.
+   Design for 50k sustained; survive 100k by buffering, not by
+   provisioning for the worst hour of the year.)
+</code></pre>
+
+    <h3>Raw storage — the input side</h3>
+<pre><code>  One click event, realistically:
+    ad_id 8B · campaign_id 8B · user_id 8B · event_id 16B
+    timestamp 8B · region ~8B · device ~8B · ip ~16B + framing
+    ≈ 100 bytes
+
+  1B/day × 100 B  =  100 GB/day raw
+                  ≈  36 TB/year
+                  ≈  ~3 TB/day if you keep it uncompressed in Kafka
+                     with replication factor 3 → 300 GB/day on disk
+
+  Compressed (columnar, on S3): 100 GB/day → ~10-20 GB/day.
+  Cheap. Keep it forever. §7c explains why that decision is load-bearing.
+</code></pre>
+
+    <h3>Aggregated storage — the output side, and the punchline</h3>
+<pre><code>  Say ~10,000 active campaigns, ~100,000 individual ads.
+
+  Per-minute buckets, per ad:
+    100k ads × 1,440 min/day  =  144M rows/day   ← if you store every
+                                                    ad × every minute
+
+  But most ads get zero clicks in most minutes. Only store non-empty
+  buckets. Realistically:  ~10M rows/day.
+
+  Each row: (ad_id, minute, region, device, count) ≈ 40 bytes
+    10M × 40 B  ≈  400 MB/day  →  ~150 GB/year, uncompressed,
+                                  columnar-compressed to a fraction.
+
+  Campaign × hour × day rollups: a few thousand rows. Kilobytes.
+</code></pre>
+
+    <div class="senior">Now spend the number — this is the sentence that makes the estimation section <em>mean</em> something: <em>"So the asymmetry is the whole point. A hundred gigabytes a day goes in; a few hundred megabytes a day comes out — and the number the advertiser actually looks at is a few kilobytes. This pipeline is a <strong>reducer</strong>. That tells me two things immediately. One: the ingest path and the query path have almost nothing in common and should be scaled, deployed, and reasoned about separately. Two: the query side is easy — the output is small enough to fit in RAM — so all the engineering difficulty is in the reduction itself, which is exactly where I'll spend the rest of the time."</em></div>
+
+    <h3>Which number drives the design?</h3>
+    <p>
+      Not the storage. Not the QPS on reads (the dashboard gets, what, a few thousand queries a second from a few thousand
+      advertisers — trivially cacheable). <strong>The number that drives the design is 12k–50k writes/sec against a few thousand
+      logical counters.</strong> Put those two facts side by side and the naive design dies in public:
+    </p>
+
+<pre><code>  50,000/sec of:  UPDATE ad_stats SET clicks = clicks + 1
+                  WHERE ad_id = ? AND minute = ?
+
+  → All clicks for one popular ad hit ONE row.
+  → That row is a lock. Postgres serialises writers on it.
+  → A single row does maybe 1-5k updates/sec, optimistically.
+  → And a viral ad concentrates traffic on exactly ONE row.
+
+  You are not throughput-bound. You are CONTENTION-bound.
+  (Same disease as tutorial 14's seat inventory — the hot row.)
+</code></pre>
+
+    <p>
+      The escape is the one every system on this list eventually takes: <strong>stop mutating shared state on the write path.</strong>
+      Append immutable events to a log, and let a separate process reduce them in batches. One consumer thread owning one partition
+      can add 50,000 numbers together in memory in single-digit milliseconds, with no locks, because nobody else is touching its
+      state. The contention doesn't get solved — it gets <em>designed out of existence</em> by partitioning ownership. That is
+      exactly the move from <a href="04-partitioning-hashing.html">04</a>, and it is the reason Kafka is in this design and not just
+      decoration.
+    </p>
+
+    <h3>Bandwidth &amp; the stream processor's state</h3>
+<pre><code>  Inbound:  50k/sec × 100 B  ≈  5 MB/sec  ≈  40 Mbps   — nothing.
+
+  Stream processor in-memory state (the part people forget to size):
+    open windows × keys × counters
+    ~100k ads × a few open minute-windows × ~50 B
+    ≈ tens of MB per aggregation stage.        — comfortable.
+
+  Dedup state (§7b) is the one that can hurt:
+    every event_id seen in the last N minutes.
+    50k/sec × 600 sec (10 min) = 30M ids × 16 B = ~500 MB exact.
+    → Which is why §7b reaches for a bloom filter / TTL'd state.
+</code></pre>
+
+    <div class="pitfall">Don't say "1 billion clicks a day" and then design as if the events were spread evenly. They are not. Ad traffic is <strong>bursty and skewed</strong> — one campaign can be 30% of your total volume for an hour. The average tells you what to provision; the skew tells you what will page you at 3am. Mention both, and you've pre-loaded the hot-partition discussion in §7b, which is where the interviewer was going to take you anyway.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="api">4. API design</h2>
+
+    <p>
+      Two APIs, and they could not be more different. One is the highest-volume, dumbest endpoint you will ever write. The other is
+      an analytics query. Present them as a pair and point out the asymmetry — it echoes the estimation section and shows you're
+      designing from the numbers.
+    </p>
+
+    <h3>4.1 The ingest endpoint — its only job is to not lose the event</h3>
+
+<pre><code>  POST /v1/events/click
+  Content-Type: application/json
+
+  {
+    <span class="str">"event_id"</span>:    <span class="str">"9f2c...-a71e"</span>,   <span class="com">// UUID minted by the CLIENT SDK — §7b</span>
+    <span class="str">"ad_id"</span>:       <span class="str">"ad_8891"</span>,
+    <span class="str">"campaign_id"</span>: <span class="str">"cmp_42"</span>,
+    <span class="str">"user_id"</span>:     <span class="str">"u_1177"</span>,        <span class="com">// hashed; for unique-visitor counts (§7d)</span>
+    <span class="str">"event_ts"</span>:    <span class="num">1752480000123</span>,    <span class="com">// EVENT time — when the click HAPPENED</span>
+    <span class="str">"region"</span>:      <span class="str">"us-east"</span>,
+    <span class="str">"device"</span>:      <span class="str">"ios"</span>
+  }
+
+  → 202 Accepted        <span class="com">// not 200. You have not processed it.</span>
+     {}                 <span class="com">// empty body. Nothing to say.</span>
+</code></pre>
+
+    <p>Four things in that snippet are load-bearing, and each is worth one sentence out loud:</p>
+
+    <ul>
+      <li><strong><code>event_id</code> is minted by the client, not the server.</strong> It is the idempotency key
+        (<a href="13-payments-orders.html">13</a> again). If the SDK retries because the network dropped the response, it retries
+        with the <em>same</em> id, and the pipeline can tell "the same click twice" from "the user clicked twice." A server-generated
+        id cannot make that distinction — it stamps a fresh id on the retry and you've invented a click that never happened, and
+        billed for it.</li>
+      <li><strong><code>event_ts</code> is when the click happened, not when it arrived.</strong> This one field is the entirety of
+        §7a. If you leave it out and timestamp on arrival, your minute buckets are wrong and your invoices are wrong, and you will
+        never notice because the totals still look plausible.</li>
+      <li><strong><code>202 Accepted</code>, not <code>200 OK</code>.</strong> A tiny detail that says a lot. You are not telling the
+        client the click was counted — you're telling it the click was <em>durably accepted</em>. Being precise about that in the
+        status code is the kind of thing interviewers notice.</li>
+      <li><strong>Fire and forget.</strong> The response body is empty, the client doesn't wait on it, and the ad redirect happens
+        regardless. Nothing about the user's experience may depend on this pipeline being healthy.</li>
+    </ul>
+
+    <h3>The click handler, in full. Yes, this is all of it.</h3>
+
+<pre><code>  <span class="ann">@PostMapping</span>(<span class="str">"/v1/events/click"</span>)
+  <span class="kw">public</span> <span class="typ">ResponseEntity</span>&lt;<span class="typ">Void</span>&gt; click(<span class="ann">@RequestBody</span> <span class="typ">ClickEvent</span> e) {
+      validateShape(e);                <span class="com">// required fields, sane sizes. Cheap.</span>
+      producer.send(<span class="str">"clicks"</span>,          <span class="com">// topic</span>
+                    e.adId(),          <span class="com">// PARTITION KEY — §7b</span>
+                    serialize(e));     <span class="com">// acks=all, durably replicated</span>
+      <span class="kw">return</span> <span class="typ">ResponseEntity</span>.accepted().build();
+  }
+</code></pre>
+
+    <div class="senior">Say this explicitly, because it is a genuine principle and not just a code comment: <em>"The click handler does no processing whatsoever. No enrichment, no lookup of the campaign, no fraud check, no counting, no database write. Its only job is to durably append the event to Kafka and return. Everything else in this system is downstream of that log and can be slow, can be retried, can be redeployed, can be rewritten — because the event is already safe. The moment you do work on the click path, the click path's availability becomes the availability of that work, and clicks are the one thing here that cannot be regenerated."</em> That last clause is the argument. A failed dashboard query can be retried by the user. A click that was never durably written is gone from the universe.</div>
+
+    <div class="pitfall">The classic wrong turn is doing "just a tiny bit" of work on the click path — a quick Redis <code>INCR</code>, "just" a campaign-budget check, "just" a bot-score lookup. Each one is 2ms and each one is a new hard dependency whose outage becomes <em>your</em> outage, at 50k/sec, on the path that generates the company's revenue. Everything that isn't "append to log" goes downstream. Every time.</div>
+
+    <h3>4.2 The query API — for the dashboard</h3>
+
+<pre><code>  GET /v1/campaigns/{campaign_id}/clicks
+        ?from=2026-07-14T00:00:00Z
+        &amp;to=2026-07-14T23:59:00Z
+        &amp;granularity=minute            <span class="com">// minute | hour | day</span>
+        &amp;group_by=region,device        <span class="com">// optional dimensions</span>
+        &amp;filter=region:us-east         <span class="com">// optional</span>
+
+  200 OK
+  {
+    <span class="str">"campaign_id"</span>: <span class="str">"cmp_42"</span>,
+    <span class="str">"granularity"</span>: <span class="str">"minute"</span>,
+    <span class="str">"series"</span>: [
+      { <span class="str">"ts"</span>: <span class="str">"2026-07-14T10:00:00Z"</span>, <span class="str">"region"</span>: <span class="str">"us-east"</span>,
+        <span class="str">"device"</span>: <span class="str">"ios"</span>, <span class="str">"clicks"</span>: <span class="num">1183</span> },
+      { <span class="str">"ts"</span>: <span class="str">"2026-07-14T10:01:00Z"</span>, <span class="str">"region"</span>: <span class="str">"us-east"</span>,
+        <span class="str">"device"</span>: <span class="str">"ios"</span>, <span class="str">"clicks"</span>: <span class="num">1240</span> },
+      ...
+    ],
+    <span class="str">"source"</span>: <span class="str">"speed"</span>,          <span class="com">// "speed" | "batch"  ← honest about which layer</span>
+    <span class="str">"final"</span>:  <span class="kw">false</span>,             <span class="com">// may still be revised by late data</span>
+    <span class="str">"as_of"</span>:  <span class="str">"2026-07-14T10:02:11Z"</span>
+  }
+</code></pre>
+
+    <p>
+      <code>source</code> and <code>final</code> are the two fields that separate a considered API from a generated one, and they
+      cost you nothing to add. They let the UI say <em>"live — may adjust"</em> next to today's number and <em>"finalised"</em> next
+      to yesterday's. That is not a cosmetic nicety: it is the API <strong>telling the truth about its own consistency model</strong>
+      instead of quietly presenting a revisable number as a fact and then changing it under the user. As a frontend engineer you
+      already know exactly what a silently-changing number does to user trust — say that; the domain-crossing observation lands well.
+    </p>
+
+    <div class="note">Both APIs are read-your-own-writes hostile and that's <em>fine</em>. An advertiser who clicks their own ad and refreshes will not see the count move for a few seconds. Nobody cares, nobody has ever cared, and pretending otherwise would cost you the entire architecture. State that you've made that trade rather than leaving the interviewer to wonder if you noticed.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="data-model">5. Data model</h2>
+
+    <p>
+      There are exactly two datasets in this system, and they have nothing in common. Confusing them is the most common structural
+      error in this question.
+    </p>
+
+    <h3>5.1 Raw events — the log</h3>
+
+<pre><code>  Kafka topic: <span class="str">"clicks"</span>
+    partitions:  ~64          (see §7b for why keyed by ad_id)
+    replication: 3
+    retention:   7 days in Kafka  →  then tiered to S3, FOREVER
+
+  Record = the ClickEvent from §4, verbatim. Immutable. Append-only.
+  Nobody updates it. Nobody deletes it (except GDPR — see §10).
+</code></pre>
+
+    <p>
+      This is not a queue you drain and forget. <strong>It is the system of record.</strong> The aggregates you are about to compute
+      are <em>derived</em> from it, which means they are, formally, a cache — and any of them can be thrown away and rebuilt from the
+      log. That single property is what makes the batch layer possible (§7c), what makes backfills after a code bug possible (§10),
+      and what lets you add a brand-new dimension six months from now and compute it for all of history. Keep the raw log. It is
+      the cheapest insurance in the design.
+    </p>
+
+    <h3>5.2 Aggregates — the cube</h3>
+
+<pre><code>  ad_stats_minute
+  ──────────────────────────────────────────────────
+    minute        TIMESTAMP    <span class="com">-- event-time bucket, UTC</span>
+    ad_id         BIGINT
+    campaign_id   BIGINT
+    region        VARCHAR
+    device        VARCHAR
+    clicks        BIGINT       <span class="com">-- the count</span>
+    uniques_hll   BLOB         <span class="com">-- HyperLogLog sketch (§7d)</span>
+    PRIMARY KEY (minute, campaign_id, ad_id, region, device)
+
+  Rollups, precomputed — NOT computed on read:
+    ad_stats_hour     (same shape, hour buckets)
+    campaign_stats_day(same shape, day buckets)  ← what billing reads
+</code></pre>
+
+    <p>
+      Note the primary key starts with <code>minute</code>. Every query in this system is <em>"a time range, for a campaign."</em>
+      Time is the leading dimension of every access pattern, so time leads the key, so a scan for a time range is contiguous. This
+      is the same instinct as any index design — <strong>the key order is dictated by the query, not by the entity</strong> — you
+      just did it in Postgres for a whole phase.
+    </p>
+
+    <h3>5.3 The real decision: OLTP or OLAP?</h3>
+
+    <p>
+      This is the part of the page that teaches you something genuinely new, so slow down. Every store you have used in this course
+      so far — Postgres, MySQL, DynamoDB, Cassandra — is designed for <strong>OLTP</strong>: Online Transaction Processing. Lots of
+      small operations, each touching <em>a few whole rows</em>. "Fetch user 42." "Insert this order." "Update this seat." The unit
+      of work is <em>a row</em>, and these systems are built to find and manipulate individual rows very fast.
+    </p>
+
+    <p>
+      What the dashboard asks is a completely different <em>shape</em> of question:
+    </p>
+
+<pre><code>  <span class="kw">SELECT</span> minute, region, <span class="kw">SUM</span>(clicks)
+  <span class="kw">FROM</span>   ad_stats_minute
+  <span class="kw">WHERE</span>  campaign_id = <span class="num">42</span>
+    <span class="kw">AND</span>  minute <span class="kw">BETWEEN</span> <span class="str">'2026-07-01'</span> <span class="kw">AND</span> <span class="str">'2026-07-14'</span>
+  <span class="kw">GROUP BY</span> minute, region;
+</code></pre>
+
+    <p>
+      That query touches <strong>millions of rows</strong> and returns a handful. It reads <em>three columns</em> out of the eight in
+      the table. It doesn't want any individual row — it wants a <em>column, aggregated</em>. That is <strong>OLAP</strong>: Online
+      Analytical Processing. Few queries, each touching enormous numbers of rows but only a few columns, and always ending in
+      <code>SUM</code>/<code>COUNT</code>/<code>GROUP BY</code>. And the storage layout that is optimal for one is close to
+      pessimal for the other.
+    </p>
+
+    <h3>Row-oriented vs column-oriented — draw this</h3>
+
+    <p>Take four rows of <code>ad_stats_minute</code>. A <strong>row store</strong> (Postgres) lays them out on disk like this:</p>
+
+<pre><code>  ROW-ORIENTED — all of row 1, then all of row 2, ...
+
+  [10:00 | ad_1 | cmp_42 | us-east | ios     | 1183]
+  [10:00 | ad_2 | cmp_42 | eu-west | android |  204]
+  [10:01 | ad_1 | cmp_42 | us-east | ios     | 1240]
+  [10:01 | ad_2 | cmp_99 | us-east | ios     |   17]
+   ▲                                            ▲
+   └──────── one disk page holds WHOLE rows ────┘
+
+  To SUM(clicks) over a billion rows, you must read a billion
+  ENTIRE rows off disk — dragging ad_id, region, device and every
+  other column you did not ask for through the I/O path with you.
+  You wanted 8 bytes per row. You paid for 40.
+</code></pre>
+
+    <p>A <strong>column store</strong> (ClickHouse, Druid, Pinot, BigQuery, Redshift) lays the exact same data out like this:</p>
+
+<pre><code>  COLUMN-ORIENTED — all of column 1, then all of column 2, ...
+
+  minute:   [10:00, 10:00, 10:01, 10:01, ...]
+  ad_id:    [ad_1,  ad_2,  ad_1,  ad_2,  ...]
+  campaign: [cmp_42,cmp_42,cmp_42,cmp_99,...]
+  region:   [us-east,eu-west,us-east,us-east,...]
+  device:   [ios,   android,ios,   ios,   ...]
+  clicks:   [1183,  204,   1240,  17,    ...]   ◀── read ONLY this
+                                                    (plus minute,
+                                                     plus campaign)
+
+  SUM(clicks) reads the clicks column and nothing else.
+  Three columns out of six  →  you moved HALF the bytes.
+  Three out of thirty (a real table)  →  you moved a TENTH.
+</code></pre>
+
+    <p>That's the first win, and it's the obvious one. The second win is bigger and less obvious, and it's the one to say out loud:</p>
+
+    <p>
+      <strong>A single column compresses beautifully, because adjacent values are similar.</strong> Look at the
+      <code>region</code> column above: <code>us-east, eu-west, us-east, us-east…</code> — a handful of distinct strings repeated a
+      billion times. Dictionary-encode it and each value becomes a 1-byte integer. The <code>minute</code> column is a sorted,
+      monotonically-increasing sequence — delta-encode it and each value is a couple of bits. The <code>device</code> column has
+      maybe five distinct values in a billion rows; run-length encoding turns a million consecutive <code>ios</code>es into the pair
+      <code>(ios, 1000000)</code>. In a row store none of this is available to you, because your <code>ios</code> is wedged between
+      a timestamp and a bigint that look nothing like it — <strong>the entropy of a row is high; the entropy of a column is
+      low.</strong> Real columnar compression ratios on data like this are 10:1 or better, routinely.
+    </p>
+
+    <p>
+      Now compose the two wins: you read a third of the columns, and each column is a tenth of the size. <strong>You have moved
+      1/30th of the bytes.</strong> A query that takes Postgres four minutes takes ClickHouse under a second — not because it's
+      "faster," but because it <em>read almost nothing</em>. That is the whole trick, and stating it in those terms is what
+      distinguishes understanding columnar storage from having heard of it.
+    </p>
+
+    <table>
+      <thead><tr><th></th><th>OLTP — row store (Postgres)</th><th>OLAP — column store (ClickHouse/Druid/Pinot)</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Unit of work</strong></td><td>A row, or a few rows</td><td>A column, across billions of rows</td></tr>
+        <tr><td><strong>Typical query</strong></td><td><code>SELECT * WHERE id = 42</code></td><td><code>SUM(x) GROUP BY y</code> over a time range</td></tr>
+        <tr><td><strong>Reads</strong></td><td>Point lookups, index seeks</td><td>Massive sequential scans of few columns</td></tr>
+        <tr><td><strong>Writes</strong></td><td>Single-row insert/update, transactional</td><td>Bulk append. Updates are painful or unsupported</td></tr>
+        <tr><td><strong>Compression</strong></td><td>Poor — a row is heterogeneous</td><td>Excellent — a column is homogeneous (10:1+)</td></tr>
+        <tr><td><strong>Latency profile</strong></td><td>Sub-ms per row</td><td>Sub-second over a billion rows</td></tr>
+        <tr><td><strong>Concurrency</strong></td><td>Tens of thousands of concurrent txns</td><td>A few hundred analytical queries</td></tr>
+        <tr><td><strong>Use it for</strong></td><td>Orders, users, seats, ledgers (13, 14)</td><td>Metrics, dashboards, analytics (<strong>this page</strong>)</td></tr>
+      </tbody>
+    </table>
+
+    <div class="senior">Say: <em>"The aggregate store is an OLAP store, not an OLTP one — ClickHouse, Druid or Pinot. The queries here are 'sum one column across a huge time range, grouped by a dimension,' and that's a columnar workload: I read three columns out of thirty rather than a billion whole rows, and each column compresses at maybe ten to one because adjacent values are similar. It's not that Postgres is slow — it's that Postgres would have to physically read thirty times more bytes to answer the same question. I'd still keep Postgres for the campaign and advertiser metadata, because that part genuinely is OLTP."</em> Naming the <em>metadata store as separate</em> at the end is a small thing that reads as real-world experience — analytics people forget you still need a boring relational database for the boring relational stuff.</div>
+
+    <div class="note">A time-series database (InfluxDB, TimescaleDB, Prometheus's TSDB) is a legitimate alternative and is essentially a columnar store that has hard-coded the assumption that the leading dimension is time. If your dimensionality is low and everything is a time series, they're simpler to run. The moment you want to slice by six dimensions and add a seventh next quarter, you want a real OLAP store. Say that if pressed; don't volunteer a tour of the vendor landscape — interviewers do not award points for naming more databases.</div>
+
+    <div class="pitfall">Do not propose Postgres for the aggregates and try to save it with "…and I'd add an index." An index does not help a query that already has to touch a billion rows — indexes exist to <em>avoid</em> scanning, and an aggregation over a range fundamentally <em>is</em> a scan. Adding an index to a full-range aggregation makes it slower, if anything. The fix isn't a better index, it's a different <em>storage layout</em>, and that's precisely the insight the question is testing.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="hld">6. High-level design</h2>
+
+    <p>Draw it in two passes. First the spine — the path a click takes:</p>
+
+<pre><code>  Browser /          ┌──────────────┐        ┌───────────────┐
+  Mobile SDK ──────▶ │   Ingest     │ append │               │
+   (click)   HTTP    │   Service    ├───────▶│    KAFKA      │
+                     │ (stateless,  │  acks  │  topic:clicks │
+                     │  does NOTHING│  =all  │  64 partitions│
+                     │  but append) │        │  keyed: ad_id │
+                     └──────────────┘        └───┬───────┬───┘
+                                                 │       │
+                        ┌────────────────────────┘       └────────┐
+                        │ SPEED LAYER (seconds)      BATCH LAYER  │
+                        ▼                            (hourly)     ▼
+              ┌───────────────────┐                    ┌──────────────────┐
+              │  Stream Processor │                    │  Raw event lake  │
+              │  (Flink / Kafka   │                    │  S3, columnar,   │
+              │   Streams)        │                    │  partitioned by  │
+              │  · dedupe (§7b)   │                    │  hour. IMMUTABLE │
+              │  · window by      │                    └────────┬─────────┘
+              │    EVENT TIME     │                             │
+              │  · watermarks     │                             ▼
+              │  · aggregate      │                    ┌──────────────────┐
+              └─────────┬─────────┘                    │  Batch job       │
+                        │ minute counts                │  (Spark, hourly) │
+                        │                              │  EXACT recompute │
+                        ▼                              └────────┬─────────┘
+              ┌────────────────────────────────────┐            │
+              │        OLAP STORE (columnar)       │◀───────────┘
+              │  ClickHouse / Druid / Pinot        │  overwrites the
+              │  ad_stats_minute / _hour / _day    │  speed layer's
+              └─────────────────┬──────────────────┘  numbers with truth
+                                │
+                    ┌───────────┴───────────┐
+                    ▼                       ▼
+            ┌───────────────┐       ┌───────────────┐
+            │ Query Service │       │  Billing job  │
+            │  + Redis cache│       │ (reads _day,  │
+            └───────┬───────┘       │  batch only)  │
+                    ▼               └───────────────┘
+             Advertiser dashboard
+</code></pre>
+
+    <p>
+      Two paths out of one log. That is the whole picture, and it is a picture you <em>derived</em> in §2 rather than drew from
+      memory. Note who reads what: <strong>the dashboard reads whatever is freshest; billing reads only the batch layer, ever.</strong>
+      Billing is never allowed to look at speed-layer numbers, because speed-layer numbers are revisable and an invoice is not.
+    </p>
+
+    <h3>Walkthrough 1 — one click, end to end</h3>
+
+    <ol>
+      <li><strong>The click happens</strong> at <code>10:00:00.123</code>. The SDK mints an <code>event_id</code> (a UUID) and stamps
+        <code>event_ts</code> = now. <em>The event's identity and its time both originate at the source.</em> Everything downstream
+        depends on that.</li>
+      <li><strong>The browser is redirected immediately</strong> to the advertiser's landing page. It does not wait for us. The
+        beacon fires asynchronously (<code>navigator.sendBeacon</code>, which you know from the frontend side — it survives page
+        unload precisely because it doesn't block navigation).</li>
+      <li><strong>Ingest service</strong> validates the shape and appends to Kafka with <code>acks=all</code>, keyed by
+        <code>ad_id</code>. Returns <code>202</code>. Total server work: microseconds of validation, a network hop, done. If the
+        service is CPU-bound on anything, something is wrong.</li>
+      <li><strong>Kafka</strong> durably replicates the event to three brokers and hands it to a partition — the same partition every
+        click for that ad will land in, forever. It's now safe. Everything after this is recoverable.</li>
+      <li><strong>Stream processor</strong> (Flink) reads the partition. It (a) checks the <code>event_id</code> against its
+        recent-ids state and drops it if seen (§7b); (b) assigns it to the <code>10:00</code> <em>event-time</em> window — note: not
+        the window it happened to <em>arrive</em> in (§7a); (c) increments a counter in local state, keyed by
+        <code>(ad, minute, region, device)</code>. No lock, no coordination, no network — this partition is <em>its</em> partition.</li>
+      <li><strong>The watermark passes 10:01</strong>, meaning Flink now believes it has seen essentially everything for the
+        <code>10:00</code> window. It emits <code>(ad_8891, 10:00, us-east, ios) → 1183</code> and writes it to the OLAP store.
+        Elapsed since the click: seconds. The dashboard is live.</li>
+      <li><strong>In parallel</strong>, a Kafka Connect sink has been streaming the same raw events to S3 in hourly, columnar
+        partitions. That copy is untouched by any of the above.</li>
+      <li><strong>An hour later</strong>, the batch job reads <code>s3://clicks/date=2026-07-14/hour=10/</code> — a complete,
+        settled, immutable set of events including every late arrival — dedupes it globally, aggregates it exactly, and
+        <strong>overwrites</strong> the speed layer's numbers for that hour. The dashboard number may tick slightly. The invoice is
+        computed only from this.</li>
+    </ol>
+
+    <h3>Walkthrough 2 — one dashboard query</h3>
+
+    <ol>
+      <li>Advertiser opens the dashboard. Frontend issues <code>GET /v1/campaigns/42/clicks?from=…&amp;to=…&amp;granularity=minute</code>.</li>
+      <li><strong>Query service</strong> checks Redis. Yesterday's data is <em>final</em> — it can be cached for hours or days with no
+        risk, because it will never change again. That's most of the query, and it's free.</li>
+      <li>Only the <strong>current, still-open hour</strong> misses cache and actually hits the OLAP store. It's a scan of a few
+        thousand rows in a columnar table with time as the leading key — single-digit milliseconds.</li>
+      <li>Response is assembled, tagged <code>source: "speed", final: false</code> for the recent buckets and
+        <code>source: "batch", final: true</code> for the settled ones, and returned.</li>
+    </ol>
+
+    <div class="senior">The cache observation is worth saying because it's counter-intuitive and it's free: <em>"The read path is almost embarrassingly easy, and it's easy for a structural reason — historical aggregates are immutable once finalised. A number for last Tuesday can be cached forever with a 100% hit rate and zero invalidation logic, because there is no event that can change it. All the read pressure collapses onto the current hour, which is a tiny slice of data. So I get a near-perfect cache for free, purely as a consequence of the data being append-only and time-bucketed. Immutability keeps paying — it's the same reason the batch layer can exist at all."</em></div>
+
+    <div class="note">Notice what is <em>not</em> in the diagram: no database on the click path, no synchronous call between the ingest service and anything except Kafka, and no shared mutable state anywhere in the aggregation. Every component can be restarted, redeployed, or lost without losing a click. That property is not an accident of the drawing — it's what you were optimising for the whole time, and it's worth pointing at explicitly when you finish the diagram.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="deep-dive-1">7a. Deep dive: windowing, event time &amp; late data</h2>
+
+    <p>
+      <strong>This is where the interview really happens.</strong> Everything up to here was setup. If you get pushed into exactly one
+      deep dive on this question, it will be this one, because it is the part that separates people who have <em>operated</em> a
+      streaming pipeline from people who have drawn one. It is also, genuinely, the most transferable idea in stream processing:
+      once you understand event time versus processing time, every streaming system you ever touch makes sense, and until you do,
+      none of them do.
+    </p>
+
+    <h3>Event time vs processing time — the whole ballgame</h3>
+
+    <p>Two clocks. They are not the same clock, and confusing them silently corrupts your data.</p>
+
+    <ul>
+      <li><strong>Event time</strong> — when the click actually <em>happened</em>, on the user's device. Stamped by the SDK. It is a
+        fact about the world, and it never changes.</li>
+      <li><strong>Processing time</strong> — when your stream processor <em>got around to seeing it</em>. It is a fact about your
+        infrastructure, and it depends on network weather, GC pauses, consumer lag, whether you just redeployed, and whether the
+        user was in a tunnel.</li>
+    </ul>
+
+<pre><code>  EVENT TIME     10:00:00  ●  the user taps the ad (on a train)
+                             │
+                             │  ... phone enters a tunnel ...
+                             │  ... SDK retries, backs off, batches ...
+                             │
+  PROCESSING     10:00:37    ●  your Flink job finally sees it
+     TIME
+
+                 └── 37 seconds of "skew" ──┘
+
+  Bucket it by ARRIVAL and it lands in the 10:00 bucket by luck.
+  Now make the tunnel 4 minutes long:
+     event at 10:00:00 arrives at 10:04:12
+     → bucketed by arrival, it lands in the 10:04 bucket.
+     → The 10:00 minute is undercounted. The 10:04 minute is
+       overcounted. BOTH numbers are wrong. The daily total is
+       still right, which is exactly why nobody notices for months.
+</code></pre>
+
+    <p>
+      That last line is the one to say out loud. The failure is <em>invisible</em>: the totals reconcile, the dashboards look
+      plausible, and the per-minute shape of the data — which is precisely what an advertiser optimising a campaign is staring at —
+      is quietly, structurally wrong. And the moment you slice by region, it gets worse: users on bad mobile networks in
+      geographically distant regions have systematically higher skew, so <strong>your processing-time buckets are biased against
+      exactly the users with the worst connectivity.</strong> You have not made a random error. You have made a <em>correlated</em>
+      one, which is far more dangerous, because it survives averaging.
+    </p>
+
+    <div class="senior">Say it flatly, and this is the single highest-value sentence on the page: <em>"I have to aggregate by <strong>event time</strong>, not processing time. The click happened at 10:00 even if I see it at 10:04, and if I bucket by arrival I'll systematically undercount the minutes where users had bad connectivity and overcount the minutes after — the daily total still reconciles, so the bug is invisible, but every per-minute number is wrong and I'm billing on it. Bucketing by arrival time is the single most common way these pipelines are quietly broken in production."</em> Interviewers who have built one of these will visibly relax. It is a shibboleth.</div>
+
+    <div class="pitfall">Do not trust client clocks blindly, either — this is the sophisticated counterpoint and you should raise it <em>yourself</em>, before they do. Phones have wrong clocks. Some are wrong by hours; some are wrong <em>deliberately</em> (a fraudster backdating events into a cheaper billing period, or forward-dating them to poison a competitor's window). Mitigations: have the ingest service also stamp a trusted <code>received_ts</code> and keep <em>both</em>; reject or clamp events whose <code>event_ts</code> is implausible relative to <code>received_ts</code> (more than a few hours in the past, or <em>any</em> amount in the future); and use the client-server clock delta at SDK handshake to correct for a consistently-skewed device clock. "Trust the client's timestamp, but verify it against a server-side one and clamp the outliers" is the mature answer, and volunteering the fraud angle unprompted is a strong signal.</div>
+
+    <h3>Window types — know all three, use the first</h3>
+
+<pre><code>  TUMBLING (fixed, non-overlapping)   ← the default. "clicks per minute"
+    │──10:00──│──10:01──│──10:02──│──10:03──│
+    Every event belongs to EXACTLY ONE window.
+    Cheap: one counter per key per window. This is what you want.
+
+  SLIDING / HOPPING (overlapping)     ← "clicks in the last 5 min,
+    │────── 5 min ──────│               updated every 1 min"
+        │────── 5 min ──────│
+            │────── 5 min ──────│
+    Every event belongs to FIVE windows (size ÷ hop).
+    → 5× the state and 5× the update cost. Use only when the
+      question demands a moving average / trend line.
+
+  SESSION (gap-based, variable length) ← "a burst of activity,
+    │─ ─ ─│      │─ ─ ─ ─ ─│            then 30 min of silence"
+      ▲              ▲
+    activity      activity     Windows END when a gap threshold passes.
+    Not what you want for click counts. It IS what you want for
+    "user sessions," "engagement bouts," IoT device activity bursts.
+</code></pre>
+
+    <p>
+      For "clicks per minute" the answer is <strong>tumbling</strong>, and you should say why in one clause: every event lands in
+      exactly one bucket, so the state is one counter per key per window and the buckets sum cleanly into hours and days. Hopping
+      windows multiply your state by the overlap factor and don't compose — you cannot add up overlapping windows to get a daily
+      total, because you'd be counting each click five times. Reach for them only when the requirement is explicitly a moving
+      average. <strong>Knowing which window type <em>not</em> to use, and why, is the actual signal here</strong> — anyone can list
+      three window types.
+    </p>
+
+    <h3>Watermarks — how you decide a window is done</h3>
+
+    <p>
+      Here is the problem in its purest form. It is <code>10:01:00</code>. Is the <code>10:00</code> window complete? <strong>You
+      cannot know.</strong> There is no message that says "that was the last click of 10:00." A click from 10:00:59 might still be
+      in a tunnel, and you will find out only when it shows up — or never. You must therefore <em>decide</em>, on incomplete
+      information, when to stop waiting and publish the number.
+    </p>
+
+    <p>
+      A <strong>watermark</strong> is that decision, formalised. It's an assertion the stream processor makes to itself:
+      <em>"I believe I have now seen all events with event_time ≤ T."</em> When the watermark passes the end of a window, the window
+      fires — the aggregate is emitted and the state can be released. The usual heuristic is dead simple, and its simplicity is
+      worth admitting:
+    </p>
+
+<pre><code>  watermark = (max event_ts seen so far) − (allowed lateness)
+
+  e.g. allowed lateness = 30s:
+
+    max event_ts seen = 10:01:30
+    → watermark       = 10:01:00
+    → the 10:00 window (which covers 10:00:00-10:00:59) is now
+      BEHIND the watermark → fire it. Emit 1,183. Free the state.
+
+  A click with event_ts 10:00:45 that shows up at 10:02:10 is now
+  LATE. The window it belongs to has already been emitted.
+  What you do about it is the next subsection, and it's the
+  question the interviewer is actually building toward.
+</code></pre>
+
+    <div class="note"><strong>A watermark is a heuristic bet, not a guarantee.</strong> Nothing enforces it. It is an educated guess about how far behind reality your stream is, and it can be wrong — a whole region's events can be delayed by ten minutes by one bad network partition, sail past your 30-second watermark, and arrive late en masse. Watermarks make the <em>common</em> case correct and give you a defined, bounded policy for the uncommon one. Saying "it's a heuristic, not a guarantee" out loud is a small sentence that tells an interviewer you have actually thought about this rather than read the Flink docs once.</div>
+
+    <h3>The trade-off, and it is unavoidable</h3>
+
+    <p>Watermark lateness is a single dial with your two consumers pulling in opposite directions on it:</p>
+
+    <table>
+      <thead><tr><th>Allowed lateness</th><th>Latency</th><th>Correctness at emit</th><th>Consequence</th></tr></thead>
+      <tbody>
+        <tr><td><strong>0s</strong> (fire immediately)</td><td>Instant</td><td>Poor — you miss anything even slightly delayed</td><td>Constant revisions. The dashboard flickers.</td></tr>
+        <tr><td><strong>30s</strong></td><td>~30s behind</td><td>Catches the vast majority</td><td><strong>The sweet spot for a dashboard.</strong></td></tr>
+        <tr><td><strong>5 min</strong></td><td>5 min behind</td><td>Very good</td><td>Dashboard now feels sluggish. Users complain.</td></tr>
+        <tr><td><strong>3 hours</strong></td><td>Useless for live</td><td>Nearly everything</td><td>You have accidentally rebuilt batch processing — badly.</td></tr>
+      </tbody>
+    </table>
+
+    <p>
+      <strong>Wait longer = more correct but higher latency. Emit sooner = faster but you'll have to revise.</strong> There is no
+      setting that is both. This is not an implementation detail you can tune your way out of; it is a fundamental property of trying
+      to publish a fact about a time period that hasn't finished arriving yet, and interviewers push here <em>precisely because</em>
+      there's no right answer — they want to see whether you'll pretend there is one.
+    </p>
+
+    <div class="senior">The answer that lands: <em>"I'd set the watermark's allowed lateness to about 30 seconds, based on the p99 of the observed event-time skew — and I'd measure that skew as a first-class metric rather than guessing, because it tells me whether my 30 seconds is still right six months from now when the mobile SDK changes its batching. But I want to be clear that no watermark setting makes this correct; it's a bet about how much of the distribution I've seen. Which is exactly why the batch layer exists — the batch job doesn't need a watermark at all, because by the time it runs, the hour is genuinely over and everything has arrived. The speed layer <strong>guesses</strong>; the batch layer <strong>knows</strong>. Billing reads the one that knows."</em> That paragraph collapses §7a and §7c into one idea and is close to the strongest thing you can say on this page.</div>
+
+    <h3>Late data — the click that shows up an hour late</h3>
+
+    <p>The window fired. The number was published. And now a click for that window arrives. Three options, and you must pick per-consumer:</p>
+
+    <table>
+      <thead><tr><th>Option</th><th>How</th><th>Cost</th><th>When</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>1. Drop it</strong></td>
+          <td>Discard events behind the watermark. <strong>Emit a metric counting the drops.</strong></td>
+          <td>Silent undercount. Revenue you never billed.</td>
+          <td>Acceptable for the dashboard. <strong>Never</strong> for billing.</td>
+        </tr>
+        <tr>
+          <td><strong>2. Update the aggregate (restate)</strong></td>
+          <td>Re-open the window, add the click, re-emit the corrected total. Requires an <em>updatable</em> sink and downstream consumers that tolerate a number changing.</td>
+          <td>The published number moves. Anything that already consumed it must handle the correction.</td>
+          <td><strong>The billing answer.</strong> Also the right default for recent windows.</td>
+        </tr>
+        <tr>
+          <td><strong>3. Side output</strong></td>
+          <td>Route late events to a separate "late" topic/table. Reconcile them out-of-band, on a schedule.</td>
+          <td>Complexity. A second path that must not be forgotten.</td>
+          <td>When lateness is rare but must be audited — the fintech-flavoured answer.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>
+      Notice that option 1 is not "do nothing" — it is "drop it <em>and count how often you did</em>." The drop rate is a metric you
+      alert on. If it creeps from 0.01% to 3%, something upstream has changed (a new SDK version batching more aggressively, a
+      region with degraded connectivity) and you want to know that from a graph, not from an advertiser's angry email. <strong>An
+      unmeasured drop is a bug; a measured drop is a policy.</strong> That distinction is a genuinely senior instinct and it costs
+      one line of code.
+    </p>
+
+    <h3>Restatement is normal — and this is tutorial 13 again</h3>
+
+    <p>
+      For billing you <strong>cannot drop</strong>. An advertiser paid for a click that happened; you are contractually obliged to
+      count it, and "our watermark had already passed" is not a defence anyone outside engineering will accept. So you
+      <strong>restate</strong>: you go back, correct the number, and — critically — you make the correction <em>visible and
+      auditable</em> rather than silently overwriting.
+    </p>
+
+    <p>
+      This should feel familiar, because it is the exact posture from <a href="13-payments-orders.html">tutorial 13</a>. In a
+      double-entry ledger you never edit a posted entry; you post a <strong>correcting entry</strong> and the history shows both.
+      Financial restatement is a normal, expected, well-understood operation — a Tuesday. It is not a failure, it is not an
+      embarrassment, and any system that touches money is built assuming it will happen. Applied here: the billing pipeline produces
+      a number for each day, and when late data or a corrected dedup arrives, it produces a <em>delta</em> against that number with a
+      reason code, rather than mutating yesterday's total into a different total that nobody can explain.
+    </p>
+
+    <div class="senior">Say: <em>"For the dashboard I'd drop late data past the watermark and just track the drop rate as a metric. For billing I <strong>can't</strong> drop it — so I restate. The batch layer recomputes the hour from the raw log once the hour is genuinely settled, and if that produces a different number than what we already invoiced, we issue an adjustment. That's not a failure mode, that's just how anything that touches money works — it's the same reason a ledger posts a correcting entry instead of editing history. Same event, same system, two different policies, because the two consumers have two different tolerances. That's what the split from the requirements section actually buys me."</em></div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="deep-dive-2">7b. Deep dive: exactly-once counting</h2>
+
+    <p>
+      Frame the stakes in one sentence before you touch the mechanism, because the stakes are what make this different from counting
+      page views: <strong>advertisers are billed on these numbers, so double-counting a click is not a rounding error — it is billing
+      fraud.</strong> Undercounting is revenue you never invoiced; overcounting is money you took for a click that didn't happen.
+      Both are unacceptable in the batch layer. Now: how do duplicates get in?
+    </p>
+
+    <h3>Duplicates are guaranteed, not hypothetical</h3>
+
+<pre><code>  Where a duplicate is born — every one of these is REAL:
+
+  1. Client retry.     SDK sends, network eats the 202, SDK retries.
+                       Two identical events on the wire.
+  2. Producer retry.   Ingest service writes to Kafka, the broker's
+                       ack is lost, the producer retries. Two records.
+  3. Consumer replay.  Flink crashes after aggregating a batch but
+                       before committing its offset. On restart it
+                       re-reads from the last COMMITTED offset and
+                       re-processes events it already counted.
+  4. Redeploy / rebalance. Same as 3, on purpose, every Tuesday.
+</code></pre>
+
+    <p>
+      You proved in <a href="05-coordination-consensus.html">05</a> that you cannot make delivery exactly-once — the
+      general-two-armies problem doesn't go away because you bought a better message broker. Every one of those pipes is
+      <strong>at-least-once</strong>. So the duplicates are coming, they are coming continuously, and the design question is not "how
+      do I prevent them" but <strong>"how do I make counting them twice harmless."</strong> Which is the same answer it was in 05, 06,
+      12, and 13: <strong>at-least-once delivery + idempotent processing = effectively-once.</strong>
+    </p>
+
+    <div class="senior">The sentence, and you should say it before they can ask: <em>"I want to be precise about exactly-once, because I don't think it exists at the level people usually mean it. Delivery is at-least-once — that's what the network gives me and no broker changes it. What I can achieve is <strong>idempotent processing</strong>: every event carries a unique ID minted at the source, and applying the same event twice produces the same count as applying it once. That's effectively-once, and it's the only version of exactly-once that's real."</em> This is the payoff of tutorial 05 and you should visibly spend it.</div>
+
+    <h3>Idempotent aggregation — and the problem with it</h3>
+
+    <p>
+      Give every event a UUID at the source (§4 — the SDK mints it, and it survives retries). Now the aggregator can dedupe: keep the
+      set of IDs it has already counted, and skip repeats.
+    </p>
+
+<pre><code>  <span class="kw">if</span> (seenIds.contains(e.eventId())) <span class="kw">return</span>;   <span class="com">// duplicate — drop</span>
+  seenIds.add(e.eventId());
+  counts.merge(key(e), <span class="num">1L</span>, <span class="typ">Long</span>::sum);
+</code></pre>
+
+    <p>
+      Beautifully simple, and it does not work, for a reason you should raise <em>yourself</em>:
+      <strong><code>seenIds</code> grows without bound.</strong> A billion events a day × 16 bytes is 16 GB a day of IDs, forever,
+      and you must check membership against all of it on every single event at 50k/sec. You cannot hold a global set of a billion
+      event IDs in memory. Anyone who writes that line and moves on has not thought about it; anyone who writes it and then says
+      "…and here's why that's a lie" is having a different interview.
+    </p>
+
+    <h3>Bounded dedup — the honest, pragmatic answer</h3>
+
+    <p><strong>You dedupe within a bounded window, not globally.</strong> Two ways, and you'd use both at different layers:</p>
+
+    <table>
+      <thead><tr><th></th><th>Keyed state store with TTL</th><th>Bloom filter</th></tr></thead>
+      <tbody>
+        <tr><td><strong>What</strong></td><td>Flink/Kafka-Streams keyed state (RocksDB-backed): <code>event_id → seen</code>, TTL 10–60 min</td><td>A probabilistic set (<a href="06-caching-queues-resilience.html">06</a>, and you used it for URL dedup in <a href="17-web-crawler-search.html">17</a>)</td></tr>
+        <tr><td><strong>Memory</strong></td><td>Exact but heavy: 30M ids in 10 min ≈ 500 MB+ per operator, spilled to disk</td><td>~1.2 GB for 1B ids at 1% FP — or a few hundred MB per rotating window</td></tr>
+        <tr><td><strong>Error</strong></td><td>None within the window</td><td>False positives only: it may claim it has seen an event it hasn't → <strong>you drop a real click</strong></td></tr>
+        <tr><td><strong>Verdict</strong></td><td><strong>Use in the speed layer.</strong> Exact, bounded, survives restart via checkpoints.</td><td>Great as a cheap pre-filter; risky as the <em>only</em> gate for billing, because a false positive silently deletes revenue.</td></tr>
+      </tbody>
+    </table>
+
+    <p>
+      Note the direction of the bloom filter's error and why it matters <em>here</em> specifically. A bloom filter never says "not
+      seen" about something it has seen, but it will occasionally say "seen" about something it hasn't. In the crawler (17) that was
+      fine — a false positive meant you skipped crawling one URL out of a billion, and who cares. Here, a false positive means
+      <strong>you silently drop a real, billable click</strong>. Same data structure, same error rate, completely different
+      acceptability, purely because of what the error <em>costs</em> in this domain. <strong>Reasoning about the direction and the
+      price of a probabilistic error, rather than just quoting its rate, is exactly the senior move</strong> — and it's the same
+      reasoning that will govern §7d.
+    </p>
+
+    <div class="senior">Be honest about the limit rather than papering over it — this is a place where candidates bluff and interviewers can tell: <em>"I should be clear that this is dedup <strong>within a window</strong>, not global dedup. I'll keep event IDs for, say, an hour, which catches essentially every realistic duplicate — client retries, producer retries, and consumer replay all happen within seconds. A duplicate arriving four hours apart would slip through the stream layer. That's the pragmatic real-world answer, and it's what production systems actually do. The batch layer is what closes the gap: it re-reads the raw hour from S3 and does an exact global <code>SELECT DISTINCT event_id</code> over the whole partition, where memory isn't a constraint because it's not a streaming job. So the speed layer is approximately deduped and the batch layer is exactly deduped — which, again, is precisely the split I set up in requirements."</em> Everything on this page keeps landing back on that one decision. That's what a coherent design feels like.</div>
+
+    <h3>Kafka's exactly-once semantics (EOS) — what it does and doesn't buy you</h3>
+
+    <p>
+      The interviewer may well say "but Kafka has exactly-once now, doesn't it?" This is a trap only if you don't know the shape of
+      the answer. Kafka's transactions give you an <strong>atomic read-process-write within Kafka</strong>: consume from topic A,
+      produce to topic B, and commit the consumer offset — all three in one transaction that either fully commits or fully aborts.
+      Combined with an idempotent producer (which dedupes producer retries using a sequence number per partition), that genuinely
+      eliminates duplicate categories 2, 3 and 4 from the list above <em>as long as you stay inside Kafka</em>.
+    </p>
+
+<pre><code>  WHAT KAFKA EOS COVERS:
+
+    [Kafka topic] ──▶ [ Flink / Kafka Streams ] ──▶ [Kafka topic]
+                       └── offset commit ────┘
+    └──────── all atomic, all inside Kafka ─────────┘   ✅
+
+  WHAT IT CANNOT COVER:
+
+    [ Flink ] ──▶ [ ClickHouse ]   ← an EXTERNAL side effect.
+                  [ S3 ]              Kafka's transaction
+                  [ an HTTP call ]    cannot roll this back.  ❌
+
+    The sink must be idempotent (upsert by primary key) or
+    transactional (two-phase commit with the sink), or you're
+    back to at-least-once at the last mile.
+</code></pre>
+
+    <p>
+      So: EOS is real, it is useful, and it is <strong>not a general solution</strong> — it can't make your external side effect
+      exactly-once, because the moment the effect leaves Kafka's world, Kafka has no way to undo it. This is exactly
+      <a href="05-coordination-consensus.html">tutorial 05</a>'s line: <em>delivery is a myth, processing is achievable.</em> The
+      practical fix at the sink is the boring one and it works: make the OLAP write an <strong>idempotent upsert</strong> keyed by
+      <code>(minute, ad_id, region, device)</code> that <em>sets</em> the count rather than incrementing it. Re-applying the same
+      window emit twice writes the same value twice. Harmless. <strong>Idempotency at the sink is what makes at-least-once delivery
+      to the sink survivable</strong>, and it costs nothing but choosing <code>SET</code> over <code>INCREMENT</code>.
+    </p>
+
+    <div class="pitfall">An <em>incrementing</em> sink (<code>UPDATE … SET clicks = clicks + ?</code>) is not idempotent, and it will silently over-bill on every single Flink restart, forever, in a way that reconciles against nothing and that you will discover months later. <strong>Emit whole window totals and upsert them, never deltas.</strong> If the window's true count is 1,183, write <code>1183</code> — write it a hundred times if the pipeline retries; the answer is still 1,183. This one-word difference between <code>SET</code> and <code>+=</code> is the difference between a pipeline that survives restarts and one that quietly commits fraud.</div>
+
+    <h3>Kafka partitioning — what makes this parallel AND what makes it correct</h3>
+
+    <p>
+      Now the piece that ties the whole architecture together, and it is worth being explicit about because most candidates treat
+      partitioning as a throughput knob and miss that it is doing <em>correctness</em> work too.
+    </p>
+
+<pre><code>  Key every click by ad_id:
+
+    partition = hash(ad_id) % 64
+
+    ad_8891 ─────────────────▶ partition 12 ──▶ consumer C3
+    ad_8891 ─────────────────▶ partition 12 ──▶ consumer C3
+    ad_8891 ─────────────────▶ partition 12 ──▶ consumer C3
+    ad_1234 ─────────────────▶ partition 47 ──▶ consumer C9
+
+  ⇒ EVERY click for ad_8891 lands on ONE partition,
+    read by ONE consumer, aggregated into ONE local counter.
+</code></pre>
+
+    <p>Read what that bought you, because it's two things and they're both large:</p>
+
+    <ul>
+      <li><strong>Parallelism.</strong> 64 partitions, 64 consumers, 64× the throughput. Linear scale-out by adding partitions.</li>
+      <li><strong>Correctness without coordination.</strong> This is the good bit. Because <em>all</em> clicks for an ad go to
+        <em>one</em> consumer, that consumer can hold the running count in <strong>local memory</strong> and increment it with no
+        lock, no transaction, no Redis, no consensus, no network round-trip. There is no race, because there is no second writer.
+        <strong>Partitioning by the aggregation key turns a distributed counting problem into a bunch of independent single-threaded
+        counting problems</strong> — and single-threaded counting is trivial. The hard distributed problem was <em>designed away</em>
+        rather than solved.</li>
+    </ul>
+
+    <div class="senior">Say: <em>"The partition key isn't just a sharding decision, it's what makes the aggregation correct. By keying on ad_id, every click for a given ad is handled by exactly one consumer, so that consumer owns the counter outright and can update it in local memory with no coordination at all. I'm not solving distributed counting — I'm partitioning the problem so that it's never distributed in the first place. That's why this design has no distributed lock and no <code>INCR</code> anywhere in it, which is the thing that would have killed it at 50k/sec."</em> That framing — <em>partition so the hard problem doesn't exist</em> — is the reusable idea from <a href="04-partitioning-hashing.html">04</a> in its purest form.</div>
+
+    <h3>And the consequence: the hot partition. It always finds you.</h3>
+
+    <p>
+      You knew this was coming, because it has come for every system in this course. Key by <code>ad_id</code> and <strong>one viral
+      ad is one melting partition.</strong> The Super Bowl spot, the celebrity endorsement, the campaign that gets 30% of the day's
+      total traffic — all of it hashes to a single partition, handled by a single consumer, which is now doing 15k events/sec while
+      63 of its peers idle at 200/sec. You cannot fix this by adding partitions: <code>hash(ad_8891)</code> is still one number, so
+      it still lands in exactly one place. <strong>More partitions does not split one key.</strong>
+    </p>
+
+    <p>The fix is <strong>key salting plus a second aggregation stage</strong> — and this is a genuinely good answer to a hard follow-up:</p>
+
+<pre><code>  STAGE 1 — salt the key to spread the hot ad across N partitions:
+
+    key = ad_id + ":" + random(0..15)     <span class="com">// 16 salts</span>
+
+    ad_8891:0 ──▶ partition 12 ──▶ C3  ──▶ partial count: 74
+    ad_8891:1 ──▶ partition 29 ──▶ C7  ──▶ partial count: 81
+    ad_8891:2 ──▶ partition 51 ──▶ C11 ──▶ partial count: 69
+    ...                                    (16 partials, in parallel,
+                                            on 16 different machines)
+
+  STAGE 2 — re-key by ad_id alone and combine the partials:
+
+    (ad_8891, minute, partial) ──▶ re-partition by ad_id
+                                ──▶ ONE consumer sums 16 partials
+                                ──▶ 74 + 81 + 69 + ... = 1,183  ✅
+
+  The second stage handles 16 messages per ad per minute
+  instead of 15,000 per second. It cannot be hot. That's the trick.
+</code></pre>
+
+    <p>
+      <strong>Two-level aggregation.</strong> The first level does the enormous work and is perfectly parallel because the salt
+      spreads it; the second level does trivial work (summing 16 numbers) and therefore doesn't care that it's a single point for
+      that key. You have moved the skew into a stage where skew doesn't hurt. This is the same shape as a MapReduce combiner, and the
+      same shape as the hybrid fan-out answer in <a href="10-news-feed.html">tutorial 10</a>: <strong>the celebrity gets a different
+      code path, and the code path is cheap precisely because it operates on already-reduced data.</strong>
+    </p>
+
+    <div class="note">The refinement that shows real judgment: <strong>salt adaptively, not always.</strong> Salting every ad doubles the pipeline's stages and its state for the 99.99% of ads that are not hot and never will be. Better: track per-key throughput, and salt only the keys that cross a threshold — maintain a small dynamic set of "hot ads" (a count-min sketch is literally built for this, see §7d) and apply the salt only to them. Same trade you made for celebrities in tutorial 10: <strong>the common case stays simple, and only the pathological case pays the complexity tax.</strong> Applying an expensive fix uniformly to a rare problem is a real cost, and noticing that is the difference between knowing the technique and knowing when to use it.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="deep-dive-3">7c. Deep dive: batch vs stream (lambda vs kappa)</h2>
+
+    <p>
+      Most candidates arrive at lambda architecture by reciting it. You are going to arrive at it because <strong>§2 proved you
+      needed it</strong>, and that difference is audible. Recall the requirement that forced this: <em>the dashboard wants speed and
+      tolerates error; billing wants exactness and tolerates delay.</em> Two consumers, two tolerances, one event log. So: two layers
+      over that log.
+    </p>
+
+    <h3>The speed layer</h3>
+    <ul>
+      <li><strong>What:</strong> the Flink job from §7a/§7b. Reads Kafka continuously, windows by event time, emits within seconds.</li>
+      <li><strong>Properties:</strong> fast (seconds), approximate (bounded dedup, watermark drops, HLL estimates), and
+        <strong>revisable</strong> — its numbers are the best guess available right now.</li>
+      <li><strong>Serves:</strong> the dashboard. <em>Only</em> the dashboard.</li>
+    </ul>
+
+    <h3>The batch layer</h3>
+    <ul>
+      <li><strong>What:</strong> an hourly (or daily) Spark job that reads the raw events for a <em>settled</em> hour from S3 and
+        recomputes the aggregate from scratch.</li>
+      <li><strong>Properties:</strong> slow (hours), <strong>exact</strong> — global dedup over the whole partition, every late
+        event already present, no watermark needed because <em>the hour is genuinely over</em>. Nothing is a guess.</li>
+      <li><strong>Serves:</strong> billing. And it <strong>overwrites the speed layer's numbers</strong> in the OLAP store as it
+        goes, so the dashboard's history silently converges on the truth as it ages.</li>
+    </ul>
+
+    <p>
+      That last clause is the elegant part and it deserves a sentence of its own: <strong>the batch layer doesn't just serve billing,
+      it continuously <em>corrects</em> the speed layer.</strong> Today's numbers on the dashboard are approximate and live.
+      Yesterday's are exact and final, because the batch job has been through them. The user sees one seamless chart; the freshness
+      and the accuracy of any given point depend on its age. That is not a bug you're apologising for — it's the design working, and
+      it's exactly what the <code>final: true|false</code> flag in your §4 API response is telling the client.
+    </p>
+
+    <h3>Why the batch layer can exist at all</h3>
+
+    <p>
+      Stop and stare at this, because it's the deepest idea on the page and it is <em>not</em> obvious:
+    </p>
+
+    <p style="font-size:1.05rem"><strong>The batch layer is only possible because the raw event log is immutable and retained. Any aggregate can always be re-derived from it. Therefore no aggregate is ever precious — every aggregate is just a cache.</strong></p>
+
+    <p>
+      If you had thrown the raw clicks away after aggregating them — as the naive <code>counter++</code> design does, implicitly, on
+      every single event — there would be nothing to recompute <em>from</em>. A bug in your aggregation logic would be permanent:
+      the wrong number would be the only number you have, forever, with no way back to the truth. Instead: <strong>store the raw
+      events forever, cheaply, in S3, and treat every aggregate as a disposable, rebuildable view.</strong> That single decision buys
+      you, in one purchase:
+    </p>
+
+    <ul>
+      <li><strong>The batch layer.</strong> Recompute exactly, whenever, as many times as you like.</li>
+      <li><strong>Backfills.</strong> Bug in the aggregation logic? Fix the code, replay, overwrite. (§10.)</li>
+      <li><strong>New dimensions.</strong> Product wants to slice by browser next quarter, retroactively? The field was in the raw
+        event all along. Recompute history. No time machine required.</li>
+      <li><strong>Auditability.</strong> "Why was I billed for 1,183 clicks?" — here are the 1,183 raw events, with IDs and
+        timestamps. That is a defensible answer, and it is the <em>only</em> defensible answer.</li>
+      <li><strong>Disaster recovery.</strong> Lost the entire OLAP cluster? It was a cache. Rebuild it.</li>
+    </ul>
+
+    <div class="senior">Point at the through-line, out loud, because it's the thing that makes you sound like you've internalised the whole course rather than memorised twelve designs: <em>"This is the same principle as the ledger in the payments design and the timeline in the news feed: <strong>keep the immutable source of truth, derive everything else, and never mutate a derived value in place.</strong> The event log is truth; the aggregate is a materialised view over it; the cache is a materialised view over that. Every layer can be rebuilt from the one below it. That's why I can be relaxed about the speed layer being approximate — nothing it produces is precious, because I can always regenerate it from data I never threw away."</em> The interviewer is now grading you on <em>architecture</em>, not on ad-click trivia.</div>
+
+    <h3>Lambda architecture — run both. And be honest about the cost.</h3>
+
+<pre><code>            ┌────────────────────────────────────────┐
+            │        RAW EVENT LOG (immutable)       │
+            │           Kafka  →  S3                 │
+            └───────┬────────────────────────┬───────┘
+                    │                        │
+        SPEED LAYER │                        │ BATCH LAYER
+        (Flink)     │                        │ (Spark, hourly)
+        seconds     │                        │ hours
+        approximate │                        │ EXACT
+        revisable   │                        │ final
+                    ▼                        ▼
+            ┌───────────────────────────────────────┐
+            │            SERVING LAYER              │
+            │      (OLAP store — batch WINS)        │
+            └───────────────────────────────────────┘
+                    │                        │
+                    ▼                        ▼
+               Dashboard                  Billing
+          (reads freshest)          (reads batch ONLY)
+</code></pre>
+
+    <p>
+      Now say the quiet part, because pretending lambda is free is the tell of someone who has only read about it:
+      <strong>you now maintain two implementations of the same aggregation logic, in two different systems, in two different
+      programming models — and they will drift.</strong> A Flink job in Java and a Spark job in Scala both computing "clicks per
+      minute per region." Someone fixes a timezone bug in one and forgets the other. Someone adds a new dimension to the batch job
+      and the streaming job silently keeps emitting the old schema. The dashboard and the invoice disagree, an advertiser notices,
+      and now you're in a meeting. <strong>This is a well-known, real, expensive pain — and saying so unprompted is worth more than
+      any amount of enthusiasm about the pattern.</strong>
+    </p>
+
+    <h3>Kappa architecture — just the stream, and replay when you need to</h3>
+
+    <p>
+      The alternative, and increasingly the modern default. <strong>Delete the batch layer. Keep only the stream.</strong> If you
+      need to recompute — because of a bug, a new dimension, or a correction — you <em>replay the log from the beginning through the
+      same code</em>.
+    </p>
+
+<pre><code>  KAPPA:
+
+    RAW LOG (Kafka + tiered storage) ──▶ [ Stream job ] ──▶ OLAP
+                    ▲                          │
+                    └──── replay from offset 0 ┘
+                         with the NEW code,
+                         writing to a NEW table,
+                         then atomically swap.
+
+  ONE codebase. ONE programming model. ONE set of bugs.
+  "Batch" is just "a stream you're reading very fast, from the start."
+</code></pre>
+
+    <p>
+      The insight is that <strong>batch is not a different kind of computation — it's a bounded stream.</strong> Flink and Spark
+      Structured Streaming both explicitly support this: the same job runs over a bounded historical range or an unbounded live one.
+      So if reprocessing is just "run the same job from offset 0," you never needed a second implementation. You needed a
+      <em>replayable log</em>, which you have, which is why kappa is possible <em>precisely and only because Kafka retains the raw
+      events</em> (with tiered storage to S3 for the long tail). Kappa is not a clever trick — it is what falls out naturally once
+      you take "the log is the source of truth" seriously.
+    </p>
+
+    <table>
+      <thead><tr><th></th><th>Lambda</th><th>Kappa</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Codebases</strong></td><td>Two (stream + batch). <strong>They drift.</strong></td><td>One. No drift possible.</td></tr>
+        <tr><td><strong>Exactness</strong></td><td>Batch layer is trivially exact — the hour is settled and memory isn't a constraint</td><td>Must engineer exactness into the stream job (global dedup on replay, no watermark drops when reprocessing bounded data)</td></tr>
+        <tr><td><strong>Reprocessing</strong></td><td>Run the batch job. Natural.</td><td>Replay from offset 0. Needs long retention + enough throughput to catch up.</td></tr>
+        <tr><td><strong>Ops burden</strong></td><td>Two systems, two on-call surfaces, two skill sets</td><td>One system</td></tr>
+        <tr><td><strong>Maturity</strong></td><td>The battle-tested answer. What most big shops actually run.</td><td>The modern answer. What most of them are migrating toward.</td></tr>
+        <tr><td><strong>When you'd pick it</strong></td><td>Money is on the line and you want a dead-simple, obviously-correct exact path that a finance auditor can read</td><td>You trust your stream job's correctness and value having one codebase over having a trivially-auditable one</td></tr>
+      </tbody>
+    </table>
+
+    <div class="senior">The answer that gets you the offer: <em>"I'd start with lambda, and I'd say so knowing it's not fashionable. The reason is specifically the billing requirement: a batch job that reads a settled hour from S3 and does a plain <code>SELECT COUNT(DISTINCT event_id) GROUP BY</code> is <strong>obviously</strong> correct — I can hand that SQL to a finance auditor and they can read it. Convincing anyone that a stateful streaming job with watermarks and TTL'd dedup state is exactly correct is a much harder conversation, and when the output is an invoice, 'obviously correct' has real value beyond engineering elegance. That said, I'd acknowledge the cost honestly: two codebases computing the same thing will drift, and that's a real, recurring operational pain — so I'd mitigate it by sharing the aggregation logic as a library between the two jobs, and I'd add a <strong>reconciliation check that alerts when the two layers disagree by more than a threshold</strong>. And if the team is strong on Flink, kappa is the better long-term answer and I'd plan to migrate — the raw log makes that migration possible at any time, which is exactly why keeping it is the decision that matters more than the choice between lambda and kappa."</em> That answer picks a side, defends it on grounds specific to <em>this</em> problem, names its cost, mitigates the cost, and identifies the decision that outranks the question asked. That's the whole game.</div>
+
+    <div class="pitfall">Do not say "I'd use lambda architecture" and stop, as though naming it were the answer. And do not say "lambda is outdated, I'd use kappa" without being able to explain how kappa achieves exactness for billing — because that is the very next question, and "the stream job is exactly-once" is not an answer after you've just spent §7b explaining that exactly-once delivery is a myth. The interviewer is not testing whether you know the two words. They are testing whether you know what each layer <em>costs</em>.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="approx">7d. Approximate algorithms — and knowing when error is acceptable</h2>
+
+    <p>
+      These get name-dropped in a lot of interviews where they don't belong. <strong>Here they genuinely earn their place</strong>,
+      because you have a requirement that explicitly licenses them ("1% error on the dashboard is fine") and a requirement that
+      explicitly forbids them ("not on the invoice"). That contrast is the lesson, and it's a bigger lesson than any of the three
+      data structures.
+    </p>
+
+    <h3>The problem: counting <em>distinct</em> things is expensive</h3>
+
+    <p>
+      "Clicks" is easy — it's a counter, 8 bytes. "<strong>Unique users who clicked</strong>" is a completely different animal, and
+      advertisers care about it more (a thousand clicks from one bot is worth nothing; a thousand clicks from a thousand people is a
+      campaign). To count distinct users <em>exactly</em>, you must remember <strong>every user ID you have seen</strong>, because you
+      cannot know whether the next one is new without checking against all of them.
+    </p>
+
+<pre><code>  EXACT unique-visitor count, per ad, per minute:
+
+    Set&lt;UserId&gt; seen  — for EVERY (ad, minute, region, device) key
+
+    A campaign with 10M unique users today:
+      10M × 8 B  =  80 MB    for ONE campaign, ONE day.
+    × thousands of campaigns × every time bucket
+      →  hundreds of GB of RAM in the stream processor.
+
+  And the answer you wanted was a single integer.
+</code></pre>
+
+    <h3>HyperLogLog — 12 KB instead of 80 MB</h3>
+
+    <p>
+      <strong>HyperLogLog estimates the cardinality of a set in ~12 KB, with roughly 2% error, regardless of whether the set has a
+      thousand elements or a billion.</strong> That is not a typo, and the "regardless" is the astonishing part.
+    </p>
+
+    <p>
+      The intuition — this is all you need, and you should give exactly this much and no more: hash each user ID to a uniform random
+      bit string. In a stream of random bit strings, seeing one that starts with <em>k</em> leading zeros is a
+      1-in-2<sup>k</sup> event. So if the most leading zeros you have <em>ever</em> seen is 10, you have probably seen around
+      2<sup>10</sup> ≈ 1,000 distinct values — because you'd expect to need about that many draws before such a rare pattern showed
+      up. <strong>The rarest pattern you've observed is evidence of how many things you've observed.</strong> One extreme
+      observation is a wildly noisy estimator, of course, so HLL splits the hash space into thousands of independent buckets, tracks
+      the max leading-zero count in each, and takes a bias-corrected harmonic mean across them. That averaging is what drops the
+      error to ~2% and what turns a party trick into a production data structure.
+    </p>
+
+    <p>And two properties make it perfect for <em>this</em> pipeline specifically, which is the reason it's here and not just trivia:</p>
+
+    <ul>
+      <li><strong>Fixed size.</strong> 12 KB whether the ad had 100 unique users or 100 million. Your state size is now bounded by
+        the number of <em>keys</em>, not by the number of <em>users</em> — which is exactly the unbounded-state problem you were
+        trying to escape.</li>
+      <li><strong>Mergeable.</strong> This is the one that actually matters here. <code>HLL(A) ∪ HLL(B)</code> is a valid HLL of
+        <code>A ∪ B</code> — a bytewise max of the registers. So you can store one sketch <em>per minute</em>, and then compute
+        uniques for any hour, day, or arbitrary range by merging the minute sketches. <strong>You cannot do that with exact
+        counts</strong>: summing the distinct-user counts of 60 minutes double-counts everyone who clicked in two different minutes,
+        and you have no way to correct for it because you threw the identities away. Mergeability is what makes rollups possible at
+        all, and it's why the <code>uniques_hll BLOB</code> column exists in the §5 schema.</li>
+    </ul>
+
+    <div class="senior">The framing that matters more than the algorithm: <em>"For unique visitors I'd store a HyperLogLog sketch per bucket — about 12 KB, roughly 2% error, and crucially it's <strong>mergeable</strong>, so I can roll minutes up into hours and days by unioning sketches. Exact distinct counts don't roll up at all: you can't add the uniques of 60 minutes to get the uniques of an hour. And 2% error on a unique-visitor chart is completely invisible to an advertiser — nobody has ever made a decision differently because a number said 4.9M instead of 5.0M. <strong>But I would not use it for anything billable.</strong> Same system, same data, different error tolerance — and knowing which is which is the actual skill. Approximation is a design choice I'm making deliberately here, not a corner I'm cutting."</em></div>
+
+    <h3>Count-min sketch — heavy hitters and top-K</h3>
+
+    <p>
+      Same trade in a different shape. <strong>"What are the top 100 trending ads right now?"</strong> Exactly answering that means
+      keeping a counter for every ad in existence and sorting it — millions of counters, most of them holding tiny numbers you don't
+      care about, all to find the hundred that are big.
+    </p>
+
+    <p>
+      A <strong>count-min sketch</strong> is a small 2-D array of counters plus <em>d</em> independent hash functions. To increment,
+      hash the key <em>d</em> ways and bump one counter in each row. To query, hash it <em>d</em> ways and take the
+      <strong>minimum</strong> of those counters. Collisions can only ever <em>add</em> to a counter, never subtract — so the minimum
+      across <em>d</em> rows is the least-contaminated estimate available, and the sketch <strong>always over-estimates, never
+      under-estimates</strong>. In a few megabytes it will tell you which keys are heavy with high confidence.
+    </p>
+
+    <p>
+      Note the error direction, and note that it is the <em>right</em> direction here: the sketch may tell you a cold ad is slightly
+      warmer than it is, but it will never tell you a genuinely hot ad is cold. For finding heavy hitters, an over-estimate on the
+      cold tail is harmless while a missed hot key would be fatal — the structure's bias is aligned with the use case. Which is why
+      count-min is the right tool for the <strong>adaptive hot-key detector</strong> you promised in §7b: you need to reliably notice
+      the ads that are melting a partition, and you do not care about being slightly wrong about the ads that aren't.
+    </p>
+
+    <h3>Reservoir sampling — keep a fair sample of an infinite stream</h3>
+
+    <p>
+      The third one, and the simplest. You want to keep <em>k</em> events out of a stream of unknown, unbounded length, such that
+      every event has an equal probability of being in your sample. <strong>Reservoir sampling</strong>: keep the first <em>k</em>;
+      for the <em>n</em>-th event thereafter, keep it with probability <em>k/n</em>, evicting a random incumbent. One pass, O(k)
+      memory, provably uniform, and it never needs to know how long the stream is.
+    </p>
+
+    <p>
+      Where it earns its keep here: <strong>debugging and inspection.</strong> You cannot store every raw event in your hot query
+      path, but a uniform sample of clicks lets you answer "show me some example events for this campaign," compute distributions and
+      percentiles, and drive the fraud team's model training — without touching the full firehose. It's also how most tracing systems
+      (<a href="06-caching-queues-resilience.html">06</a>) decide which requests to keep.
+    </p>
+
+    <table>
+      <thead><tr><th>Structure</th><th>Answers</th><th>Cost</th><th>Error</th><th>Use it for</th></tr></thead>
+      <tbody>
+        <tr><td><strong>HyperLogLog</strong></td><td>How many <em>distinct</em>?</td><td>~12 KB, fixed</td><td>~2%, and mergeable</td><td>Unique visitors on the dashboard</td></tr>
+        <tr><td><strong>Count-min sketch</strong></td><td>Which keys are <em>heavy</em>?</td><td>A few MB</td><td>Over-estimates only</td><td>Top-K trending; hot-key detection for salting</td></tr>
+        <tr><td><strong>Bloom filter</strong></td><td>Have I <em>seen</em> this?</td><td>~1.2 GB / 1B keys @1%</td><td>False positives only</td><td>Cheap dedup pre-filter (§7b) — carefully</td></tr>
+        <tr><td><strong>Reservoir sample</strong></td><td>Give me a <em>fair sample</em></td><td>O(k)</td><td>It's a sample, by construction</td><td>Debugging, distributions, model training</td></tr>
+        <tr><td><strong>An exact counter</strong></td><td>How many, <em>really</em>?</td><td>8 bytes per key</td><td><strong>None</strong></td><td><strong>The invoice.</strong> Always.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="note">The last row is the point of the whole table. Total click counts are <em>not</em> approximated — an exact counter is 8 bytes and there is no reason on earth to estimate it. Approximation is only ever the answer when the exact version is genuinely infeasible (distinct counts, top-K over millions of keys). <strong>Reaching for a sketch when a plain counter would do is not clever, it's a red flag</strong> — it says you're pattern-matching on "streaming = sketches" rather than reasoning about what's actually expensive. Interviewers notice that in exactly the same way they notice premature optimisation in code.</div>
+
+    <div class="pitfall">The generic version of the mistake, which shows up far beyond this page: candidates present approximate algorithms as strictly-better technology ("I'd use HLL, it's more efficient!") instead of as a <em>trade</em>. It is a trade. You are buying a 6,000× reduction in memory with a 2% error, and whether that's a good deal depends <strong>entirely</strong> on what the error costs in your domain — free on a chart, criminal on an invoice. Say the price out loud every time you name one of these, and you'll never be caught by the follow-up.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="scaling">8. Scaling &amp; bottlenecks</h2>
+
+    <p>What breaks first at 10×, in the order it actually breaks.</p>
+
+    <h3>1. Ingest — it must never block, and it must never fail the ad</h3>
+
+    <p>
+      The click path is the one thing in this system with no retry from above. The user has already navigated away; there is no
+      second chance to collect that event. And yet — this is the part candidates miss — <strong>the ad impression itself must not
+      fail because your analytics pipeline is unhealthy.</strong> If Kafka is down, the correct behaviour is <em>not</em> to return a
+      500 and break the ad.
+    </p>
+
+<pre><code>  Kafka unavailable. In order of preference:
+
+  1. Producer-side buffering. The Kafka producer already batches in
+     memory (linger.ms). Let it. Absorbs blips of seconds.
+
+  2. Local disk spool. Write the event to a local append-only file /
+     local Kafka-like buffer on the ingest box. Drain to Kafka when
+     it recovers. Survives outages of minutes. (This is what a
+     sidecar agent — Fluent Bit, Vector — is FOR.)
+
+  3. SHED. Buffer full, Kafka still down → DROP the event, increment
+     a "dropped_events" counter, alert, and STILL RETURN 202.
+
+  ❌ Never: block the click handler waiting for Kafka.
+  ❌ Never: fail the ad impression because analytics is down.
+</code></pre>
+
+    <p>
+      Step 3 is uncomfortable and you should say it anyway, because it's the honest engineering answer and dodging it is worse:
+      <strong>you would rather lose some click data than break the ad-serving path.</strong> The ad is the product and the revenue
+      event; the click count is telemetry about the product. Losing telemetry costs you some billing accuracy for a window and you
+      will know exactly how much because you counted the drops. Blocking the click path costs you the ad itself — and it costs it for
+      <em>every</em> user, not just the ones whose events you'd have dropped. <strong>Naming which side of that trade you fall on, and
+      why, is the whole point of the question.</strong>
+    </p>
+
+    <div class="senior">Say: <em>"The ingest path has to degrade rather than fail. It buffers locally, and if the buffer fills it sheds load and still returns 202 — because the alternative is that a Kafka outage takes down ad serving, and that's strictly worse than losing some analytics. I'd emit the shed count as a first-class metric so the loss is measured rather than silent, and I'd size the local buffer so that shedding only happens in an outage measured in tens of minutes, not seconds."</em> Note the shape of the argument: not "we never lose data" (a lie), but "here is precisely what we sacrifice, why it's the cheaper sacrifice, and how we'd know it happened." That is what availability engineering actually sounds like.</div>
+
+    <h3>2. Hot partitions</h3>
+    <p>
+      Covered at length in §7b: salt the key, aggregate in two stages, detect hot keys adaptively with a count-min sketch. The thing
+      to add here is that <strong>partition count is effectively a one-way door.</strong> Increasing Kafka partitions on a keyed topic
+      re-maps <code>hash(ad_id) % N</code> and therefore breaks the guarantee that all of one ad's clicks land in one partition —
+      exactly during the transition, exactly when your state is keyed on that assumption. So: <strong>over-provision partitions from
+      day one</strong> (64 or 128 when you need 16 — they're cheap), rather than planning to add them later under load. This is the
+      same lesson as consistent hashing in <a href="04-partitioning-hashing.html">04</a>, learned the hard way: plan the key space
+      before you need it.
+    </p>
+
+    <h3>3. The stream processor's state</h3>
+    <p>
+      Flink's state is the quiet bottleneck, and it's the one candidates never size. It holds: open windows (small), dedup IDs
+      (large — §3 priced this at ~500 MB per 10-minute window), and HLL sketches (12 KB × keys). It grows with <em>allowed
+      lateness</em> — a longer watermark means more windows held open simultaneously — and with dedup TTL. Fixes, in order:
+    </p>
+    <ul>
+      <li><strong>RocksDB state backend</strong> — spills to local SSD instead of dying on heap. Slower per access, unbounded in
+        practice. This is the default for any real job.</li>
+      <li><strong>Aggressive TTLs</strong> on dedup state. Every extra minute of TTL is real RAM. Set it from measured skew.</li>
+      <li><strong>Incremental checkpointing</strong> to S3 — so a checkpoint doesn't stall the pipeline by writing gigabytes of state
+        every time.</li>
+      <li><strong>More parallelism</strong> — state is per-operator, so more subtasks means less state each. But this only works if
+        the keys are well-spread, which brings you right back to hot partitions.</li>
+    </ul>
+
+    <div class="pitfall">Checkpointing is where streaming jobs actually die in production, and mentioning it unprompted is a strong signal. If checkpoints take longer than the checkpoint interval, they pile up, backpressure the pipeline, consumer lag grows, the job falls behind, and — the vicious bit — <strong>falling behind makes the state bigger</strong> (more windows open at once), which makes checkpoints slower, which makes it fall further behind. It's a death spiral, and it is why "just increase allowed lateness to be safer" is not a free change: more lateness → more open windows → bigger state → slower checkpoints → a job that can no longer keep up. The correctness knob and the stability knob are the same knob.</div>
+
+    <h3>4. OLAP query performance</h3>
+    <p>
+      A dashboard asking for "clicks per minute for the last 90 days, grouped by region and device" is scanning ~130,000 minute
+      buckets × dimensions, and doing it every time someone opens a browser tab. Fixes, cheapest first:
+    </p>
+    <ul>
+      <li><strong>Pre-aggregate into rollup tables.</strong> The single biggest win, and it's just precomputation.
+        <code>_minute</code> → <code>_hour</code> → <code>_day</code>, each written once by the pipeline. A 90-day query then reads
+        90 daily rows, not 130,000 minute rows. <strong>Never compute on read what you can compute on write</strong> — the same
+        precompute-vs-compute-on-read trade you made in <a href="10-news-feed.html">10</a> (fan-out on write), in
+        <a href="07-url-shortener.html">07</a> (cache the hot keys), and in <a href="17-web-crawler-search.html">17</a> (build the
+        inverted index offline). It never stops being the right question.</li>
+      <li><strong>Cache finalised ranges in Redis.</strong> Historical buckets are immutable — infinite TTL, perfect hit rate, no
+        invalidation logic to get wrong (§6).</li>
+      <li><strong>Cap the granularity by range.</strong> Nobody needs minute-level resolution across 90 days — the chart is 1,500
+        pixels wide and they physically cannot see it. Silently downgrade to daily granularity for long ranges. This is a
+        <em>product</em> answer to a performance problem, and offering one is a distinctly senior move.</li>
+    </ul>
+
+    <h3>5. The batch job</h3>
+    <p>
+      It reads a full hour (~4 GB) from S3 and recomputes it. Embarrassingly parallel, so it scales by adding executors, and it's
+      elastic — spin the cluster up hourly, spin it down. The real risk isn't compute, it's <strong>the job silently failing and
+      nobody noticing</strong>, because the dashboard keeps showing speed-layer numbers and everything <em>looks</em> fine right up
+      until the invoices go out wrong. <strong>Alert on the batch job's absence, not just its failure</strong> — a job that didn't run
+      produces no error, and a monitor that only watches for errors will not see it.
+    </p>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="tradeoffs">9. Trade-offs</h2>
+
+    <p>Every real decision on this page, the alternative you rejected, and the condition that would make you flip. This is the table to revise from.</p>
+
+    <table>
+      <thead><tr><th>Decision</th><th>Alternative</th><th>Why this way</th><th>When you'd flip</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Append to Kafka on the click path</strong></td>
+          <td><code>UPDATE … SET clicks = clicks + 1</code></td>
+          <td>50k/sec against a few thousand rows is a lock convoy, not a workload. Appending is contention-free and durable.</td>
+          <td>Truly small scale (&lt; ~100/sec) and no billing stakes. Then a counter table is genuinely fine — <em>say this</em>, so they know you're not cargo-culting Kafka.</td>
+        </tr>
+        <tr>
+          <td><strong>Aggregate by event time</strong></td>
+          <td>Aggregate by processing time</td>
+          <td>Processing-time buckets are wrong, and wrong in a biased way that reconciles at the daily total so nobody notices.</td>
+          <td>Never, if per-bucket numbers matter. Only if you literally only ever need a running lifetime total.</td>
+        </tr>
+        <tr>
+          <td><strong>Tumbling windows</strong></td>
+          <td>Sliding / hopping</td>
+          <td>One event → one window. State is minimal and buckets sum cleanly into hours and days.</td>
+          <td>The requirement is explicitly a moving average or trend line. Then pay the 5× state.</td>
+        </tr>
+        <tr>
+          <td><strong>Watermark ≈ 30s</strong></td>
+          <td>0s (instant) or 5min (safe)</td>
+          <td>Catches the bulk of the skew distribution while keeping the dashboard live. Set it from measured p99 skew.</td>
+          <td>Raise it if the measured drop rate climbs. Lower it if the dashboard's freshness SLA tightens — and accept more revisions.</td>
+        </tr>
+        <tr>
+          <td><strong>Bounded dedup (TTL'd keyed state)</strong></td>
+          <td>Global exact dedup in the stream</td>
+          <td>A global set of 1B event IDs doesn't fit and can't be checked at 50k/sec. A 1-hour window catches every realistic duplicate.</td>
+          <td>Never in the stream. The batch layer does the exact global dedup — that's its job.</td>
+        </tr>
+        <tr>
+          <td><strong>Idempotent upsert at the sink (SET, not +=)</strong></td>
+          <td>Incrementing writes</td>
+          <td>Kafka EOS can't cover an external side effect. An idempotent sink makes at-least-once delivery to it harmless.</td>
+          <td>Never. An incrementing sink over-bills on every restart, forever, silently.</td>
+        </tr>
+        <tr>
+          <td><strong>OLAP columnar store</strong></td>
+          <td>Postgres / MySQL</td>
+          <td><code>SUM … GROUP BY</code> over a billion rows reads 3 columns of 30, each compressing ~10:1. ~1/30th of the bytes.</td>
+          <td>Low volume, or the aggregates fit comfortably in a single Postgres table that a human could scan. Keep Postgres for campaign/advertiser <em>metadata</em> regardless.</td>
+        </tr>
+        <tr>
+          <td><strong>Lambda (both layers)</strong></td>
+          <td>Kappa (stream only)</td>
+          <td>Billing demands <em>obviously</em> exact — a SQL <code>COUNT(DISTINCT)</code> over settled data an auditor can read.</td>
+          <td>Strong Flink team + tolerance for proving stream correctness → kappa, one codebase, no drift. This is the modern direction and you should say so.</td>
+        </tr>
+        <tr>
+          <td><strong>Key by <code>ad_id</code></strong></td>
+          <td>Round-robin partitioning</td>
+          <td>Co-locates an ad's clicks on one consumer → local, lock-free aggregation with no coordination.</td>
+          <td>Never for the aggregation stage. Round-robin would force a distributed shared counter, which is the problem you're avoiding.</td>
+        </tr>
+        <tr>
+          <td><strong>Salt hot keys + two-stage aggregation</strong></td>
+          <td>Just add more partitions</td>
+          <td>More partitions cannot split a single key — <code>hash(ad_id)</code> is one number. Salting is the only thing that does.</td>
+          <td>Apply the salt <em>adaptively</em>, only to keys above a hotness threshold. Salting everything doubles complexity for the 99.99% that never needed it.</td>
+        </tr>
+        <tr>
+          <td><strong>HLL for uniques</strong></td>
+          <td>Exact distinct counts</td>
+          <td>12 KB vs 80 MB, ~2% error, and it <em>merges</em> — so minutes roll up into hours. Exact counts don't.</td>
+          <td>Never approximate anything billable. If uniques become billable, store raw user IDs for the billing path and eat the cost.</td>
+        </tr>
+        <tr>
+          <td><strong>Retain raw events forever (S3)</strong></td>
+          <td>Aggregate and discard</td>
+          <td>Enables the batch layer, backfills, new dimensions retroactively, and audit. ~$20/TB/month is nothing against ad revenue.</td>
+          <td>Never discard, but do <em>tier</em>: hot in Kafka for 7 days, warm in S3, cold in Glacier past a year. And obey GDPR deletion (§10).</td>
+        </tr>
+        <tr>
+          <td><strong>Shed load rather than fail the click</strong></td>
+          <td>Return 500 when Kafka is down</td>
+          <td>A broken analytics pipeline must never break ad serving. Measure the drops; don't hide them.</td>
+          <td>If the click <em>is</em> the transaction (a purchase, not an impression) — then it's tutorial 13's problem and you never shed. Know which system you're in.</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="followups">10. Follow-ups you should expect</h2>
+
+    <h3>"How do you handle fraudulent / bot clicks?"</h3>
+    <p>
+      The instinct is to filter on the click path. <strong>Resist it.</strong> Fraud scoring needs context that the click path does
+      not have and cannot afford to fetch: this user's recent history, this IP's behaviour across campaigns, device fingerprints, ML
+      model inference. That is tens of milliseconds and several hard dependencies, bolted onto the one path that must never block and
+      must never fail.
+    </p>
+    <p>
+      <strong>Score asynchronously and reconcile.</strong> Ingest everything, unfiltered, into the raw log. A separate fraud consumer
+      reads the same Kafka topic, scores each event (or each user's pattern), and writes verdicts to a <code>fraud_verdicts</code>
+      topic keyed by <code>event_id</code>. The <em>batch</em> layer joins clicks against verdicts and excludes the fraudulent ones
+      from the billable aggregate. The dashboard, in the meantime, may show slightly inflated numbers — and that is fine, because
+      the dashboard was never the billing source of truth.
+    </p>
+    <div class="senior">Say: <em>"Fraud detection is a whole system of its own and I'd scope it out — but I'd be specific about <strong>where it plugs in</strong>: it's an asynchronous consumer of the same event log, not a filter on the ingest path. Two reasons. One, I refuse to put an ML model inference on the click path — that's latency and a hard dependency on the one path that must never fail. Two, fraud verdicts arrive <em>late</em>, sometimes days late when a pattern only becomes visible in aggregate, so filtering at ingest is impossible in principle, not just impractical — you don't yet know. So fraud becomes another <strong>restatement</strong>: the batch layer excludes flagged events on its next run, and the billable number moves. Which is exactly the mechanism I already built for late data — I don't need anything new."</em> That answer reuses machinery instead of inventing more, and interviewers love that, because it's what good architecture actually feels like.</div>
+
+    <h3>"You shipped a bug in the aggregation logic three weeks ago. Every number since is wrong. Now what?"</h3>
+    <p>
+      <strong>This is the payoff of the immutable-log principle, and the reason the whole design was worth it. You replay.</strong>
+    </p>
+<pre><code>  1. Fix the code. Deploy it, but write to a NEW table
+     (ad_stats_minute_v2) so nothing is destroyed while you work.
+  2. Replay the raw events from S3/Kafka from the bad deploy's
+     timestamp forward — 3 weeks × 100 GB/day = ~2 TB.
+     Embarrassingly parallel. A big Spark cluster eats it in hours.
+  3. Validate v2 against v1: how many buckets moved, and by how
+     much? Do the deltas match the bug's theory? If they don't,
+     your fix is wrong — STOP. (This step is not optional.)
+  4. Atomically swap the table alias. Dashboard now reads correct
+     history.
+  5. Compute the billing delta per advertiser and issue
+     adjustments — credits or invoices. (Tutorial 13's restatement,
+     again, and everyone in finance has a well-worn process for it.)
+</code></pre>
+    <p>
+      Then say the thing that makes the answer land: <strong>"None of that is possible if you threw the raw events away."</strong>
+      In the naive <code>counter++</code> design, a three-week aggregation bug is permanent and unfixable — the corrupted number is
+      the only number in existence and there is no path back to the truth. You kept the log, so a catastrophic bug becomes a
+      <em>Tuesday</em>: a few hours of compute and a finance adjustment. <strong>That is what the immutable log actually buys, and
+      this follow-up is where you cash it in.</strong>
+    </p>
+
+    <h3>"How do you test a streaming pipeline?"</h3>
+    <p>Genuinely hard, rarely prepared for, and a great question to have an answer to:</p>
+    <ul>
+      <li><strong>Unit-test the aggregation as a pure function.</strong> <code>(events, window) → counts</code>. No Kafka, no Flink.
+        This is where you test late events, duplicates, and out-of-order arrival — feed a hand-crafted list and assert the count. Most
+        of your bug surface is here, and it needs no infrastructure at all.</li>
+      <li><strong>Drive event time deterministically.</strong> Flink and Kafka Streams both let you inject a test clock and advance
+        the watermark by hand. So you can write the test "event at 10:00 arrives after the 10:00 window fired → assert it lands in the
+        late side-output" as an ordinary, fast, deterministic unit test. <strong>Do not use wall-clock sleeps.</strong> A test that
+        sleeps is a test that is flaky.</li>
+      <li><strong>Integration test on a real (embedded/testcontainers) Kafka</strong> with a small fixed corpus, asserting exact final
+        counts. Fewer of these; they're slow.</li>
+      <li><strong>The production test that actually catches things:</strong> a continuous <strong>reconciliation job</strong>
+        comparing speed-layer and batch-layer totals for every settled hour, alerting when they diverge beyond a threshold. Two
+        independent implementations that agree are strong evidence both are right; when they disagree, you learn about it from a
+        graph rather than from an advertiser. <em>Lambda's biggest weakness — two implementations — is also, used deliberately, a
+        continuous correctness check.</em> Point that inversion out; it's a nice moment.</li>
+      <li><strong>Chaos:</strong> kill the Flink job mid-window and assert the counts are unchanged after recovery. That is the single
+        test that proves your idempotency claim from §7b, and it is the one nobody writes.</li>
+    </ul>
+
+    <h3>"The advertiser wants sub-second freshness."</h3>
+    <p>
+      First, <strong>push back</strong> — ask what decision they'd make differently with a 500ms-old number versus a 30-second-old
+      one. Usually there isn't one, and the honest question is worth more than the engineering. But when it's real (live-event
+      bidding, a launch war-room, a real-time auction feedback loop), the answer is:
+    </p>
+    <ul>
+      <li><strong>Drop the watermark to ~0</strong> and emit continuously with <em>early firings</em> — Flink can emit a running
+        partial for an open window on every element or every N ms, and revise it later. You get sub-second numbers that are explicitly
+        provisional. The number ticks and occasionally goes <em>down</em>. Your <code>final: false</code> flag from §4 is what makes
+        that honest rather than alarming.</li>
+      <li><strong>Push, don't poll.</strong> WebSocket or SSE from the query service (<a href="11-chat-system.html">11</a>) so the
+        dashboard receives updates rather than hammering the OLAP store every 500ms × every open dashboard. That polling load, not the
+        aggregation, is what would actually melt.</li>
+      <li><strong>Serve the live tail from Redis, not the OLAP store.</strong> Columnar stores are built for scans, not for
+        thousands of point-reads per second on the newest bucket. Keep the current minute's counters in Redis, keyed by
+        <code>(ad, minute)</code>, updated by the stream job; serve the last few minutes from there and everything older from OLAP.
+        <strong>Two stores, split by age, because the access pattern genuinely differs by age</strong> — the same hot/cold split you
+        made in 11 and 15.</li>
+    </ul>
+
+    <h3>"An advertiser disputes their bill. Prove the number."</h3>
+    <p>
+      You can, and this is the whole reason for the design. Every billable click has an <code>event_id</code>, an
+      <code>event_ts</code>, and a raw record sitting in S3. The invoice number is reproducible by re-running a deterministic batch
+      job over an immutable input — so you can show not just the total but <em>every event that composed it</em>, and demonstrate that
+      running the same query again yields the same total. <strong>An aggregate you can't decompose back into its inputs is an
+      assertion; an aggregate you can is evidence.</strong> That is precisely the audit posture of the ledger in
+      <a href="13-payments-orders.html">13</a>, and it is why fintech interviewers like this question.
+    </p>
+
+    <h3>"GDPR — a user requests deletion. Your raw log is immutable."</h3>
+    <p>
+      The sharp one, and a real tension worth naming rather than dodging: <em>immutable</em> and <em>right to erasure</em> are in
+      genuine conflict. The standard resolutions, and you'd combine them:
+    </p>
+    <ul>
+      <li><strong>Don't store the PII in the first place.</strong> The <code>user_id</code> in the event is a hashed, salted,
+        rotating pseudonym — not an email, not a device ID. Aggregate counts don't need identity, only distinctness.</li>
+      <li><strong>Crypto-shredding.</strong> Encrypt any per-user field with a per-user key. Deletion = destroy the key. The bytes
+        remain in the immutable log; they are now permanently unreadable. This is the answer that actually reconciles the two
+        constraints, and naming it is a strong signal.</li>
+      <li><strong>Aggregates survive.</strong> Once a click is folded into "1,183 clicks in this minute," the individual is already
+        gone. You do not have to un-count them, because the count is not personal data. <em>The aggregate is anonymous by
+        construction</em> — which is a nice, true, and slightly surprising thing to point out at the end of a page about aggregation.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="qa">Interview Q&amp;A</h2>
+
+    <details class="qa">
+      <summary>Why not just <code>UPDATE ad_stats SET clicks = clicks + 1</code> in Postgres?</summary>
+      <div class="answer">
+        <p>
+          Three independent reasons, any one of which is fatal, and you should give them in this order because they escalate:
+        </p>
+        <ol>
+          <li><strong>Contention, not throughput.</strong> All clicks for one ad hit one row. That row is a lock, and Postgres
+            serialises writers on it — you get maybe 1–5k updates/sec on a single hot row no matter how big the box is. A viral ad
+            concentrates traffic on exactly one row. You are not I/O-bound, you are <em>contention</em>-bound, and buying a bigger
+            machine does not help. (Same disease as the seat inventory in <a href="14-ticket-booking.html">14</a>.)</li>
+          <li><strong>It's not idempotent.</strong> The request retries, the increment happens twice, and you have just billed an
+            advertiser for a click that didn't happen. There is no way to detect it after the fact, because you kept no record of
+            <em>which</em> events produced the number.</li>
+          <li><strong>It destroys the raw data.</strong> The event is folded into a counter and discarded. Now a bug in your logic is
+            permanent — there is nothing to recompute from. No backfills, no new dimensions, no audit, no answer when an advertiser
+            asks you to justify the number.</li>
+        </ol>
+        <p>
+          The fix for all three is the same single move: <strong>append immutable events; derive counts.</strong> Which is the
+          principle the whole page is built on.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Event time vs processing time — explain the difference and why it matters here.</summary>
+      <div class="answer">
+        <p>
+          <strong>Event time</strong> is when the click happened on the user's device. <strong>Processing time</strong> is when your
+          stream processor saw it. They differ — by milliseconds usually, by minutes when a phone is in a tunnel or a mobile SDK
+          batches events and flushes on app resume.
+        </p>
+        <p>
+          <strong>You must aggregate by event time.</strong> If you bucket by arrival, a click that happened at 10:00 and arrived at
+          10:04 lands in the 10:04 bucket: the 10:00 minute is undercounted and 10:04 is overcounted. The <em>daily total is still
+          right</em>, which is exactly why nobody catches this for months — but every per-minute number is wrong, and per-minute
+          numbers are what advertisers optimise campaigns against and what you bill on.
+        </p>
+        <p>
+          The subtle killer: the error is <strong>not random, it's correlated</strong>. Users on poor networks have systematically
+          higher skew, so processing-time buckets are biased against exactly the regions and devices with the worst connectivity. A
+          correlated error survives averaging; a random one wouldn't.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>What is a watermark, and what's the trade-off in setting it?</summary>
+      <div class="answer">
+        <p>
+          A watermark is the stream processor's assertion: <em>"I believe I've now seen all events with event time ≤ T."</em> When it
+          passes the end of a window, the window fires — emit the aggregate, release the state. Typically computed as
+          <code>max_event_ts_seen − allowed_lateness</code>.
+        </p>
+        <p>
+          It is <strong>a heuristic bet, not a guarantee</strong>. Nothing enforces it. A network partition can delay a whole region's
+          events past any watermark you set.
+        </p>
+        <p>
+          <strong>The trade-off: wait longer = more correct but higher latency; emit sooner = lower latency but you'll have to
+          revise.</strong> There is no setting that is both, and that is not an implementation limitation — it's fundamental to
+          publishing a fact about a time period that hasn't finished arriving. The honest answer is: tune it from the measured p99 of
+          event-time skew (~30s is typical), accept it's a bet, and <strong>lean on the batch layer for the numbers that must be
+          right</strong> — the batch job needs no watermark at all, because by the time it runs the hour is genuinely over.
+        </p>
+        <p>
+          One trap: raising allowed lateness isn't free even in latency terms. More lateness → more windows open simultaneously →
+          bigger operator state → slower checkpoints → a job that falls behind → which opens <em>more</em> windows. The correctness
+          knob and the stability knob are the same knob.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>A click arrives an hour late. What do you do with it?</summary>
+      <div class="answer">
+        <p><strong>Depends entirely on the consumer, and the fact that the answer differs by consumer <em>is</em> the answer.</strong></p>
+        <ul>
+          <li><strong>Dashboard:</strong> drop it — <em>and emit a metric counting the drop.</em> Nobody will notice one click, and
+            the drop rate is a health signal you alert on. If it drifts from 0.01% to 3%, something upstream changed and you want a
+            graph to tell you, not an advertiser. An unmeasured drop is a bug; a measured drop is a policy.</li>
+          <li><strong>Billing:</strong> you <strong>cannot drop it</strong> — that's revenue for a real click by a real user.
+            You <strong>restate</strong>. The batch layer recomputes the settled hour from the raw log, which includes every late
+            arrival, and the corrected number supersedes the estimate.</li>
+        </ul>
+        <p>
+          Financial restatement is a normal, expected operation, not a failure — the same posture as a correcting entry in the ledger
+          in <a href="13-payments-orders.html">13</a>. The third option, for auditability, is a <strong>side output</strong>: route
+          late events to a separate stream and reconcile out-of-band.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Kafka has exactly-once semantics now. Doesn't that solve your duplicate problem?</summary>
+      <div class="answer">
+        <p><strong>Partially, and knowing exactly where the boundary is is the point of the question.</strong></p>
+        <p>
+          <strong>What EOS gives you:</strong> an atomic read-process-write <em>within Kafka</em>. Consume from topic A, produce to
+          topic B, commit the offset — all three in one transaction that fully commits or fully aborts. Plus an idempotent producer
+          that dedupes producer retries by sequence number. That genuinely eliminates duplicates from producer retries, consumer
+          replay after a crash, and rebalances.
+        </p>
+        <p>
+          <strong>What it cannot give you:</strong> anything involving an external side effect. The write to ClickHouse, to S3, or an
+          HTTP call is <em>outside</em> Kafka's transaction, and Kafka has no way to roll it back. Nor does it help with a duplicate
+          born on the <em>client</em> — the SDK that retried and sent two events is two genuinely different Kafka records, and Kafka
+          has no idea they mean the same click.
+        </p>
+        <p>
+          So: <strong>delivery is a myth, processing is achievable</strong> (<a href="05-coordination-consensus.html">05</a>). You
+          still need a client-minted <code>event_id</code> for dedup, and an <strong>idempotent sink</strong> — upsert the whole
+          window total keyed by <code>(minute, ad, region, device)</code>, never <code>+=</code> a delta. Then re-applying the same
+          emit is harmless, and at-least-once at the last mile stops mattering.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>You can't hold a billion event IDs in memory. So how do you actually dedupe?</summary>
+      <div class="answer">
+        <p>
+          You don't dedupe globally — <strong>you dedupe within a bounded window, and you say so out loud rather than pretending
+          otherwise.</strong>
+        </p>
+        <ul>
+          <li><strong>Speed layer:</strong> a keyed state store (Flink/RocksDB) mapping <code>event_id → seen</code> with a TTL of
+            ~1 hour. That catches every realistic duplicate — client retries, producer retries, and consumer replay all happen within
+            <em>seconds</em>. A bloom filter works as a cheap pre-filter but is risky as the only gate, because its false positives
+            mean <strong>silently dropping a real, billable click</strong>. (Note the error direction matters: in the crawler in
+            <a href="17-web-crawler-search.html">17</a>, a bloom false positive just skipped one URL and nobody cared. Same structure,
+            same error rate, completely different acceptability — because the <em>cost</em> of the error changed.)</li>
+          <li><strong>Batch layer:</strong> exact, global dedup — <code>SELECT COUNT(DISTINCT event_id)</code> over the hour's
+            partition in S3. Memory isn't a constraint because it isn't a streaming job; it's a Spark job over bounded data with a
+            whole cluster.</li>
+        </ul>
+        <p>
+          <strong>The speed layer is approximately deduped; the batch layer is exactly deduped.</strong> Which is, once again, the
+          same requirements split from §2 paying for itself.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Why key Kafka by <code>ad_id</code>? What does that actually buy, and what does it cost?</summary>
+      <div class="answer">
+        <p><strong>Buys two things, and the second one is the one people miss.</strong></p>
+        <ol>
+          <li><strong>Parallelism</strong> — 64 partitions, 64 consumers, linear scale-out.</li>
+          <li><strong>Correctness without coordination</strong> — every click for one ad goes to <em>one</em> partition, read by
+            <em>one</em> consumer, which therefore owns that ad's counter outright and can increment it in local memory with no lock,
+            no transaction, no Redis, no consensus. There's no race because there's no second writer. <strong>You didn't solve
+            distributed counting; you partitioned the problem so it was never distributed.</strong></li>
+        </ol>
+        <p>
+          <strong>Costs:</strong> the hot partition. One viral ad = one melting consumer while 63 idle, and you <em>cannot</em> fix
+          it by adding partitions, because <code>hash(ad_8891)</code> is still a single number that lands in a single place.
+        </p>
+        <p>
+          <strong>Fix:</strong> salt the key (<code>ad_id + ":" + random(0..15)</code>) so the hot ad spreads across 16 partitions,
+          then add a <strong>second aggregation stage</strong> that re-keys by <code>ad_id</code> alone and sums the 16 partials.
+          Stage 2 handles 16 messages per ad per minute instead of 15,000/sec, so it cannot be hot. Two-level aggregation — the same
+          shape as a MapReduce combiner, and the same shape as the hybrid celebrity path in <a href="10-news-feed.html">10</a>. And
+          apply the salt <strong>adaptively</strong>, only to keys a count-min sketch says are hot, so the 99.99% of normal ads don't
+          pay for the complexity.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Why an OLAP store? Why not just index Postgres properly?</summary>
+      <div class="answer">
+        <p>
+          <strong>Because an index doesn't help a query that must touch a billion rows.</strong> Indexes exist to <em>avoid</em>
+          scanning; an aggregation over a time range fundamentally <em>is</em> a scan. Adding an index to it makes it slower, if
+          anything.
+        </p>
+        <p>The real difference is the physical layout:</p>
+        <ul>
+          <li><strong>Row store (Postgres):</strong> a disk page holds whole rows. <code>SUM(clicks)</code> must read every byte of
+            every row — dragging <code>ad_id</code>, <code>region</code>, <code>device</code> and 25 other columns you didn't ask for
+            through the I/O path. You wanted 8 bytes per row and paid for 200.</li>
+          <li><strong>Column store (ClickHouse/Druid/Pinot):</strong> each column is stored contiguously. You read the
+            <code>clicks</code> column and nothing else — 3 columns of 30. <strong>And</strong> each column compresses ~10:1, because
+            adjacent values within a column are similar (dictionary-encode <code>region</code>'s five distinct values to one byte;
+            delta-encode the monotonic <code>minute</code>; run-length-encode a million consecutive <code>ios</code>es). The entropy of
+            a row is high; the entropy of a column is low.</li>
+        </ul>
+        <p>
+          Compose those: <strong>1/10th of the columns × 1/10th of the bytes = ~1/30th of the I/O.</strong> ClickHouse isn't magically
+          faster — it <em>read almost nothing</em>. Keep Postgres for campaign and advertiser metadata; that part really is OLTP.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Explain lambda vs kappa, and pick one.</summary>
+      <div class="answer">
+        <p>
+          <strong>Lambda:</strong> a speed layer (stream — seconds, approximate, revisable) and a batch layer (recompute from the raw
+          log — hours, exact, final), both over the same immutable event log. The batch layer serves billing <em>and</em> corrects the
+          speed layer's numbers as they age. <strong>Cost: two implementations of the same logic in two systems, and they will
+          drift.</strong> That's a real, recurring, well-documented pain and you should say so, not gloss it.
+        </p>
+        <p>
+          <strong>Kappa:</strong> only the stream. To recompute, <em>replay the log from offset 0</em> with the new code into a new
+          table and swap. One codebase, no drift. The insight underneath it: <strong>batch isn't a different kind of computation, it's
+          a bounded stream</strong> — so you never needed a second implementation, you needed a replayable log.
+        </p>
+        <p>
+          <strong>Pick:</strong> lambda, <em>for this problem specifically</em>, because of billing. A batch job doing
+          <code>COUNT(DISTINCT event_id) GROUP BY</code> over settled S3 data is <em>obviously</em> correct — an auditor can read the
+          SQL. Convincing anyone that a stateful streaming job with watermarks and TTL'd dedup is exactly right is a much harder
+          conversation, and when the output is an invoice, "obviously correct" has value beyond elegance. Mitigate the drift with a
+          shared aggregation library and a reconciliation alert when the layers disagree. Then say the honest thing: <strong>kappa is
+          the modern direction and I'd plan to migrate</strong> — and the raw log makes that migration possible whenever we want,
+          which is why <em>keeping the log</em> is the decision that outranks the choice between them.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Where does HyperLogLog fit, and where would you refuse to use it?</summary>
+      <div class="answer">
+        <p>
+          <strong>Fits:</strong> unique-visitor counts. Exact distinct counting means storing every user ID you've seen — 10M uniques
+          × 8 B = 80 MB for <em>one</em> campaign for <em>one</em> day, and you have thousands of campaigns × every time bucket. HLL
+          estimates cardinality in <strong>~12 KB with ~2% error, at any scale</strong>.
+        </p>
+        <p>
+          The property that actually matters: <strong>it merges.</strong> <code>HLL(A) ∪ HLL(B)</code> is a valid sketch of
+          <code>A ∪ B</code>, so you store one sketch per minute and compute uniques for any hour, day, or arbitrary range by unioning
+          them. <strong>Exact counts can't do that</strong> — summing 60 minutes of distinct-user counts double-counts anyone who
+          clicked in two minutes, and you can't correct for it because you threw the identities away. Mergeability is what makes
+          rollups possible at all.
+        </p>
+        <p>
+          <strong>Refuse:</strong> anything billable. 2% error on a chart is invisible; 2% error on an invoice is a lawsuit. And also
+          refuse it for <em>total</em> clicks — that's an exact 8-byte counter and there's no reason to approximate it. Reaching for a
+          sketch where a plain counter would do isn't clever, it's a red flag. <strong>Approximation is a trade you make deliberately
+          when the exact version is genuinely infeasible, and the senior skill is knowing when the error is acceptable.</strong>
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Kafka is down. What does your ingest service do?</summary>
+      <div class="answer">
+        <p><strong>It degrades. It does not fail, and it absolutely does not break ad serving.</strong> In order:</p>
+        <ol>
+          <li><strong>Producer buffering</strong> — the Kafka client already batches in memory. Absorbs blips of seconds for free.</li>
+          <li><strong>Local disk spool</strong> — append events to a local file / sidecar agent (Vector, Fluent Bit) and drain when
+            Kafka recovers. Survives outages of minutes to tens of minutes.</li>
+          <li><strong>Shed</strong> — buffer full and Kafka still down? Drop the event, increment a <code>dropped_events</code>
+            counter, alert — and <strong>still return 202</strong>.</li>
+        </ol>
+        <p>
+          <strong>Never block the click handler on Kafka. Never fail the ad impression because analytics is unhealthy.</strong> The ad
+          is the product and the revenue event; the click count is telemetry <em>about</em> the product. Losing some telemetry costs
+          you billing accuracy for a window — and you'll know exactly how much, because you counted the drops. Blocking the click path
+          costs you the ad itself, for every user.
+        </p>
+        <p>
+          The shape of that answer matters more than the content: not "we never lose data" (a lie), but "here's precisely what we
+          sacrifice, why it's the cheaper sacrifice, and how we'd know it happened."
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>You deployed a bug three weeks ago. Every aggregate since is wrong. Fix it.</summary>
+      <div class="answer">
+        <p><strong>Replay from the raw log.</strong> This is the moment the entire design pays for itself.</p>
+        <ol>
+          <li>Fix the code; deploy it writing to a <strong>new</strong> table, destroying nothing.</li>
+          <li>Replay raw events from S3 from the bad deploy forward (~2 TB for three weeks). Embarrassingly parallel; hours on a big
+            Spark cluster.</li>
+          <li><strong>Validate the new table against the old:</strong> which buckets moved, by how much, and do the deltas match your
+            theory of the bug? If they don't, <em>your fix is wrong</em> — stop. Skipping this step is how you replace one silent
+            corruption with another.</li>
+          <li>Atomically swap the table alias.</li>
+          <li>Compute the per-advertiser billing delta and issue credits or adjustments — tutorial 13's restatement, which finance
+            already has a well-worn process for.</li>
+        </ol>
+        <p>
+          Then land the point: <strong>none of this is possible if you threw the raw events away.</strong> In the naive
+          <code>counter++</code> design a three-week bug is permanent — the wrong number is the only number that exists. Because you
+          kept the immutable log, a catastrophe becomes a Tuesday. <strong>That is what the log buys, and this question is where you
+          cash it in.</strong>
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>How is this the same system as YouTube view counts, a leaderboard, and IoT telemetry?</summary>
+      <div class="answer">
+        <p>
+          <strong>Because it is.</strong> Every one of them is: a firehose of immutable events in → reduce → a tiny aggregate out,
+          where the events arrive out of order, arrive twice, arrive late, and arrive very fast.
+        </p>
+        <ul>
+          <li><strong>YouTube view counts</strong> — the same thing, with an extra "was it really a view?" rule (watched &gt;30s) and
+            lower correctness stakes than billing.</li>
+          <li><strong>Real-time leaderboard</strong> — the same aggregation, then a top-K on the output. Count-min sketch for the
+            approximate version; an exact sorted set (Redis ZSET) when K and the key space are small.</li>
+          <li><strong>Analytics dashboards (Mixpanel, Amplitude)</strong> — literally this page, with more dimensions.</li>
+          <li><strong>IoT telemetry</strong> — same pipeline; event-time skew is <em>worse</em> (devices go offline for days), so
+            late data handling matters more, not less.</li>
+          <li><strong>Log/metrics pipelines (Datadog, Prometheus)</strong> — same, plus aggressive downsampling of old data, which is
+            just your rollup tables with a retention policy.</li>
+          <li><strong>Fraud detection</strong> — same ingest, but the stream job scores rather than counts, and the windows are
+            behavioural rather than fixed.</li>
+        </ul>
+        <p>
+          <strong>Say this in the interview.</strong> Naming the archetype and listing its costumes is how you prove you'll recognise
+          it again on a problem you've never seen — which is the only thing the interview was ever a proxy for.
+        </p>
+      </div>
+    </details>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="takeaways">What to remember</h2>
+
+    <p>The compressed recall list. If you revise nothing else the night before, revise this.</p>
+
+    <ul>
+      <li><strong>Counting is trivial until the events arrive out of order, arrive twice, arrive late, or arrive a billion times a
+        second.</strong> Every hard part of this system is one of those four words. Structure your answer around them and you cannot
+        get lost.</li>
+      <li><strong>One system, two consumers, contradictory requirements.</strong> The dashboard wants low latency and tolerates
+        approximation. Billing wants exactness and tolerates delay. <strong>Recognising that — and designing for both instead of
+        compromising into something that serves neither — is the single strongest move on this page</strong>, and it's what makes
+        lambda architecture an <em>inference</em> rather than a name you dropped.</li>
+      <li><strong>The ingest path does nothing but durably append to Kafka and return 202.</strong> No enrichment, no counting, no
+        fraud check, no database. A click that isn't written is gone from the universe; everything else can be retried. If Kafka is
+        down: buffer, then shed — never block, never fail the ad.</li>
+      <li><strong>Aggregate by event time, never processing time.</strong> A click that happened at 10:00 and arrived at 10:04 belongs
+        to 10:00. Processing-time buckets are wrong in a way that reconciles at the daily total, so nobody notices for months — and
+        the error is <em>correlated</em> with bad connectivity, so it doesn't average out.</li>
+      <li><strong>A watermark is a bet, not a guarantee.</strong> Wait longer = more correct, higher latency. Emit sooner = faster,
+        expect to revise. No setting is both. Tune from measured p99 skew; lean on the batch layer for the numbers that must be right.</li>
+      <li><strong>Late data: drop it (and count the drops) for the dashboard; restate for billing.</strong> Financial restatement is
+        a normal operation, not a failure — the ledger's correcting entry, again.</li>
+      <li><strong>At-least-once + idempotent = effectively-once.</strong> Client-minted <code>event_id</code>, bounded-window dedup in
+        the stream, exact global dedup in batch. And the sink <strong>upserts whole window totals — never <code>+=</code></strong>,
+        or every restart silently over-bills.</li>
+      <li><strong>Kafka EOS is atomic read-process-write <em>within Kafka</em>.</strong> It cannot make an external side effect
+        exactly-once. Delivery is a myth; processing is achievable.</li>
+      <li><strong>Keying by <code>ad_id</code> is what makes the aggregation both parallel and correct</strong> — one owner per key,
+        local state, no coordination. And it's what creates the hot partition. Fix: salt + two-stage aggregation, applied adaptively
+        to keys a sketch says are hot.</li>
+      <li><strong>The aggregate store is OLAP, not OLTP.</strong> Columnar: you read 3 columns of 30, and each compresses ~10:1
+        because adjacent values in a column are similar. ~1/30th of the bytes. Not faster — it <em>read less</em>.</li>
+      <li><strong>The raw event log is immutable and retained; every aggregate is a cache.</strong> This buys the batch layer,
+        backfills after a bug, new dimensions retroactively, audit, and disaster recovery — all from one decision.</li>
+      <li><strong>Approximate is a design choice, not a shortcut.</strong> HLL (uniques — and it <em>merges</em>, which exact counts
+        can't), count-min (heavy hitters), reservoir (fair sampling). Exact counters for anything billable, always. Knowing when the
+        error is acceptable is the senior skill; reaching for a sketch when a counter would do is a red flag.</li>
+      <li><strong>Name the archetype.</strong> Ad clicks, YouTube views, analytics dashboards, leaderboards, IoT telemetry, log and
+        metrics pipelines, fraud detection, trending/top-K — <em>all the same system</em>. Say so.</li>
+    </ul>
+
+    <hr>
+
+    <h3>Closing the backend track — the eight ideas behind all twelve case studies</h3>
+
+    <p>
+      That's the last backend case study. Twelve designs, twelve archetypes — and if you look back at them now, they were never twelve
+      independent things. <strong>They were about eight ideas, wearing twelve costumes.</strong> This is the compression that actually
+      survives into the interview room, because you will not be asked any of the twelve questions you studied. You will be asked a
+      thirteenth, and what you need is not more answers but the reflexes to derive one.
+    </p>
+
+    <ol>
+      <li>
+        <strong>Immutable log + derived views.</strong> Never mutate the truth in place. Append facts; derive everything else; treat
+        every derived thing as a rebuildable cache. The ledger in <a href="13-payments-orders.html">13</a>, the timeline in
+        <a href="10-news-feed.html">10</a>, the event log <em>on this page</em>. It buys you audit, backfill, recovery, and the
+        freedom to change your mind later — which is the only freedom that matters in a system that lives for five years.
+      </li>
+      <li>
+        <strong>Push the invariant down into the database.</strong> If something must never happen — no double booking
+        (<a href="14-ticket-booking.html">14</a>), no double charge (<a href="13-payments-orders.html">13</a>), no duplicate short
+        code (<a href="07-url-shortener.html">07</a>) — enforce it with a unique constraint or a conditional write, at the one place
+        that can actually serialise. Application-level checks are races with extra steps. <em>Correctness lives at the single point
+        of truth, not in the layer above it.</em>
+      </li>
+      <li>
+        <strong>At-least-once delivery + idempotent processing = effectively-once.</strong> Exactly-once delivery does not exist. Stop
+        trying to buy it and start making retries harmless: a client-minted idempotency key, an upsert instead of an increment, a
+        dedup window. This appeared in 05, 06, 11, 12, 13, and again here — it is the most-reused single idea in the whole phase.
+      </li>
+      <li>
+        <strong>Precompute vs compute-on-read.</strong> Fan-out on write or on read (<a href="10-news-feed.html">10</a>). Build the
+        inverted index offline or search at query time (<a href="17-web-crawler-search.html">17</a>). Roll up to daily buckets or
+        <code>SUM</code> a billion rows per page load (here). <strong>It is always the same question</strong> — pay now on write, or
+        pay later on read — and the answer is always dictated by the read:write ratio, which is why estimation comes before
+        architecture and not after.
+      </li>
+      <li>
+        <strong>The hot key always finds you.</strong> The celebrity with 100M followers, the Taylor Swift on-sale, the viral ad, the
+        one URL on the front page of Reddit. Uniform hashing assumes uniform traffic and traffic is never uniform. The fix is always
+        shaped the same: <strong>give the pathological case a different code path</strong> — hybrid fan-out, salted keys plus a
+        second aggregation stage, a dedicated cache. Never make the 99.99% pay for the 0.01%.
+      </li>
+      <li>
+        <strong>Async everything not on the critical path.</strong> What must happen <em>before</em> you return to the user, and what
+        merely must happen <em>eventually</em>? Notifications, analytics, fraud scoring, transcoding, indexing, emails — eventually.
+        Put a queue in front of it. The critical path's availability is the product of every dependency on it, so the shortest
+        critical path wins, and every piece of work you move off it is availability you bought for free.
+      </li>
+      <li>
+        <strong>Approximate when the error is tolerable.</strong> Bloom filters, HLL, count-min, sampling, cached-and-slightly-stale
+        counts. These are trades, not upgrades — and the price is measured in what the error <em>costs in this domain</em>. A bloom
+        false positive skips a URL in the crawler (fine) or deletes a billable click (not fine). <strong>Same structure, same error
+        rate, opposite verdict.</strong> Reasoning about the direction and the price of the error is the senior move; quoting the
+        error rate is not.
+      </li>
+      <li>
+        <strong>The archetype is the answer.</strong> There are about a dozen shapes and you now know all of them: read-heavy KV, the
+        storage layer itself, quotas, fan-out, real-time push, reliable async delivery, money &amp; correctness, inventory under
+        contention, geospatial, media &amp; CDN, crawl-index-query, streaming aggregation. <strong>You will not be asked a question
+        you studied.</strong> You will be asked one you haven't seen, and the entire skill is looking at it for ninety seconds and
+        saying: <em>"this is fan-out with a correctness constraint," "this is streaming aggregation with a hot-key problem," "this is
+        inventory contention wearing a hat."</em> That recognition is what the interview is a proxy for. Everything else on these
+        eighteen pages was in service of it.
+      </li>
+    </ol>
+
+    <div class="senior">The last say-it-out-loud line, and it works on almost any distributed design question you will ever be handed: <em>"Before I start drawing, let me say what I think this <strong>is</strong>. Underneath the domain, this is a streaming aggregation problem — a firehose of events in, small aggregates out — and that tells me the hard parts before I've asked a single question: the events will arrive out of order, they'll arrive twice, some will arrive late, and there'll be a hot key. So I'd like to nail down the requirements with those four in mind, because how much each of them matters depends entirely on who's consuming the numbers and what they'll tolerate."</em> An interviewer who hears that in the first two minutes has already largely made up their mind. That is what seven years is supposed to sound like.</div>
+
+    <p>
+      Next: tutorial 19 opens Block C and the round you're actually most likely to face —
+      <strong>frontend system design</strong>, which is graded on completely different axes and where, for once, you start with the
+      home-field advantage.
+    </p>
+  </section>
+
+  <nav class="page-nav">
+    <a href="17-web-crawler-search.html">← 17 — Design a Web Crawler &amp; Search Index</a>
+    <a href="index.html">Course Home →</a>
+  </nav>
+
+</main>
+</body>
+</html>

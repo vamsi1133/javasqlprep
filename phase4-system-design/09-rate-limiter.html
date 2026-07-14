@@ -1,0 +1,1593 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>09 — Design a Rate Limiter | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <div class="breadcrumb"><a href="index.html">← Course Home</a></div>
+    <h1>09 — Design a Rate Limiter</h1>
+    <p>The small question that goes deep fast. Archetype: <strong>quotas &amp; shared counters under concurrency</strong>.</p>
+  </div>
+</header>
+
+<main class="container">
+
+  <section>
+    <h2>Why this matters in the interview</h2>
+    <p>
+      Interviewers love this one precisely because it looks trivial. "Allow 100 requests per minute per user" is a sentence a
+      junior engineer will answer in ninety seconds with a hash map and a counter — and then spend the remaining forty-three
+      minutes being taken apart. Every layer of the onion is a real distributed-systems problem: the counter has a
+      <strong>boundary bug</strong>, the fix costs memory, the memory fix costs accuracy, the whole thing has to be
+      <strong>shared across N app servers</strong> so now you have a read-then-write race, the shared store is now in the
+      <strong>hot path of every single request in your system</strong> so latency is life-or-death, and then the interviewer
+      asks the question that actually decides the round: <em>"what happens when Redis is down?"</em> There is no diagram to
+      memorise here. There is only judgment, which is exactly what a 7-YOE candidate is graded on.
+    </p>
+    <p>
+      And the archetype transfers further than almost any other in this phase. <strong>Any "at most N per unit of time,
+      counted across a fleet" problem is this problem.</strong> Rate limiting an API. Enforcing a plan quota (10,000 API calls
+      a month). A billing meter that counts metered usage. Ad-budget pacing — don't spend more than $500/day of this
+      advertiser's money across 200 ad servers. Concurrent-session limits — this account may stream on 4 devices. Coupon
+      redemption caps. Login-attempt throttling. Every one of them is: a shared counter, incremented concurrently by many
+      machines, checked against a limit, where the cost of being slightly wrong is the design's central negotiation. Learn the
+      shape once and you can walk into any of those prompts and reuse this entire page. Say that out loud in the interview,
+      too — recognising that "this is a shared-counter problem" is itself a senior signal.
+    </p>
+  </section>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ul>
+      <li><a href="#prompt">1. The prompt</a></li>
+      <li><a href="#requirements">2. Requirements</a> — and the one clarifying question that changes the design</li>
+      <li><a href="#estimation">3. Estimation</a> — the number that rules out Postgres</li>
+      <li><a href="#api">4. API &amp; the headers you owe the client</a></li>
+      <li><a href="#datamodel">5. Data model — rules and counter state</a></li>
+      <li><a href="#hld">6. High-level design</a></li>
+      <li><a href="#algorithms">7. Deep dive 1 — the algorithms</a> (fixed window · sliding log · sliding counter · token bucket · leaky bucket)</li>
+      <li><a href="#distributed">8. Deep dive 2 — making it distributed</a> (the race · the Lua fix · the latency fix)</li>
+      <li><a href="#where">9. Where does the limiter live?</a></li>
+      <li><a href="#redisdown">10. When Redis is down — fail open or fail closed?</a></li>
+      <li><a href="#scaling">11. Scaling &amp; bottlenecks</a></li>
+      <li><a href="#tradeoffs">12. Trade-offs</a></li>
+      <li><a href="#followups">13. Follow-ups you should expect</a></li>
+      <li><a href="#qa">Interview Q&amp;A</a></li>
+      <li><a href="#takeaways">What to remember</a></li>
+    </ul>
+  </div>
+
+  <section>
+    <h2 id="prompt">1. The prompt</h2>
+    <p>As the interviewer will actually say it — vague on purpose, because the vagueness is the test:</p>
+    <blockquote style="border-left:4px solid #cbd5e1; margin:1.2rem 0; padding:.4rem 0 .4rem 1.1rem; color:#334155;">
+      <em>"Design a rate limiter for our public API."</em>
+    </blockquote>
+    <p>
+      That's it. Nothing about who's limited, what "our public API" is, whether the limit is for security or for money, or how
+      exact it needs to be. If you start drawing boxes, you have already lost points. There are three things unspecified here
+      that each lead to a <em>different</em> design, and finding them is step one.
+    </p>
+    <div class="pitfall">
+      The single most common failure on this question is answering the algorithm question and stopping. Candidates spend
+      twenty minutes lovingly comparing token bucket and leaky bucket, feel good about it, and never get to the part the
+      interviewer actually cares about — that there are fifty app servers and one counter, and the counter is now a
+      distributed-consensus problem in a trench coat. <strong>Budget your time: the algorithms are ten minutes. Distribution,
+      latency, and failure are thirty.</strong>
+    </div>
+  </section>
+
+  <section>
+    <h2 id="requirements">2. Requirements</h2>
+
+    <h3>The clarifying questions to ask first</h3>
+    <table>
+      <thead><tr><th>Ask</th><th>Why it matters</th><th>Answer you'll assume</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Is this for abuse prevention, or for fairness/billing?</strong></td>
+          <td>Abuse prevention tolerates slop — if a scraper gets 105 requests instead of 100, nobody cares. Billing does not: if you sell "10,000 calls/month" and let someone have 10,400, you gave away product. This decides whether you may cache state locally.</td>
+          <td><strong>Abuse prevention and fairness</strong> for a public API. Billing quotas are a separate, harder system — I'll call that out.</td>
+        </tr>
+        <tr>
+          <td><strong>Is a small overshoot acceptable, or must the limit be exact?</strong></td>
+          <td><em>This is the question that changes the design.</em> "Approximately 100/min" gives you local counters, batched sync, and sub-millisecond checks. "Exactly 100/min, globally, always" forces every request through a single serialisation point, and that point is now your throughput ceiling and your SPOF.</td>
+          <td><strong>Small overshoot is fine</strong> (a few percent). I'll defend that explicitly.</td>
+        </tr>
+        <tr>
+          <td><strong>What's the limit key — user, IP, API key, endpoint?</strong></td>
+          <td>Different keys have wildly different cardinality and hot-key risk. An IP limit behind a corporate NAT punishes a whole office. A global limit (one key for everyone) can't be sharded at all.</td>
+          <td>Primarily <strong>API key</strong> (authenticated) with <strong>IP</strong> as the fallback for unauthenticated traffic.</td>
+        </tr>
+        <tr>
+          <td><strong>Do rules differ per plan / per endpoint?</strong></td>
+          <td>Decides whether "the rules" are a config constant or a small distributed configuration system with its own cache and propagation story.</td>
+          <td>Yes — free/pro/enterprise tiers, and some expensive endpoints have their own tighter limit.</td>
+        </tr>
+        <tr>
+          <td><strong>Do we control the clients?</strong></td>
+          <td>If yes, you can push some limiting client-side and rely on well-behaved backoff. If it's a public API, assume clients are hostile, buggy, or both.</td>
+          <td>Public API. Assume nothing about the client.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="senior">
+      Open with: <em>"Before I design anything — is this limiter protecting us from abuse, or is it enforcing a paid quota?
+      Because if a user going slightly over the limit costs us nothing, I can keep counters local to each server and sync them
+      lazily, and the check costs microseconds. If it has to be exact, every request has to touch one shared counter, and that
+      counter becomes both my latency budget and my single point of failure. Those are two different systems and I'd rather
+      build the right one."</em> That sentence, in the first ninety seconds, tells the interviewer you have built one of these.
+    </div>
+
+    <h3>Functional requirements</h3>
+    <ul>
+      <li><strong>Limit by identity</strong> — user ID, API key, or IP address; the limiter accepts a <em>key</em> and doesn't care what produced it.</li>
+      <li><strong>Configurable rules</strong> — "100 requests per minute", "1,000 per hour", "10 per second on <code>POST /search</code>". Rules are data, not code, and must be changeable without a deploy.</li>
+      <li><strong>Multiple simultaneous rules</strong> — a request can be checked against a per-second <em>and</em> a per-day limit; it passes only if it passes all of them.</li>
+      <li><strong>Reject with HTTP 429</strong> <code>Too Many Requests</code>, with a <code>Retry-After</code> header so a well-behaved client knows exactly when to come back.</li>
+      <li><strong>Expose state proactively</strong> via <code>X-RateLimit-Limit</code>, <code>X-RateLimit-Remaining</code>, <code>X-RateLimit-Reset</code> on <em>every</em> response, not just the rejections — so clients can self-pace instead of discovering the wall by hitting it.</li>
+      <li><strong>Explicitly out of scope:</strong> DDoS mitigation (that's the CDN/edge, and it is <em>not</em> the same thing — see the follow-ups), WAF rules, authentication itself.</li>
+    </ul>
+
+    <h3>Non-functional requirements — these are the real ones</h3>
+    <ul>
+      <li><strong>Negligible added latency.</strong> This runs on the hot path of <em>every request in the entire system</em>. If the check costs 20 ms, you have added 20 ms to your P50 for every endpoint you own, forever, in exchange for a feature that does nothing on 99.9% of requests. Budget: <strong>≤ 1–2 ms at P99</strong>, and be prepared to defend it. This constraint alone kills several otherwise reasonable designs.</li>
+      <li><strong>Accurate enough</strong> — bounded, understood overshoot. Not "exact" unless someone pays for exact.</li>
+      <li><strong>Fail gracefully.</strong> The limiter is a dependency of everything. If it's down, it must not take the API down with it. A rate limiter whose outage becomes a total outage is a self-inflicted wound and interviewers will hunt for whether you've thought about it.</li>
+      <li><strong>Distributed</strong> — enforced consistently across N app servers / gateway instances, which is where all the difficulty lives.</li>
+      <li><strong>Cheap</strong> — memory per key must be small and bounded, because there are millions of keys.</li>
+    </ul>
+
+    <div class="note">
+      Notice how lopsided this is: the functional requirements are almost boring, and every single interesting decision on the
+      page comes from the non-functional ones. That's characteristic of infrastructure problems, and it's why the method in
+      <a href="01-the-method.html">tutorial 01</a> insists you split them. Say which side is driving your design.
+    </div>
+  </section>
+
+  <section>
+    <h2 id="estimation">3. Estimation</h2>
+    <p>Round hard, say you're rounding, and get to the one number that matters.</p>
+<pre><code>  Users                       1,000,000 registered
+  Peak API traffic            100,000 requests/sec  (given / assumed)
+
+  Rate-limit checks needed    1 per request (at least)
+  ────────────────────────────────────────────────────────────
+  ⇒ The limiter itself must sustain 100,000 QPS.
+
+  With two rules per request (per-second AND per-day), and a
+  read+write per check, that's ~200k-400k Redis ops/sec.
+
+  Latency budget
+  ──────────────
+  Typical API endpoint P99            ~200 ms
+  Acceptable limiter overhead         ~1%  ⇒ ~2 ms
+  Redis GET/SET, same AZ              ~0.2-0.5 ms round trip   ✅
+  Postgres SELECT + UPDATE, same AZ   ~2-10 ms, and it's DISK  ❌
+  Cross-region Redis call             ~80 ms                   ❌❌
+
+  Memory
+  ──────
+  Token bucket per key: ~20 bytes (tokens: float, lastRefill: long)
+  1M active keys × 20 B  ≈ 20 MB          → trivial. One Redis node.
+  1M keys × 2 rules      ≈ 40 MB          → still trivial.
+
+  Sliding-window LOG, same 1M keys, 100 req/min each:
+  100 timestamps × ~16 B × 1M keys ≈ 1.6 GB, and it's proportional
+  to the LIMIT, so a 10,000/hr tier is 100× worse.
+</code></pre>
+    <p>
+      <strong>The number that drives the design is 100k QPS at sub-millisecond latency on a shared counter.</strong> Say it out
+      loud. That single line does three things for you at once: it rules out "just put a counter in Postgres" (you'd be doing
+      100k disk-backed read-modify-writes per second on the same rows — the row locks alone would melt it, and even if they
+      didn't, the latency is 10× your entire budget); it rules out any design where the limiter is a network hop to another
+      <em>service</em> rather than a hop to an in-memory <em>store</em>; and it tells you the state has to be tiny and O(1) per
+      key, which is what will kill the sliding-window log later.
+    </p>
+    <div class="senior">
+      Say: <em>"The 100k QPS figure isn't really about capacity — Redis does that on one box. It's about the fact that this
+      check is now the most frequently executed piece of code in my entire company. Anything I add here, I add to every
+      request. That's why I'm going to be aggressive about O(1) state and about keeping the check to a single round trip, and
+      why I'll eventually argue for doing the check locally with periodic sync."</em>
+    </div>
+    <p>
+      One more number to keep in your pocket: the <strong>storage is a non-issue</strong> and you should say so and move on. A
+      rate limiter's data is a few tens of megabytes of ephemeral counters. Candidates waste minutes estimating storage here
+      out of habit. The scarce resources on this problem are <em>latency</em> and <em>coordination</em>, not bytes.
+    </p>
+  </section>
+
+  <section>
+    <h2 id="api">4. API &amp; the headers you owe the client</h2>
+    <p>
+      The rate limiter mostly has no public API — it's middleware, and its "interface" is what it does to <em>other</em>
+      people's responses. But there are two contracts worth writing down, and the headers one is the part candidates forget
+      and interviewers notice.
+    </p>
+
+    <h3>4.1 The internal check API</h3>
+    <p>The whole limiter, as far as the calling code is concerned, is one function:</p>
+<pre><code><span class="kw">public interface</span> <span class="typ">RateLimiter</span> {
+    <span class="com">// key: "user:9f31c2", "ip:203.0.113.7", "apikey:abc:endpoint:/search"</span>
+    <span class="typ">Decision</span> check(<span class="typ">String</span> key, <span class="typ">Rule</span> rule);
+}
+
+<span class="kw">public record</span> <span class="typ">Decision</span>(
+    <span class="kw">boolean</span> allowed,
+    <span class="kw">long</span>    limit,        <span class="com">// e.g. 100</span>
+    <span class="kw">long</span>    remaining,    <span class="com">// tokens/quota left after this request</span>
+    <span class="kw">long</span>    resetEpochSec,<span class="com">// when the bucket is full / window rolls</span>
+    <span class="kw">long</span>    retryAfterSec <span class="com">// 0 when allowed</span>
+) {}
+</code></pre>
+    <p>
+      Keep it that small. A rate limiter that returns a boolean is a rate limiter that <em>cannot</em> produce good headers,
+      and you will regret it. Returning <code>remaining</code> and <code>reset</code> costs nothing — the algorithm computed
+      them anyway — and it's the difference between clients that self-pace and clients that hammer you until they get a 429.
+    </p>
+
+    <h3>4.2 The HTTP contract — what the client sees</h3>
+<pre><code>  <span class="com">--- Allowed ---</span>
+  HTTP/1.1 200 OK
+  X-RateLimit-Limit: 100
+  X-RateLimit-Remaining: 42
+  X-RateLimit-Reset: 1752505260        <span class="com"># epoch seconds</span>
+
+  <span class="com">--- Rejected ---</span>
+  HTTP/1.1 429 Too Many Requests
+  Retry-After: 18                      <span class="com"># seconds (RFC 9110 — also accepts an HTTP-date)</span>
+  X-RateLimit-Limit: 100
+  X-RateLimit-Remaining: 0
+  X-RateLimit-Reset: 1752505260
+  Content-Type: application/json
+
+  {"error":"rate_limit_exceeded",
+   "message":"Rate limit of 100 req/min exceeded for API key.",
+   "retry_after":18}
+</code></pre>
+    <p>
+      Three details that separate a considered answer from a recited one:
+    </p>
+    <ul>
+      <li><strong>429, not 503, and never 200-with-an-error-body.</strong> 429 is the specific status; HTTP clients, SDKs and
+        proxies have retry logic keyed on it. 503 says "I'm broken", which invites retries you don't want. And a 200 carrying
+        an error breaks every generic client on earth.</li>
+      <li><strong><code>Retry-After</code> is the load-bearing header.</strong> It's the only thing that turns a rejection into
+        a <em>cooperative</em> rejection. Without it, a client's only strategy is to poll, and a rate-limited client polling is
+        precisely the retry storm you were trying to prevent (see <a href="#followups">follow-ups</a>).</li>
+      <li><strong>Send the <code>X-RateLimit-*</code> headers on successes too.</strong> As a React developer you already know
+        the client-side value of this: with <code>Remaining</code> in hand, a well-written SDK can throttle itself, show a
+        progress bar, or queue work — <em>before</em> it hits the wall. (The IETF is standardising this as
+        <code>RateLimit-Limit</code>/<code>-Remaining</code>/<code>-Reset</code> without the <code>X-</code>; mentioning that
+        you know the <code>X-</code> forms are the de-facto convention and the un-prefixed forms are the emerging standard is
+        a nice, cheap detail.)</li>
+    </ul>
+
+    <div class="pitfall">
+      Don't emit the headers by re-querying the limiter. Some candidates describe a design where the middleware calls the
+      limiter to decide, then calls it <em>again</em> to fetch remaining/reset for the headers. That's two round trips per
+      request on the hottest path in the system, and the second read is racy anyway. The check returns everything the headers
+      need, in one call, atomically.
+    </div>
+  </section>
+
+  <section>
+    <h2 id="datamodel">5. Data model — rules and counter state</h2>
+    <p>There are two completely different kinds of data here, with opposite characteristics, and conflating them is a mistake.</p>
+
+    <h3>5.1 The rules — small, read-mostly, config-shaped</h3>
+    <p>
+      Rules change a few times a day at most and are read on every request. That is a caching problem, not a database problem.
+      Store the source of truth wherever it's convenient (Postgres, or a YAML file in a config repo — genuinely, both are
+      defensible), and have every limiter instance hold the entire rule set <strong>in local memory</strong>, refreshed every
+      ~10–30 seconds or pushed via a config service. The rule set is kilobytes. It never touches the hot path over the network.
+    </p>
+<pre><code><span class="com">-- source of truth; changed by humans, read by a background refresher</span>
+<span class="kw">CREATE TABLE</span> rate_limit_rules (
+    id             <span class="typ">BIGSERIAL</span> <span class="kw">PRIMARY KEY</span>,
+    scope          <span class="typ">TEXT</span> <span class="kw">NOT NULL</span>,   <span class="com">-- 'api_key' | 'ip' | 'user' | 'global'</span>
+    plan           <span class="typ">TEXT</span>,                <span class="com">-- 'free' | 'pro' | 'enterprise' | NULL = any</span>
+    endpoint       <span class="typ">TEXT</span>,                <span class="com">-- '/v1/search' | NULL = all endpoints</span>
+    algorithm      <span class="typ">TEXT</span> <span class="kw">NOT NULL</span>,   <span class="com">-- 'token_bucket' | 'sliding_counter' | ...</span>
+    capacity       <span class="typ">INT</span>  <span class="kw">NOT NULL</span>,   <span class="com">-- burst size (token bucket) or limit (window)</span>
+    refill_per_sec <span class="typ">NUMERIC</span>,             <span class="com">-- steady-state rate</span>
+    window_secs    <span class="typ">INT</span>,                 <span class="com">-- for window algorithms</span>
+    <span class="kw">UNIQUE</span> (scope, plan, endpoint)
+);
+</code></pre>
+    <p>
+      Resolution order at request time, all in local memory: most specific rule wins (<code>plan + endpoint</code> →
+      <code>plan</code> → <code>scope</code> default). A request can match several rules — a per-second one and a per-day one —
+      and it must satisfy <em>all</em> of them.
+    </p>
+
+    <h3>5.2 The counter state — tiny, ephemeral, brutally hot</h3>
+    <p>
+      This is the opposite in every dimension: written on <em>every</em> request, read on every request, worthless five minutes
+      after it's written, and it must never touch a disk. It lives in Redis, keyed by the limit key, with a TTL so that idle
+      keys evict themselves and you never need a cleanup job.
+    </p>
+<pre><code>  <span class="com"># Token bucket — one Redis HASH per (key, rule), ~20 bytes of payload</span>
+  KEY   rl:tb:{apikey:abc123}:{search_per_sec}
+  TYPE  hash
+  VALUE { tokens: 7.5, last_refill_ms: 1752505243871 }
+  TTL   ~ 2 × (capacity / refill_rate)   <span class="com"># idle bucket refills to full anyway,</span>
+                                         <span class="com"># so forgetting it is FREE and CORRECT</span>
+
+  <span class="com"># Fixed / sliding window counter — one STRING per (key, window)</span>
+  KEY   rl:fw:{apikey:abc123}:1752505200   <span class="com"># bucket = floor(now / window)</span>
+  TYPE  string (integer)
+  TTL   2 × window_secs                  <span class="com"># keep the PREVIOUS window alive too —</span>
+                                         <span class="com"># the sliding counter needs to read it</span>
+
+  <span class="com"># Sliding window LOG — one ZSET per key; score = timestamp = member</span>
+  KEY   rl:sl:{apikey:abc123}
+  TYPE  zset
+  TTL   window_secs
+</code></pre>
+    <div class="senior">
+      The TTL is doing real design work here, and saying so scores. <em>"Expiry isn't housekeeping, it's the correctness
+      argument. A token bucket that's been idle longer than its refill time is, by definition, full — so a bucket that
+      disappears from Redis and gets recreated full is not a bug, it's exactly right. That means I need no eviction job, no
+      cleanup cron, no unbounded key growth: the state is self-cleaning because forgetting is the correct behaviour."</em>
+      Compare it to the eviction problem in <a href="08-distributed-cache.html">tutorial 08</a> — here you get it for free.
+    </div>
+    <div class="note">
+      Those <code>{curly braces}</code> in the Redis keys aren't decoration — they're Redis Cluster <strong>hash tags</strong>.
+      Only the text inside the braces is hashed to pick a slot, which lets you force all the rules for one API key onto one
+      shard so a multi-rule check (per-second + per-day) can run in a single Lua script. A Lua script in Redis Cluster may only
+      touch keys in one slot; if you forget the hash tag, your beautiful atomic script fails with <code>CROSSSLOT</code> the
+      day you scale out. That is a genuinely hard-won detail and it costs you one sentence.
+    </div>
+  </section>
+
+  <section>
+    <h2 id="hld">6. High-level design</h2>
+    <p>
+      The architecture is unremarkable and you should present it fast — <em>all</em> the interesting content is inside two of
+      these boxes. Get here in ten minutes and spend the rest of the time on sections 7 and 8.
+    </p>
+<pre><code>                        ┌──────────────────────────┐
+   Client ──request──▶  │      API Gateway         │
+                        │  ┌────────────────────┐  │
+                        │  │ Rate-limit         │  │   1. resolve key + rules
+                        │  │ middleware         │──┼── 2. check counters
+                        │  └────────┬───────────┘  │
+                        └───────────┼──────────────┘
+                          allow │   │ deny
+                                │   └────────▶ 429 + Retry-After
+                                ▼                (never reaches the service)
+                         ┌─────────────┐
+                         │  Service    │
+                         └─────────────┘
+
+   The middleware's state lives here:
+                        ┌───────────────────────────────┐
+                        │  Redis (counters)             │  ← shared, hot,
+                        │  rl:tb:{key} → tokens, ts     │    sub-ms, TTL'd
+                        └───────────────────────────────┘
+                        ┌───────────────────────────────┐
+                        │  Rules store (Postgres/config)│  ← cold, pulled
+                        │  polled every 10s → local map │    into local RAM
+                        └───────────────────────────────┘
+</code></pre>
+
+    <h3>The walkthrough — one request, end to end</h3>
+    <ol>
+      <li><strong>Identify.</strong> The gateway has already authenticated the request, so it has an API key (or, for anonymous
+        traffic, the client IP — taken from the trusted proxy's <code>X-Forwarded-For</code>, not from a header the client can
+        forge). The limit key is <code>apikey:abc123</code>.</li>
+      <li><strong>Resolve rules.</strong> Look up the rules for (plan=pro, endpoint=/v1/search) in the <em>local</em> in-memory
+        map. Two rules match: 10/sec burst 20, and 100,000/day. Zero network calls. Zero milliseconds.</li>
+      <li><strong>Check counters.</strong> One round trip to Redis running a Lua script that evaluates <em>both</em> rules
+        atomically and returns allow/deny plus remaining and reset for each. ~0.3 ms. This is the only network hop the limiter
+        adds, and section 8 is entirely about making it correct and then making it disappear.</li>
+      <li><strong>Deny path.</strong> If any rule fails, respond <strong>429</strong> immediately with <code>Retry-After</code>
+        computed from the <em>tightest</em> failing rule. Increment a <code>rate_limit_rejections{key,rule}</code> counter and
+        move on. The request never reaches the service, never opens a DB connection, never costs you anything — <em>that's the
+        entire point of doing this at the gateway.</em></li>
+      <li><strong>Allow path.</strong> Attach the <code>X-RateLimit-*</code> headers (from the values the script already
+        returned) and forward to the service.</li>
+    </ol>
+    <div class="note">
+      Note what is <em>not</em> in this diagram: a "rate limiter service." Making the limiter a separate network service that
+      the gateway calls adds a full RPC hop — serialise, cross the network, deserialise, and now you've built a second thing
+      that can be down — to a decision that is fundamentally one Redis command. <strong>The limiter is a library plus a data
+      store, not a service.</strong> If an interviewer draws a "Rate Limiter Service" box and hands you the marker, ask why it
+      isn't in-process; it's a legitimate question and the honest answers (polyglot fleet, central policy, a team that owns it)
+      are about org structure, not latency.
+    </div>
+  </section>
+
+  <section>
+    <h2 id="algorithms">7. Deep dive 1 — the algorithms</h2>
+    <p>
+      <strong>This is where the interview really happens</strong> — the first half of it, anyway. There are five algorithms
+      worth knowing, and they form a chain: each one exists because the previous one has a specific, nameable flaw. Present them
+      that way. A candidate who lists five algorithms has memorised a blog post; a candidate who says <em>"the simplest thing
+      has this exact bug, so you fix it like this, and that fix costs you memory, so you make this trade"</em> is doing
+      engineering out loud, and that's the thing being graded.
+    </p>
+
+    <h3>7.1 Fixed window counter — the simplest thing, and its famous bug</h3>
+    <p>
+      Chop time into fixed windows (say, each calendar minute). Keep one counter per (key, window). Increment on each request;
+      reject when the counter exceeds the limit; let the key expire when the window rolls.
+    </p>
+<pre><code>  bucket = floor(now / window)          <span class="com"># 1752505243 / 60 → 29208420</span>
+  key    = "rl:fw:" + userKey + ":" + bucket
+
+  count = INCR key
+  <span class="kw">if</span> count == 1: EXPIRE key (2 × window)     <span class="com"># first hit sets the TTL</span>
+  <span class="kw">if</span> count &gt; limit: reject
+</code></pre>
+    <p>
+      <strong>State:</strong> one integer per key per window. <strong>Memory:</strong> O(1), a few bytes — the cheapest thing on
+      this page. <strong>Cost:</strong> one <code>INCR</code>, which is atomic in Redis, so it's <em>almost</em> race-free for
+      free (almost — see 8.1). It's genuinely tempting.
+    </p>
+    <p>And then here is the bug, which you should draw, because drawing it is more persuasive than describing it:</p>
+<pre><code>  Limit: 100 requests per minute.
+
+   window 12:00-12:01          window 12:01-12:02
+  ├───────────────────────────┼───────────────────────────┤
+  │                    ██████ │ ██████                    │
+  │                    100 req│ 100 req                   │
+  │                  at 12:00:59│ at 12:01:00              │
+  └───────────────────────────┴───────────────────────────┘
+                       └──────┬──────┘
+                    200 requests in ~2 seconds.
+                    Both windows are "within limit".
+                    Your backend saw 2× the limit, instantly.
+
+  Worst case is always 2× the limit, and it can happen in an
+  arbitrarily short instant straddling the boundary.
+</code></pre>
+    <p>
+      That's the <strong>boundary burst</strong>, and it is the single most important thing to be able to explain on this page,
+      because <em>every other algorithm in this section exists to fix it</em>. It's not a theoretical concern: a client that
+      simply retries on a schedule aligned to the minute will discover it by accident, and an attacker will discover it on
+      purpose. If your limit exists because 100/min is genuinely all your backend can take, a fixed window quietly permits
+      200/min at the worst possible moment.
+    </p>
+    <div class="senior">
+      Say: <em>"Fixed window is one <code>INCR</code> and a TTL, and I'd happily ship it for something forgiving — a
+      per-day quota, say, where a burst at the midnight boundary is harmless. But it allows 2× the limit across a window
+      boundary, and if the limit exists to protect a fragile downstream, 2× is exactly the number that hurts. So the question
+      I'd ask is: does this limit exist for tidiness, or is it load-bearing?"</em> Naming the flaw <em>and then saying when
+      you'd ship it anyway</em> is worth more than reciting a better algorithm.
+    </div>
+
+    <h3>7.2 Sliding window log — exact, and expensive in the wrong dimension</h3>
+    <p>
+      Forget windows. Store <strong>a timestamp for every request</strong> in a sorted set, keyed by user. On each request:
+      drop everything older than <code>now − window</code>, count what's left, and if that's under the limit, add this request's
+      timestamp.
+    </p>
+<pre><code>  ZREMRANGEBYSCORE rl:sl:user123  0  (now - 60_000)   <span class="com"># evict stale</span>
+  count = ZCARD rl:sl:user123
+  <span class="kw">if</span> count &lt; limit:
+      ZADD rl:sl:user123  now  now:randomSuffix       <span class="com"># suffix = uniqueness</span>
+      EXPIRE rl:sl:user123 60
+      allow
+  <span class="kw">else</span>: reject
+
+  The window truly slides — it's the last 60 seconds, continuously:
+
+   t-60s                                            now
+     ├──────────── the window, always ───────────────┤
+     · · ·  ×  ×  ×      ×   ×  ×  × ×     ×  ×  ×  ×
+   evicted  └─────────── counted (must be &lt; 100) ────┘
+</code></pre>
+    <p>
+      <strong>This is exact.</strong> No boundary bug, ever — the window is always precisely the trailing 60 seconds. It also
+      gives you a perfect <code>Retry-After</code>: it's the oldest surviving timestamp plus the window, to the millisecond.
+    </p>
+    <p>
+      <strong>And it's O(number of requests in the window) memory, per key.</strong> That's the wrong thing to be proportional
+      to. Your heaviest users — the ones you most want to limit — are exactly the ones who cost you the most memory. A user
+      allowed 10,000 requests/hour costs you 10,000 timestamps, ~160 KB, and a million such users is 160 GB. Worse, in the naive
+      version you store timestamps <em>even for rejected requests</em> if you're not careful, which means an attacker who's
+      being rejected can still make you allocate memory. (Fix: only <code>ZADD</code> on allow — as above. Note the cost of that
+      fix: a rejected request no longer extends the penalty, which is usually what you want anyway.)
+    </p>
+    <div class="pitfall">
+      The sliding log's cost is proportional to <em>the limit</em>, not to the number of users. Candidates say "O(N) memory" and
+      wave at it. Be specific: <em>"memory per key is proportional to the configured limit, so raising a customer's rate limit
+      raises my memory bill linearly — my most expensive keys are my best customers. That coupling is what makes me reject it
+      for a general-purpose limiter, even though it's the only exact one."</em>
+    </div>
+    <p>
+      When you <em>would</em> use it: small limits where exactness matters and the volume is low. "5 failed logins per 15
+      minutes" — five timestamps per key, exactly correct, no boundary exploit on a security-sensitive limit. That's a genuinely
+      good fit and naming it shows you're choosing rather than ranking.
+    </p>
+
+    <h3>7.3 Sliding window counter — the pragmatic compromise</h3>
+    <p>
+      You want the fixed window's O(1) memory and the sliding log's lack of a boundary cliff. You can have ~95% of both, and the
+      trick is one line of arithmetic: keep two fixed-window counters (current and previous) and <strong>weight the previous
+      window's count by how much of it still overlaps the trailing window.</strong>
+    </p>
+<pre><code>  elapsed = fraction of the current window that has passed  (0.0 → 1.0)
+
+  estimate = current_count + previous_count × (1 − elapsed)
+
+  ────────────────────────────────────────────────────────────────
+  Limit 100/min. It is 12:01:15, so elapsed = 15/60 = 0.25.
+  Previous window (12:00-12:01) saw 80 requests.
+  Current window  (12:01-12:02) has seen 12 so far.
+
+  estimate = 12 + 80 × (1 − 0.25)
+           = 12 + 60
+           = 72        → 72 &lt; 100, allow. Remaining ≈ 28.
+
+  Intuition: 75% of the trailing 60-second window still lies inside
+  the previous calendar minute, so we count 75% of its traffic.
+
+   12:00              12:01              12:02
+     ├──────────────────┼──────────────────┤
+     │      80 req      │   12 req so far  │
+     └────────┬─────────┴──────┬───────────┘
+        count 75% of it   count 100% of it
+              ▲                ▲
+              └──── trailing 60s window ────┘  (as of 12:01:15)
+</code></pre>
+    <p>
+      <strong>State:</strong> two integers per key. <strong>Memory:</strong> O(1) — about 20 bytes, same as fixed window.
+      <strong>Boundary bug:</strong> gone, or near enough. Take the 12:00:59 + 12:01:00 attack from 7.1: the second burst
+      arrives at elapsed ≈ 0, so the previous window's 100 requests are counted at ~100% weight, the estimate is immediately
+      ~100, and the burst is rejected. <strong>Failure mode:</strong> it <em>assumes traffic in the previous window was evenly
+      distributed</em>. It wasn't — it was a spike at the end. So the estimate can be slightly wrong in both directions: it can
+      allow a few extra requests, or reject a few that a perfect limiter would have allowed. Cloudflare famously measured this
+      against exact counting on real traffic and found the error to be a fraction of a percent, with roughly 0.003% of requests
+      wrongly rejected. That is a rounding error, and you are trading it for a 99% memory reduction.
+    </p>
+    <div class="senior">
+      Say: <em>"Sliding window counter is my default recommendation when the semantics are 'N per window', because it costs the
+      same as a fixed window — two integers — and eliminates the boundary burst by interpolating the previous window's count.
+      The approximation it makes is that traffic within the previous window was uniform, which is false, so it's off by
+      well under a percent in practice. I'll take that error to avoid storing a timestamp per request."</em> Then give the
+      formula. Producing <code>current + previous × (1 − elapsed)</code> from memory, unprompted, is a strong signal — most
+      candidates know the <em>name</em> of this algorithm and not the arithmetic.
+    </div>
+
+    <h3>7.4 Token bucket — what real systems actually use</h3>
+    <p>
+      Different model entirely, and a better one for APIs. A bucket holds up to <strong>B</strong> tokens (the capacity) and is
+      refilled at <strong>R</strong> tokens per second. Every request removes one token. No token, no service.
+    </p>
+<pre><code>              refill: R tokens/sec (continuous)
+                        │
+                        ▼
+                 ┌─────────────┐
+                 │ ● ● ● ● ●   │  capacity B = 10
+                 │ ● ● ●       │  tokens now = 8
+                 └──────┬──────┘
+                        │ each request takes 1 token
+                        ▼
+                   request allowed   (tokens ≥ 1)
+                   request 429'd     (tokens &lt; 1)
+
+  Behaviour: an idle client accumulates up to B tokens, so it may
+  BURST up to B requests instantly — then it's throttled down to the
+  steady rate R, because that's all the refill can sustain.
+</code></pre>
+    <p>
+      That burst behaviour is the whole point, and it's why <strong>Stripe, AWS, GitHub and most serious APIs use token
+      bucket</strong>. Real clients are bursty: a page loads and fires eight parallel requests; a nightly job wakes up and syncs.
+      Punishing that is user-hostile, and a limiter that forbids all bursts (leaky bucket, 7.5) makes normal applications feel
+      broken. Token bucket says: <em>burst all you like, up to B, as long as your long-run average stays under R.</em> B and R
+      are two independent knobs — <strong>burst tolerance and sustained rate</strong> — and having two knobs is a feature. The
+      window algorithms only give you one.
+    </p>
+
+    <h4>The implementation trick: lazy refill</h4>
+    <p>
+      The naive reading of "refilled at R tokens per second" is a timer that walks every bucket and tops it up. With ten million
+      buckets that is an absurd amount of work to do continuously, and 99.99% of it is wasted on buckets nobody is looking at.
+      <strong>Don't run a timer. Compute the refill on read, from elapsed time.</strong> A bucket's token count is a pure
+      function of (tokens at last touch, time since last touch), so you can reconstruct it lazily at the exact moment someone
+      asks — and if nobody ever asks, you did no work at all and the key just expires.
+    </p>
+<pre><code><span class="kw">public final class</span> <span class="typ">TokenBucket</span> {
+    <span class="kw">private final double</span> capacity;      <span class="com">// B — max burst</span>
+    <span class="kw">private final double</span> refillPerSec;  <span class="com">// R — sustained rate</span>
+
+    <span class="kw">private double</span> tokens;               <span class="com">// fractional on purpose</span>
+    <span class="kw">private long</span>   lastRefillNanos;
+
+    <span class="kw">public</span> <span class="typ">TokenBucket</span>(<span class="kw">double</span> capacity, <span class="kw">double</span> refillPerSec) {
+        <span class="kw">this</span>.capacity     = capacity;
+        <span class="kw">this</span>.refillPerSec = refillPerSec;
+        <span class="kw">this</span>.tokens          = capacity;      <span class="com">// start full</span>
+        <span class="kw">this</span>.lastRefillNanos = <span class="typ">System</span>.nanoTime();
+    }
+
+    <span class="com">/* The whole algorithm. No timer, no background thread, no scheduler. */</span>
+    <span class="kw">public synchronized boolean</span> tryAcquire(<span class="kw">int</span> permits) {
+        refill();
+        <span class="kw">if</span> (tokens &gt;= permits) {
+            tokens -= permits;
+            <span class="kw">return true</span>;
+        }
+        <span class="kw">return false</span>;
+    }
+
+    <span class="kw">private void</span> refill() {
+        <span class="kw">long</span> now     = <span class="typ">System</span>.nanoTime();
+        <span class="kw">double</span> secs  = (now - lastRefillNanos) / <span class="num">1</span>_<span class="num">000</span>_<span class="num">000</span>_<span class="num">000.0</span>;
+        tokens          = <span class="typ">Math</span>.min(capacity, tokens + secs * refillPerSec);
+        lastRefillNanos = now;
+    }
+
+    <span class="com">/* For Retry-After / X-RateLimit-Reset: when will 1 token exist? */</span>
+    <span class="kw">public synchronized long</span> retryAfterMillis() {
+        refill();
+        <span class="kw">if</span> (tokens &gt;= <span class="num">1</span>) <span class="kw">return</span> <span class="num">0</span>;
+        <span class="kw">double</span> deficit = <span class="num">1</span> - tokens;
+        <span class="kw">return</span> (<span class="kw">long</span>) <span class="typ">Math</span>.ceil(deficit / refillPerSec * <span class="num">1000</span>);
+    }
+}
+</code></pre>
+    <p>
+      Four things in that code are worth narrating out loud, because each is a small piece of evidence that you've written one:
+    </p>
+    <ul>
+      <li><strong>Tokens are a <code>double</code>.</strong> If they were integers you couldn't express "refill 0.5 tokens" and a
+        rate of 30/minute would round to nothing on a fast check. Fractional tokens are how sub-1/sec rates work at all.</li>
+      <li><strong><code>Math.min(capacity, …)</code> is the burst bound.</strong> Remove that clamp and a client idle for a week
+        comes back with 600,000 tokens and can hammer you at will. The clamp <em>is</em> the burst policy.</li>
+      <li><strong><code>nanoTime()</code>, not <code>currentTimeMillis()</code></strong>, for the local version — it's monotonic,
+        so an NTP correction or a leap second can't hand a client free tokens or freeze their bucket. (In Redis you'll use the
+        server's clock instead, precisely so that all app servers agree — see 8.2.)</li>
+      <li><strong><code>tryAcquire(permits)</code>, not <code>tryAcquire()</code>.</strong> One line of generality that buys you
+        <em>weighted</em> limiting for free: an expensive endpoint can cost 10 tokens and a cheap one 1. That's how you rate-limit
+        by <em>cost</em> rather than by request count, and it's a follow-up you can now answer in one sentence.</li>
+    </ul>
+    <div class="note">
+      If this looks familiar, it should: this is exactly what Guava's <code>RateLimiter</code> and Bucket4j do, and it's what
+      Spring Cloud Gateway's <code>RequestRateLimiter</code> filter runs (as a Lua script, against Redis) under the names
+      <code>replenishRate</code> = R and <code>burstCapacity</code> = B. Naming the Spring filter is a cheap, concrete win in an
+      enterprise loop — it says you'd reach for a battle-tested implementation rather than hand-rolling one in production, which
+      is the correct instinct and the opposite of what the interview is asking you to do on the whiteboard.
+    </div>
+
+    <h3>7.5 Leaky bucket — for when the downstream is fragile</h3>
+    <p>
+      A queue drained at a constant rate. Requests arrive whenever they like and join the queue; the queue is served at exactly
+      R per second; if the queue is full, new requests are dropped (or rejected). The <em>output</em> is perfectly smooth
+      regardless of how spiky the input is.
+    </p>
+<pre><code>  bursty in                     smooth out
+  ▶▶▶▶      ▶     ▶▶▶▶▶▶  ──▶ ┌──────────┐ ──▶  ▶  ▶  ▶  ▶  ▶  ▶
+                              │ ░░░░░░░░ │      exactly R/sec
+                              │ queue    │      forever
+                              └────┬─────┘
+                                   │ overflow → 429 (or drop)
+                                   ▼
+  Token bucket lets a burst THROUGH (up to B) and then throttles.
+  Leaky bucket NEVER lets a burst through — it flattens it,
+  by making it WAIT. That waiting is added latency.
+</code></pre>
+    <p>
+      Note the inversion: token bucket smooths <em>the average</em> and permits bursts; leaky bucket smooths <em>the
+      instantaneous rate</em> and forbids them. Use leaky bucket when the thing behind you genuinely cannot absorb a spike — a
+      legacy mainframe with a fixed thread pool, a third-party API that charges per call and rate-limits <em>you</em>, a printer
+      queue, an SMS gateway. It's traffic <strong>shaping</strong>, not just admission control. The cost is real and you must name
+      it: <strong>queuing adds latency</strong>, and a request that sits in a bucket for 3 seconds may be a request whose client
+      gave up 2 seconds ago (which is the deadline problem from <a href="06-caching-queues-resilience.html">tutorial 06</a> —
+      don't do work for a client that's gone). For a synchronous public API, users usually prefer a fast 429 to a slow 200.
+    </p>
+    <div class="pitfall">
+      "Leaky bucket" is used to mean two different things in the literature and candidates get burned by it. There's the
+      <em>queue</em> version above (shapes traffic, adds latency, what most people mean) and the <em>meter</em> version — a
+      bucket that leaks at a constant rate and that each request adds to, rejecting when it would overflow — which is
+      mathematically a mirror image of the token bucket and adds no latency at all. If the interviewer says "leaky bucket",
+      it costs you five seconds to say <em>"the queue-based one that shapes output, yes?"</em> and it prevents an entire
+      conversation at cross purposes.
+    </div>
+
+    <h3>7.6 The comparison table — the thing to revise the night before</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>Algorithm</th><th>Burst tolerance</th><th>Memory / key</th><th>Accuracy</th><th>Complexity</th><th>Use it when</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>Fixed window</strong></td>
+          <td>Bad — allows <strong>2× at the boundary</strong></td>
+          <td>O(1) — one int</td>
+          <td>Poor</td>
+          <td>Trivial (one <code>INCR</code>)</td>
+          <td>Forgiving limits (daily quotas), or you need it working in ten minutes.</td>
+        </tr>
+        <tr>
+          <td><strong>Sliding window log</strong></td>
+          <td>Exact — none permitted beyond the limit</td>
+          <td><strong>O(limit)</strong> — a timestamp per request</td>
+          <td><strong>Exact</strong></td>
+          <td>Moderate (ZSET + 3 ops)</td>
+          <td>Small limits where exactness is the product: "5 failed logins / 15 min".</td>
+        </tr>
+        <tr>
+          <td><strong>Sliding window counter</strong></td>
+          <td>Good — no boundary cliff</td>
+          <td>O(1) — two ints</td>
+          <td>~99.9% (assumes uniform traffic in the previous window)</td>
+          <td>Low</td>
+          <td><strong>The default for "N per window" semantics.</strong> Cheapest thing that isn't broken.</td>
+        </tr>
+        <tr>
+          <td><strong>Token bucket</strong></td>
+          <td><strong>Explicitly configurable</strong> — burst B, then rate R</td>
+          <td>O(1) — a float + a timestamp</td>
+          <td>Good</td>
+          <td>Low (lazy refill)</td>
+          <td><strong>The default for public APIs.</strong> What Stripe/AWS/GitHub do. Two knobs, and bursts are normal.</td>
+        </tr>
+        <tr>
+          <td><strong>Leaky bucket (queue)</strong></td>
+          <td><strong>None</strong> — output is perfectly flat</td>
+          <td>O(queue size) — holds the requests</td>
+          <td>Good</td>
+          <td>Moderate (a real queue + a drainer)</td>
+          <td>Shaping traffic into a fragile or fixed-capacity downstream. Adds latency — say so.</td>
+        </tr>
+      </tbody>
+    </table>
+    <div class="senior">
+      The one-sentence recommendation to have loaded and ready: <em>"I'd use a <strong>token bucket</strong> for the public API
+      limit — it's what the state of the art does, it costs 20 bytes a key, and it lets me tune burst and sustained rate
+      independently, which matches how real clients actually behave. If the requirement is literally phrased as 'N per minute'
+      and someone will read the number off a dashboard, I'd use a <strong>sliding window counter</strong> instead, because it
+      matches that mental model exactly and costs the same. I'd only reach for the sliding <strong>log</strong> where exactness
+      is worth O(limit) memory, and for a leaky bucket only when I'm protecting something that can't take a spike at all."</em>
+    </div>
+  </section>
+
+  <section>
+    <h2 id="distributed">8. Deep dive 2 — making it distributed</h2>
+    <p>
+      <strong>This is the other half of where the interview happens, and it's the reason the question gets asked at all.</strong>
+      Everything in section 7 works beautifully on one machine. You do not have one machine.
+    </p>
+
+    <h3>8.1 The two problems, in order</h3>
+    <p>
+      Start by naming both, because candidates usually spot the first and get ambushed by the second.
+    </p>
+<pre><code>  PROBLEM 1 — the counter must be SHARED.
+
+    50 app servers, each with its own in-memory token bucket
+    configured at 100/min.
+
+    Real enforced limit = 50 × 100 = 5000/min.
+
+    Your "100 per minute" limit is a 5000 per minute limit, and it
+    silently gets looser every time you autoscale. A limit that
+    changes when you add capacity is not a limit.
+
+  PROBLEM 2 — once it's shared, it's CONCURRENT.
+
+    Two servers, same user, same instant, limit = 100:
+
+      Server A: GET count → 99          ─┐  both read 99
+      Server B: GET count → 99          ─┘  before either writes
+      Server A: 99 &lt; 100 → allow, SET 100
+      Server B: 99 &lt; 100 → allow, SET 100
+
+    Two requests allowed. Counter says 100. Reality: 101 served.
+    Classic lost update / read-then-write race.
+
+    With 50 servers hammering the same key, you don't overshoot
+    by one — you overshoot by roughly the number of concurrent
+    checks in flight.
+</code></pre>
+    <p>
+      Problem 1's answer is immediate: move the counter to a shared store, and the store is <strong>Redis</strong>, for the
+      reasons the estimation section already forced — sub-millisecond, in-memory, atomic primitives, and the exact data
+      structures this problem needs (see <a href="06-caching-queues-resilience.html">tutorial 06</a>). Postgres is out on
+      latency and on row contention: 100k concurrent <code>UPDATE</code>s on the same row is a lock convoy, not a rate limiter.
+    </p>
+    <p>Problem 2 is the interesting one, and there are three answers with different quality.</p>
+
+    <h3>8.2 Fixing the race — three options, ranked</h3>
+
+    <h4>Option A — <code>INCR</code> alone (atomic, but not sufficient on its own)</h4>
+    <p>
+      Redis's <code>INCR</code> is atomic and returns the new value, which means for the <em>fixed window</em> algorithm you can
+      collapse the read and the write into one operation and the race disappears entirely:
+    </p>
+<pre><code>  count = INCR key            <span class="com"># atomic; returns post-increment value</span>
+  <span class="kw">if</span> count == 1: EXPIRE key ttl
+  <span class="kw">if</span> count &gt; limit: reject    <span class="com"># decide AFTER incrementing, on the returned value</span>
+</code></pre>
+    <p>
+      This is genuinely race-free for the allow/deny decision, and it's why fixed-window-with-<code>INCR</code> is the world's
+      most deployed rate limiter. But notice what it costs. You increment <em>before</em> you know whether you'll allow, so
+      rejected requests still count against the user — a client being throttled digs its own hole deeper (arguably fine, arguably
+      not; it's a policy choice you should <em>name</em>). And it only works because fixed-window's state update is a single
+      commutative operation. The moment your algorithm needs <em>read → compute → conditionally write</em> — which token bucket,
+      sliding log and sliding counter all do — <code>INCR</code> can't save you. There's also a subtle bug lurking: the
+      <code>INCR</code> and the <code>EXPIRE</code> are two commands, and a crash between them leaves a key with no TTL that
+      never resets. That user is now banned forever. (You'd never find this in testing. You'd find it in production, once.)
+    </p>
+
+    <h4>Option B — <code>WATCH</code>/<code>MULTI</code>/<code>EXEC</code> (optimistic transactions — works, don't use it)</h4>
+    <p>
+      Redis's transactions with <code>WATCH</code> give you optimistic concurrency control: watch the key, read it, queue your
+      writes, and <code>EXEC</code> fails if anyone touched the key meanwhile. Correct, and exactly the optimistic-locking
+      pattern you know from Postgres version columns. But under contention on a hot key — which is <em>precisely</em> the
+      situation a rate limiter exists to handle — it degenerates: everyone's <code>EXEC</code> fails, everyone retries, and you
+      have a retry storm inside your rate limiter, plus two-to-three round trips per attempt on your hottest path. It's the
+      right idea in the wrong place. Mention it, dismiss it, and say why: <em>"optimistic concurrency is a bad fit when
+      contention is the norm rather than the exception."</em>
+    </p>
+
+    <h4>Option C — a Lua script (the standard answer)</h4>
+    <p>
+      Redis executes a Lua script <strong>atomically on its single thread</strong>: no other command from any other client runs
+      in the middle of it. So you ship the entire read-compute-write decision into the server, and the race cannot exist —
+      not because you locked anything, but because there is no interleaving to lose an update in. One round trip, one atomic
+      decision, all the state and all the arithmetic on the same box.
+    </p>
+    <p>Here is the token bucket with lazy refill, as an atomic Redis script. This is the artifact worth being able to reproduce:</p>
+<pre><code><span class="com">-- rate_limit.lua  ·  KEYS[1] = "rl:tb:{apikey:abc}:search"
+-- ARGV: capacity, refillPerSec, nowMillis, requestedTokens
+-- Returns: { allowed(0|1), remaining, retryAfterMillis }</span>
+
+<span class="kw">local</span> key        = KEYS[<span class="num">1</span>]
+<span class="kw">local</span> capacity   = <span class="typ">tonumber</span>(ARGV[<span class="num">1</span>])
+<span class="kw">local</span> refillRate = <span class="typ">tonumber</span>(ARGV[<span class="num">2</span>])   <span class="com">-- tokens per second</span>
+<span class="kw">local</span> now        = <span class="typ">tonumber</span>(ARGV[<span class="num">3</span>])   <span class="com">-- ms, passed IN by the caller</span>
+<span class="kw">local</span> requested  = <span class="typ">tonumber</span>(ARGV[<span class="num">4</span>])
+
+<span class="kw">local</span> state  = redis.call(<span class="str">'HMGET'</span>, key, <span class="str">'tokens'</span>, <span class="str">'ts'</span>)
+<span class="kw">local</span> tokens = <span class="typ">tonumber</span>(state[<span class="num">1</span>])
+<span class="kw">local</span> ts     = <span class="typ">tonumber</span>(state[<span class="num">2</span>])
+
+<span class="kw">if</span> tokens == <span class="kw">nil then</span>                     <span class="com">-- first sighting, or the key expired:</span>
+  tokens = capacity                        <span class="com">-- an absent bucket is a FULL bucket</span>
+  ts     = now
+<span class="kw">end</span>
+
+<span class="com">-- LAZY REFILL: reconstruct the tokens that "accrued" while we weren't looking</span>
+<span class="kw">local</span> elapsed = <span class="typ">math</span>.max(<span class="num">0</span>, now - ts) / <span class="num">1000.0</span>
+tokens = <span class="typ">math</span>.min(capacity, tokens + elapsed * refillRate)
+
+<span class="kw">local</span> allowed = <span class="num">0</span>
+<span class="kw">local</span> retryAfter = <span class="num">0</span>
+
+<span class="kw">if</span> tokens &gt;= requested <span class="kw">then</span>
+  tokens  = tokens - requested
+  allowed = <span class="num">1</span>
+<span class="kw">else</span>
+  <span class="kw">local</span> deficit = requested - tokens
+  retryAfter = <span class="typ">math</span>.ceil(deficit / refillRate * <span class="num">1000</span>)
+<span class="kw">end</span>
+
+redis.call(<span class="str">'HSET'</span>, key, <span class="str">'tokens'</span>, tokens, <span class="str">'ts'</span>, now)
+
+<span class="com">-- self-cleaning: a bucket idle for (capacity/rate) seconds is full anyway,
+-- so letting it vanish is not just safe, it's exactly equivalent.</span>
+redis.call(<span class="str">'PEXPIRE'</span>, key, <span class="typ">math</span>.ceil(capacity / refillRate * <span class="num">1000</span>) * <span class="num">2</span>)
+
+<span class="kw">return</span> { allowed, <span class="typ">math</span>.floor(tokens), retryAfter }
+</code></pre>
+    <p>Calling it from Spring, with the script pre-loaded and invoked by SHA so you're not shipping the source every request:</p>
+<pre><code><span class="ann">@Component</span>
+<span class="kw">public class</span> <span class="typ">RedisTokenBucketLimiter</span> <span class="kw">implements</span> <span class="typ">RateLimiter</span> {
+
+    <span class="kw">private final</span> <span class="typ">StringRedisTemplate</span> redis;
+    <span class="kw">private final</span> <span class="typ">RedisScript</span>&lt;<span class="typ">List</span>&gt; script =
+        <span class="typ">RedisScript</span>.of(<span class="kw">new</span> <span class="typ">ClassPathResource</span>(<span class="str">"rate_limit.lua"</span>), <span class="typ">List</span>.<span class="kw">class</span>);
+
+    <span class="ann">@Override</span>
+    <span class="kw">public</span> <span class="typ">Decision</span> check(<span class="typ">String</span> key, <span class="typ">Rule</span> rule) {
+        <span class="kw">try</span> {
+            <span class="typ">List</span>&lt;<span class="typ">Long</span>&gt; r = redis.execute(script,
+                <span class="typ">List</span>.of(<span class="str">"rl:tb:{"</span> + key + <span class="str">"}:"</span> + rule.name()),
+                <span class="typ">String</span>.valueOf(rule.capacity()),
+                <span class="typ">String</span>.valueOf(rule.refillPerSec()),
+                <span class="typ">String</span>.valueOf(<span class="typ">Instant</span>.now().toEpochMilli()),
+                <span class="str">"1"</span>);
+            <span class="kw">return</span> <span class="typ">Decision</span>.of(r);
+        } <span class="kw">catch</span> (<span class="typ">RedisConnectionFailureException</span> | <span class="typ">QueryTimeoutException</span> e) {
+            <span class="com">// THE decision of this page — see section 10.</span>
+            <span class="kw">return</span> fallback.check(key, rule);   <span class="com">// local bucket, fail-open-ish</span>
+        }
+    }
+}
+</code></pre>
+    <div class="senior">
+      Say the <em>reason</em> Lua works, not just that it works: <em>"Redis is single-threaded, so a Lua script is a critical
+      section I get for free — while it runs, no other client's command can interleave with it. That's what makes this clean:
+      I'm not taking a distributed lock, I'm exploiting the fact that Redis already serialises everything. The whole
+      read-modify-write happens where the data is, in one round trip, and the lost-update race is structurally impossible
+      rather than defended against."</em> The phrase <strong>"structurally impossible rather than defended against"</strong> is
+      the difference between a 3-YOE and a 7-YOE answer.
+    </div>
+    <div class="pitfall">
+      <strong>Pass the timestamp in; don't call <code>TIME</code> inside the script — and don't use each app server's clock
+      either.</strong> Both halves matter. Historically Redis forbade non-deterministic commands like <code>TIME</code> before a
+      write because scripts were replicated verbatim to replicas (effects replication since Redis 5 makes this safe, but the
+      habit is right and interviewers of a certain vintage will ask). Meanwhile, using each app server's own clock means 50
+      slightly-skewed clocks writing to one bucket, and a server whose clock runs 2 seconds fast hands its users free tokens.
+      <strong>Pick one clock and be explicit about which:</strong> the app server's (simple, tolerates skew badly) or Redis's own
+      via a single <code>TIME</code> call (one authoritative clock, at the cost of that determinism caveat). Naming clock skew
+      unprompted on a rate-limiter question is a real signal — almost nobody does.
+    </div>
+
+    <h3>8.3 The second problem: you just put Redis in every request's hot path</h3>
+    <p>
+      Congratulations, the counter is correct. Now look at what you've built: <strong>every single request in your entire
+      system now makes a network call to one Redis cluster before it does anything else.</strong> Roughly 0.3–0.5 ms in the same
+      AZ if all is well — which is fine, and honestly you could stop here and defend it. But be aware of what you've signed up
+      for:
+    </p>
+    <ul>
+      <li>You've added a hard dependency to <em>everything</em>. Redis's availability is now an upper bound on your API's
+        availability (until section 10 fixes that).</li>
+      <li>P99 is not P50. Redis's P99 under load, plus a connection-pool wait, plus a GC pause on your side, is not 0.3 ms. It's
+        occasionally 20 ms, and that 20 ms is now on the P99 of every endpoint you own.</li>
+      <li>Cross-AZ or cross-region, this is 2 ms or 80 ms and the design is simply dead. <strong>The limiter's Redis must be
+        local to the servers it serves.</strong> Which raises the multi-region question — see section 11.</li>
+    </ul>
+
+    <h3>8.4 The optimisation: local buckets with periodic sync</h3>
+    <p>
+      Here's the move that shows you've operated one of these. <strong>Stop asking Redis for permission on every request. Ask it
+      for a <em>budget</em>, occasionally, and enforce locally.</strong>
+    </p>
+<pre><code>  Each app server keeps a LOCAL token bucket per hot key.
+  Redis holds the authoritative global budget.
+
+  Every ~100 ms (or when a local bucket runs dry), the server
+  reconciles:  "I consumed 37 tokens for user X since we last spoke.
+                Deduct them, and lease me 40 more."
+
+   App server 1 ──┐   local bucket: 40 tokens  ─┐
+   App server 2 ──┼──▶ local bucket: 40 tokens  ─┼─▶ Redis: global
+   App server 3 ──┘   local bucket: 40 tokens  ─┘   counter, synced
+                                                    every 100 ms
+   Hot path cost:  a few NANOSECONDS (an in-memory CAS).
+   Redis traffic:  100k QPS → ~10-30 calls/sec/server. A 1000× cut.
+   Cost of the trade: for up to 100 ms, servers act on stale
+   information, so the fleet can collectively overshoot by roughly
+   (leased tokens still held) in the worst case.
+</code></pre>
+    <p>
+      This is not exotic — it's how high-volume limiters actually work, and it's the same lease/batch idea as the
+      <a href="07-url-shortener.html">ID-range allocation</a> in the URL shortener (grab a block of 1,000 IDs from the counter,
+      hand them out locally, come back for more). Same pattern, same trade: <strong>batch the coordination, accept bounded
+      staleness, get orders of magnitude.</strong> Note it also degrades beautifully — if Redis blips, each server still has a
+      local bucket with a lease in it and keeps enforcing something reasonable while it reconnects.
+    </p>
+    <p>The knobs, and how to describe the trade honestly:</p>
+    <table>
+      <thead><tr><th>Sync interval</th><th>Redis load</th><th>Worst-case overshoot</th><th>Verdict</th></tr></thead>
+      <tbody>
+        <tr><td>Every request (no local bucket)</td><td>100k QPS</td><td>~0 (exact)</td><td>The baseline. Correct, and a 0.3 ms tax on everything.</td></tr>
+        <tr><td>~100 ms</td><td>~10/sec/server</td><td>≤ (N servers × lease size), bounded and computable</td><td><strong>The sweet spot for abuse prevention.</strong></td></tr>
+        <tr><td>~1 s</td><td>~1/sec/server</td><td>Larger, and a burst can be 1 s stale</td><td>Fine for daily quotas; too loose for a per-second limit.</td></tr>
+      </tbody>
+    </table>
+    <div class="senior">
+      This is the trade-off to make explicitly, out loud, tied back to the clarifying question you asked in section 2:
+      <em>"For abuse prevention I'd absolutely take local buckets with a 100 ms sync — the limiter stops being a network call
+      at all, and the cost is that a determined client might get 105 requests instead of 100 during a burst. Nobody is harmed
+      by that. <strong>For billing I would not</strong>: if I'm selling 10,000 API calls and a fleet-wide race gives away 400 of
+      them, that's revenue, and multiplied across every customer it's a real number. Metered billing goes through the atomic
+      Redis path, or it gets reconciled asynchronously against a durable event log rather than enforced by the limiter at
+      all."</em> That paragraph is the single highest-value thing on this page. It is the same technical mechanism being
+      accepted and rejected on business grounds, which is exactly what senior judgment looks like.
+    </div>
+  </section>
+
+  <section>
+    <h2 id="where">9. Where does the limiter live?</h2>
+    <p>
+      Four candidate locations. The interviewer wants to hear you pick one and say why the others lose — and, crucially, to hear
+      that <strong>"client-side" is never enforcement</strong>.
+    </p>
+    <table>
+      <thead><tr><th>Location</th><th>What it buys</th><th>What it costs</th><th>Verdict</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Client-side</strong> (in your SDK / React app)</td>
+          <td>Requests that would be rejected never leave the device. Zero server cost, instant feedback, you can grey out the button.</td>
+          <td><strong>Trivially bypassed.</strong> Anyone can <code>curl</code> your API. A rate limit you can disable with devtools is not a rate limit.</td>
+          <td><strong>Courtesy, never enforcement.</strong> Do it <em>as well</em>, never <em>instead</em>. Say that sentence.</td>
+        </tr>
+        <tr>
+          <td><strong>API gateway / edge proxy</strong> (Kong, Envoy, Nginx, Spring Cloud Gateway, ALB+WAF)</td>
+          <td>Bad traffic dies at the front door — before auth, before a thread, before a DB connection, before it costs you anything. One place to configure. Protects <em>every</em> service behind it automatically, including new ones.</td>
+          <td>Only knows what's in the request (key, IP, path). Can't limit on business facts it doesn't have — "10 refunds per account per day" is invisible to it.</td>
+          <td><strong>The default answer, and the one to lead with.</strong> Cross-reference <a href="02-networking-delivery.html">tutorial 02</a>: this is exactly the cross-cutting concern gateways exist for.</td>
+        </tr>
+        <tr>
+          <td><strong>Sidecar</strong> (Envoy in a service mesh)</td>
+          <td>Same enforcement, but per-service and language-agnostic; the mesh handles config distribution; enables service-to-service limiting, not just ingress.</td>
+          <td>You now run a service mesh. Operational weight, another hop, another thing to debug at 3am.</td>
+          <td>Right if you already have a mesh; a very expensive way to get a rate limiter if you don't.</td>
+        </tr>
+        <tr>
+          <td><strong>In the service</strong> (middleware / a Spring interceptor)</td>
+          <td>Full business context — plan, account state, the cost of the specific operation, "this user is on a fraud hold".</td>
+          <td>Every service reimplements it (or shares a library and drifts). The request has already cost you a thread and an auth check by the time you reject it.</td>
+          <td>Use <strong>in addition</strong>, for semantic limits the gateway can't express. Not instead.</td>
+        </tr>
+      </tbody>
+    </table>
+    <div class="senior">
+      The answer that closes this section: <em>"Gateway for the coarse limits — per-IP, per-API-key, per-endpoint — because that's
+      where I can reject traffic before it costs me anything, and it protects services I haven't written yet. Then a thin layer
+      inside the service for limits that need business context, like 'five password resets per account per hour', which the
+      gateway can't see. Client-side throttling in the SDK as a courtesy to well-behaved clients, and I'd never count it as
+      enforcement. <strong>Defence in depth: the layers have different information, so they catch different things.</strong>"</em>
+    </div>
+    <div class="note">
+      There's a real-world anchor worth knowing: this is precisely what Envoy's global rate limiting does — the proxy calls an
+      external rate-limit service over gRPC, which is backed by Redis. So the "limiter is a library + a store" claim from section
+      6 has an industrial-strength counter-example, and the reason is the one I gave there: a polyglot fleet needs <em>one</em>
+      implementation and <em>one</em> policy store, and that's worth an extra sub-millisecond hop <em>inside the same pod</em>.
+      Being able to name both the rule and its exception is what "awareness" looks like.
+    </div>
+  </section>
+
+  <section>
+    <h2 id="redisdown">10. When Redis is down — fail open or fail closed?</h2>
+    <p>
+      <strong>This is the best follow-up on the page, and interviewers use it as the senior filter.</strong> You have just made
+      Redis a hard dependency of literally every request. Redis is now down — a failover, a network partition, a cluster
+      upgrade gone wrong, an OOM. What does the limiter do?
+    </p>
+<pre><code>  FAIL OPEN                         FAIL CLOSED
+  (allow the request)               (reject with 429/503)
+
+  "I can't tell if you're over       "I can't tell if you're over
+   the limit, so I'll let you         the limit, so I'll assume the
+   through."                          worst and reject you."
+
+  Risk: unlimited traffic hits       Risk: your entire API is down
+        the backend during the             because a CACHE is down.
+        limiter outage.
+
+  Availability: preserved.           Availability: destroyed.
+  Protection:   gone.                Protection:   absolute.
+</code></pre>
+    <p>
+      <strong>The default is fail open, and here's the argument to make:</strong> a rate limiter is a <em>protective</em>
+      control, not a <em>correctness</em> control. Its job is to stop a minority of abusive traffic from harming the majority. If
+      failing closed means that a Redis blip converts "some users are being throttled" into "<em>every</em> user gets a 429",
+      you have taken an outage in a component that only matters for 0.1% of requests and turned it into a 100% outage of your
+      product. <strong>A rate limiter whose failure mode is a total outage is a self-own</strong> — you've built a system that is
+      strictly less available than the one you were protecting. Say exactly that.
+    </p>
+    <p>
+      <strong>But fail open is not "do nothing", and this is where most candidates stop and lose the point.</strong> Fail open,
+      degraded, with a local fallback:
+    </p>
+    <ul>
+      <li><strong>Local in-memory bucket per instance.</strong> If Redis is unreachable, each server enforces the limit <em>on
+        its own</em>. With 50 servers, the effective limit is 50× — much too loose, and yet infinitely better than unlimited. A
+        single abusive client hitting one server still gets throttled. You've traded exactness for availability, temporarily, on
+        purpose.</li>
+      <li><strong>Tighten the local limit during the outage.</strong> If you know traffic is roughly evenly balanced across 50
+        servers, set the fallback bucket to limit/50 × a fudge factor. Now the fleet-wide enforcement is approximately right
+        even with no shared state at all. This is a genuinely clever answer and it costs one sentence.</li>
+      <li><strong>Short-circuit, don't hang.</strong> Wrap the Redis call in a <strong>circuit breaker</strong> with a tight
+        timeout (5–10 ms — remember your latency budget; a call that takes 500 ms has already failed even if it eventually
+        succeeds). Without a breaker, "Redis is slow" means every request waits 10 ms on a dead socket and your thread pools fill
+        — the cascading failure from <a href="06-caching-queues-resilience.html">tutorial 06</a>, triggered by your own safety
+        feature. <strong>The timeout on the limiter's Redis call is the most important config value in this design.</strong></li>
+      <li><strong>Alarm loudly.</strong> "Limiter degraded" is a page, not a log line. You are unprotected and you should know it.</li>
+    </ul>
+
+    <h3>When you fail closed instead</h3>
+    <p>
+      Flip the default when the thing behind the limiter <strong>will actually fall over, or will actually cost money,</strong>
+      if you let the traffic through:
+    </p>
+    <ul>
+      <li><strong>A third-party quota you must not exceed.</strong> Your payment provider allows 500 TPS and starts charging
+        (or blocking you) above it. Unlimited traffic there doesn't degrade you — it gets your merchant account throttled.
+        Reject. Fail closed.</li>
+      <li><strong>Metered/billed usage.</strong> If you can't count it, you can't charge for it. Better to reject than to serve
+        for free.</li>
+      <li><strong>A fragile downstream with no headroom</strong> — the legacy mainframe with 40 connections. Letting the flood
+        through kills it, and it takes an hour to bring back. A 429 for five minutes is cheaper than a one-hour outage.</li>
+      <li><strong>Security-critical limits</strong> — login attempts, OTP sends. If you can't count failed logins, you are
+        running an open credential-stuffing target. Fail closed (or fall back to a conservative local limit and accept the false
+        positives).</li>
+    </ul>
+    <div class="senior">
+      Don't answer "it depends" — <strong>make the choice and defend it</strong>, which is the whole skill being tested:
+      <em>"Fail open, with a local per-instance fallback bucket, a circuit breaker with a 10 ms timeout, and a page. My reasoning
+      is that the limiter protects against a minority of abusive traffic, and if its failure mode is 'reject everything', I've
+      built something whose outage is worse than the problem it solves. But I'd invert that for any limit protecting a hard
+      external quota — a payment provider's TPS cap, say — because there, letting the traffic through doesn't degrade my system,
+      it breaks a contract. So: <strong>fail open by default, fail closed where the limit is load-bearing, and make that a
+      per-rule flag rather than a global policy.</strong>"</em> That last clause — <em>per-rule, not global</em> — is the one that
+      gets remembered.
+    </div>
+    <div class="pitfall">
+      The trap here is answering "fail open" reflexively because you read it somewhere, and then folding the instant the
+      interviewer pushes ("so an attacker just DDoSes your Redis and then gets unlimited access to your API?"). Have the
+      comeback ready: <em>"Yes — which is why the fallback is a local bucket rather than nothing, why the limiter's Redis isn't
+      reachable from the internet, and why volumetric attacks are handled at the edge, not here. A rate limiter is not a DDoS
+      defence, and I wouldn't claim it as one."</em>
+    </div>
+  </section>
+
+  <section>
+    <h2 id="scaling">11. Scaling &amp; bottlenecks</h2>
+    <p>What breaks first at 10×, in the order it breaks.</p>
+
+    <h3>11.1 The hot key — the first thing that melts</h3>
+    <p>
+      Rate-limit keys are sharded by user/API key, so load spreads evenly across the Redis cluster — right up until it doesn't.
+      Two ways it doesn't:
+    </p>
+    <ul>
+      <li><strong>One hammering client.</strong> A single API key sending 50k RPS maps to <em>one key</em>, which maps to
+        <em>one slot</em>, which lives on <em>one shard</em>. Adding shards does not help: consistent hashing distributes
+        <em>keys</em>, and you have one key. That shard is now single-threaded (Redis!) and doing 50k round trips a second while
+        the rest of the cluster idles. This is the celebrity-partition problem from
+        <a href="04-partitioning-hashing.html">tutorial 04</a>, and it is delicious irony: <em>the abusive traffic your rate
+        limiter exists to stop is the traffic that kills your rate limiter.</em></li>
+      <li><strong>A global limit.</strong> "The whole system does at most 10,000 writes/sec to the payment provider" is
+        <em>one counter, by definition</em>. There is no key to shard on. This is the genuinely unavoidable case and you should
+        say so rather than pretending sharding solves it.</li>
+    </ul>
+    <p><strong>The fixes, in the order you'd apply them:</strong></p>
+    <ol>
+      <li><strong>Local buckets with periodic sync (8.4) — this is the real answer, and note that it solves the hot key for
+        free.</strong> If each server only talks to Redis 10 times a second per key, a hammering client generates 50 servers ×
+        10/sec = 500 Redis ops/sec instead of 50,000. The hot key evaporates. Say this explicitly: <em>"batching the
+        coordination isn't just a latency optimisation, it's my hot-key mitigation — it's the same fix wearing a different
+        hat."</em></li>
+      <li><strong>Shard the counter (key splitting).</strong> For a genuinely global limit, split it into N sub-counters —
+        <code>global:writes:0…9</code>, each with limit/10 — and have each app server deterministically use one. You've turned
+        one hot key into ten warm ones. The cost: if load isn't perfectly even across the shards, one sub-limit fills while
+        others have headroom, and you under-admit. Classic, and worth naming: <strong>you traded a hot key for a
+        utilisation loss.</strong> The refinement is to let a server steal budget from a neighbouring shard when its own runs
+        dry, which recovers most of the loss and costs you a second round trip on the unhappy path.</li>
+      <li><strong>Reject earlier.</strong> A client that is <em>already</em> being throttled doesn't need a fresh Redis check on
+        every request. Cache the "this key is blocked until T" decision locally for a second or two. A blocked abuser then costs
+        you a hash-map lookup, not a network call — which is exactly what you want, since blocked abusers are the ones sending
+        the most traffic.</li>
+    </ol>
+
+    <h3>11.2 Redis itself</h3>
+    <ul>
+      <li><strong>Vertical first, and it's usually enough.</strong> One Redis node does ~100k+ ops/sec with pipelining, and your
+        state is tens of megabytes. Say that out loud — it's an honest, calibrated statement and it prevents you from
+        over-architecting a cluster you don't need. <em>"At 100k QPS with local buckets I'm doing maybe 2k Redis ops/sec. One
+        node, one replica, done. I'd only shard when I can show I need to."</em></li>
+      <li><strong>Then Redis Cluster</strong>, sharded by limit key (with the hash tags from section 5.2 so one key's multiple
+        rules stay in one slot and the Lua script stays legal).</li>
+      <li><strong>Replicas don't help with correctness.</strong> Redis replication is asynchronous — reading a counter from a
+        replica gives you a stale count, and a limiter that reads stale counts is a limiter that over-admits. Replicas are for
+        <em>failover</em>, not for scaling the limiter's reads. And note the sharp edge: on failover, unreplicated writes are
+        lost, so a few buckets snap back to a more permissive state. For a rate limiter that's completely acceptable — a
+        momentary blip of leniency — and saying <em>"I'm fine losing counter state on failover; this is ephemeral data and the
+        blast radius is a few seconds of leniency"</em> shows you've thought about durability and correctly decided you don't
+        need it.</li>
+    </ul>
+
+    <h3>11.3 Multi-region</h3>
+    <p>
+      Don't share the counter across regions. A cross-region Redis call is ~80 ms, and adding 80 ms to every request in your
+      system to enforce a limit precisely is an obviously bad trade. <strong>Run an independent limiter per region</strong> and
+      accept that a client hitting two regions gets up to 2× the limit. If that's unacceptable (it usually isn't — clients are
+      pinned to a region by DNS/GeoDNS anyway), split the budget: each region enforces limit/num_regions, optionally with slow
+      async rebalancing of unused budget between them. If someone insists on an exact global limit across regions, tell them the
+      truth: <em>"that requires cross-region coordination on every request, which costs 80 ms and a shared failure domain. I'd
+      push back and ask what the exactness is actually worth."</em>
+    </p>
+
+    <h3>11.4 The other bottlenecks worth naming</h3>
+    <ul>
+      <li><strong>Rules distribution.</strong> With per-plan and per-endpoint rules, the rule set is real config. Don't fetch it
+        per request. Poll into local memory every ~10 s and accept that a rule change takes 10 seconds to take effect fleet-wide
+        — which is fine, and which you should <em>state</em> rather than leave implicit.</li>
+      <li><strong>Key cardinality.</strong> Per-IP limiting on IPv6 is a cardinality trap: an attacker has a /64 with 18
+        quintillion addresses in it and gets a fresh bucket for each one. Limit on the <strong>/64 prefix</strong>, not the
+        address. This is a lovely, specific detail that almost nobody mentions.</li>
+      <li><strong>Observability.</strong> Emit rejection rate per rule and per key. The two alarms that matter: rejections
+        spiking (you're under attack, or you shipped a bad limit and are now throttling your own biggest customer), and
+        rejections going to zero (your limiter is silently failing open and you'd never otherwise know).</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2 id="tradeoffs">12. Trade-offs</h2>
+    <table>
+      <thead><tr><th>Decision</th><th>Chosen</th><th>Alternative</th><th>Flip when</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>Algorithm</td>
+          <td><strong>Token bucket</strong> (lazy refill)</td>
+          <td>Sliding window counter; sliding log; fixed window; leaky bucket</td>
+          <td>Requirement is literally "N per window" → sliding counter. Exactness on a small limit → log. Fragile downstream that can't take a spike → leaky bucket.</td>
+        </tr>
+        <tr>
+          <td>Counter store</td>
+          <td><strong>Redis</strong></td>
+          <td>Postgres; in-process only; a purpose-built limiter service</td>
+          <td>Never Postgres for the hot counter (latency + row contention). In-process only if you truly have one server, or as the degraded fallback.</td>
+        </tr>
+        <tr>
+          <td>Atomicity</td>
+          <td><strong>Lua script</strong> (one round trip, atomic on Redis's single thread)</td>
+          <td><code>INCR</code>; <code>WATCH</code>/<code>MULTI</code>; a distributed lock</td>
+          <td><code>INCR</code> alone is fine <em>if and only if</em> you're doing fixed-window. Never a distributed lock — it's ~10× the cost to solve a problem Redis's single thread already solved.</td>
+        </tr>
+        <tr>
+          <td>Where the check runs</td>
+          <td><strong>Local buckets + ~100 ms sync</strong></td>
+          <td>Redis on every request (exact)</td>
+          <td>Flip to per-request Redis for <strong>billing/metered quotas</strong>, or any limit where overshoot costs money or breaks a contract.</td>
+        </tr>
+        <tr>
+          <td>Placement</td>
+          <td><strong>API gateway</strong> (+ in-service for semantic limits)</td>
+          <td>Sidecar/mesh; service-only; client-only</td>
+          <td>Sidecar if you already run a mesh. Client-side is <em>never</em> enforcement — only a courtesy.</td>
+        </tr>
+        <tr>
+          <td>Redis unavailable</td>
+          <td><strong>Fail open</strong> + local fallback bucket + circuit breaker + page</td>
+          <td>Fail closed</td>
+          <td>Fail closed when the limit protects a hard external quota (payment provider), metered billing, a fragile downstream, or a security limit. Make it a <strong>per-rule flag.</strong></td>
+        </tr>
+        <tr>
+          <td>Multi-region</td>
+          <td><strong>Independent limiter per region</strong>, budget split</td>
+          <td>One globally-shared counter</td>
+          <td>Essentially never flip — 80 ms per request and a shared failure domain is not worth exactness. Push back on the requirement instead.</td>
+        </tr>
+        <tr>
+          <td>Counter durability</td>
+          <td><strong>None</strong> — TTLs, no AOF/RDB needed, lose it on failover</td>
+          <td>Persist the counters</td>
+          <td>Only for long-window quotas where losing state is a real giveaway (a monthly billing quota shouldn't reset because Redis failed over — but that quota belongs in a durable store, not the limiter).</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2 id="followups">13. Follow-ups you should expect</h2>
+
+    <h3>"The user has a per-second limit AND a per-day limit. How?"</h3>
+    <p>
+      Multiple rules, evaluated together, and the request passes only if <em>all</em> pass. Two important details. First,
+      <strong>evaluate them in one round trip</strong> — one Lua script, taking all the applicable rules, checking each, and
+      consuming from all of them only if all would allow. If you check them sequentially you'll consume a token from the
+      per-second bucket and then get rejected by the daily one, leaking budget from the first. Second, <strong>the
+      <code>Retry-After</code> comes from the rule that will free up <em>last</em></strong> — no point telling someone to retry
+      in 1 second when their daily quota resets in 6 hours. And put the tightest/cheapest rule first so the common rejection
+      short-circuits fast. The hash-tag trick from 5.2 is what lets all those keys live in one slot so a single script can touch
+      them.
+    </p>
+
+    <h3>"Different limits per plan tier?"</h3>
+    <p>
+      That's the rules table from section 5.1 doing its job: rules are data, keyed by (scope, plan, endpoint), resolved
+      most-specific-first, cached in local memory, refreshed every 10 seconds. The limiter itself doesn't change at all — it
+      takes a key and a rule. Worth saying: <em>"a plan upgrade should take effect within seconds, not on the next deploy, which
+      is why the rules are config and not code."</em> The one wrinkle: the <em>key</em> must include the plan or the rule name,
+      otherwise upgrading a user from free to pro leaves them holding a bucket sized for free.
+    </p>
+
+    <h3>"Clients ignore your 429 and hammer you. Now what?"</h3>
+    <p>
+      This is a retry storm, and it's the <a href="06-caching-queues-resilience.html">tutorial 06</a> material paying off. A
+      client that retries immediately on a 429 turns a rate limit into a busy-wait, and a thousand such clients retrying in
+      lockstep is a self-inflicted DDoS. Three layers of response:
+    </p>
+    <ul>
+      <li><strong>Cooperate first:</strong> send <code>Retry-After</code>, and ship an SDK that honours it with
+        <strong>exponential backoff plus jitter</strong> — jitter especially, because synchronized retries are the whole problem
+        and randomness is what desynchronizes them.</li>
+      <li><strong>Make rejection cheap for you:</strong> cache "blocked until T" locally (11.1) so a hammering client costs a
+        map lookup, not a Redis call. Rejecting must always be cheaper than serving, or the abuse still wins.</li>
+      <li><strong>Escalate:</strong> a client that ignores 429s for sustained periods gets a longer penalty (a "block" bucket
+        with an increasing TTL), then a hard block at the edge/WAF. At some point this stops being rate limiting and starts
+        being abuse mitigation — and you should say so, because knowing where your system's responsibility ends is itself a
+        signal.</li>
+    </ul>
+
+    <h3>"Is this how you'd stop a DDoS?"</h3>
+    <p>
+      <strong>No, and this is a trap question — take the bait deliberately.</strong> A rate limiter is an
+      <em>application-layer</em>, per-identity control. It assumes the request reached your gateway, which means it already cost
+      you a TCP handshake, a TLS handshake, and a slot in a connection pool. A volumetric DDoS is 500 Gbps from a botnet of
+      100,000 IPs — each one individually <em>under</em> your per-IP limit, and collectively saturating your network before your
+      limiter ever executes a line of code. <em>"You can't rate-limit your way out of a saturated uplink."</em> DDoS is handled
+      <strong>upstream, at the edge</strong>: CDN/scrubbing (Cloudflare, Shield), anycast to spread the load, SYN cookies, IP
+      reputation, challenges. The rate limiter is for the <em>legitimate-but-excessive</em> client — the buggy integration, the
+      scraper, the customer who wrote a while-loop. Different threat, different layer, different tool. Being able to say clearly
+      what your system is <em>not</em> for is a senior signal, and this is one of the cleanest opportunities to show it.
+    </p>
+
+    <h3>"How would you rate-limit by cost rather than by request count?"</h3>
+    <p>
+      Already free from the design: <code>tryAcquire(permits)</code>. A cheap <code>GET</code> costs 1 token, a heavy
+      aggregation costs 50. This is exactly how GitHub's GraphQL API and most cloud provider APIs work, because with GraphQL
+      "one request" is a meaningless unit of load — the client chooses how expensive their query is. Compute the cost up front
+      (query complexity analysis) and charge the bucket accordingly. If cost is only known <em>after</em> execution, charge an
+      estimate up front and reconcile afterwards by deducting the difference — which permits some overshoot on a single
+      surprising request, and is fine.
+    </p>
+
+    <h3>"Should a rejected request count against the limit?"</h3>
+    <p>
+      A policy question with no universal answer, which is why it's a good interview question. Counting rejections means a client
+      in a hot loop digs itself deeper and can never recover — punitive, arguably correct for abuse, and it's what the naive
+      <code>INCR</code> implementation does <em>by accident</em>. Not counting them (the token bucket above, which only decrements
+      on allow) means the client recovers exactly at the refill rate, which is more predictable and friendlier to a client
+      that's merely buggy. Default: <strong>don't count rejections</strong>, but do <em>separately</em> track rejection rate per
+      key so a client that ignores 429s can be escalated deliberately, as a policy, rather than by accident of implementation.
+    </p>
+  </section>
+
+  <section>
+    <h2 id="qa">Interview Q&amp;A</h2>
+
+    <details class="qa">
+      <summary>1. What's the boundary problem with a fixed window counter, and what does it actually cost you?</summary>
+      <div class="answer">
+        <p>With a 100/min limit and calendar-minute windows, a client can send 100 requests at 12:00:59 and 100 more at
+        12:01:00. Both windows are individually within limit; your backend just took <strong>200 requests in about one
+        second</strong>. The worst case is always <strong>2× the configured limit</strong>, delivered in an arbitrarily short
+        instant straddling the boundary.</p>
+        <p>What it costs depends entirely on <em>why</em> the limit exists. For a daily quota, nothing — a burst at midnight is
+        harmless. But if the limit is sized to what a downstream can survive, 2× at the worst possible moment is precisely the
+        thing you were preventing, and a client whose retry schedule happens to align to the minute will hit it by accident.
+        The fix that keeps the O(1) memory is the <strong>sliding window counter</strong>.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>2. Give me the sliding window counter formula and explain what approximation it makes.</summary>
+      <div class="answer">
+        <p><code>estimate = current_window_count + previous_window_count × (1 − elapsed_fraction_of_current_window)</code></p>
+        <p>At 12:01:15 with 60-second windows, 25% of the current window has elapsed, so 75% of the trailing 60 seconds still
+        lies inside the previous minute — weight the previous window's count by 0.75. If the previous minute saw 80 requests and
+        this one has seen 12: <code>12 + 80 × 0.75 = 72</code>.</p>
+        <p><strong>The approximation:</strong> it assumes traffic in the previous window was <em>uniformly distributed</em>. It
+        wasn't — it might all have been in the last two seconds. So the estimate can be a little high or a little low, and you
+        can both over-admit and over-reject by a small margin. Measured against exact counting on real traffic, the error is a
+        fraction of a percent. You pay that to store two integers instead of a timestamp per request. For anything that isn't
+        billing, it's an obviously good trade.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>3. Why is the sliding window log rarely the right answer despite being exact?</summary>
+      <div class="answer">
+        <p>Its memory is <strong>O(the limit)</strong> per key — a timestamp per request in the window. That's proportional to
+        the wrong thing: your <em>most permissive</em> limits (your best-paying customers) become your <em>most expensive</em>
+        keys. A 10,000/hour tier costs 10,000 timestamps (~160 KB) per active key; a million such keys is ~160 GB of RAM for a
+        rate limiter.</p>
+        <p>It also costs more Redis ops per check (<code>ZREMRANGEBYSCORE</code> + <code>ZCARD</code> + <code>ZADD</code>) than
+        the O(1) algorithms.</p>
+        <p><strong>When it <em>is</em> right:</strong> small limits where exactness is the product. "5 failed logins per 15
+        minutes" — five timestamps, exactly correct, no boundary exploit on a security-sensitive limit, and it gives you a
+        precise <code>Retry-After</code> for free (oldest surviving timestamp + window).</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>4. Explain token bucket's lazy refill, and why you don't run a timer.</summary>
+      <div class="answer">
+        <p>A bucket's token count is a pure function of <em>(tokens at last touch, time elapsed since)</em>. So you never
+        proactively refill anything — on each check you compute
+        <code>tokens = min(capacity, tokens + elapsed_seconds × refill_rate)</code>, and then decide. No scheduler, no
+        background thread, no cron sweeping ten million buckets.</p>
+        <p>That matters at scale for two reasons. A timer would do continuous work proportional to the <em>total</em> number of
+        buckets, when the work you actually need is proportional to the number of <em>active</em> ones — and 99.99% of buckets
+        are idle at any instant. And a bucket that's been idle longer than <code>capacity/rate</code> is by definition full, so
+        a key that quietly expires out of Redis and gets recreated <em>full</em> is not a bug — it's the correct value. That's
+        why the state is self-cleaning: <strong>forgetting an idle bucket is free and correct.</strong></p>
+        <p>Two details in the implementation that matter: tokens must be fractional (a <code>double</code>) or sub-1/sec rates
+        round to zero, and the <code>min(capacity, …)</code> clamp <em>is</em> the burst policy — remove it and a client idle
+        for a week returns with hundreds of thousands of tokens.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>5. Token bucket vs leaky bucket — when would you actually pick leaky?</summary>
+      <div class="answer">
+        <p>They're opposites in what they smooth. <strong>Token bucket</strong> bounds the <em>average</em> rate and explicitly
+        permits bursts up to the bucket capacity — which is what you want for a public API, because real clients are bursty (a
+        page loads and fires eight parallel requests) and punishing that makes normal apps feel broken. <strong>Leaky
+        bucket</strong> (the queue version) bounds the <em>instantaneous</em> rate: requests queue and drain at exactly R/sec, so
+        the output is perfectly flat and no burst ever reaches the downstream.</p>
+        <p>Pick leaky when the thing behind you genuinely cannot absorb a spike: a legacy system with a fixed thread pool, an SMS
+        gateway, a third-party API that rate-limits <em>you</em>. It's traffic <em>shaping</em>, not admission control.</p>
+        <p><strong>Its cost, which you must name:</strong> queuing adds latency, and a request that sits in the bucket for three
+        seconds may belong to a client that timed out two seconds ago — pure waste. For a synchronous public API, users generally
+        prefer a fast 429 to a slow 200.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>6. You have 50 app servers each with an in-memory limiter set to 100/min. What's the actual limit?</summary>
+      <div class="answer">
+        <p><strong>5,000/min</strong> — and worse, it changes every time you autoscale. A limit that gets looser when you add
+        capacity isn't a limit. (It's also not even <em>evenly</em> 5,000: it depends entirely on how the load balancer happens
+        to distribute that user's requests.)</p>
+        <p>So the counter must be shared, which means Redis. And <em>that</em> immediately creates the second problem: with a
+        shared counter, two servers can both read 99, both conclude "99 &lt; 100, allow", and both write 100. Two requests
+        allowed on the last token. That's a classic <strong>read-then-write race / lost update</strong>, and with 50 servers you
+        don't overshoot by one — you overshoot by roughly the number of checks in flight.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>7. How do you make the distributed check atomic? Why is Lua the standard answer?</summary>
+      <div class="answer">
+        <p>Ship the entire read-compute-write into a <strong>Lua script</strong> executed by Redis. Redis is
+        <strong>single-threaded</strong>, and a script runs to completion with no other client's command interleaved — so the
+        script <em>is</em> a critical section, for free. The lost-update race isn't defended against, it's
+        <strong>structurally impossible</strong>. One round trip, atomic decision, arithmetic executed where the data lives.</p>
+        <p><strong>The alternatives and why they lose:</strong></p>
+        <ul>
+          <li><code>INCR</code> alone is atomic and genuinely sufficient — <em>but only for fixed window</em>, where the state
+          update is a single commutative op. Token bucket, sliding log and sliding counter all need read → compute →
+          conditionally write, and <code>INCR</code> can't express that. It also counts rejected requests against the user, and
+          the separate <code>EXPIRE</code> can be lost to a crash, leaving a key with no TTL that never resets.</li>
+          <li><code>WATCH</code>/<code>MULTI</code>/<code>EXEC</code> is correct optimistic concurrency, but it degenerates
+          under contention — and contention is the <em>normal</em> case for a rate limiter. Everyone's <code>EXEC</code> fails,
+          everyone retries, and you've built a retry storm inside your rate limiter.</li>
+          <li>A distributed lock is ~10× the cost and solves a problem Redis's single thread already solved. Don't.</li>
+        </ul>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>8. The Redis round trip is now on every request in the company. What do you do about it?</summary>
+      <div class="answer">
+        <p><strong>Local token buckets with periodic sync.</strong> Each app server keeps an in-memory bucket per hot key,
+        enforces locally at nanosecond cost, and reconciles with Redis every ~100 ms (or when its local budget runs dry): "I
+        consumed 37 tokens for user X, deduct them and lease me 40 more."</p>
+        <p>The effect: the hot-path check becomes an in-memory operation instead of a network call, and Redis traffic drops by
+        roughly 1000× (100k QPS becomes tens of calls per second per server). <strong>It also incidentally solves the hot-key
+        problem</strong> — the hammering client that would have pinned one Redis shard now generates a handful of ops per
+        second.</p>
+        <p><strong>The cost:</strong> for up to one sync interval, servers act on stale information, so the fleet can
+        collectively overshoot by roughly the sum of the outstanding leases. Bounded and computable, but real. Take this trade
+        for abuse prevention; <strong>refuse it for billing</strong>, where the overshoot is revenue you gave away.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>9. Redis is down. Do you fail open or fail closed?</summary>
+      <div class="answer">
+        <p><strong>Fail open by default — allow the traffic — with a local fallback bucket, a circuit breaker with a ~10 ms
+        timeout, and a page.</strong> The reasoning: a rate limiter is a <em>protective</em> control, not a correctness control.
+        It exists to stop a minority of abusive traffic from harming the majority. If failing closed turns a Redis blip into
+        "every user gets a 429", you've taken an outage in a component that matters for 0.1% of requests and converted it into a
+        100% product outage. <strong>A limiter whose failure mode is a total outage is a self-own.</strong></p>
+        <p>But fail open is not "do nothing". Fall back to a per-instance in-memory bucket — with 50 servers the effective limit
+        is 50×, which is far too loose and infinitely better than unlimited; tighten the fallback to limit/N and it's
+        approximately right. And the circuit breaker is not optional: without it, "Redis is slow" means every request blocks on a
+        dead socket and your thread pools fill — your safety feature causes the cascading failure.</p>
+        <p><strong>Fail closed when</strong> the limit is load-bearing: a hard third-party quota (a payment provider's TPS cap —
+        exceeding it breaks a contract, it doesn't just degrade you), metered billing you can't charge for if you can't count it,
+        a fragile downstream with no headroom, or a security limit like login attempts. Best answer: make it a
+        <strong>per-rule flag</strong>, not a global policy.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>10. Where do you put the rate limiter, and is client-side ever acceptable?</summary>
+      <div class="answer">
+        <p><strong>API gateway</strong> for the coarse limits (per-IP, per-API-key, per-endpoint): traffic dies at the front
+        door before it costs you a thread, an auth check or a DB connection, it's configured in one place, and it protects
+        services you haven't written yet. Plus a thin layer <strong>inside the service</strong> for limits needing business
+        context the gateway can't see — "five password resets per account per hour". Defence in depth, because the layers have
+        different information and therefore catch different things.</p>
+        <p><strong>Client-side is a courtesy, never enforcement.</strong> Throttling in your SDK genuinely reduces load and gives
+        instant feedback (grey out the button) — but anyone can <code>curl</code> your API, and a limit you can disable in
+        devtools is not a limit. Do it <em>as well</em>, never <em>instead</em>. A candidate who proposes client-side limiting as
+        the mechanism has failed the question.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>11. A single API key sends 50k RPS. What happens to your Redis cluster?</summary>
+      <div class="answer">
+        <p>One key → one hash slot → <strong>one shard</strong>, which is single-threaded, now doing 50k ops/sec while the rest
+        of the cluster idles. Adding shards does not help: consistent hashing distributes <em>keys</em>, and there is one key.
+        This is the celebrity-partition problem from tutorial 04, with a nasty irony — <em>the abusive traffic your limiter
+        exists to stop is the traffic that kills your limiter.</em></p>
+        <p>Fixes, in order: <strong>local buckets with periodic sync</strong> (the hot key evaporates — 50 servers × 10 syncs/sec
+        = 500 ops/sec instead of 50,000); <strong>cache the "blocked until T" decision locally</strong> so an already-throttled
+        client costs a map lookup rather than a network call; and for a genuinely <em>global</em> limit — where there is no key
+        to shard on by definition — <strong>split the counter into N sub-counters</strong> of limit/N each. That last one trades
+        a hot key for a utilisation loss (one sub-limit fills while others have headroom), which you can partly recover by
+        letting a server borrow budget from a neighbouring shard.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>12. Is a rate limiter a DDoS defence?</summary>
+      <div class="answer">
+        <p><strong>No, and confusing the two is a real red flag.</strong> A rate limiter is an application-layer, per-identity
+        control that runs <em>after</em> the request has reached your gateway — which means it has already cost you a TCP
+        handshake, a TLS handshake and a connection-pool slot. A volumetric DDoS is 500 Gbps from 100,000 IPs, each one
+        individually <em>under</em> your per-IP limit, saturating your uplink before your limiter executes a single line of code.
+        <em>You cannot rate-limit your way out of a saturated network link.</em></p>
+        <p>DDoS is handled <strong>upstream at the edge</strong>: CDN/scrubbing providers, anycast, SYN cookies, IP reputation,
+        challenge pages. The rate limiter's job is the <em>legitimate-but-excessive</em> client — the buggy integration, the
+        scraper, the customer who wrote a while-loop. Different threat, different layer, different tool. Saying clearly what your
+        system is <em>not</em> for is one of the cheapest senior signals available.</p>
+      </div>
+    </details>
+  </section>
+
+  <section>
+    <h2 id="takeaways">What to remember</h2>
+    <ul>
+      <li><strong>The archetype: quotas &amp; shared counters under concurrency.</strong> Rate limiting, plan quotas, billing
+        meters, ad-budget pacing, concurrent-session caps, coupon limits — all the same problem: <em>N per unit time, counted
+        across a fleet.</em> Recognise the shape and reuse this entire page.</li>
+      <li><strong>The clarifying question that changes the design: abuse prevention or billing?</strong> Overshoot-tolerant →
+        local counters, lazy sync, microsecond checks. Exact → every request through one serialisation point, which is now your
+        latency ceiling and your SPOF. Ask it in the first ninety seconds.</li>
+      <li><strong>The number: 100k QPS, sub-millisecond, on a shared counter.</strong> It rules out Postgres (latency + row
+        contention) and any design where the check is an RPC to another service. Storage is a non-issue — say so and move on.</li>
+      <li><strong>Fixed window is 2× at the boundary.</strong> 100 at 12:00:59 + 100 at 12:01:00 = 200 in a second. This flaw is
+        why every other algorithm exists.</li>
+      <li><strong>Sliding window counter:</strong> <code>current + previous × (1 − elapsed)</code>. O(1) memory, no boundary
+        cliff, sub-1% error (it assumes the previous window was uniform). The default for "N per window" semantics.</li>
+      <li><strong>Sliding window log is exact but O(limit) memory</strong> — your best customers become your most expensive keys.
+        Use it only for small, security-sensitive limits ("5 failed logins / 15 min").</li>
+      <li><strong>Token bucket is what real systems use</strong> (Stripe, AWS, GitHub). Capacity B = burst, refill R = sustained
+        rate — two independent knobs, and bursts are normal client behaviour. <strong>Lazy refill:</strong> compute tokens from
+        elapsed time on read; never run a timer; an absent bucket is a full bucket, so the state is self-cleaning.</li>
+      <li><strong>Leaky bucket</strong> = a queue drained at a fixed rate. No bursts, perfectly smooth output, <em>adds
+        latency</em>. For shaping traffic into something fragile — not for a synchronous public API.</li>
+      <li><strong>N servers with local counters = N × the limit.</strong> Share the counter → Redis → now you have a
+        read-then-write race (both read 99, both allow, you served 101).</li>
+      <li><strong>Fix the race with a Lua script.</strong> Redis is single-threaded, so a script is a critical section for free:
+        the race is <em>structurally impossible</em>, not defended against. One round trip. <code>INCR</code> alone only suffices
+        for fixed window; <code>WATCH</code>/<code>MULTI</code> degenerates under exactly the contention you're built to handle.</li>
+      <li><strong>Then get Redis off the hot path:</strong> local buckets + ~100 ms sync. 1000× less Redis traffic, nanosecond
+        checks, and it kills the hot key too. The price is bounded overshoot — right for abuse prevention, <em>wrong for
+        billing</em>.</li>
+      <li><strong>Gateway is where it lives</strong> (+ in-service for business-context limits). Client-side is a courtesy, never
+        enforcement.</li>
+      <li><strong>Redis down → fail open</strong>, with a local fallback bucket, a circuit breaker on a ~10 ms timeout, and a
+        page. A limiter whose outage becomes a total outage is a self-own. <strong>Fail closed</strong> when the limit is
+        load-bearing (third-party quota, metered billing, fragile downstream, login attempts) — and make it a <em>per-rule
+        flag</em>.</li>
+      <li><strong>Hot keys:</strong> one hammering client = one Redis shard on fire; a global limit has no key to shard on at all.
+        Local buckets fix the first; splitting the counter into N sub-counters fixes the second, at the cost of utilisation.</li>
+      <li><strong>A rate limiter is not a DDoS defence.</strong> You cannot rate-limit your way out of a saturated uplink — that's
+        the CDN/edge's job. Knowing where your system's responsibility ends is a senior signal.</li>
+    </ul>
+  </section>
+
+  <nav class="page-nav">
+    <a href="08-distributed-cache.html">← 08 — Design a Distributed Cache</a>
+    <a href="10-news-feed.html">10 — Design a News Feed →</a>
+  </nav>
+
+</main>
+</body>
+</html>
