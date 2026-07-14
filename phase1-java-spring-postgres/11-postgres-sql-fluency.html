@@ -127,6 +127,7 @@ INSERT INTO orders VALUES
   <div class="toc">
     <strong>On this page</strong>
     <ol>
+      <li><a href="#psql-crud">Hands-on: psql and everyday CRUD</a></li>
       <li><a href="#why">Why interviewers ask this</a></li>
       <li><a href="#schema">The sample schema</a></li>
       <li><a href="#joins">Joins mastery</a></li>
@@ -142,6 +143,267 @@ INSERT INTO orders VALUES
       <li><a href="#exercises">Hands-on exercises</a></li>
     </ol>
   </div>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="psql-crud">Hands-on: psql and everyday CRUD <span class="tier tier-hands">Hands-on</span></h2>
+    <p>
+      Everything above and below assumes you can actually <em>reach</em> a Postgres and type SQL into it. Coming from 7 years
+      of React, that's the one gap theory never fills: you know what a <code>LEFT JOIN</code> is, but you've never opened
+      <code>psql</code>, never run <code>CREATE TABLE</code>, never watched an <code>UPDATE</code> report
+      <code>UPDATE 3</code>. This section is the on-ramp — get a database running, connect, and run the CRUD you'll write
+      every single day. Do it with your hands, not your eyes; the rest of the page lands far harder once these are muscle memory.
+    </p>
+
+    <h3>Getting Postgres running &amp; connecting</h3>
+    <p>You need a running server and a client. The fastest server for local practice is Docker — one command, no system install, throw it away when done:</p>
+<pre><code><span class="com"># Docker: a throwaway Postgres on the standard port 5432</span>
+docker run --name pg -e POSTGRES_PASSWORD=secret -p 5432:5432 -d postgres
+
+<span class="com"># ...or a native install, then it's already running as a service:</span>
+<span class="com">#   macOS:   brew install postgresql@16 &amp;&amp; brew services start postgresql@16</span>
+<span class="com">#   Ubuntu:  sudo apt install postgresql &amp;&amp; sudo systemctl start postgresql</span></code></pre>
+    <p>
+      The default superuser is <code>postgres</code> and the default database is also <code>postgres</code>. Connect with the
+      <code>psql</code> command-line client. If you used the Docker image above and don't have <code>psql</code> installed
+      locally, <code>docker exec -it pg psql -U postgres</code> gets you a shell inside the container.
+    </p>
+<pre><code><span class="com"># Connect: -h host, -U user, -d database (it'll prompt for the password)</span>
+psql -h localhost -U postgres -d appdb
+
+<span class="com"># Or pass everything as a connection URL — the same string apps use:</span>
+psql postgresql://postgres:secret@localhost:5432/appdb</code></pre>
+    <p>
+      That URL shape — <code>postgresql://user:pass@host:5432/db</code> — is worth memorizing: it's exactly what you'll drop
+      into an app's config, a <code>DATABASE_URL</code> env var, or a Docker Compose file. Once connected, your prompt becomes
+      <code>appdb=#</code> (the <code>#</code> means superuser; a regular user gets <code>=&gt;</code>).
+    </p>
+    <div class="note">
+      <p>Prefer a GUI? <strong>DBeaver</strong> (free, all databases) and <strong>pgAdmin</strong> (Postgres-specific) give you
+      a table browser, a query editor, and visual <code>EXPLAIN</code>. They're great for exploring. But interviews and
+      production incidents happen in <code>psql</code> over SSH — learn the terminal client first, treat the GUI as a
+      convenience, not a crutch.</p>
+    </div>
+
+    <h3>Essential psql meta-commands</h3>
+    <p>
+      Commands starting with a backslash are <em>psql</em> features, not SQL — they don't end with a semicolon and never leave
+      the client. These are the ones people blank on during a live screen-share; drill them until they're automatic:
+    </p>
+    <table>
+      <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr><td><code>\l</code></td><td>List all databases</td></tr>
+        <tr><td><code>\c appdb</code></td><td>Connect to (switch to) a database</td></tr>
+        <tr><td><code>\dt</code></td><td>List tables in the current schema</td></tr>
+        <tr><td><code>\d orders</code></td><td>Describe a table — columns, types, indexes, FKs</td></tr>
+        <tr><td><code>\du</code></td><td>List roles (users)</td></tr>
+        <tr><td><code>\dn</code></td><td>List schemas</td></tr>
+        <tr><td><code>\x</code></td><td>Toggle expanded output — one column per line, a lifesaver for wide rows</td></tr>
+        <tr><td><code>\timing</code></td><td>Toggle showing how long each query took</td></tr>
+        <tr><td><code>\?</code> / <code>\h SELECT</code></td><td>Help on psql commands / help on a SQL statement</td></tr>
+        <tr><td><code>\q</code></td><td>Quit</td></tr>
+      </tbody>
+    </table>
+    <div class="note">
+      <p>Turn on <code>\timing</code> and <code>\x</code> at the start of any exploration session. <code>\x</code> in
+      particular turns an unreadable 20-column row that wraps across your terminal into a clean key-value list — the single
+      most useful trick for reading real data in <code>psql</code>.</p>
+    </div>
+
+    <h3>Create a database, schema &amp; table</h3>
+    <p>
+      Let's build a tiny scratch database from nothing so every statement below has something to run against. This is a
+      throwaway learning DB — separate from the sample schema this page uses elsewhere. From the default
+      <code>postgres</code> connection:
+    </p>
+<pre><code><span class="com">-- Run once, from any database, to create a fresh one:</span>
+CREATE DATABASE appdb;
+<span class="com">-- then in psql: \c appdb   (CREATE DATABASE can't run inside a transaction block)</span></code></pre>
+    <p>
+      Everything lives in a <em>schema</em> (a namespace); if you don't create one, tables land in the default schema
+      <code>public</code>. Now the tables — a small, coherent domain of <code>customers</code> and their <code>orders</code>:
+    </p>
+<pre><code>CREATE TABLE customers (
+  id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,  <span class="com">-- auto-incrementing PK (SQL-standard)</span>
+  email       text        NOT NULL UNIQUE,                      <span class="com">-- TEXT: unbounded, no length games</span>
+  full_name   varchar(120) NOT NULL,
+  is_active   boolean     NOT NULL DEFAULT true,
+  created_at  timestamptz NOT NULL DEFAULT now()                <span class="com">-- store timestamps WITH time zone</span>
+);
+
+CREATE TABLE orders (
+  id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  customer_id  bigint       NOT NULL REFERENCES customers(id),  <span class="com">-- FOREIGN KEY → customers</span>
+  amount       numeric(10,2) NOT NULL,                          <span class="com">-- NUMERIC for money — never float!</span>
+  status       varchar(20)  NOT NULL DEFAULT 'pending',
+  created_at   timestamptz  NOT NULL DEFAULT now()
+);</code></pre>
+    <p>Type choices, decoded — this is the everyday palette:</p>
+    <ul>
+      <li><code>bigint GENERATED ALWAYS AS IDENTITY</code> — the modern auto-increment PK. <code>BIGSERIAL</code> is the
+        older shorthand and still everywhere; both give you an auto-filled 64-bit id.</li>
+      <li><code>text</code> / <code>varchar(n)</code> — text. <code>numeric(10,2)</code> — exact decimals for money.
+        <code>timestamptz</code> — a point in time. <code>boolean</code> — <code>true</code>/<code>false</code>.</li>
+      <li><code>NOT NULL</code> forbids missing values; <code>DEFAULT</code> fills them in; <code>PRIMARY KEY</code> is
+        unique + not-null + the row's identity; <code>REFERENCES</code> makes a foreign key so an order can't point at a
+        customer that doesn't exist.</li>
+    </ul>
+    <div class="senior">
+      <p>Two Postgres-specific choices worth defending out loud. (1) <strong><code>timestamptz</code> over
+      <code>timestamp</code>, always.</strong> Despite the name, <code>timestamptz</code> doesn't store a zone — it stores an
+      absolute instant (UTC) and converts on the way in/out per the session's zone. Plain <code>timestamp</code> stores a
+      wall-clock reading with no zone, so the same value means different instants for different users — a bug factory.
+      (2) <strong><code>text</code> vs <code>varchar(n)</code>:</strong> in Postgres they're the same performance; a length
+      cap buys you nothing but a truncation error, so reach for <code>text</code> unless a real business rule needs the limit.</p>
+    </div>
+
+    <h3>INSERT — putting rows in</h3>
+<pre><code><span class="com">-- Single row. We DON'T supply id/created_at — IDENTITY and DEFAULT fill them.</span>
+INSERT INTO customers (email, full_name)
+VALUES ('ada@example.com', 'Ada Lovelace');
+
+<span class="com">-- Multi-row: one statement, many tuples — cheaper than N round-trips.</span>
+INSERT INTO customers (email, full_name, is_active) VALUES
+  ('grace@example.com', 'Grace Hopper', true),
+  ('alan@example.com',  'Alan Turing',  false),
+  ('edsger@example.com','Edsger Dijkstra', DEFAULT);   <span class="com">-- DEFAULT = use the column default (true)</span>
+
+<span class="com">-- RETURNING: get the generated id back in the SAME statement — no follow-up SELECT.</span>
+INSERT INTO orders (customer_id, amount, status)
+VALUES (1, 250.00, 'paid')
+RETURNING id, created_at;</code></pre>
+    <p>
+      <code>RETURNING</code> is the one every ORM leans on: after an insert you almost always need the new id, and this hands
+      it back without a second query. (You'll see the same clause on <code>UPDATE</code> and <code>DELETE</code> below.)
+    </p>
+
+    <h3>SELECT — the everyday patterns</h3>
+    <p>The bread and butter. <code>WHERE</code> filters rows, <code>ORDER BY</code> sorts, <code>LIMIT</code> caps:</p>
+<pre><code><span class="com">-- Common predicates you'll type constantly</span>
+SELECT id, email, full_name FROM customers WHERE is_active = true;
+SELECT * FROM orders   WHERE status IN ('paid', 'refunded');       <span class="com">-- set membership</span>
+SELECT * FROM customers WHERE email LIKE '%@example.com';          <span class="com">-- case-sensitive pattern</span>
+SELECT * FROM customers WHERE full_name ILIKE 'a%';                <span class="com">-- ILIKE = case-INSENSITIVE (a Postgres extra)</span>
+SELECT * FROM orders   WHERE amount BETWEEN 100 AND 500;           <span class="com">-- inclusive range</span>
+SELECT * FROM orders   WHERE status IS NULL;                       <span class="com">-- IS NULL, never = NULL (see pitfall)</span>
+
+<span class="com">-- Sort, then page: newest first, 10 per page, second page</span>
+SELECT id, amount, created_at
+FROM orders
+ORDER BY created_at DESC
+LIMIT 10 OFFSET 10;
+
+<span class="com">-- DISTINCT: unique values of a column</span>
+SELECT DISTINCT status FROM orders;</code></pre>
+    <p>A light touch of aggregation (the deep <code>GROUP BY</code> material is later on this page):</p>
+<pre><code>SELECT status,
+       COUNT(*)      AS n,
+       SUM(amount)   AS total,
+       ROUND(AVG(amount), 2) AS avg_amount
+FROM orders
+GROUP BY status;
+
+<span class="com">-- A simple 2-table join: each order with its customer's name</span>
+SELECT o.id, c.full_name, o.amount, o.status
+FROM orders o
+JOIN customers c ON c.id = o.customer_id
+ORDER BY o.created_at DESC;</code></pre>
+
+    <h3>UPDATE and DELETE — change rows carefully</h3>
+<pre><code><span class="com">-- UPDATE: SET the new values, WHERE picks the rows. RETURNING shows what changed.</span>
+UPDATE orders
+SET status = 'refunded'
+WHERE id = 1
+RETURNING id, status;
+
+<span class="com">-- DELETE: WHERE picks what to remove.</span>
+DELETE FROM orders
+WHERE status = 'cancelled'
+RETURNING *;</code></pre>
+    <div class="pitfall">
+      <p>An <code>UPDATE</code> or <code>DELETE</code> <strong>without a <code>WHERE</code> clause hits every row in the
+      table</strong> — <code>UPDATE orders SET status='paid'</code> silently repaints all of them; <code>DELETE FROM orders</code>
+      empties the table. There is no undo outside a transaction. Two habits that save you: (1) write the <code>WHERE</code>
+      <em>first</em>, then go back and add <code>SET</code>; (2) run a <code>SELECT</code> with the same <code>WHERE</code>
+      first to see exactly which rows you're about to touch. In psql you can also wrap risky work in
+      <code>BEGIN; ... ROLLBACK;</code> to preview, and swap to <code>COMMIT;</code> only when the row count looks right.</p>
+    </div>
+
+    <h3>UPSERT — the idempotent write</h3>
+    <p>
+      "Insert this row, or if it already exists, update it instead." You'll write this constantly — syncing external data,
+      handling retries, maintaining counters. Postgres does it atomically with <code>ON CONFLICT</code> (the conflict target
+      must have a unique constraint — here, <code>email</code>):
+    </p>
+<pre><code>INSERT INTO customers (email, full_name)
+VALUES ('ada@example.com', 'Ada King')
+ON CONFLICT (email) DO UPDATE
+SET full_name = EXCLUDED.full_name;   <span class="com">-- EXCLUDED = the row we tried to insert</span></code></pre>
+    <p>
+      Run it once and it inserts; run it again and it updates <code>full_name</code> instead of erroring on the duplicate
+      email. That "same statement, safe to repeat" property is what <em>idempotent</em> means. Use
+      <code>DO NOTHING</code> instead of <code>DO UPDATE</code> when a re-run should simply be a no-op. (There's a deeper
+      dive on <code>ON CONFLICT</code> and <code>EXCLUDED</code> in the <a href="#upsert">UPSERT section</a> below.)
+    </p>
+
+    <h3>Pagination in practice</h3>
+    <p>
+      <code>LIMIT n OFFSET m</code> is the pagination you'll reach for first, and it's fine for small offsets and admin
+      screens. Its catch: <code>OFFSET 100000</code> still makes Postgres generate and discard 100,000 rows to reach your
+      page, so deep pages get slower and slower, and rows shifting under you can duplicate or skip entries between pages.
+    </p>
+<pre><code><span class="com">-- Offset pagination: simple, but degrades on deep pages</span>
+SELECT id, amount FROM orders ORDER BY id LIMIT 20 OFFSET 40;   <span class="com">-- page 3</span></code></pre>
+    <p>
+      The scalable alternative is <strong>keyset (seek) pagination</strong>: instead of an offset, remember the last row you
+      saw and ask for rows <em>after</em> it — <code>WHERE id &gt; :last_id ORDER BY id LIMIT 20</code>. It stays fast at any
+      depth because an index jumps straight to the cursor. It's the right default for infinite-scroll feeds and public APIs;
+      there's a fuller treatment elsewhere, but knowing the trade-off is enough to say the right thing in an interview.
+    </p>
+
+    <h3>Wiring it up from Spring</h3>
+    <p>
+      This connects straight to the Java side of the course. The exact same server, the exact same SQL — Spring just points a
+      JDBC URL at it. In <code>application.properties</code>:
+    </p>
+<pre><code>spring.datasource.url=jdbc:postgresql://localhost:5432/appdb
+spring.datasource.username=postgres
+spring.datasource.password=secret</code></pre>
+    <p>
+      Note the <code>jdbc:</code> prefix on the same <code>host:5432/appdb</code> shape you connected to with <code>psql</code>.
+      Whether you use <code>JdbcTemplate</code>, Spring Data JPA repositories, or Hibernate, the SQL that ultimately hits the
+      database is the <code>SELECT</code>/<code>INSERT</code>/<code>UPDATE</code> you just practised by hand — an ORM writes it
+      for you, it doesn't replace it. Being able to open <code>psql</code> and reproduce (or debug) the query your app runs is
+      exactly the fluency interviewers are probing for.
+    </p>
+
+    <details class="qa">
+      <summary>How do you do an upsert in PostgreSQL?</summary>
+      <div class="answer">
+        <p><code>INSERT ... ON CONFLICT (col) DO UPDATE SET ...</code>. The conflict target column(s) must be covered by a
+        unique constraint or unique index — that's how Postgres detects the collision race-free. Inside <code>DO UPDATE</code>,
+        <code>EXCLUDED.col</code> refers to the row you tried to insert and the table name refers to the existing row, so you
+        can merge them (e.g. <code>SET views = orders.views + EXCLUDED.views</code> to accumulate). Use
+        <code>DO NOTHING</code> when a duplicate should be silently ignored. It's a single atomic statement, which is why it's
+        the go-to pattern for idempotent writes and retry-safe imports — far better than a read-then-write in application code,
+        which has a race between the check and the insert.</p>
+      </div>
+    </details>
+    <details class="qa">
+      <summary>LIMIT/OFFSET vs keyset pagination — when would you switch?</summary>
+      <div class="answer">
+        <p><code>LIMIT/OFFSET</code> is simple and fine for shallow pages, but Postgres must scan and throw away every row
+        before the offset, so page 5,000 is slow, and concurrent inserts/deletes can shift the window and cause rows to
+        repeat or vanish across pages. <strong>Keyset (seek) pagination</strong> uses the last-seen value as a cursor —
+        <code>WHERE (created_at, id) &lt; (:last_ts, :last_id) ORDER BY created_at DESC, id DESC LIMIT 20</code> — so an index
+        seeks directly to the next page in constant time regardless of depth, and it's stable under concurrent writes. I'd
+        switch as soon as pages go deep or the data is high-churn: infinite-scroll feeds, public list APIs, exports. The
+        trade-off is you can't jump to an arbitrary page number, only next/previous, and multi-column ordering needs a
+        matching composite index.</p>
+      </div>
+    </details>
+  </section>
 
   <!-- ============================================================ -->
   <section>

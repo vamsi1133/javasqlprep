@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 — Objects, Collections &amp; Generics | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header"><div class="container"><div class="breadcrumb"><a href="index.html">← Course Home</a></div><h1>02 — Objects, Collections &amp; Generics</h1><p>Equality, immutability, the collections you'll use every day, and generics you can read and write</p></div></header>
+<main class="container">
+
+<nav class="pathbar">
+  <span class="step done">1 · Foundations</span><span class="sep">→</span>
+  <span class="step here">2 · Objects &amp; Collections</span><span class="sep">→</span>
+  <span class="step">3 · Modern Java</span><span class="sep">→</span>
+  <span class="step">4 · Concurrency &amp; JVM</span>
+</nav>
+
+<p class="levelmeta mid"><span class="dot"></span>Level: mid, rising to upper-mid · builds on page 01</p>
+
+<p>Page 01 gave you objects and classes. This page makes them <em>behave</em>: how Java decides two objects are equal (and why getting it wrong silently corrupts a <code>HashMap</code>), how to make an object that can't be tampered with, and how to store and organize many objects with the collections framework. These are the topics interviewers reach for first because they reveal whether you understand Java's value semantics or are just writing Java-flavored JavaScript. The deep "how does a HashMap work inside" material lives in a clearly-marked <strong>⭐ Level-Up appendix</strong> at the end — learn the everyday usage first, then go there.</p>
+
+<div class="toc"><strong>On this page</strong><ol>
+<li><a href="#equals">The equals() / hashCode() contract</a></li>
+<li><a href="#immutability">Immutability — designing a bulletproof object</a></li>
+<li><a href="#records">Records — value types with zero boilerplate</a></li>
+<li><a href="#collections">The collections framework: List, Set, Map, Queue</a></li>
+<li><a href="#choosing">Choosing the right collection</a></li>
+<li><a href="#sorting">Sorting: Comparable vs Comparator</a></li>
+<li><a href="#generics">Generics you can read and write</a></li>
+<li><a href="#exceptions">Exceptions &amp; try-with-resources</a></li>
+<li><a href="#levelup">⭐ Level-Up: collection internals</a></li>
+<li><a href="#qa">Interview Q&amp;A</a></li>
+<li><a href="#exercises">Hands-on exercises</a></li>
+</ol></div>
+
+<!-- ============================================================ -->
+<h2 id="equals">The equals() / hashCode() contract <span class="tier tier-1">T1</span></h2>
+
+<p>By default, <code>equals()</code> compares object <em>identity</em> — are these the exact same object in memory? Usually you want <em>value</em> equality: two <code>Point(1,2)</code> objects should be "equal." You get that by overriding <code>equals()</code>. The catch — and the reason this is a top interview topic — is that <strong>you must override <code>hashCode()</code> at the same time</strong>, from the same fields.</p>
+
+<p>Why? Hash-based collections (<code>HashMap</code>, <code>HashSet</code>) do a two-step lookup: <code>hashCode()</code> picks the bucket, then <code>equals()</code> confirms the match inside it. The contract:</p>
+<ul>
+<li>Equal objects <strong>must</strong> have equal hash codes.</li>
+<li>Unequal objects <em>may</em> share a hash code (a "collision" — allowed, just slower).</li>
+</ul>
+<pre><code><span class="kw">public class</span> <span class="typ">Point</span> {
+    <span class="kw">private final</span> <span class="kw">int</span> x, y;
+    <span class="typ">Point</span>(<span class="kw">int</span> x, <span class="kw">int</span> y) { <span class="kw">this</span>.x = x; <span class="kw">this</span>.y = y; }
+
+    <span class="ann">@Override</span>
+    <span class="kw">public boolean</span> equals(<span class="typ">Object</span> o) {
+        <span class="kw">if</span> (<span class="kw">this</span> == o) <span class="kw">return</span> <span class="kw">true</span>;
+        <span class="kw">if</span> (!(o <span class="kw">instanceof</span> <span class="typ">Point</span> p)) <span class="kw">return</span> <span class="kw">false</span>;  <span class="com">// pattern matching, Java 16+</span>
+        <span class="kw">return</span> x == p.x &amp;&amp; y == p.y;                <span class="com">// same fields both methods use</span>
+    }
+    <span class="ann">@Override</span>
+    <span class="kw">public int</span> hashCode() { <span class="kw">return</span> <span class="typ">Objects</span>.hash(x, y); }  <span class="com">// derived from the SAME fields</span>
+}</code></pre>
+
+<div class="pitfall"><p>Override <code>equals</code> but forget <code>hashCode</code> and this happens: <code>map.put(new Point(1,2), "a")</code> then <code>map.get(new Point(1,2))</code> returns <strong>null</strong>. The two points are value-equal but have different default hash codes, so they land in different buckets and <code>equals</code> is never even called. A <code>HashSet</code> will happily store "duplicates." Always override both, from the same field set.</p></div>
+
+<div class="pitfall"><p><strong>Never use a mutable object as a map key.</strong> If you mutate a field that feeds <code>hashCode</code> after inserting, the entry sits in the bucket for the <em>old</em> hash while every lookup computes the <em>new</em> hash and searches the wrong bucket — the entry becomes unreachable yet still occupies memory. This is why keys should be immutable: <code>String</code>, boxed numbers, or records.</p></div>
+
+<p>The good news: you'll rarely write this by hand anymore — <strong>records generate both methods correctly</strong> (below). But you must be able to explain the contract, because it's the "do they actually understand Java" litmus test.</p>
+
+<!-- ============================================================ -->
+<h2 id="immutability">Immutability — designing a bulletproof object <span class="tier tier-1">T1</span></h2>
+
+<p>An immutable object can't change after construction. That single property buys you an enormous amount: it's automatically thread-safe (no writes to race on — page 04), safe to share and cache, and safe to use as a map key or set element. <code>String</code>, <code>Integer</code>, and <code>LocalDate</code> are all immutable, and it's why <code>String</code> is such a reliable key.</p>
+<p>The recipe for a hand-rolled immutable class:</p>
+<ol>
+<li>Make the class <code>final</code> (no subclass can add mutable state).</li>
+<li>Make all fields <code>private final</code>.</li>
+<li>Set every field in the constructor; provide <strong>no setters</strong>.</li>
+<li><strong>Defensively copy</strong> any mutable input or output (arrays, collections, dates) so callers can't reach in and mutate your internals.</li>
+</ol>
+<pre><code><span class="kw">public final class</span> <span class="typ">Money</span> {
+    <span class="kw">private final</span> <span class="kw">long</span> cents;
+    <span class="kw">private final</span> <span class="typ">List</span>&lt;<span class="typ">String</span>&gt; tags;
+
+    <span class="kw">public</span> <span class="typ">Money</span>(<span class="kw">long</span> cents, <span class="typ">List</span>&lt;<span class="typ">String</span>&gt; tags) {
+        <span class="kw">this</span>.cents = cents;
+        <span class="kw">this</span>.tags = <span class="typ">List</span>.copyOf(tags);   <span class="com">// defensive copy — caller's later edits can't leak in</span>
+    }
+    <span class="kw">public</span> <span class="typ">List</span>&lt;<span class="typ">String</span>&gt; tags() { <span class="kw">return</span> tags; }  <span class="com">// List.copyOf is already unmodifiable — safe to hand out</span>
+    <span class="com">// "mutation" returns a NEW object, like String.toUpperCase()</span>
+    <span class="kw">public</span> <span class="typ">Money</span> plus(<span class="kw">long</span> more) { <span class="kw">return new</span> <span class="typ">Money</span>(cents + more, tags); }
+}</code></pre>
+<div class="note"><p>Immutability and the <code>equals</code>/<code>hashCode</code> contract are really one topic: immutable objects make safe keys precisely because their hash can never drift. Reach for immutability by default and only add mutability where you truly need it.</p></div>
+
+<!-- ============================================================ -->
+<h2 id="records">Records — value types with zero boilerplate <span class="tier tier-1">T1</span></h2>
+
+<p>Since Java 16, a <strong>record</strong> is the one-liner for an immutable data carrier. It auto-generates the constructor, private final fields, accessors, and — crucially — a correct <code>equals()</code>, <code>hashCode()</code>, and <code>toString()</code> from its components:</p>
+<pre><code><span class="kw">public record</span> <span class="typ">Point</span>(<span class="kw">int</span> x, <span class="kw">int</span> y) { }   <span class="com">// that's the whole class</span>
+
+<span class="typ">Point</span> p = <span class="kw">new</span> <span class="typ">Point</span>(<span class="num">1</span>, <span class="num">2</span>);
+p.x();                              <span class="com">// accessor (note: x(), not getX())</span>
+p.equals(<span class="kw">new</span> <span class="typ">Point</span>(<span class="num">1</span>, <span class="num">2</span>));       <span class="com">// true — value equality for free</span>
+p;                                  <span class="com">// toString ⇒ Point[x=1, y=2]</span>
+
+<span class="com">// Add validation with a compact constructor</span>
+<span class="kw">public record</span> <span class="typ">Money</span>(<span class="kw">long</span> cents, <span class="typ">String</span> currency) {
+    <span class="kw">public</span> <span class="typ">Money</span> {                       <span class="com">// runs before the fields are assigned</span>
+        <span class="kw">if</span> (cents &lt; <span class="num">0</span>) <span class="kw">throw new</span> <span class="typ">IllegalArgumentException</span>(<span class="str">"negative"</span>);
+    }
+}</code></pre>
+<p>Reach for a record for DTOs, API request/response bodies, map keys, coordinates, query results — anything that's "just data." It's the modern default and it makes the <code>equals</code>/<code>hashCode</code> contract a non-issue because the compiler honors it for you. Use a regular class when you need mutability, inheritance, or hidden internal state.</p>
+
+<!-- ============================================================ -->
+<h2 id="collections">The collections framework: List, Set, Map, Queue</h2>
+
+<p>Java's collections are organized under a few interfaces. Program to the <em>interface</em> on the left, pick the <em>implementation</em> on the right:</p>
+<table>
+<thead><tr><th>Interface</th><th>Meaning</th><th>Go-to implementation</th><th>JS analog</th></tr></thead>
+<tbody>
+<tr><td><code>List&lt;E&gt;</code></td><td>Ordered, indexed, allows duplicates</td><td><code>ArrayList</code></td><td><code>Array</code></td></tr>
+<tr><td><code>Set&lt;E&gt;</code></td><td>No duplicates</td><td><code>HashSet</code> / <code>LinkedHashSet</code></td><td><code>Set</code></td></tr>
+<tr><td><code>Map&lt;K,V&gt;</code></td><td>Key → value</td><td><code>HashMap</code> / <code>LinkedHashMap</code></td><td><code>Map</code> / object</td></tr>
+<tr><td><code>Queue&lt;E&gt;</code> / <code>Deque&lt;E&gt;</code></td><td>FIFO / double-ended</td><td><code>ArrayDeque</code></td><td>array as stack/queue</td></tr>
+</tbody>
+</table>
+<pre><code><span class="typ">List</span>&lt;<span class="typ">String</span>&gt; names = <span class="kw">new</span> <span class="typ">ArrayList</span>&lt;&gt;();  <span class="com">// declare as the INTERFACE, not ArrayList</span>
+names.add(<span class="str">"Ada"</span>);
+<span class="kw">for</span> (<span class="typ">String</span> n : names) { ... }
+
+<span class="typ">Map</span>&lt;<span class="typ">String</span>, <span class="typ">Integer</span>&gt; scores = <span class="kw">new</span> <span class="typ">HashMap</span>&lt;&gt;();
+scores.put(<span class="str">"ada"</span>, <span class="num">10</span>);
+scores.getOrDefault(<span class="str">"bob"</span>, <span class="num">0</span>);            <span class="com">// no NPE on missing key</span>
+scores.merge(<span class="str">"ada"</span>, <span class="num">1</span>, <span class="typ">Integer</span>::sum);       <span class="com">// increment-or-insert in one call</span>
+
+<span class="com">// computeIfAbsent shines for a map-of-lists (grouping)</span>
+<span class="typ">Map</span>&lt;<span class="typ">String</span>, <span class="typ">List</span>&lt;<span class="typ">String</span>&gt;&gt; byDept = <span class="kw">new</span> <span class="typ">HashMap</span>&lt;&gt;();
+byDept.computeIfAbsent(<span class="str">"eng"</span>, k -&gt; <span class="kw">new</span> <span class="typ">ArrayList</span>&lt;&gt;()).add(<span class="str">"Ada"</span>);  <span class="com">// create list once, then append</span>
+
+<span class="typ">Set</span>&lt;<span class="typ">String</span>&gt; seen = <span class="kw">new</span> <span class="typ">HashSet</span>&lt;&gt;();
+<span class="kw">boolean</span> isNew = seen.add(<span class="str">"x"</span>);            <span class="com">// false if already present — handy for dedup</span>
+
+<span class="com">// Immutable literals (Java 9+) — great for constants and test data</span>
+<span class="typ">List</span>&lt;<span class="typ">Integer</span>&gt; primes = <span class="typ">List</span>.of(<span class="num">2</span>, <span class="num">3</span>, <span class="num">5</span>);   <span class="com">// throws if you try to modify it</span></code></pre>
+<p>Declaring variables by their interface (<code>List</code>, not <code>ArrayList</code>) means you can swap the implementation later without touching callers — the everyday face of "program to interfaces" from page 01. <code>computeIfAbsent</code>, <code>getOrDefault</code>, and <code>merge</code> are the map methods that make code clean; know them cold.</p>
+
+<h3>The variants worth knowing</h3>
+<ul>
+<li><strong><code>LinkedHashMap</code> / <code>LinkedHashSet</code></strong> — same as the hash versions but preserve <em>insertion order</em> when you iterate. Reach for these when order matters.</li>
+<li><strong><code>TreeMap</code> / <code>TreeSet</code></strong> — keep keys <em>sorted</em>; O(log n) ops and range queries (<code>headMap</code>, <code>ceilingKey</code>). Use when you need sorted order or "nearest key" lookups.</li>
+<li><strong><code>ArrayDeque</code></strong> — the modern stack <em>and</em> queue. Faster than the legacy <code>Stack</code> and <code>LinkedList</code>; use it for both.</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="choosing">Choosing the right collection</h2>
+<table>
+<thead><tr><th>You need…</th><th>Use</th></tr></thead>
+<tbody>
+<tr><td>An ordered list, index access, iterate a lot</td><td><code>ArrayList</code></td></tr>
+<tr><td>Uniqueness / fast "have I seen this?"</td><td><code>HashSet</code></td></tr>
+<tr><td>Key → value lookups</td><td><code>HashMap</code></td></tr>
+<tr><td>…and insertion order preserved</td><td><code>LinkedHashMap</code> / <code>LinkedHashSet</code></td></tr>
+<tr><td>…and sorted order / range queries</td><td><code>TreeMap</code> / <code>TreeSet</code></td></tr>
+<tr><td>Stack or queue (add/remove at ends)</td><td><code>ArrayDeque</code></td></tr>
+</tbody>
+</table>
+<div class="senior"><p>The classic "<code>ArrayList</code> vs <code>LinkedList</code>?" — almost always <code>ArrayList</code>. Even for the operations <code>LinkedList</code> theoretically wins (insert in the middle), you first have to <em>walk</em> to the position (O(n)), and its scattered nodes destroy CPU cache locality, so it loses in practice. Reach for <code>ArrayDeque</code>, not <code>LinkedList</code>, when you need a queue. Real answer: "I default to <code>ArrayList</code>; I've essentially never needed <code>LinkedList</code>."</p></div>
+
+<!-- ============================================================ -->
+<h2 id="sorting">Sorting: Comparable vs Comparator <span class="tier tier-1">T1</span></h2>
+
+<p>Two ways to define order. <strong><code>Comparable</code></strong> is the type's <em>one natural</em> ordering, baked into the class. <strong><code>Comparator</code></strong> is an <em>external, swappable</em> ordering you pass in — and the one you'll use constantly.</p>
+<pre><code><span class="com">// Comparator — the modern, composable way (no need to touch the class)</span>
+<span class="kw">record</span> <span class="typ">Employee</span>(<span class="typ">String</span> name, <span class="typ">String</span> dept, <span class="kw">int</span> salary) { }
+
+staff.sort(<span class="typ">Comparator</span>.comparing(<span class="typ">Employee</span>::dept)          <span class="com">// by dept asc,</span>
+        .thenComparing(<span class="typ">Employee</span>::salary, <span class="typ">Comparator</span>.reverseOrder())  <span class="com">// then salary desc,</span>
+        .thenComparing(<span class="typ">Employee</span>::name));                    <span class="com">// then name asc</span></code></pre>
+<div class="pitfall"><p><code>Comparator.comparing(...).reversed()</code> reverses the <em>entire</em> chain, not just the last key. To reverse only one key, pass <code>Comparator.reverseOrder()</code> to that specific <code>comparing</code>/<code>thenComparing</code> call, as above. Flipping the whole chain by accident is a very common bug.</p></div>
+<p>Java's <code>List.sort</code> uses TimSort, which is <strong>stable</strong> — equal elements keep their relative order. That lets you sort by successive keys (sort by name, then by dept) and get a correct multi-key result. Interviewers like this because it shows you understand ordering, not just calling <code>.sort()</code>.</p>
+
+<!-- ============================================================ -->
+<h2 id="generics">Generics you can read and write</h2>
+
+<p>Generics are Java's version of TypeScript generics: parameterize a type so <code>List&lt;String&gt;</code> only holds Strings and the compiler catches misuse. You already use them every time you write <code>List&lt;X&gt;</code>. Writing your own is straightforward:</p>
+<pre><code><span class="com">// A generic method — &lt;T&gt; before the return type declares the type variable</span>
+<span class="kw">static</span> &lt;<span class="typ">T</span>&gt; <span class="typ">T</span> firstOrNull(<span class="typ">List</span>&lt;<span class="typ">T</span>&gt; list) {
+    <span class="kw">return</span> list.isEmpty() ? <span class="kw">null</span> : list.get(<span class="num">0</span>);
+}
+
+<span class="com">// A generic class</span>
+<span class="kw">class</span> <span class="typ">Box</span>&lt;<span class="typ">T</span>&gt; {
+    <span class="kw">private</span> <span class="typ">T</span> value;
+    <span class="kw">public</span> <span class="typ">T</span> get() { <span class="kw">return</span> value; }
+    <span class="kw">public void</span> set(<span class="typ">T</span> v) { <span class="kw">this</span>.value = v; }
+}
+
+<span class="com">// Bounded type — "T must be a Number (or subtype)" so you can call number methods</span>
+<span class="kw">static</span> &lt;<span class="typ">T</span> <span class="kw">extends</span> <span class="typ">Number</span>&gt; <span class="kw">double</span> sum(<span class="typ">List</span>&lt;<span class="typ">T</span>&gt; xs) {
+    <span class="kw">double</span> total = <span class="num">0</span>;
+    <span class="kw">for</span> (<span class="typ">T</span> x : xs) total += x.doubleValue();
+    <span class="kw">return</span> total;
+}</code></pre>
+<p><strong>Wildcards</strong> (<code>?</code>) express flexible relationships: <code>List&lt;? extends Number&gt;</code> is "a list of <em>some</em> subtype of Number — I'll only read from it," and <code>List&lt;? super Integer&gt;</code> is "a list I can write Integers into." The rule of thumb (PECS — "Producer Extends, Consumer Super") and Java's type erasure are worth a deeper look once the basics are solid — see the appendix. For day-to-day work, being able to read <code>&lt;T&gt;</code>, write a bounded method, and understand why <code>List&lt;String&gt;</code> isn't a <code>List&lt;Object&gt;</code> is enough.</p>
+
+<!-- ============================================================ -->
+<h2 id="exceptions">Exceptions &amp; try-with-resources</h2>
+
+<p>Java splits exceptions into two families:</p>
+<ul>
+<li><strong>Checked</strong> (<code>IOException</code>, <code>SQLException</code>) — the compiler forces you to either <code>catch</code> them or declare <code>throws</code>. Meant for recoverable, expected failures (a file's missing, the network hiccuped).</li>
+<li><strong>Unchecked</strong> (<code>RuntimeException</code> and subclasses: <code>NullPointerException</code>, <code>IllegalArgumentException</code>) — no compiler ceremony. Meant for programming errors.</li>
+</ul>
+<pre><code><span class="com">// try-with-resources — auto-closes anything AutoCloseable, even on exception</span>
+<span class="kw">try</span> (<span class="kw">var</span> reader = <span class="typ">Files</span>.newBufferedReader(path)) {
+    <span class="kw">return</span> reader.readLine();
+} <span class="kw">catch</span> (<span class="typ">IOException</span> e) {
+    <span class="kw">throw new</span> <span class="typ">UncheckedIOException</span>(<span class="str">"failed reading "</span> + path, e);  <span class="com">// wrap, keep the cause</span>
+}   <span class="com">// reader.close() runs automatically here — no finally block needed</span></code></pre>
+<div class="senior"><p>Best practices worth stating: use <strong>try-with-resources</strong> for anything closeable (files, streams, JDBC connections) — it replaces error-prone <code>finally</code> blocks. Never swallow an exception with an empty <code>catch</code>. When you rethrow, <strong>preserve the cause</strong> (<code>new XException(msg, e)</code>) so the stack trace stays intact. Throw <code>IllegalArgumentException</code>/<code>IllegalStateException</code> for bad inputs/state. The prevailing modern style favors unchecked exceptions for most application errors — checked exceptions don't compose well with lambdas and streams.</p></div>
+
+<!-- ============================================================ -->
+<div class="levelup">
+  <h2 id="levelup">Level-Up appendix: collection internals</h2>
+  <p>Senior differentiators. Skip on your first read — come back once everything above is automatic. These are the "explain how it actually works" questions that separate mid from senior.</p>
+</div>
+
+<h3>How HashMap works inside <span class="tier tier-2">T2</span></h3>
+<p>A <code>HashMap</code> is an array of "buckets." <code>put(k,v)</code>: (1) compute <code>hash = key.hashCode() ^ (h &gt;&gt;&gt; 16)</code> — the XOR spreads high bits into the low bits, because only the low bits pick the bucket. (2) Index with <code>(n-1) &amp; hash</code> — capacity <code>n</code> is a power of two, so this equals modulo but is a single AND instruction. (3) If the bucket is empty, place the node; otherwise walk the chain comparing hash then <code>equals</code> — equal key replaces the value, else append. (4) When <code>size &gt; capacity × 0.75</code> (the load factor), the table <strong>doubles and rehashes</strong>. Amortized O(1).</p>
+<p><strong>Treeification (Java 8):</strong> when a single bucket's chain reaches 8 nodes <em>and</em> capacity ≥ 64, that bucket converts from a linked list to a red-black tree, bounding worst-case lookup at O(log n) instead of O(n). This defends against hash-flooding denial-of-service attacks (an attacker deliberately sending colliding keys). Bins revert to lists at 6 nodes — the gap prevents flip-flopping.</p>
+
+<h3>ConcurrentHashMap <span class="tier tier-2">T2</span></h3>
+<p>A plain <code>HashMap</code> is <em>not</em> thread-safe — concurrent writes can corrupt it or (pre-Java 8) spin into an infinite loop during resize. <code>ConcurrentHashMap</code> is the answer: it locks only the individual bucket being written (fine-grained locking / CAS), so reads are lock-free and writes to different buckets proceed in parallel. Use its atomic compound methods — <code>merge</code>, <code>computeIfAbsent</code> — because a get-then-put across two calls is <em>not</em> atomic even on a concurrent map. (Much more on this in page 04.)</p>
+
+<h3>Fail-fast iterators <span class="tier tier-3">T3</span></h3>
+<p>Modifying a collection while iterating it with a for-each loop throws <code>ConcurrentModificationException</code> — the iterator tracks a <code>modCount</code> and "fails fast" when it changes underneath. To remove during iteration, use the explicit <code>Iterator.remove()</code> or <code>collection.removeIf(predicate)</code>. It's called fail-<em>fast</em> because surfacing the bug immediately beats silent corruption.</p>
+
+<h3>PECS &amp; type erasure <span class="tier tier-3">T3</span></h3>
+<p><strong>Erasure:</strong> generics exist only at compile time — the JVM sees raw <code>List</code>, the type arguments are erased. Hence you can't write <code>new T[]</code> or check <code>x instanceof List&lt;String&gt;</code>. <strong>PECS</strong> — "Producer Extends, Consumer Super" — decides wildcard direction: use <code>&lt;? extends T&gt;</code> for a source you only read from (a producer), <code>&lt;? super T&gt;</code> for a sink you only write to (a consumer). <code>Collections.copy(dest, src)</code> is the canonical example: <code>copy(List&lt;? super T&gt; dest, List&lt;? extends T&gt; src)</code>.</p>
+
+<div class="recap"><ul>
+<li>Override <code>equals</code> and <code>hashCode</code> <strong>together, from the same fields</strong> — or hash collections silently break. Prefer <strong>records</strong>, which do it for you.</li>
+<li><strong>Immutable</strong> objects are thread-safe, cacheable, and safe as keys — make them your default.</li>
+<li>Declare variables by their <strong>interface</strong> (<code>List</code>, <code>Map</code>); default to <code>ArrayList</code>, <code>HashMap</code>, <code>HashSet</code>, <code>ArrayDeque</code>.</li>
+<li>Know the map power-methods: <code>getOrDefault</code>, <code>computeIfAbsent</code>, <code>merge</code>.</li>
+<li>Use <code>Comparator.comparing().thenComparing()</code> for multi-key sorts — and reverse a single key, not the whole chain.</li>
+<li>Use <strong>try-with-resources</strong>, preserve exception causes, don't swallow.</li>
+</ul></div>
+
+<!-- ============================================================ -->
+<h2 id="qa">Interview Q&amp;A</h2>
+
+<details class="qa"><summary>Why must you override hashCode() whenever you override equals()?</summary><div class="answer"><p>Hash collections do a two-phase lookup: <code>hashCode()</code> selects the bucket, <code>equals()</code> confirms the match within it. The contract requires equal objects to have equal hash codes. Override only <code>equals</code> and two value-equal objects keep distinct default hash codes, land in different buckets, and <code>equals</code> is never called — so <code>map.get</code> returns null after a <code>put</code> with an equal key, and a <code>HashSet</code> stores duplicates. Derive both methods from the same fields, or use a record.</p></div></details>
+
+<details class="qa"><summary>What happens if you mutate an object after using it as a HashMap key?</summary><div class="answer"><p>If the mutation changes a field used by <code>hashCode</code>, the entry is stranded: it physically sits in the bucket for the old hash, but every <code>get</code>/<code>remove</code>/<code>containsKey</code> computes the new hash and searches a different bucket. The entry becomes unreachable through the API yet still consumes memory and still shows up in iteration — a leak plus phantom data. That's why keys must be immutable: String, boxed numbers, records.</p></div></details>
+
+<details class="qa"><summary>How do you make a class immutable?</summary><div class="answer"><p>Make the class <code>final</code>, all fields <code>private final</code>, set them only in the constructor, expose no setters, and defensively copy any mutable input or returned collection/array/date so callers can't reach in and mutate internal state. "Mutations" return a new instance instead of changing the current one (like <code>String</code>). Or, for plain data, use a record — it's immutable by construction. Immutable objects are inherently thread-safe and safe as map keys.</p></div></details>
+
+<details class="qa"><summary>ArrayList vs LinkedList — which and why?</summary><div class="answer"><p>ArrayList almost always. It's a backing array: O(1) random access and excellent cache locality, so iteration and access are fast. LinkedList's theoretical win — O(1) insertion — requires you to first walk to the position (O(n)), and its scattered nodes wreck cache performance, so it loses in practice and costs more memory per element. For a queue or stack, use ArrayDeque, not LinkedList. I default to ArrayList and have essentially never needed LinkedList.</p></div></details>
+
+<details class="qa"><summary>When would you use a record instead of a class?</summary><div class="answer"><p>Use a record for immutable data carriers — DTOs, API bodies, value objects, map keys, query results. It auto-generates the constructor, accessors, and a correct <code>equals</code>/<code>hashCode</code>/<code>toString</code> from the components, eliminating both boilerplate and the risk of a broken equality contract. Use a regular class when you need mutability, inheritance, or encapsulated internal state that isn't just its components. Records can't extend another class (they implicitly extend <code>Record</code>) but can implement interfaces.</p></div></details>
+
+<details class="qa"><summary>What's the difference between checked and unchecked exceptions?</summary><div class="answer"><p>Checked exceptions (subclasses of <code>Exception</code> but not <code>RuntimeException</code>, e.g. <code>IOException</code>) must be caught or declared with <code>throws</code> — the compiler enforces it; they model recoverable, expected failures. Unchecked exceptions (<code>RuntimeException</code> and subclasses, e.g. <code>NullPointerException</code>, <code>IllegalArgumentException</code>) need no ceremony and model programming errors. Modern style leans toward unchecked exceptions for application errors because checked ones don't compose with lambdas/streams; the key discipline is preserving the cause when you wrap and rethrow.</p></div></details>
+
+<details class="qa"><summary>Walk me through what HashMap.put() does. <span class="tier tier-2">T2</span></summary><div class="answer"><p>Compute <code>hash = key.hashCode() ^ (h &gt;&gt;&gt; 16)</code> to spread high bits down; index the bucket with <code>(n-1) &amp; hash</code> (n is a power of two, so this is modulo via one AND). If the bucket is empty, place a node; otherwise walk the chain comparing hash then <code>equals</code> — replace on an equal key, else append. If a chain hits 8 nodes with capacity ≥ 64 it treeifies to a red-black tree (O(log n) worst case, a hash-flooding defense). When size exceeds capacity × 0.75, the table doubles and rehashes. Amortized O(1).</p></div></details>
+
+<!-- ============================================================ -->
+<h2 id="exercises">Hands-on exercises</h2>
+
+<div class="exercise"><h4>Exercise 1: Break and fix a HashSet</h4>
+<p>Write a <code>class User { String email; }</code> that overrides <code>equals</code> to compare emails but forgets <code>hashCode</code>. Add two <code>User</code>s with the same email to a <code>HashSet</code>. How many are in the set, and why? Then fix it.</p>
+<details><summary>Solution</summary>
+<p>The set contains <strong>two</strong> users. With only <code>equals</code> overridden, the two objects have different default (identity) hash codes, so they hash to different buckets and <code>equals</code> is never invoked to detect the duplicate — the "no duplicates" guarantee is broken. Fix by adding <code>public int hashCode() { return Objects.hash(email); }</code> so equal emails share a bucket, or better, make it <code>record User(String email) {}</code> and delete all the hand-written code.</p></details></div>
+
+<div class="exercise"><h4>Exercise 2: Word frequency count</h4>
+<p>Given <code>List&lt;String&gt; words</code>, build a <code>Map&lt;String,Integer&gt;</code> of counts using one map method per word (no get-then-put). Which method, and what's the one-liner?</p>
+<details><summary>Solution</summary>
+<pre><code><span class="typ">Map</span>&lt;<span class="typ">String</span>, <span class="typ">Integer</span>&gt; freq = <span class="kw">new</span> <span class="typ">HashMap</span>&lt;&gt;();
+<span class="kw">for</span> (<span class="typ">String</span> w : words)
+    freq.merge(w, <span class="num">1</span>, <span class="typ">Integer</span>::sum);   <span class="com">// insert 1, or add 1 to the existing count</span></code></pre>
+<p><code>merge(key, 1, Integer::sum)</code> inserts <code>1</code> if the key is absent, otherwise applies <code>sum</code> to the old and new values — the whole increment-or-insert in a single atomic call. This same one-liner is the correct, thread-safe way to count on a <code>ConcurrentHashMap</code>, which is why interviewers like it.</p></details></div>
+
+<div class="exercise"><h4>Exercise 3: Multi-key sort with a reverse trap</h4>
+<p>Sort <code>List&lt;Employee&gt;</code> (a record of name, dept, salary) by dept ascending, then salary <em>descending</em>, then name ascending — and explain why you can't just append <code>.reversed()</code>.</p>
+<details><summary>Solution</summary>
+<pre><code>staff.sort(<span class="typ">Comparator</span>.comparing(<span class="typ">Employee</span>::dept)
+        .thenComparing(<span class="typ">Employee</span>::salary, <span class="typ">Comparator</span>.reverseOrder())
+        .thenComparing(<span class="typ">Employee</span>::name));</code></pre>
+<p>Appending <code>.reversed()</code> to the whole chain would flip <em>every</em> key — dept and name would go descending too. To reverse only salary, pass <code>Comparator.reverseOrder()</code> as that single key's comparator. Because TimSort is stable, this composed comparator yields a correct, deterministic multi-key ordering.</p></details></div>
+
+<nav class="page-nav"><a href="01-java-foundations.html">← Prev: Foundations</a><a href="03-java-modern.html">Next: Modern Java →</a></nav>
+</main>
+</body>
+</html>

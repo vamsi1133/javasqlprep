@@ -14,6 +14,7 @@
 
 <div class="toc"><strong>On this page</strong><ol>
 <li><a href="#controllers">Controllers &amp; request mapping</a></li>
+<li><a href="#crud-endtoend">Hands-on: build a CRUD REST API end-to-end</a></li>
 <li><a href="#jackson">Jackson: how JSON (de)serialization actually happens</a></li>
 <li><a href="#dto">The DTO pattern: never expose entities</a></li>
 <li><a href="#exceptions">Global exception handling &amp; ProblemDetail</a></li>
@@ -131,6 +132,383 @@
 <div class="pitfall"><p>Type-conversion failures are 400s, not 500s: <code>GET /api/orders/abc</code> against <code>@PathVariable long id</code> throws <code>MethodArgumentTypeMismatchException</code>. If your global error handler doesn't map it, Boot's default does — but with a generic message. Handle it explicitly so the frontend gets "id must be a number", not a blob.</p></div>
 
 <div class="note"><p>Mapping from your React mental model: <code>fetch(`/api/orders/${id}?status=${s}`, { method: 'POST', headers: { 'Idempotency-Key': k }, body: JSON.stringify(payload) })</code> decomposes exactly into <code>@PathVariable</code> (the template literal segment), <code>@RequestParam</code> (the query string), <code>@RequestHeader</code> (the headers object), and <code>@RequestBody</code> (the JSON body). Every annotation is one field of the fetch options object.</p></div>
+
+<!-- ============================================================ -->
+<h2 id="crud-endtoend">Hands-on: build a CRUD REST API end-to-end <span class="tier tier-hands">Hands-on</span></h2>
+
+<p>You have the individual annotations now. This section wires them into <em>one complete, runnable resource</em> — a <code>Task</code> API — so you can see how a request travels down through the layers and back, and reproduce the whole vertical slice from memory. Everything after this section (Jackson internals, the DTO rationale, the exception ladder, validation edge-cases) then dissects a piece you'll have already seen working end-to-end. Think of it as the reference implementation you build once and refer back to; it's the Java equivalent of scaffolding a full CRUD feature — route, handler, service, data layer — the way you'd stand up an Express router with a Prisma model behind it.</p>
+
+<div class="handson"><p>We build a single resource, <code>Task</code> (fields: <code>title</code>, <code>description</code>, <code>status</code>, timestamps), with the full stack: <strong>Entity → Repository → Service → DTOs → Controller</strong>, plus validation, pagination, a ProblemDetail error contract, and one outbound call to an external API. Assume a Spring Boot 3.x project with <code>spring-boot-starter-web</code>, <code>-data-jpa</code>, <code>-validation</code>, and a PostgreSQL driver on the classpath.</p></div>
+
+<h3>1. The layers, one flow</h3>
+<p>Every request walks the same path down and back up. Each layer has exactly one job — that separation is what keeps the code testable and lets each piece change without breaking the others:</p>
+
+<pre><code>HTTP request  (JSON body / query params)
+   │
+   ▼
+<span class="typ">TaskController</span>   <span class="ann">@RestController</span>   <span class="com">← HTTP concerns only: bind &amp; validate input, map DTO⇄domain, choose status codes</span>
+   │
+   ▼
+<span class="typ">TaskService</span>      <span class="ann">@Service</span>          <span class="com">← business rules + transactions; knows nothing about HTTP or SQL</span>
+   │
+   ▼
+<span class="typ">TaskRepository</span>   <span class="ann">@Repository</span>       <span class="com">← data access; Spring Data generates the SQL from method names</span>
+   │
+   ▼
+<span class="typ">PostgreSQL</span>
+   │
+   ▲   Task (entity) ──&gt; TaskResponse (DTO)   <span class="com">← mapping happens at the CONTROLLER edge, never deeper</span>
+   └───────────────────────────────────────── JSON response
+</code></pre>
+
+<p>Why the layering earns its keep: the controller can be swapped (REST → GraphQL → a message listener) without touching business logic; the service is unit-testable with a mocked repository and no web server; the repository can be re-pointed at a different query without the service caring. One responsibility per layer, DTO mapping only at the HTTP boundary.</p>
+
+<h3>2. The entity</h3>
+<p>A plain JPA <code>@Entity</code>. Keep it focused on persistence — it is <em>not</em> your API shape (that's the DTO's job, see step 3 and the dedicated <a href="#dto">DTO section</a>).</p>
+
+<pre><code><span class="ann">@Entity</span>
+<span class="ann">@Table</span>(name = <span class="str">"tasks"</span>)
+<span class="kw">public class</span> <span class="typ">Task</span> {
+
+    <span class="ann">@Id</span>
+    <span class="ann">@GeneratedValue</span>(strategy = GenerationType.IDENTITY)   <span class="com">// Postgres identity/serial column assigns the id</span>
+    <span class="kw">private</span> Long id;
+
+    <span class="ann">@Column</span>(nullable = <span class="kw">false</span>, length = <span class="num">200</span>)
+    <span class="kw">private</span> String title;
+
+    <span class="ann">@Column</span>(length = <span class="num">2000</span>)
+    <span class="kw">private</span> String description;
+
+    <span class="ann">@Enumerated</span>(EnumType.STRING)              <span class="com">// store "TODO", not the ordinal 0 (ordinals break on reorder — see ch.07)</span>
+    <span class="ann">@Column</span>(nullable = <span class="kw">false</span>, length = <span class="num">20</span>)
+    <span class="kw">private</span> TaskStatus status = TaskStatus.TODO;
+
+    <span class="ann">@CreationTimestamp</span>                        <span class="com">// Hibernate sets this on INSERT</span>
+    <span class="ann">@Column</span>(updatable = <span class="kw">false</span>)
+    <span class="kw">private</span> Instant createdAt;
+
+    <span class="ann">@UpdateTimestamp</span>                          <span class="com">// Hibernate bumps this on every UPDATE</span>
+    <span class="kw">private</span> Instant updatedAt;
+
+    <span class="kw">protected</span> Task() {}                        <span class="com">// JPA requires a no-arg constructor</span>
+
+    <span class="com">// getters + setters omitted — or use Lombok @Getter/@Setter</span>
+}
+
+<span class="kw">public enum</span> <span class="typ">TaskStatus</span> { TODO, IN_PROGRESS, DONE }
+</code></pre>
+
+<h3>3. The DTOs — request and response as records</h3>
+<p>Two Java <code>record</code>s: one for what a client is <em>allowed to send</em>, one for what it's <em>allowed to see</em>. Never bind <code>@RequestBody</code> straight to the entity — that couples your JSON contract to the DB schema, opens you to over-posting (a client sending <code>{"id":1,"createdAt":...}</code> to overwrite server-owned fields), and drags lazy relationships into Jackson's serializer. The <a href="#dto">DTO section</a> argues all four reasons in full; here we just apply the pattern.</p>
+
+<pre><code><span class="com">// ---- request DTO: create AND update share this shape; only client-settable fields ----</span>
+<span class="kw">public record</span> <span class="typ">TaskRequest</span>(
+        <span class="ann">@NotBlank @Size</span>(max = <span class="num">200</span>) String title,
+        <span class="ann">@Size</span>(max = <span class="num">2000</span>) String description,
+        <span class="ann">@NotNull</span> TaskStatus status          <span class="com">// note: no id, no createdAt — those are server-owned</span>
+) {}
+
+<span class="com">// ---- response DTO: exactly what leaves over the wire ----</span>
+<span class="kw">public record</span> <span class="typ">TaskResponse</span>(
+        Long id,
+        String title,
+        String description,
+        TaskStatus status,
+        Instant createdAt,
+        Instant updatedAt
+) {
+    <span class="com">// static factory keeps the entity→DTO mapping next to the shape it produces</span>
+    <span class="kw">static</span> TaskResponse from(Task t) {
+        <span class="kw">return new</span> TaskResponse(t.getId(), t.getTitle(), t.getDescription(),
+                                t.getStatus(), t.getCreatedAt(), t.getUpdatedAt());
+    }
+}
+</code></pre>
+<div class="note"><p>Mapping approach here is a hand-written static factory — zero magic, compile-time safe, and fine for a handful of DTOs. Once you have dozens, reach for <strong>MapStruct</strong> (compile-time codegen, covered in the <a href="#dto">DTO section</a>) rather than a runtime reflection mapper.</p></div>
+
+<h3>4. The repository</h3>
+<p>One interface. Extending <code>JpaRepository&lt;Task, Long&gt;</code> gives you <code>save</code>, <code>findById</code>, <code>findAll(Pageable)</code>, <code>existsById</code>, <code>deleteById</code>, <code>count</code> — all implemented by Spring Data at runtime, no code to write. Add a <em>derived query</em> and Spring Data parses the method name into a SQL <code>WHERE</code> clause:</p>
+
+<pre><code><span class="kw">public interface</span> <span class="typ">TaskRepository</span> <span class="kw">extends</span> JpaRepository&lt;Task, Long&gt; {
+
+    <span class="com">// method name → SELECT * FROM tasks WHERE status = ?  (paged &amp; sorted by the Pageable)</span>
+    Page&lt;Task&gt; findByStatus(TaskStatus status, Pageable pageable);
+}
+</code></pre>
+
+<h3>5. The service — business logic &amp; transactions</h3>
+<p><code>@Service</code>, constructor injection (no field <code>@Autowired</code> — constructor injection is the senior default: it makes dependencies explicit and the class trivially testable). Writes are <code>@Transactional</code>; reads use <code>@Transactional(readOnly = true)</code>. Not-found is signalled by throwing a domain exception, which the global handler (step 9) turns into a 404 — the service never touches HTTP types.</p>
+
+<pre><code><span class="ann">@Service</span>
+<span class="kw">public class</span> <span class="typ">TaskService</span> {
+
+    <span class="kw">private final</span> TaskRepository repository;
+
+    <span class="kw">public</span> TaskService(TaskRepository repository) {   <span class="com">// constructor injection</span>
+        <span class="kw">this</span>.repository = repository;
+    }
+
+    <span class="ann">@Transactional</span>
+    <span class="kw">public</span> TaskResponse create(TaskRequest req) {
+        Task task = <span class="kw">new</span> Task();
+        task.setTitle(req.title());
+        task.setDescription(req.description());
+        task.setStatus(req.status());
+        <span class="kw">return</span> TaskResponse.from(repository.save(task));   <span class="com">// save → INSERT, id populated</span>
+    }
+
+    <span class="ann">@Transactional</span>(readOnly = <span class="kw">true</span>)
+    <span class="kw">public</span> TaskResponse getById(Long id) {
+        Task task = repository.findById(id)
+                .orElseThrow(() -&gt; <span class="kw">new</span> NotFoundException(<span class="str">"Task"</span>, id));   <span class="com">// → 404 in the advice</span>
+        <span class="kw">return</span> TaskResponse.from(task);
+    }
+
+    <span class="ann">@Transactional</span>(readOnly = <span class="kw">true</span>)
+    <span class="kw">public</span> Page&lt;TaskResponse&gt; list(TaskStatus status, Pageable pageable) {
+        Page&lt;Task&gt; page = (status == <span class="kw">null</span>)
+                ? repository.findAll(pageable)
+                : repository.findByStatus(status, pageable);
+        <span class="kw">return</span> page.map(TaskResponse::from);        <span class="com">// Page.map preserves the paging metadata</span>
+    }
+
+    <span class="ann">@Transactional</span>
+    <span class="kw">public</span> TaskResponse update(Long id, TaskRequest req) {
+        Task task = repository.findById(id)
+                .orElseThrow(() -&gt; <span class="kw">new</span> NotFoundException(<span class="str">"Task"</span>, id));
+        task.setTitle(req.title());
+        task.setDescription(req.description());
+        task.setStatus(req.status());
+        <span class="kw">return</span> TaskResponse.from(task);   <span class="com">// no save() needed: dirty-checking flushes the UPDATE on commit</span>
+    }
+
+    <span class="ann">@Transactional</span>
+    <span class="kw">public void</span> delete(Long id) {
+        <span class="kw">if</span> (!repository.existsById(id)) <span class="kw">throw new</span> NotFoundException(<span class="str">"Task"</span>, id);
+        repository.deleteById(id);
+    }
+}
+</code></pre>
+<div class="senior"><p>The <code>update</code> method has no <code>repository.save()</code> and that's deliberate, not a bug. Inside a transaction, a managed entity is <em>dirty-checked</em>: Hibernate compares its state at commit and auto-issues the <code>UPDATE</code>. Being able to explain that — and that <code>readOnly = true</code> skips dirty checking for a small read speedup — is a reliable senior signal. (Full treatment in the persistence chapter.)</p></div>
+
+<h3>6. The controller — all CRUD endpoints</h3>
+<p><code>@RestController</code> + <code>@RequestMapping("/api/tasks")</code>. Each method binds its slice of the request, delegates to the service, and returns the right status code. Note the deliberate mix: fixed-status reads return a bare DTO (200 by default), while create/delete use <code>ResponseEntity</code> because their status/headers are the point (201 + <code>Location</code>, 204 empty).</p>
+
+<pre><code><span class="ann">@RestController</span>
+<span class="ann">@RequestMapping</span>(<span class="str">"/api/tasks"</span>)
+<span class="kw">public class</span> <span class="typ">TaskController</span> {
+
+    <span class="kw">private final</span> TaskService service;
+    <span class="kw">public</span> TaskController(TaskService service) { <span class="kw">this</span>.service = service; }
+
+    <span class="com">// CREATE → 201 Created + Location header pointing at the new resource</span>
+    <span class="ann">@PostMapping</span>
+    <span class="kw">public</span> ResponseEntity&lt;TaskResponse&gt; create(<span class="ann">@Valid @RequestBody</span> TaskRequest req,
+                                              UriComponentsBuilder uri) {
+        TaskResponse created = service.create(req);
+        URI location = uri.path(<span class="str">"/api/tasks/{id}"</span>).buildAndExpand(created.id()).toUri();
+        <span class="kw">return</span> ResponseEntity.created(location).body(created);   <span class="com">// 201, Location: /api/tasks/42</span>
+    }
+
+    <span class="com">// READ one → 200, or 404 when the service throws NotFoundException</span>
+    <span class="ann">@GetMapping</span>(<span class="str">"/{id}"</span>)
+    <span class="kw">public</span> TaskResponse one(<span class="ann">@PathVariable</span> Long id) {
+        <span class="kw">return</span> service.getById(id);                              <span class="com">// bare DTO → 200 OK</span>
+    }
+
+    <span class="com">// READ many → paged, with an optional ?status= filter</span>
+    <span class="ann">@GetMapping</span>
+    <span class="kw">public</span> PageResponse&lt;TaskResponse&gt; list(
+            <span class="ann">@RequestParam</span>(required = <span class="kw">false</span>) TaskStatus status,
+            <span class="ann">@PageableDefault</span>(size = <span class="num">20</span>, sort = <span class="str">"createdAt"</span>, direction = Sort.Direction.DESC)
+            Pageable pageable) {
+        <span class="kw">return</span> PageResponse.from(service.list(status, pageable));
+    }
+
+    <span class="com">// UPDATE (full replace) → 200 with the updated resource</span>
+    <span class="ann">@PutMapping</span>(<span class="str">"/{id}"</span>)
+    <span class="kw">public</span> TaskResponse update(<span class="ann">@PathVariable</span> Long id, <span class="ann">@Valid @RequestBody</span> TaskRequest req) {
+        <span class="kw">return</span> service.update(id, req);
+    }
+
+    <span class="com">// DELETE → 204 No Content (empty body)</span>
+    <span class="ann">@DeleteMapping</span>(<span class="str">"/{id}"</span>)
+    <span class="kw">public</span> ResponseEntity&lt;Void&gt; delete(<span class="ann">@PathVariable</span> Long id) {
+        service.delete(id);
+        <span class="kw">return</span> ResponseEntity.noContent().build();               <span class="com">// 204</span>
+    }
+}
+</code></pre>
+<div class="note"><p>We used <code>PUT</code> for a full replacement (client sends the complete <code>TaskRequest</code>). For partial updates — e.g. flipping only <code>status</code> — you'd add a <code>@PatchMapping</code>; the PUT-vs-PATCH decision and the "absent vs null" merge-patch trap are covered in the <a href="#rest-design">REST design section</a>. For a simple, fully-populated DTO like this one, PUT is the honest choice.</p></div>
+
+<h3>7. Validation — the annotations already do the work</h3>
+<p>The constraints are already on <code>TaskRequest</code> (<code>@NotBlank</code>, <code>@Size</code>, <code>@NotNull</code>). The one line that <em>activates</em> them is <code>@Valid</code> in front of <code>@RequestBody</code> in the controller. With it, a bad payload never reaches your service: Spring throws <code>MethodArgumentNotValidException</code>, which the advice (step 9) turns into a structured 400. Without <code>@Valid</code>, those annotations are inert decoration — the single most common "why isn't my validation firing" bug.</p>
+
+<pre><code><span class="com">// POST /api/tasks  with  {"title":"","status":null}</span>
+<span class="com">//   @NotBlank on title  → violation</span>
+<span class="com">//   @NotNull  on status → violation</span>
+<span class="com">// → MethodArgumentNotValidException → 400 (see the error body in step 9)</span>
+</code></pre>
+<div class="pitfall"><p>Forgetting <code>@Valid</code> means invalid data flows straight into your service and DB. The annotations on the DTO don't self-execute — <code>@Valid</code> (bodies) / <code>@Validated</code> (path/query params) is the trigger. The full annotation menu and the two-different-exceptions gotcha live in the <a href="#validation">Bean Validation section</a>.</p></div>
+
+<h3>8. Pagination &amp; sorting</h3>
+<p>Spring Data binds <code>?page=0&amp;size=20&amp;sort=createdAt,desc</code> straight into a <code>Pageable</code> — you never parse query params by hand. <code>@PageableDefault</code> supplies sane defaults (and caps you'd otherwise get from unbounded client input). The repository's <code>findAll(pageable)</code>/<code>findByStatus(status, pageable)</code> returns a <code>Page&lt;Task&gt;</code>; the service <code>.map()</code>s it to <code>Page&lt;TaskResponse&gt;</code>, and we wrap it in a stable envelope rather than serializing <code>Page</code> directly (its JSON shape isn't a guaranteed contract — Boot even logs a warning):</p>
+
+<pre><code><span class="com">// A stable, self-defined page envelope (reused across endpoints)</span>
+<span class="kw">public record</span> <span class="typ">PageResponse</span>&lt;T&gt;(
+        List&lt;T&gt; content,
+        <span class="kw">int</span> page,
+        <span class="kw">int</span> size,
+        <span class="kw">long</span> totalElements,
+        <span class="kw">int</span> totalPages,
+        <span class="kw">boolean</span> last) {
+
+    <span class="kw">public static</span> &lt;T&gt; PageResponse&lt;T&gt; from(Page&lt;T&gt; p) {
+        <span class="kw">return new</span> PageResponse&lt;&gt;(p.getContent(), p.getNumber(), p.getSize(),
+                                  p.getTotalElements(), p.getTotalPages(), p.isLast());
+    }
+}
+</code></pre>
+<pre><code><span class="com">// GET /api/tasks?status=TODO&amp;page=0&amp;size=2&amp;sort=createdAt,desc  →</span>
+{
+  <span class="str">"content"</span>: [
+    { <span class="str">"id"</span>: <span class="num">42</span>, <span class="str">"title"</span>: <span class="str">"Ship the REST chapter"</span>, <span class="str">"status"</span>: <span class="str">"TODO"</span>,
+      <span class="str">"createdAt"</span>: <span class="str">"2026-07-06T10:15:30Z"</span>, <span class="str">"updatedAt"</span>: <span class="str">"2026-07-06T10:15:30Z"</span> }
+  ],
+  <span class="str">"page"</span>: <span class="num">0</span>, <span class="str">"size"</span>: <span class="num">2</span>, <span class="str">"totalElements"</span>: <span class="num">1</span>, <span class="str">"totalPages"</span>: <span class="num">1</span>, <span class="str">"last"</span>: <span class="kw">true</span>
+}
+</code></pre>
+<div class="pitfall"><p><strong>N+1 on the list endpoint.</strong> The moment <code>Task</code> gains a lazy relationship (say <code>@ManyToOne Project</code>) and your mapper touches <code>t.getProject().getName()</code>, listing 20 tasks fires 1 query for the page + 20 more for the projects. Fix at the repository with a fetch-join or an <code>@EntityGraph</code>, not by making the relationship eager. This is the single most common performance bug in exactly this kind of list-with-mapping code.</p></div>
+
+<h3>9. Error handling — one ProblemDetail contract</h3>
+<p>The service throws <code>NotFoundException</code>; <code>@Valid</code> throws <code>MethodArgumentNotValidException</code>. A single <code>@RestControllerAdvice</code> maps both to <strong>RFC 7807 <code>ProblemDetail</code></strong> bodies so the whole API speaks one error dialect (the full multi-exception ladder is in the <a href="#exceptions">exception-handling section</a>):</p>
+
+<pre><code><span class="com">// domain exception — plain RuntimeException, thrown from the service</span>
+<span class="kw">public class</span> <span class="typ">NotFoundException</span> <span class="kw">extends</span> RuntimeException {
+    <span class="kw">public</span> NotFoundException(String resource, Object id) {
+        <span class="kw">super</span>(resource + <span class="str">" "</span> + id + <span class="str">" not found"</span>);
+    }
+}
+
+<span class="ann">@RestControllerAdvice</span>
+<span class="kw">public class</span> <span class="typ">ApiExceptionHandler</span> {
+
+    <span class="com">// 404 — resource not found</span>
+    <span class="ann">@ExceptionHandler</span>(NotFoundException.<span class="kw">class</span>)
+    <span class="kw">public</span> ProblemDetail handleNotFound(NotFoundException ex) {
+        ProblemDetail pd = ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND, ex.getMessage());
+        pd.setTitle(<span class="str">"Resource not found"</span>);
+        pd.setProperty(<span class="str">"timestamp"</span>, Instant.now());
+        <span class="kw">return</span> pd;   <span class="com">// status is taken from the ProblemDetail</span>
+    }
+
+    <span class="com">// 400 — @Valid failure → per-field errors the frontend can map onto inputs</span>
+    <span class="ann">@ExceptionHandler</span>(MethodArgumentNotValidException.<span class="kw">class</span>)
+    <span class="kw">public</span> ProblemDetail handleValidation(MethodArgumentNotValidException ex) {
+        ProblemDetail pd = ProblemDetail.forStatusAndDetail(HttpStatus.BAD_REQUEST, <span class="str">"Validation failed"</span>);
+        pd.setTitle(<span class="str">"Invalid request"</span>);
+        List&lt;Map&lt;String, String&gt;&gt; errors = ex.getBindingResult().getFieldErrors().stream()
+                .map(fe -&gt; Map.of(<span class="str">"field"</span>, fe.getField(),
+                                  <span class="str">"message"</span>, fe.getDefaultMessage() == <span class="kw">null</span> ? <span class="str">"invalid"</span> : fe.getDefaultMessage()))
+                .toList();
+        pd.setProperty(<span class="str">"errors"</span>, errors);
+        <span class="kw">return</span> pd;
+    }
+}
+</code></pre>
+<pre><code><span class="com">// GET /api/tasks/999  →  404</span>
+HTTP/1.1 404 Not Found
+Content-Type: application/problem+json
+
+{
+  <span class="str">"type"</span>: <span class="str">"about:blank"</span>,
+  <span class="str">"title"</span>: <span class="str">"Resource not found"</span>,
+  <span class="str">"status"</span>: <span class="num">404</span>,
+  <span class="str">"detail"</span>: <span class="str">"Task 999 not found"</span>,
+  <span class="str">"timestamp"</span>: <span class="str">"2026-07-06T10:20:00Z"</span>
+}
+
+<span class="com">// POST /api/tasks  {"title":"","status":null}  →  400</span>
+HTTP/1.1 400 Bad Request
+Content-Type: application/problem+json
+
+{
+  <span class="str">"title"</span>: <span class="str">"Invalid request"</span>,
+  <span class="str">"status"</span>: <span class="num">400</span>,
+  <span class="str">"detail"</span>: <span class="str">"Validation failed"</span>,
+  <span class="str">"errors"</span>: [
+    { <span class="str">"field"</span>: <span class="str">"title"</span>,  <span class="str">"message"</span>: <span class="str">"must not be blank"</span> },
+    { <span class="str">"field"</span>: <span class="str">"status"</span>, <span class="str">"message"</span>: <span class="str">"must not be null"</span> }
+  ]
+}
+</code></pre>
+
+<h3>10. Calling an external API (RestClient)</h3>
+<p>Real services also <em>consume</em> other APIs — this is the server's <code>fetch()</code>. Suppose creating a task should notify an external webhook service. Use Spring 6's <code>RestClient</code> (the recommended blocking client; <code>WebClient</code> is its reactive/async sibling for high-concurrency fan-out — see the <a href="#clients">clients section</a>):</p>
+
+<pre><code><span class="ann">@Service</span>
+<span class="kw">public class</span> <span class="typ">NotificationClient</span> {
+
+    <span class="kw">private final</span> RestClient http;
+
+    <span class="kw">public</span> NotificationClient(RestClient.Builder builder) {   <span class="com">// Boot pre-configures the builder</span>
+        <span class="kw">this</span>.http = builder.baseUrl(<span class="str">"https://hooks.internal"</span>).build();
+    }
+
+    <span class="com">// deserialize the response straight into a record</span>
+    <span class="kw">public record</span> <span class="typ">Ack</span>(String id, String status) {}
+
+    <span class="kw">public</span> Ack notifyCreated(TaskResponse task) {
+        <span class="kw">return</span> http.post()
+                .uri(<span class="str">"/v1/notify"</span>)
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of(<span class="str">"event"</span>, <span class="str">"task.created"</span>, <span class="str">"taskId"</span>, task.id()))
+                .retrieve()
+                .onStatus(HttpStatusCode::is4xxClientError, (req, res) -&gt; {   <span class="com">// basic error handling</span>
+                    <span class="kw">throw new</span> IllegalStateException(<span class="str">"notify rejected: "</span> + res.getStatusCode());
+                })
+                .body(Ack.<span class="kw">class</span>);      <span class="com">// blocking; returns the deserialized DTO</span>
+    }
+}
+</code></pre>
+<div class="pitfall"><p>Always set connect/read <strong>timeouts</strong> on outbound clients (the defaults can hang a request thread indefinitely) and don't let a flaky downstream fail the whole create — for a side-effect like a notification, log-and-continue or push it to an async queue rather than blocking the user's 201.</p></div>
+
+<h3>11. Trying it with curl</h3>
+<pre><code><span class="com"># CREATE → 201 Created, Location header, echoes the new resource</span>
+curl -i -X POST http://localhost:8080/api/tasks \
+     -H <span class="str">"Content-Type: application/json"</span> \
+     -d <span class="str">'{"title":"Ship the REST chapter","description":"end-to-end CRUD","status":"TODO"}'</span>
+
+<span class="com"># → HTTP/1.1 201 Created</span>
+<span class="com"># → Location: http://localhost:8080/api/tasks/42</span>
+{
+  <span class="str">"id"</span>: <span class="num">42</span>,
+  <span class="str">"title"</span>: <span class="str">"Ship the REST chapter"</span>,
+  <span class="str">"description"</span>: <span class="str">"end-to-end CRUD"</span>,
+  <span class="str">"status"</span>: <span class="str">"TODO"</span>,
+  <span class="str">"createdAt"</span>: <span class="str">"2026-07-06T10:15:30Z"</span>,
+  <span class="str">"updatedAt"</span>: <span class="str">"2026-07-06T10:15:30Z"</span>
+}
+
+<span class="com"># LIST → 200, paged envelope, newest first</span>
+curl <span class="str">"http://localhost:8080/api/tasks?status=TODO&amp;page=0&amp;size=20&amp;sort=createdAt,desc"</span>
+
+<span class="com"># → HTTP/1.1 200 OK</span>
+{
+  <span class="str">"content"</span>: [
+    { <span class="str">"id"</span>: <span class="num">42</span>, <span class="str">"title"</span>: <span class="str">"Ship the REST chapter"</span>, <span class="str">"status"</span>: <span class="str">"TODO"</span>,
+      <span class="str">"createdAt"</span>: <span class="str">"2026-07-06T10:15:30Z"</span>, <span class="str">"updatedAt"</span>: <span class="str">"2026-07-06T10:15:30Z"</span> }
+  ],
+  <span class="str">"page"</span>: <span class="num">0</span>, <span class="str">"size"</span>: <span class="num">20</span>, <span class="str">"totalElements"</span>: <span class="num">1</span>, <span class="str">"totalPages"</span>: <span class="num">1</span>, <span class="str">"last"</span>: <span class="kw">true</span>
+}
+</code></pre>
+<div class="senior"><p>That's the whole slice: five files (<code>Task</code>, <code>TaskRepository</code>, <code>TaskService</code>, the two DTOs, <code>TaskController</code>) plus a shared advice, and you have a validated, paged, correctly-status-coded resource with a clean error contract. In an interview, being able to sketch this end-to-end — and name which layer owns which concern — demonstrates the hands-on fluency that pure theory can't fake.</p></div>
+
+<h4>Quick Q&amp;A on this build</h4>
+<details class="qa"><summary>Why return 201 with a Location header instead of just 200?</summary><div class="answer"><p><strong>201 Created</strong> is the semantically correct status for a successful POST that creates a resource, and the <code>Location</code> header tells the client the canonical URL of the thing it just made (<code>/api/tasks/42</code>) so it can immediately <code>GET</code> or link to it without guessing the id. 200 works mechanically but throws away that information and misrepresents "created" as generic "OK". Spring makes it one call: <code>ResponseEntity.created(location).body(dto)</code>. Interviewers specifically check for the <code>Location</code> header — it's a small tell that you build APIs, not just endpoints.</p></div></details>
+<details class="qa"><summary>You used PUT for update. When would you reach for PATCH here instead?</summary><div class="answer"><p>PUT is a <em>full replacement</em>: the client sends the complete <code>TaskRequest</code> and the server overwrites all mutable fields — which is exactly what our DTO expresses (title + description + status, all present). Reach for PATCH when clients need to change <em>one</em> field without resending the rest — e.g. a Kanban board flipping only <code>status</code> to <code>DONE</code>. The catch with PATCH is distinguishing "field omitted" from "field explicitly set to null"; a plain DTO can't, so you read the body as a <code>JsonNode</code>/<code>Map</code> and check key presence. For this resource, PUT is simpler and honest; add PATCH only when a real partial-update use case appears.</p></div></details>
+<details class="qa"><summary>Why map the entity to a DTO at all — the fields are nearly identical?</summary><div class="answer"><p>Because "nearly identical today" is a trap. The moment the entity grows a field you don't want exposed (an internal <code>ownerId</code>, a soft-delete flag) or a lazy relationship, returning the entity leaks it or triggers serialization bombs (N+1, <code>LazyInitializationException</code>, infinite recursion on bidirectional links). And on input, binding <code>@RequestBody</code> to the entity invites over-posting — a client setting <code>id</code> or <code>createdAt</code> you meant to own server-side. The DTO is a deliberate, stable contract decoupled from the schema, so the two can evolve independently. The tiny mapping cost buys you that boundary; the <a href="#dto">DTO section</a> lays out all four reasons.</p></div></details>
 
 <!-- ============================================================ -->
 <h2 id="jackson">Jackson: how JSON (de)serialization actually happens <span class="tier tier-1">T1</span></h2>

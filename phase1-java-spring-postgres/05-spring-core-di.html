@@ -26,6 +26,7 @@
 <div class="toc">
   <strong>On this page</strong>
   <ol>
+    <li><a href="#bootstrapping">Hands-on: bootstrapping a real Spring Boot project</a></li>
     <li><a href="#ioc-di">IoC &amp; DI from first principles</a></li>
     <li><a href="#injection-styles">Constructor vs setter vs field injection</a></li>
     <li><a href="#stereotypes">Stereotype annotations &amp; component scanning</a></li>
@@ -43,6 +44,167 @@
     <li><a href="#exercises">Hands-on exercises</a></li>
   </ol>
 </div>
+
+<!-- ============================================================ -->
+<h2 id="bootstrapping">Hands-on: bootstrapping a real Spring Boot project <span class="tier tier-hands">Hands-on</span></h2>
+<p>You know the theory; this section is the muscle memory a React/Node background doesn't give you: how you actually <em>create</em> a Boot app, where code physically goes, how config is layered per environment, and how you run the thing. Nothing here is deep auto-config internals (that's later) — it's the scaffolding every real project starts from.</p>
+
+<h3>1. Generate the project with Spring Initializr</h3>
+<p>There is no <code>npx create-spring-app</code>. The canonical scaffolder is <a href="https://start.spring.io">start.spring.io</a> (Spring Initializr) — a web UI (also built into IntelliJ: <em>New Project → Spring Boot</em>) that generates a zip with a build file, wrapper scripts, and a main class. Pick:</p>
+<ul>
+  <li><strong>Project:</strong> Maven (most common in interviews; Gradle is the alternative). Maven's <code>pom.xml</code> ≈ <code>package.json</code>, but declarative XML.</li>
+  <li><strong>Language:</strong> Java. <strong>Spring Boot:</strong> latest 3.x (stable). <strong>Java:</strong> 21 (current LTS).</li>
+  <li><strong>Packaging:</strong> Jar. <strong>Group:</strong> <code>com.example</code>, <strong>Artifact:</strong> <code>app</code> → base package <code>com.example.app</code>.</li>
+  <li><strong>Dependencies</strong> — these are <em>starters</em>: curated dependency bundles, like a meta-package that pulls a whole coherent set of libs at compatible versions (think a well-chosen bundle in <code>package.json</code>, but version-managed for you by the Boot BOM):</li>
+</ul>
+<table>
+  <thead><tr><th>Starter you tick</th><th>Artifact</th><th>What it actually pulls in</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Spring Web</strong></td><td><code>spring-boot-starter-web</code></td><td>Spring MVC, Jackson (JSON), validation glue, and an <strong>embedded Tomcat</strong> — your app becomes its own HTTP server.</td></tr>
+    <tr><td><strong>Spring Data JPA</strong></td><td><code>spring-boot-starter-data-jpa</code></td><td>Hibernate (the JPA implementation), Spring Data repositories, a HikariCP connection pool, transaction management.</td></tr>
+    <tr><td><strong>PostgreSQL Driver</strong></td><td><code>postgresql</code></td><td>The JDBC driver so JPA can actually talk to Postgres. Runtime-scoped.</td></tr>
+    <tr><td><strong>Validation</strong></td><td><code>spring-boot-starter-validation</code></td><td>Hibernate Validator — powers <code>@Valid</code>, <code>@NotBlank</code>, <code>@Min</code> on DTOs and config.</td></tr>
+    <tr><td><strong>Lombok</strong> (optional)</td><td><code>lombok</code></td><td>Compile-time codegen for <code>@RequiredArgsConstructor</code>, <code>@Getter</code>, <code>@Builder</code>. Cuts boilerplate; needs the IDE plugin.</td></tr>
+  </tbody>
+</table>
+<p>Unzip it and open in your IDE. Maven downloads dependencies on first build (into <code>~/.m2</code>, a global cache — not a per-project <code>node_modules</code>).</p>
+
+<h3>2. The main class — your entry point</h3>
+<pre><code><span class="kw">package</span> com.example.app;
+
+<span class="kw">import</span> org.springframework.boot.<span class="typ">SpringApplication</span>;
+<span class="kw">import</span> org.springframework.boot.autoconfigure.<span class="typ">SpringBootApplication</span>;
+
+<span class="ann">@SpringBootApplication</span>
+<span class="kw">public class</span> <span class="typ">AppApplication</span> {
+    <span class="kw">public static void</span> main(<span class="typ">String</span>[] args) {
+        <span class="typ">SpringApplication</span>.run(<span class="typ">AppApplication</span>.<span class="kw">class</span>, args);
+    }
+}</code></pre>
+<p><code>@SpringBootApplication</code> is a meta-annotation that bundles three: <code>@Configuration</code> (this class can declare beans), <code>@EnableAutoConfiguration</code> (turn on Boot's auto-config), and <code>@ComponentScan</code> (discover your <code>@Component</code>/<code>@Service</code>/etc. classes). <code>SpringApplication.run(...)</code> boots the container, starts the embedded server, and returns the live <code>ApplicationContext</code>.</p>
+<p><strong>Why package placement matters:</strong> <code>@ComponentScan</code> here has no explicit base package, so it scans <em>from this class's package downward</em> — <code>com.example.app</code> and everything under it. Keep the main class in the <em>root</em> package and put all your code beneath it, and scanning "just works."</p>
+
+<h3>3. Standard package layout</h3>
+<p>Boot is unopinionated about internal structure, but the near-universal convention is a layered, package-by-role tree under the root. Adopt this on day one:</p>
+<pre>com.example.app
+├── AppApplication.java        ← main class, sits at the root so scanning covers everything
+├── controller                 ← HTTP layer: @RestController, request/response mapping only
+├── service                    ← business logic, @Service, @Transactional boundaries
+├── repository                 ← data access, Spring Data JPA interfaces (@Repository)
+├── entity                     ← JPA @Entity classes (the DB-mapped domain model)
+├── dto                        ← request/response records — the API's shape, decoupled from entities
+├── config                     ← @Configuration classes, beans for third-party libs
+└── exception                  ← custom exceptions + @RestControllerAdvice handlers</pre>
+<p>One line each: <strong>controller</strong> translates HTTP ↔ method calls; <strong>service</strong> holds logic and transaction boundaries; <strong>repository</strong> talks to the database; <strong>entity</strong> maps tables to objects; <strong>dto</strong> defines what crosses the wire (never expose entities directly); <strong>config</strong> wires beans you don't own; <strong>exception</strong> centralizes error-to-HTTP mapping. Coming from React, this is your <code>components / hooks / api / types</code> discipline, enforced by convention rather than folders of convenience.</p>
+
+<h3>4. application.yml essentials</h3>
+<p>Initializr gives you an empty <code>src/main/resources/application.properties</code>. Rename it to <code>application.yml</code> (YAML nests better for the tree of settings). This file is your <code>.env</code> + config combined — but typed and validated at startup, not stringly-typed at read time.</p>
+<pre><code><span class="com"># src/main/resources/application.yml</span>
+server:
+  port: <span class="num">8080</span>              <span class="com"># the embedded Tomcat port</span>
+
+spring:
+  datasource:
+    url: <span class="str">jdbc:postgresql://localhost:5432/appdb</span>
+    username: <span class="str">appuser</span>
+    password: <span class="str">localpassword</span>
+  jpa:
+    hibernate:
+      ddl-auto: <span class="str">update</span>   <span class="com"># dev-only convenience; see pitfall below</span>
+    show-sql: <span class="kw">true</span>        <span class="com"># log generated SQL — great while learning</span>
+    properties:
+      hibernate:
+        format_sql: <span class="kw">true</span>
+
+logging:
+  level:
+    org.springframework.web: <span class="str">INFO</span>
+    org.hibernate.SQL: <span class="str">DEBUG</span>       <span class="com"># see the actual queries</span>
+    com.example.app: <span class="str">DEBUG</span></code></pre>
+<div class="note"><p><code>.properties</code> vs <code>.yml</code>: identical capabilities, different syntax. <code>server.port=8080</code> (flat, dot-separated) vs the nested YAML above. YAML wins for deep hierarchies and lists; properties is fine for a handful of keys. Pick one per file — don't split the same concern across both (Boot loads both if present, which just confuses people).</p></div>
+
+<h3>5. Profiles: per-environment config</h3>
+<p>You never want dev database credentials in production. Boot's answer is <strong>profiles</strong> — named config layers. Put shared settings in <code>application.yml</code>, then override per environment in <code>application-{profile}.yml</code>:</p>
+<pre><code><span class="com"># application-dev.yml — local Postgres, verbose, auto-schema</span>
+spring:
+  datasource:
+    url: <span class="str">jdbc:postgresql://localhost:5432/appdb</span>
+    username: <span class="str">appuser</span>
+    password: <span class="str">localpassword</span>
+  jpa:
+    hibernate:
+      ddl-auto: <span class="str">update</span>
+    show-sql: <span class="kw">true</span></code></pre>
+<pre><code><span class="com"># application-prod.yml — credentials injected from the environment, schema locked</span>
+spring:
+  datasource:
+    url: <span class="str">${DB_URL}</span>              <span class="com"># resolved from env vars at startup</span>
+    username: <span class="str">${DB_USER}</span>
+    password: <span class="str">${DB_PASSWORD}</span>
+  jpa:
+    hibernate:
+      ddl-auto: <span class="str">validate</span>       <span class="com"># never mutate a prod schema automatically</span>
+    show-sql: <span class="kw">false</span></code></pre>
+<p>Activate a profile in any of these ways (later ones override earlier):</p>
+<pre><code><span class="com"># baked into application.yml (usually just the default/dev)</span>
+spring:
+  profiles:
+    active: dev
+
+<span class="com"># or at launch — CLI system property:</span>
+mvn spring-boot:run -Dspring-boot.run.profiles=dev
+java -jar app.jar --spring.profiles.active=prod
+
+<span class="com"># or via env var (how you'd do it in a container / CI):</span>
+SPRING_PROFILES_ACTIVE=prod java -jar app.jar</code></pre>
+<p>You can also gate <em>beans</em> on a profile with <code>@Profile</code> — e.g. a fake email sender in dev, the real SES client in prod:</p>
+<pre><code><span class="ann">@Configuration</span>
+<span class="kw">public class</span> <span class="typ">MailConfig</span> {
+    <span class="ann">@Bean</span> <span class="ann">@Profile</span>(<span class="str">"dev"</span>)
+    <span class="typ">MailSender</span> logMailSender()  { <span class="kw">return new</span> <span class="typ">ConsoleMailSender</span>(); }
+
+    <span class="ann">@Bean</span> <span class="ann">@Profile</span>(<span class="str">"prod"</span>)
+    <span class="typ">MailSender</span> sesMailSender()  { <span class="kw">return new</span> <span class="typ">SesMailSender</span>(); }
+}</code></pre>
+
+<h3>6. Externalized config &amp; secrets</h3>
+<p>Two ways to read config into code. <code>@Value</code> is the quick, one-off injection; <code>@ConfigurationProperties</code> is the typed, grouped, testable approach you should prefer for anything non-trivial.</p>
+<pre><code><span class="com">// @Value — fine for a single scalar</span>
+<span class="ann">@Service</span>
+<span class="kw">public class</span> <span class="typ">TokenService</span> {
+    <span class="ann">@Value</span>(<span class="str">"${security.jwt.expiry-seconds:3600}"</span>)  <span class="com">// :default after the colon</span>
+    <span class="kw">private long</span> expirySeconds;
+}</code></pre>
+<pre><code><span class="com">// @ConfigurationProperties — a typed, validated group. Prefer this.</span>
+<span class="ann">@ConfigurationProperties</span>(prefix = <span class="str">"security.jwt"</span>)
+<span class="ann">@Validated</span>
+<span class="kw">public record</span> <span class="typ">JwtProperties</span>(
+    <span class="ann">@NotBlank</span> <span class="typ">String</span> secret,          <span class="com">// injected from env, never hardcoded</span>
+    <span class="ann">@Min</span>(<span class="num">60</span>) <span class="kw">long</span> expirySeconds
+) {}
+<span class="com">// enable with @ConfigurationPropertiesScan on the main class,</span>
+<span class="com">// then inject JwtProperties like any other bean.</span></code></pre>
+<pre><code><span class="com"># application.yml — bind env vars; the secret is NEVER a literal here</span>
+security:
+  jwt:
+    secret: <span class="str">${JWT_SECRET}</span>        <span class="com"># fails fast at startup if the env var is missing</span>
+    expiry-seconds: <span class="num">3600</span></code></pre>
+<div class="pitfall"><p><strong>Three ways this bites theory-only devs:</strong> (1) A <code>@Service</code> in <code>com.example.other</code> — a <em>sibling</em> of <code>com.example.app</code>, not under it — is silently never scanned; you get <em>"required a bean of type X that could not be found"</em> at startup. Keep everything under the main class's package. (2) <code>ddl-auto: update</code> (or worse, <code>create</code>) in production lets Hibernate mutate your live schema on deploy — data loss waiting to happen. Use <code>validate</code> in prod and manage schema with Flyway/Liquibase. (3) Committing <code>password: localpassword</code> or a JWT secret to git. Real secrets come from env vars / a secrets manager and are referenced as <code>${...}</code>; the committed files hold only non-secret defaults.</p></div>
+
+<h3>7. Running it</h3>
+<pre><code><span class="com"># from the project root, using the Maven wrapper Initializr generated:</span>
+./mvnw spring-boot:run           <span class="com"># (Windows: mvnw.cmd spring-boot:run)</span>
+
+<span class="com"># or build a self-contained "fat jar" and run it — how it ships to prod:</span>
+./mvnw clean package             <span class="com"># produces target/app-0.0.1-SNAPSHOT.jar</span>
+java -jar target/app-0.0.1-SNAPSHOT.jar</code></pre>
+<p>In an IDE you just click Run on <code>AppApplication.main()</code> — same thing. On startup you'll see a banner and finally a line like <code>Started AppApplication in 2.317 seconds (process running for 2.9)</code>. That line means the container built the whole bean graph, ran migrations/init, and the <strong>embedded Tomcat</strong> is now listening on port 8080. There is no external servlet container to install or deploy a WAR into — the HTTP server ships <em>inside</em> your jar. This is why a Boot app runs identically on your laptop and in a container: <code>java -jar</code> and it's serving.</p>
+<div class="note"><p>Add <code>spring-boot-devtools</code> (a dependency) for a faster inner loop: it watches the classpath and <strong>auto-restarts</strong> the app when you recompile — the Java equivalent of Node's <code>nodemon</code> / a dev-server hot reload. It's automatically disabled in the packaged jar, so it never runs in production.</p></div>
+<div class="senior"><p>Startup time and memory are real interview topics for the JVM. A senior habit: keep auto-configuration lean (only the starters you use), because every starter on the classpath means more <code>@Conditional</code> evaluation at boot. For latency-sensitive or serverless deploys you'd reach for <code>spring-boot-starter-actuator</code>'s startup endpoint to see which beans cost the most, lazy-init non-critical beans (<code>spring.main.lazy-initialization=true</code>), or — the big lever — compile to a GraalVM native image, trading JIT warmth for sub-100ms cold starts. Don't volunteer all of this unprompted, but knowing the fat jar contains an embedded server (not a WAR on Tomcat) and that scanning happens at startup is the baseline.</p></div>
+
+<details class="qa"><summary>What does @SpringBootApplication actually do?</summary><div class="answer"><p>It's a convenience meta-annotation combining three: <code>@Configuration</code> (the class may declare <code>@Bean</code> methods), <code>@EnableAutoConfiguration</code> (activates Boot's conditional auto-configuration — datasource, MVC, Jackson, etc., based on what's on the classpath), and <code>@ComponentScan</code> (discovers your stereotype-annotated classes). Because the bundled <code>@ComponentScan</code> has no explicit base package, it scans from the annotated class's package downward — which is exactly why convention puts the main class in the root package. <code>SpringApplication.run(...)</code> then creates and refreshes the <code>ApplicationContext</code>, starts the embedded server, and returns the live context.</p></div></details>
+
+<details class="qa"><summary>How do you manage configuration across dev, staging, and production?</summary><div class="answer"><p>Layered profiles. Shared, non-secret defaults live in <code>application.yml</code>; per-environment overrides live in <code>application-{profile}.yml</code> and win when that profile is active. I select the profile at deploy time — usually the <code>SPRING_PROFILES_ACTIVE</code> env var in the container, or <code>--spring.profiles.active</code> on the command line — never by editing code. Secrets (DB passwords, API keys, JWT secret) are never committed: the YAML references environment variables via <code>${DB_PASSWORD}</code>, injected by the platform or a secrets manager, and Boot fails fast at startup if a required one is missing. For anything more than a scalar I bind config into a typed, <code>@Validated @ConfigurationProperties</code> record so bad values are caught at boot, not at first use. And prod uses <code>ddl-auto: validate</code> with Flyway for schema, never <code>update</code>.</p></div></details>
 
 <!-- ============================================================ -->
 <h2 id="ioc-di">IoC &amp; DI from first principles <span class="tier tier-1">T1</span></h2>
@@ -1054,7 +1216,7 @@ com.acme.audit.AuditAutoConfiguration</code></pre>
 </div>
 
 <nav class="page-nav">
-  <a href="04-java-jvm.html">← Prev: JVM Internals</a>
+  <a href="04-java-concurrency-jvm.html">← Prev: Concurrency &amp; the JVM</a>
   <a href="06-spring-rest-api.html">Next: REST API Layer →</a>
 </nav>
 </main>

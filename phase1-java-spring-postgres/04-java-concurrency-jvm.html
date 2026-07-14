@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 — Concurrency &amp; the JVM (Level Up) | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header"><div class="container"><div class="breadcrumb"><a href="index.html">← Course Home</a></div><h1>04 — Concurrency &amp; the JVM <span style="opacity:.7">(Level Up)</span></h1><p>Doing many things at once, and understanding how the machine runs your code — the senior differentiators</p></div></header>
+<main class="container">
+
+<nav class="pathbar">
+  <span class="step done">1 · Foundations</span><span class="sep">→</span>
+  <span class="step done">2 · Objects &amp; Collections</span><span class="sep">→</span>
+  <span class="step done">3 · Modern Java</span><span class="sep">→</span>
+  <span class="step here">4 · Concurrency &amp; JVM</span>
+</nav>
+
+<p class="levelmeta expert"><span class="dot"></span>Level: expert · read last, after pages 01–03 are solid</p>
+
+<p>This is the top of the climb. Concurrency (running code on multiple threads) and the JVM (how your bytecode actually executes, and how memory is managed) are what separate a mid-level Java developer from a senior one in interviews. You don't write raw threads every day — frameworks like Spring handle most of it — but you're expected to <em>reason</em> about thread-safety, explain a memory leak, and know what garbage collection does. Learn the <strong>essentials</strong> in the main sections; the deepest theory (the memory model, GC internals, JIT) is quarantined in the <strong>⭐ Level-Up appendix</strong> for when you want to go from "can discuss" to "can go deep."</p>
+
+<div class="note"><p><strong>Triage advice.</strong> For most interviews, the essentials below — thread pools, <code>CompletableFuture</code>, the <code>synchronized</code>/<code>volatile</code>/atomic distinction, heap vs stack, and what GC does — are enough to be strong. The appendix (Java Memory Model, CAS, ZGC, class loading) is for FAANG systems rounds and "go deeper" follow-ups. Don't let it intimidate you into skipping the essentials.</p></div>
+
+<div class="toc"><strong>On this page</strong><ol>
+<li><a href="#threads">Threads: what and why</a></li>
+<li><a href="#pools">Thread pools &amp; ExecutorService</a></li>
+<li><a href="#cf">CompletableFuture — async composition</a></li>
+<li><a href="#safety">Thread-safety: synchronized, volatile, atomics</a></li>
+<li><a href="#vthreads">Virtual threads (Java 21) — the game-changer</a></li>
+<li><a href="#memory">JVM memory: heap vs stack</a></li>
+<li><a href="#gc">Garbage collection in one pass</a></li>
+<li><a href="#leaks">Memory leaks &amp; OutOfMemoryError</a></li>
+<li><a href="#levelup">⭐ Level-Up: the deep internals</a></li>
+<li><a href="#qa">Interview Q&amp;A</a></li>
+<li><a href="#exercises">Hands-on exercises</a></li>
+</ol></div>
+
+<!-- ============================================================ -->
+<h2 id="threads">Threads: what and why</h2>
+<p>A <strong>thread</strong> is an independent path of execution within your program. JavaScript is single-threaded (one event loop); Java is genuinely multi-threaded — many threads can run <em>at the same time</em> on different CPU cores. That buys real parallelism (use all your cores) and responsiveness (don't block while waiting on I/O), at the cost of a hard new problem: when two threads touch the same data, order and visibility stop being obvious.</p>
+<pre><code><span class="typ">Thread</span> t = <span class="kw">new</span> <span class="typ">Thread</span>(() -&gt; doWork());  <span class="com">// a Runnable is the body</span>
+t.start();                              <span class="com">// runs concurrently; start(), never run()</span>
+t.join();                               <span class="com">// wait for it to finish</span></code></pre>
+<div class="pitfall"><p>You almost never create <code>Thread</code> objects by hand in real code — raw threads are expensive to create and easy to leak. Use a <strong>thread pool</strong> (next section). Creating threads directly is mostly a teaching device and an interview talking point.</p></div>
+
+<!-- ============================================================ -->
+<h2 id="pools">Thread pools &amp; ExecutorService <span class="tier tier-1">T1</span></h2>
+<p>A thread pool keeps a set of reusable worker threads and feeds them tasks from a queue — you submit work, it manages the threads. This caps resource use (a request spike can't spawn 10,000 threads) and avoids the cost of creating a thread per task.</p>
+<pre><code><span class="kw">try</span> (<span class="typ">ExecutorService</span> pool = <span class="typ">Executors</span>.newFixedThreadPool(<span class="num">8</span>)) {  <span class="com">// AutoCloseable, Java 19+</span>
+    <span class="typ">Future</span>&lt;<span class="typ">Integer</span>&gt; f = pool.submit(() -&gt; compute());   <span class="com">// returns a handle to the result</span>
+    <span class="com">// ... submit more ...</span>
+    <span class="kw">int</span> result = f.get();                             <span class="com">// blocks until this task is done</span>
+}   <span class="com">// close() waits for submitted tasks, then shuts the pool down</span></code></pre>
+<ul>
+<li><code>submit(Callable)</code> returns a <code>Future</code> — a handle you later <code>get()</code> (blocking) for the result.</li>
+<li><code>newFixedThreadPool(n)</code> for CPU-bound work (size ≈ core count); <code>newVirtualThreadPerTaskExecutor()</code> for I/O-bound work on Java 21 (below).</li>
+<li>Always shut the pool down (try-with-resources, or <code>shutdown()</code>) or the JVM won't exit.</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="cf">CompletableFuture — async composition <span class="tier tier-2">T2</span></h2>
+<p><code>CompletableFuture</code> is Java's <code>Promise</code>: it represents a value that will arrive later, and you compose callbacks instead of blocking. If you know <code>.then()</code>/<code>async-await</code>, this is the same model.</p>
+<table>
+<thead><tr><th>JavaScript Promise</th><th>CompletableFuture</th></tr></thead>
+<tbody>
+<tr><td><code>.then(fn)</code> (transform)</td><td><code>.thenApply(fn)</code></td></tr>
+<tr><td><code>.then(fn→promise)</code> (chain async)</td><td><code>.thenCompose(fn)</code></td></tr>
+<tr><td><code>Promise.all([...])</code></td><td><code>CompletableFuture.allOf(...)</code></td></tr>
+<tr><td><code>.catch(fn)</code></td><td><code>.exceptionally(fn)</code></td></tr>
+</tbody>
+</table>
+<pre><code><span class="typ">CompletableFuture</span>.supplyAsync(() -&gt; fetchUser(id))   <span class="com">// run async, off the calling thread</span>
+    .thenApply(<span class="typ">User</span>::name)                          <span class="com">// transform when it arrives</span>
+    .thenCompose(name -&gt; lookupProfileAsync(name))    <span class="com">// chain another async call</span>
+    .exceptionally(ex -&gt; <span class="str">"fallback"</span>)                  <span class="com">// handle failure</span>
+    .thenAccept(<span class="typ">System</span>.out::println);              <span class="com">// consume the result</span></code></pre>
+<p>Use it to run independent I/O calls concurrently and combine the results — the natural fit for a service that fans out to several downstream APIs.</p>
+
+<!-- ============================================================ -->
+<h2 id="safety">Thread-safety: synchronized, volatile, atomics <span class="tier tier-1">T1</span></h2>
+<p>When multiple threads read and write shared mutable state, two things can go wrong: <strong>race conditions</strong> (interleaved read-modify-write produces lost updates) and <strong>visibility</strong> (one thread's write is never seen by another because of caching). Three tools, three jobs:</p>
+
+<h3>synchronized — mutual exclusion</h3>
+<p>Only one thread at a time can hold an object's lock, so a <code>synchronized</code> block/method serializes access to shared state. It fixes <em>both</em> race conditions and visibility.</p>
+<pre><code><span class="kw">private final</span> <span class="typ">Object</span> lock = <span class="kw">new</span> <span class="typ">Object</span>();
+<span class="kw">private</span> <span class="kw">int</span> count;
+<span class="kw">void</span> increment() {
+    <span class="kw">synchronized</span> (lock) { count++; }   <span class="com">// count++ is read-modify-write — must be atomic</span>
+}</code></pre>
+
+<h3>volatile — visibility only</h3>
+<p><code>volatile</code> guarantees every read sees the latest write (no thread-local caching) but does <em>not</em> make compound operations atomic. Perfect for a flag; wrong for a counter.</p>
+<pre><code><span class="kw">private</span> <span class="kw">volatile</span> <span class="kw">boolean</span> running = <span class="kw">true</span>;   <span class="com">// one thread sets false, others see it promptly</span>
+<span class="com">// volatile int count; count++  is STILL a race — read/modify/write isn't atomic</span></code></pre>
+
+<h3>Atomics — lock-free single-variable updates</h3>
+<p><code>AtomicInteger</code>, <code>AtomicLong</code>, <code>AtomicReference</code> give atomic read-modify-write on one variable without a lock, using a CPU compare-and-swap instruction (see appendix). Faster than <code>synchronized</code> for simple counters.</p>
+<pre><code><span class="kw">private final</span> <span class="typ">AtomicInteger</span> count = <span class="kw">new</span> <span class="typ">AtomicInteger</span>();
+count.incrementAndGet();   <span class="com">// atomic ++, no lock</span></code></pre>
+
+<table>
+<thead><tr><th>Tool</th><th>Fixes race?</th><th>Fixes visibility?</th><th>Use for</th></tr></thead>
+<tbody>
+<tr><td><code>volatile</code></td><td>❌ (single write only)</td><td>✅</td><td>flags, one-writer status</td></tr>
+<tr><td><code>Atomic*</code></td><td>✅ (one variable)</td><td>✅</td><td>counters, CAS updates</td></tr>
+<tr><td><code>synchronized</code> / <code>Lock</code></td><td>✅ (any block)</td><td>✅</td><td>multi-step invariants</td></tr>
+</tbody>
+</table>
+<div class="senior"><p>The senior-level framing: the <em>best</em> concurrency is <strong>no shared mutable state</strong>. Prefer immutable objects (page 02), confine state to one thread, or use the thread-safe <code>java.util.concurrent</code> collections (<code>ConcurrentHashMap</code>) instead of hand-rolled locking. Reach for <code>synchronized</code> only when you must protect a multi-step invariant, and keep the critical section tiny to avoid contention and deadlock.</p></div>
+<div class="pitfall"><p><strong>Deadlock</strong>: two threads each hold a lock the other needs, and both wait forever. The standard prevention is <em>lock ordering</em> — always acquire multiple locks in the same global order — plus keeping critical sections short and, where possible, using <code>tryLock</code> with a timeout.</p></div>
+
+<!-- ============================================================ -->
+<h2 id="vthreads">Virtual threads (Java 21) — the game-changer <span class="tier tier-2">T2</span></h2>
+<p>The headline modern feature. A traditional ("platform") thread maps 1:1 to an OS thread — expensive, so you can only have a few thousand, which is why blocking I/O forced you into complex async code. A <strong>virtual thread</strong> is a lightweight thread the JVM schedules onto a small pool of OS threads; when it blocks on I/O, the JVM parks it and reuses the OS thread for other work. You can run <em>millions</em>.</p>
+<pre><code><span class="com">// One virtual thread per request — write simple blocking code, get async scalability</span>
+<span class="kw">try</span> (<span class="kw">var</span> pool = <span class="typ">Executors</span>.newVirtualThreadPerTaskExecutor()) {
+    <span class="kw">for</span> (<span class="kw">var</span> req : requests)
+        pool.submit(() -&gt; handleBlocking(req));   <span class="com">// blocking is now cheap</span>
+}</code></pre>
+<p>The payoff: you write straightforward blocking, sequential code — no <code>CompletableFuture</code> gymnastics — and still handle enormous I/O concurrency. It largely dissolves the "async vs simple" tradeoff for I/O-bound server workloads. The interview soundbite: <em>"Virtual threads make blocking cheap, so simple thread-per-request code scales to millions of concurrent I/O-bound tasks."</em></p>
+
+<!-- ============================================================ -->
+<h2 id="memory">JVM memory: heap vs stack <span class="tier tier-1">T1</span></h2>
+<p>The JVM divides runtime memory into two regions you must be able to describe:</p>
+<ul>
+<li><strong>Stack</strong> — one per thread. Holds method call frames: local variables, parameters, and <em>references</em> to objects. Fast, automatically freed when a method returns. Too-deep recursion overflows it → <code>StackOverflowError</code>.</li>
+<li><strong>Heap</strong> — shared by all threads. Holds every <em>object</em> (everything you <code>new</code>). Managed by the garbage collector. Runs out → <code>OutOfMemoryError</code>.</li>
+</ul>
+<pre><code><span class="typ">Account</span> a = <span class="kw">new</span> <span class="typ">Account</span>(...);
+<span class="com">// the variable `a` (a reference) lives on the STACK</span>
+<span class="com">// the Account object it points to lives on the HEAP</span></code></pre>
+<p>This is exactly why "objects are references" (page 01) matters at the machine level: the reference sits on the stack, the object on the heap, and pass-by-value copies the reference. Primitives declared as locals live directly on the stack — no heap object, no GC.</p>
+<div class="note"><p><strong>Metaspace</strong> holds class metadata (the definitions of your classes), separate from the object heap. Leaking classes (e.g. repeated dynamic class loading) causes <code>OutOfMemoryError: Metaspace</code> — a distinct failure from a heap OOM.</p></div>
+
+<!-- ============================================================ -->
+<h2 id="gc">Garbage collection in one pass <span class="tier tier-1">T1</span></h2>
+<p>Java has no <code>free()</code> — the <strong>garbage collector</strong> automatically reclaims heap objects that are no longer reachable from any live reference (a "GC root": stack variables, static fields, etc.). If nothing can reach an object, it's garbage.</p>
+<p>The key insight GC is built on is the <strong>weak generational hypothesis</strong>: <em>most objects die young</em>. So the heap is split into a <strong>young generation</strong> (new objects; collected often and cheaply — a "minor GC") and an <strong>old generation</strong> (objects that survived long enough; collected rarely — a "major GC"). This makes the common case fast.</p>
+<p>You mostly just need the concepts and the default collector: <strong>G1GC</strong> (the default since Java 9) targets low pause times and works well out of the box; <strong>ZGC</strong> is for very large heaps needing sub-millisecond pauses. The one thing to internalize: GC frees you from manual memory management, but it does <em>not</em> free you from <strong>leaks</strong> — you can still hold references you forgot about.</p>
+
+<!-- ============================================================ -->
+<h2 id="leaks">Memory leaks &amp; OutOfMemoryError <span class="tier tier-1">T1</span></h2>
+<p>A Java "leak" isn't unreachable memory (GC handles that) — it's <strong>reachable memory you no longer need but still reference</strong>, so the GC can't collect it. The heap fills and you get <code>OutOfMemoryError: Java heap space</code>. The classic causes:</p>
+<ul>
+<li><strong>An ever-growing static collection</strong> — a <code>static Map</code> cache you add to but never evict. The most common real-world leak.</li>
+<li><strong>Unremoved listeners/callbacks</strong> — registered but never deregistered, keeping their owner alive.</li>
+<li><strong>Mutated map keys</strong> — the stranded-entry leak from page 02.</li>
+<li><strong>Unbounded queues/buffers</strong> — a producer outpacing a consumer with no backpressure.</li>
+</ul>
+<div class="senior"><p>How to talk about diagnosing one: reproduce, take a <strong>heap dump</strong> (<code>jmap</code>, or auto-dump on OOM with <code>-XX:+HeapDumpOnOutOfMemoryError</code>), open it in a tool like Eclipse MAT, and look at the "dominator tree" for the object retaining the most memory and the reference chain keeping it alive. The fix is almost always "stop holding the reference" — bound the cache (use an eviction policy / <code>WeakHashMap</code>), deregister the listener, add backpressure.</p></div>
+
+<!-- ============================================================ -->
+<div class="levelup">
+  <h2 id="levelup">Level-Up appendix: the deep internals</h2>
+  <p>The theory behind the tools — for FAANG systems rounds and "go deeper" follow-ups. Optional until the essentials above are second nature.</p>
+</div>
+
+<h3>The Java Memory Model &amp; happens-before <span class="tier tier-2">T2</span></h3>
+<p>Why does <code>volatile</code> even matter? Because compilers and CPUs freely reorder and cache operations for speed — so without rules, one thread's writes may become visible to another in a different order, or not at all. The <strong>Java Memory Model (JMM)</strong> defines <strong>happens-before</strong>: a guarantee that if action A happens-before action B, A's effects are visible to B. Key edges: releasing a lock happens-before acquiring it; a <code>volatile</code> write happens-before every subsequent read of that field; <code>Thread.start()</code> happens-before the thread's code; the thread's end happens-before <code>join()</code> returning. Correct concurrent code is really just "establish a happens-before edge between every write and the reads that must see it." That's the single mental model underneath <code>synchronized</code>, <code>volatile</code>, and the atomics.</p>
+
+<h3>CAS, the ABA problem &amp; contention <span class="tier tier-2">T2</span></h3>
+<p>Atomics are <strong>lock-free</strong>, built on a CPU <strong>compare-and-swap</strong> (CAS): "atomically set this variable to N, but only if it still equals the E I last read; otherwise tell me it changed and I'll retry." No lock, no blocking — but under heavy contention, many threads spin retrying, which can waste CPU (that's why <code>LongAdder</code> exists — it stripes a counter across cells to cut contention). The <strong>ABA problem</strong>: a value goes A→B→A between your read and your CAS, so CAS succeeds though the world changed underneath; <code>AtomicStampedReference</code> adds a version stamp to defeat it. This is the machinery <code>ConcurrentHashMap</code> and the whole <code>java.util.concurrent</code> package are built on.</p>
+
+<h3>Locks beyond synchronized <span class="tier tier-3">T3</span></h3>
+<p><code>ReentrantLock</code> is <code>synchronized</code> with extras: <code>tryLock(timeout)</code> (deadlock avoidance), interruptibility, and fairness. <code>ReadWriteLock</code> lets many readers share access while writers get exclusivity — good for read-heavy data. <code>StampedLock</code> adds an optimistic-read mode that's faster still when writes are rare. Reach for these only when profiling shows <code>synchronized</code> is the bottleneck.</p>
+
+<h3>GC internals: G1 &amp; ZGC <span class="tier tier-2">T2</span></h3>
+<p><strong>G1</strong> ("Garbage First," the default) divides the heap into equal-size regions and collects the ones with the most garbage first, doing most work concurrently with your app to hit a pause-time target (default ~200ms). <strong>ZGC</strong> and <strong>Shenandoah</strong> are concurrent collectors that do nearly all work — including compaction — while the app runs, achieving sub-millisecond pauses even on multi-terabyte heaps, at some throughput cost. The old <strong>Parallel</strong> collector maximizes throughput but "stops the world" longer. Rule of thumb: keep G1 unless you have a measured pause-time problem on a large heap, then evaluate ZGC.</p>
+
+<h3>JIT compilation &amp; class loading <span class="tier tier-3">T3</span></h3>
+<p><strong>JIT:</strong> the JVM starts by <em>interpreting</em> bytecode, profiles which methods run hot, then <em>just-in-time compiles</em> those to optimized native code (tiered: C1 for a quick win, C2 for aggressive optimization). This is why the JVM "warms up" — peak performance arrives after the hot paths compile, which matters for benchmarks (measure steady state, not startup). <strong>Class loading</strong> is lazy and hierarchical: classes load on first use through a parent-first chain of class loaders (bootstrap → platform → application), each delegating upward before trying itself — the mechanism frameworks and app servers use to isolate code.</p>
+
+<div class="recap"><ul>
+<li>Use <strong>thread pools</strong> (<code>ExecutorService</code>), not raw threads; <code>CompletableFuture</code> is Java's Promise for composing async work.</li>
+<li><strong><code>volatile</code></strong> = visibility only; <strong>atomics</strong> = lock-free single-variable updates; <strong><code>synchronized</code></strong> = mutual exclusion for multi-step invariants. Best of all: no shared mutable state.</li>
+<li><strong>Virtual threads (21)</strong> make blocking cheap — simple thread-per-request code scales to millions of I/O-bound tasks.</li>
+<li><strong>Stack</strong> = per-thread frames &amp; references; <strong>heap</strong> = all objects, managed by GC. Deep recursion → StackOverflow; full heap → OutOfMemory.</li>
+<li><strong>GC</strong> reclaims unreachable objects (young/old generations, G1 by default) — but can't help a <strong>leak</strong>, which is memory you still reference.</li>
+<li>Appendix soundbite: correct concurrency = establishing <strong>happens-before</strong> edges; atomics ride on <strong>CAS</strong>.</li>
+</ul></div>
+
+<!-- ============================================================ -->
+<h2 id="qa">Interview Q&amp;A</h2>
+
+<details class="qa"><summary>What's the difference between volatile and synchronized?</summary><div class="answer"><p><code>volatile</code> guarantees visibility — reads always see the latest write, no caching — but does nothing for atomicity, so <code>volatile count++</code> is still a race (it's read-modify-write). <code>synchronized</code> provides mutual exclusion <em>and</em> visibility: only one thread holds the lock at a time, and it establishes happens-before edges so writes are seen. Use <code>volatile</code> for a simple flag written by one thread; use <code>synchronized</code> (or an atomic for a single variable) when you need a compound operation to be atomic.</p></div></details>
+
+<details class="qa"><summary>Why use a thread pool instead of creating threads directly?</summary><div class="answer"><p>Threads are expensive to create and each consumes memory, so a task-per-thread model lets a load spike exhaust resources or OOM. A pool reuses a bounded set of workers fed by a queue: it caps concurrency, amortizes thread-creation cost, and gives lifecycle control (graceful shutdown, rejection policies). You submit tasks and get <code>Future</code>s back. On Java 21, a virtual-thread-per-task executor removes the "bounded" tradeoff for I/O-bound work because virtual threads are cheap.</p></div></details>
+
+<details class="qa"><summary>What are virtual threads and what problem do they solve?</summary><div class="answer"><p>Platform threads map 1:1 to OS threads — expensive, capped at a few thousand — which forced async/reactive code to scale I/O. A virtual thread is a lightweight JVM-scheduled thread multiplexed onto a small pool of OS threads; when it blocks, the JVM parks it and frees the carrier thread. You can run millions, so you write simple blocking thread-per-request code and still get massive I/O concurrency. It mostly dissolves the "simple vs scalable" tradeoff for I/O-bound servers. They don't add CPU parallelism — cores still bound CPU-heavy work.</p></div></details>
+
+<details class="qa"><summary>Explain the difference between the stack and the heap.</summary><div class="answer"><p>The stack is per-thread and holds method frames: local variables, parameters, and references to objects; it's freed automatically as methods return, and overflowing it (deep recursion) throws StackOverflowError. The heap is shared across threads and holds all objects you allocate with <code>new</code>; it's managed by the garbage collector, and exhausting it throws OutOfMemoryError. A local reference lives on the stack while the object it points to lives on the heap — which is exactly why Java is "pass reference by value."</p></div></details>
+
+<details class="qa"><summary>What causes a memory leak in Java if there's a garbage collector?</summary><div class="answer"><p>GC only reclaims <em>unreachable</em> objects. A leak is memory that's still reachable — you keep a reference you no longer need — so GC can't collect it and the heap grows to OutOfMemoryError. Classic causes: an unbounded static cache/collection, listeners/callbacks never deregistered, objects mutated after use as map keys, and unbounded queues. You diagnose with a heap dump (auto-dump on OOM) analyzed in a tool like Eclipse MAT, find the retaining reference chain, and fix by dropping the reference — bound the cache, deregister, add backpressure.</p></div></details>
+
+<details class="qa"><summary>How would you make a class thread-safe? <span class="tier tier-2">T2</span></summary><div class="answer"><p>Preferably by design: make it immutable (page 02) so there's nothing to race on, or confine its state to a single thread. If it must hold shared mutable state, guard every access — use an atomic for a single counter, <code>synchronized</code>/<code>ReentrantLock</code> for multi-step invariants (keeping critical sections small), or delegate to a concurrent collection like <code>ConcurrentHashMap</code> and its atomic methods (<code>merge</code>, <code>computeIfAbsent</code>). The key is that a "thread-safe collection" doesn't make your compound logic atomic — the guard must cover the whole read-modify-write.</p></div></details>
+
+<details class="qa"><summary>What is happens-before? <span class="tier tier-2">T2</span></summary><div class="answer"><p>It's the Java Memory Model's ordering/visibility guarantee: if action A happens-before B, then A's memory effects are visible to B and can't be reordered past it. Because CPUs and compilers reorder and cache freely, you need these edges for correct concurrency. The main ones: unlock happens-before a later lock on the same monitor; a volatile write happens-before subsequent reads of it; <code>Thread.start()</code> happens-before the thread's work; a thread's completion happens-before <code>join()</code> returns. Correct concurrent code establishes a happens-before edge between each write and the reads that must observe it.</p></div></details>
+
+<!-- ============================================================ -->
+<h2 id="exercises">Hands-on exercises</h2>
+
+<div class="exercise"><h4>Exercise 1: Spot the concurrency bug</h4>
+<p>Two threads each call <code>counter++</code> 100,000 times on a shared <code>volatile int counter</code>. The final value is less than 200,000. Why, and what are two correct fixes?</p>
+<details><summary>Solution</summary>
+<p><code>counter++</code> is three steps — read, add one, write — and two threads can read the same value before either writes, so increments are lost. <code>volatile</code> fixes <em>visibility</em> but not this atomicity gap, so it doesn't help. Fixes: (1) use <code>AtomicInteger</code> with <code>incrementAndGet()</code> — lock-free atomic RMW; or (2) wrap <code>counter++</code> in a <code>synchronized</code> block. Both make the whole read-modify-write indivisible; the atomic is preferable for a single counter.</p></details></div>
+
+<div class="exercise"><h4>Exercise 2: Fan out and combine</h4>
+<p>You must call three independent, slow HTTP services and combine their results. Sketch it with <code>CompletableFuture</code> so the calls run concurrently rather than one after another.</p>
+<details><summary>Solution</summary>
+<pre><code><span class="kw">var</span> a = <span class="typ">CompletableFuture</span>.supplyAsync(() -&gt; serviceA());
+<span class="kw">var</span> b = <span class="typ">CompletableFuture</span>.supplyAsync(() -&gt; serviceB());
+<span class="kw">var</span> c = <span class="typ">CompletableFuture</span>.supplyAsync(() -&gt; serviceC());
+
+<span class="typ">Result</span> combined = <span class="typ">CompletableFuture</span>.allOf(a, b, c)  <span class="com">// wait for all three</span>
+    .thenApply(v -&gt; merge(a.join(), b.join(), c.join()))  <span class="com">// join() is non-blocking now — all done</span>
+    .join();</code></pre>
+<p>Starting all three <code>supplyAsync</code> calls first launches them concurrently; <code>allOf</code> completes when the slowest finishes, so total time ≈ the slowest call, not the sum. On Java 21 you'd get the same concurrency from three virtual threads with plain blocking calls — often simpler to read.</p></details></div>
+
+<div class="exercise"><h4>Exercise 3: Explain a leak from a heap dump</h4>
+<p>Production OOMs after days of uptime. A heap dump shows a single <code>static HashMap</code> retaining 90% of the heap, holding millions of session objects. What's the diagnosis and the fix?</p>
+<details><summary>Solution</summary>
+<p>Diagnosis: a classic static-collection leak — sessions are added to the map but never removed, so they stay reachable (GC can't reclaim them) and the map grows without bound until the heap is exhausted. The "days of uptime" and single dominant retainer in the dominator tree are the tells. Fix: bound the cache with an eviction policy (size/TTL — e.g. Caffeine, or Guava's <code>CacheBuilder</code>), remove sessions on logout/expiry, or use a <code>WeakHashMap</code>/soft references so entries can be collected under pressure. The root cause is always "still holding a reference you no longer need."</p></details></div>
+
+<nav class="page-nav"><a href="03-java-modern.html">← Prev: Modern Java</a><a href="05-spring-core-di.html">Next: Spring Core &amp; DI →</a></nav>
+</main>
+</body>
+</html>
