@@ -28,6 +28,7 @@
 <li><a href="#pools">Thread pools &amp; ExecutorService</a></li>
 <li><a href="#cf">CompletableFuture — async composition</a></li>
 <li><a href="#safety">Thread-safety: synchronized, volatile, atomics</a></li>
+<li><a href="#coordination">Coordinating threads: wait/notify, latches &amp; semaphores</a></li>
 <li><a href="#vthreads">Virtual threads (Java 21) — the game-changer</a></li>
 <li><a href="#memory">JVM memory: heap vs stack</a></li>
 <li><a href="#gc">Garbage collection in one pass</a></li>
@@ -109,7 +110,65 @@ count.incrementAndGet();   <span class="com">// atomic ++, no lock</span></code>
 </tbody>
 </table>
 <div class="senior"><p>The senior-level framing: the <em>best</em> concurrency is <strong>no shared mutable state</strong>. Prefer immutable objects (page 02), confine state to one thread, or use the thread-safe <code>java.util.concurrent</code> collections (<code>ConcurrentHashMap</code>) instead of hand-rolled locking. Reach for <code>synchronized</code> only when you must protect a multi-step invariant, and keep the critical section tiny to avoid contention and deadlock.</p></div>
-<div class="pitfall"><p><strong>Deadlock</strong>: two threads each hold a lock the other needs, and both wait forever. The standard prevention is <em>lock ordering</em> — always acquire multiple locks in the same global order — plus keeping critical sections short and, where possible, using <code>tryLock</code> with a timeout.</p></div>
+<div class="pitfall"><p><strong>Deadlock</strong> is the classic failure of locking — two threads each hold a lock the other needs and both wait forever. It gets its own treatment in the next section.</p></div>
+
+<!-- ============================================================ -->
+<h2 id="coordination">Coordinating threads: wait/notify, latches &amp; semaphores <span class="tier tier-2">T2</span></h2>
+<p><code>synchronized</code> stops threads from <em>colliding</em> on shared state. Coordination is the other half: making a thread <strong>wait for a condition</strong> or for <strong>other threads</strong> before it proceeds — the producer that must wait for space, the request that must wait for three services to warm up, the pool that admits only N callers at once.</p>
+
+<h3>wait / notify — the guarded wait</h3>
+<p>Inside a <code>synchronized</code> block, <code>wait()</code> releases the lock and parks the thread until another thread calls <code>notify()</code>/<code>notifyAll()</code> on the same object. It's the low-level primitive behind every blocking queue. The canonical use — and a very common coding-round ask — is a bounded buffer:</p>
+<pre><code><span class="kw">class</span> <span class="typ">BoundedBuffer</span>&lt;<span class="typ">T</span>&gt; {
+    <span class="kw">private final</span> <span class="typ">Queue</span>&lt;<span class="typ">T</span>&gt; q = <span class="kw">new</span> <span class="typ">ArrayDeque</span>&lt;&gt;();
+    <span class="kw">private final</span> <span class="kw">int</span> cap;
+    <span class="typ">BoundedBuffer</span>(<span class="kw">int</span> cap) { <span class="kw">this</span>.cap = cap; }
+
+    <span class="kw">synchronized void</span> put(<span class="typ">T</span> x) <span class="kw">throws</span> <span class="typ">InterruptedException</span> {
+        <span class="kw">while</span> (q.size() == cap) wait();   <span class="com">// guard in a WHILE — re-check on wake</span>
+        q.add(x);
+        notifyAll();                       <span class="com">// wake a waiting consumer</span>
+    }
+    <span class="kw">synchronized</span> <span class="typ">T</span> take() <span class="kw">throws</span> <span class="typ">InterruptedException</span> {
+        <span class="kw">while</span> (q.isEmpty()) wait();
+        <span class="typ">T</span> x = q.remove();
+        notifyAll();                       <span class="com">// wake a waiting producer</span>
+        <span class="kw">return</span> x;
+    }
+}</code></pre>
+<p>Two rules interviewers listen for: <strong>always <code>wait()</code> inside a <code>while</code> loop</strong>, never an <code>if</code> — you must re-check the condition on wake, because of spurious wakeups and because another thread may have raced in ahead of you; and prefer <code>notifyAll()</code> over <code>notify()</code> when producers and consumers wait on the same monitor, so you never leave the one thread that could make progress asleep.</p>
+<div class="pitfall"><p>You rarely write <code>wait</code>/<code>notify</code> in production — it's easy to get subtly wrong. Reach for a <code>BlockingQueue</code> (<code>ArrayBlockingQueue</code>, <code>LinkedBlockingQueue</code>): its <code>put()</code> blocks when full and <code>take()</code> blocks when empty, giving you a correct producer-consumer for free. Know <code>wait</code>/<code>notify</code> for the interview; use the queue in real code.</p></div>
+
+<h3>Higher-level synchronizers</h3>
+<p>The <code>java.util.concurrent</code> synchronizers replace hand-rolled waiting with three purpose-built tools. You need two of them cold — <code>Semaphore</code> and <code>CountDownLatch</code>:</p>
+<pre><code><span class="com">// Semaphore — at most 3 threads in the guarded region at once</span>
+<span class="typ">Semaphore</span> permits = <span class="kw">new</span> <span class="typ">Semaphore</span>(<span class="num">3</span>);
+permits.acquire();                 <span class="com">// blocks if no permit is free</span>
+<span class="kw">try</span> { callRateLimitedApi(); }
+<span class="kw">finally</span> { permits.release(); }   <span class="com">// always release, even on failure</span>
+
+<span class="com">// CountDownLatch — main waits until N workers have finished starting up</span>
+<span class="typ">CountDownLatch</span> ready = <span class="kw">new</span> <span class="typ">CountDownLatch</span>(workers);
+<span class="com">// each worker, once initialised:  ready.countDown();</span>
+ready.await();                     <span class="com">// unblocks when the count reaches 0</span></code></pre>
+<table>
+<thead><tr><th>Tool</th><th>Reusable?</th><th>Use it for</th></tr></thead>
+<tbody>
+<tr><td><code>Semaphore(n)</code></td><td>yes</td><td>cap concurrent access to N permits — a bounded connection pool, a client-side rate limit</td></tr>
+<tr><td><code>CountDownLatch(n)</code></td><td>no — one-shot</td><td>wait until N events/tasks have happened once (a start signal, "all services ready")</td></tr>
+<tr><td><code>CyclicBarrier(n)</code></td><td>yes — resets</td><td>N threads wait for <em>each other</em> at a common point, then all proceed; repeats each round</td></tr>
+</tbody>
+</table>
+<div class="senior"><p>The distinction to say out loud: a <strong>latch waits for events</strong> (one-shot, "count down to zero"), a <strong>barrier waits for peers</strong> (reusable, "everyone arrive, then go"), and a <strong>semaphore limits concurrency</strong> (N permits in and out). Picking the right one for the scenario — not reaching for <code>wait</code>/<code>notify</code> — is the senior signal.</p></div>
+
+<h3>Deadlock, livelock &amp; starvation</h3>
+<p><strong>Deadlock</strong>: two threads each hold a lock the other needs and both wait forever. It requires four conditions to hold at once — mutual exclusion, hold-and-wait, no preemption, and a circular wait — so breaking <em>any one</em> prevents it. The practical fixes:</p>
+<ul>
+<li><strong>Lock ordering</strong> — always acquire multiple locks in the same global order. This breaks the circular wait and is the number-one answer.</li>
+<li><strong><code>tryLock(timeout)</code></strong> (<code>ReentrantLock</code>) — a thread that can't get the second lock in time backs off and retries instead of blocking forever.</li>
+<li><strong>Keep critical sections short</strong>, and never call foreign/unknown code while holding a lock.</li>
+</ul>
+<p>Two cousins worth naming so you're not caught out: <strong>livelock</strong> — threads keep reacting to each other and make no progress (two people stepping aside in a corridor in perfect sync); and <strong>starvation</strong> — a thread never gets the resource because others keep winning it, which a <em>fair</em> lock (<code>new ReentrantLock(true)</code>) mitigates at some throughput cost.</p>
+<div class="senior"><p>Interview soundbite: <em>"I prevent deadlock by acquiring locks in a consistent global order, with <code>tryLock</code> plus a timeout as a backstop. But the better fix is usually to not hold two locks at once — redesign so a single lock, an atomic, or a concurrent collection covers the invariant."</em></p></div>
 
 <!-- ============================================================ -->
 <h2 id="vthreads">Virtual threads (Java 21) — the game-changer <span class="tier tier-2">T2</span></h2>
@@ -175,6 +234,7 @@ count.incrementAndGet();   <span class="com">// atomic ++, no lock</span></code>
 <div class="recap"><ul>
 <li>Use <strong>thread pools</strong> (<code>ExecutorService</code>), not raw threads; <code>CompletableFuture</code> is Java's Promise for composing async work.</li>
 <li><strong><code>volatile</code></strong> = visibility only; <strong>atomics</strong> = lock-free single-variable updates; <strong><code>synchronized</code></strong> = mutual exclusion for multi-step invariants. Best of all: no shared mutable state.</li>
+<li><strong>Coordinate</strong> threads with <code>wait</code>/<code>notify</code> in a <code>while</code>-guard (or just a <code>BlockingQueue</code>); a <strong>latch</strong> waits for events, a <strong>barrier</strong> for peers, a <strong>semaphore</strong> caps concurrency. Prevent <strong>deadlock</strong> with a consistent global lock order.</li>
 <li><strong>Virtual threads (21)</strong> make blocking cheap — simple thread-per-request code scales to millions of I/O-bound tasks.</li>
 <li><strong>Stack</strong> = per-thread frames &amp; references; <strong>heap</strong> = all objects, managed by GC. Deep recursion → StackOverflow; full heap → OutOfMemory.</li>
 <li><strong>GC</strong> reclaims unreachable objects (young/old generations, G1 by default) — but can't help a <strong>leak</strong>, which is memory you still reference.</li>
@@ -195,6 +255,12 @@ count.incrementAndGet();   <span class="com">// atomic ++, no lock</span></code>
 <details class="qa"><summary>What causes a memory leak in Java if there's a garbage collector?</summary><div class="answer"><p>GC only reclaims <em>unreachable</em> objects. A leak is memory that's still reachable — you keep a reference you no longer need — so GC can't collect it and the heap grows to OutOfMemoryError. Classic causes: an unbounded static cache/collection, listeners/callbacks never deregistered, objects mutated after use as map keys, and unbounded queues. You diagnose with a heap dump (auto-dump on OOM) analyzed in a tool like Eclipse MAT, find the retaining reference chain, and fix by dropping the reference — bound the cache, deregister, add backpressure.</p></div></details>
 
 <details class="qa"><summary>How would you make a class thread-safe? <span class="tier tier-2">T2</span></summary><div class="answer"><p>Preferably by design: make it immutable (page 02) so there's nothing to race on, or confine its state to a single thread. If it must hold shared mutable state, guard every access — use an atomic for a single counter, <code>synchronized</code>/<code>ReentrantLock</code> for multi-step invariants (keeping critical sections small), or delegate to a concurrent collection like <code>ConcurrentHashMap</code> and its atomic methods (<code>merge</code>, <code>computeIfAbsent</code>). The key is that a "thread-safe collection" doesn't make your compound logic atomic — the guard must cover the whole read-modify-write.</p></div></details>
+
+<details class="qa"><summary>How do you implement a thread-safe producer-consumer / bounded buffer? <span class="tier tier-2">T2</span></summary><div class="answer"><p>Guard a plain queue with a monitor. The producer's <code>put</code> does <code>while (size == cap) wait();</code> then enqueues and <code>notifyAll()</code>; the consumer's <code>take</code> does <code>while (empty) wait();</code> then dequeues and <code>notifyAll()</code>. The two things they're checking for: <code>wait()</code> must sit in a <code>while</code> loop (re-check the condition on wake — spurious wakeups and races), and you want <code>notifyAll()</code> so a waiting thread of the <em>other</em> role is always woken. The senior close: in production you don't hand-roll this — you use a <code>BlockingQueue</code> (<code>ArrayBlockingQueue</code>/<code>LinkedBlockingQueue</code>) whose <code>put</code>/<code>take</code> block for you.</p></div></details>
+
+<details class="qa"><summary>Difference between CountDownLatch, CyclicBarrier, and Semaphore? <span class="tier tier-2">T2</span></summary><div class="answer"><p>A <strong>CountDownLatch</strong> is one-shot: initialise to N, threads call <code>countDown()</code>, and waiters blocked on <code>await()</code> proceed once it hits zero — it can't be reset. Use it to wait until N things have happened once (e.g. all dependencies warmed up). A <strong>CyclicBarrier</strong> is reusable and symmetric: N threads each call <code>await()</code> and are all released together when the last arrives, then it resets — use it for phased parallel work where workers sync each round. A <strong>Semaphore</strong> holds N permits you <code>acquire</code>/<code>release</code> to cap how many threads use a resource at once. In one line: a latch waits for <em>events</em>, a barrier waits for <em>peers</em>, a semaphore <em>limits</em> concurrency.</p></div></details>
+
+<details class="qa"><summary>What is a deadlock and how do you prevent it? <span class="tier tier-2">T2</span></summary><div class="answer"><p>Two (or more) threads each hold a lock the other needs and wait forever. It needs four conditions simultaneously — mutual exclusion, hold-and-wait, no preemption, and circular wait — so breaking any one prevents it. The practical answers: acquire multiple locks in a consistent <strong>global order</strong> (kills the circular wait — the primary fix), use <code>tryLock</code> with a timeout so a thread backs off rather than blocking forever, and keep critical sections short without calling foreign code under a lock. The strongest answer is to avoid holding two locks at all — cover the invariant with one lock, an atomic, or a concurrent collection. Related liveness failures worth naming: <strong>livelock</strong> (busy but no progress) and <strong>starvation</strong> (a thread never scheduled — a fair lock helps).</p></div></details>
 
 <details class="qa"><summary>What is happens-before? <span class="tier tier-2">T2</span></summary><div class="answer"><p>It's the Java Memory Model's ordering/visibility guarantee: if action A happens-before B, then A's memory effects are visible to B and can't be reordered past it. Because CPUs and compilers reorder and cache freely, you need these edges for correct concurrency. The main ones: unlock happens-before a later lock on the same monitor; a volatile write happens-before subsequent reads of it; <code>Thread.start()</code> happens-before the thread's work; a thread's completion happens-before <code>join()</code> returns. Correct concurrent code establishes a happens-before edge between each write and the reads that must observe it.</p></div></details>
 
@@ -222,6 +288,11 @@ count.incrementAndGet();   <span class="com">// atomic ++, no lock</span></code>
 <p>Production OOMs after days of uptime. A heap dump shows a single <code>static HashMap</code> retaining 90% of the heap, holding millions of session objects. What's the diagnosis and the fix?</p>
 <details><summary>Solution</summary>
 <p>Diagnosis: a classic static-collection leak — sessions are added to the map but never removed, so they stay reachable (GC can't reclaim them) and the map grows without bound until the heap is exhausted. The "days of uptime" and single dominant retainer in the dominator tree are the tells. Fix: bound the cache with an eviction policy (size/TTL — e.g. Caffeine, or Guava's <code>CacheBuilder</code>), remove sessions on logout/expiry, or use a <code>WeakHashMap</code>/soft references so entries can be collected under pressure. The root cause is always "still holding a reference you no longer need."</p></details></div>
+
+<div class="exercise"><h4>Exercise 4: Bounded blocking queue by hand</h4>
+<p>Without using anything from <code>java.util.concurrent</code>, implement a fixed-capacity queue whose <code>put</code> blocks when full and <code>take</code> blocks when empty, safe for many producers and consumers. What are the two easiest ways to get it wrong?</p>
+<details><summary>Solution</summary>
+<p>Guard a plain queue with a monitor: <code>put</code> does <code>while (size == cap) wait();</code> then enqueues and <code>notifyAll()</code>; <code>take</code> does <code>while (empty) wait();</code> then dequeues and <code>notifyAll()</code> — exactly the <code>BoundedBuffer</code> shown earlier. The two classic mistakes: (1) guarding with <code>if</code> instead of <code>while</code>, so a spuriously-woken or raced thread proceeds when the condition is actually false; and (2) using <code>notify()</code> instead of <code>notifyAll()</code> when producers and consumers share one monitor, which can wake the wrong role and stall the system. In real code you'd just use <code>ArrayBlockingQueue</code>.</p></details></div>
 
 <nav class="page-nav"><a href="03-java-modern.html">← Prev: Modern Java</a><a href="05-spring-core-di.html">Next: Spring Core &amp; DI →</a></nav>
 </main>
