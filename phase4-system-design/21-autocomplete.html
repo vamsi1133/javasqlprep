@@ -1,0 +1,996 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>21 — Design an Autocomplete / Typeahead | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <div class="breadcrumb"><a href="index.html">← Course Home</a></div>
+    <h1>21 — Design an Autocomplete / Typeahead</h1>
+    <p>A tiny input box with a surprisingly deep interview inside it — and one race condition that separates the people who've shipped this from the people who've read about it.</p>
+  </div>
+</header>
+
+<main class="container">
+
+  <section>
+    <h2>Why this matters in the interview</h2>
+    <p>
+      Autocomplete is the frontend round's favourite prompt because it looks trivial and isn't. Anyone can wire an input
+      to a <code>fetch</code> and render a list; the interview is entirely in the second-order problems that a naive
+      version gets wrong. Every keystroke wants to fire a request — so you need <strong>debouncing</strong>. Fast typing
+      fires those requests faster than they return, and they come back <em>out of order</em> — so you need
+      <strong>request cancellation and a stale-response guard</strong>, which is the single bug that trips up the most
+      candidates and the one this page is built around. The user navigates the results with the keyboard, not the mouse —
+      so you need a real <strong>keyboard model</strong>. And a screen-reader user has to be told the listbox opened and
+      what's highlighted — so you need the <strong>ARIA combobox pattern</strong>. None of these has a QPS number in it.
+      All of them are judgment, and all of them are things you've hit for real in seven years of shipping React.
+    </p>
+    <p>
+      So this is a frontend system design round, and you drive it with RADIO — Requirements, Architecture, Data model,
+      Interface, Optimizations — exactly as tutorial 19 laid out. The shape is the same as the feed in tutorial 20, but
+      the centre of gravity moves: for a feed, Optimizations is dominated by virtualization and optimistic updates; for a
+      typeahead it's dominated by <strong>the request lifecycle</strong> — when you fire, when you cancel, which response
+      you're allowed to trust — and by the <strong>accessibility contract</strong> of a widget that a keyboard-and-screen-reader
+      user has to operate without ever touching a mouse. The backend that actually serves the suggestions (a trie or a
+      search index) is a one-line API contract to you here; we'll touch it at the end so you can speak to it, but the
+      round is about the browser. Get the out-of-order race right, narrate the ARIA pattern like someone who has
+      implemented it, and you've won this round.
+    </p>
+    <div class="senior">Open by naming the round and the real problem in one breath: <em>"I'll treat this as a frontend design — I'll assume the backend gives me a suggestions endpoint and design the client against it. The interesting parts of a typeahead aren't the happy path, they're the request lifecycle — debouncing keystrokes, cancelling stale requests, and guarding against out-of-order responses so a slow earlier request can't overwrite a newer one — plus full keyboard and screen-reader support via the ARIA combobox pattern. I'll structure it as RADIO and spend most of the time there."</em> That sentence tells the interviewer you already know where the depth is, before you've drawn a single box.</div>
+  </section>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ul>
+      <li><a href="#prompt">The prompt</a> — the deliberately vague ask, and naming the round</li>
+      <li><a href="#requirements">R — Requirements</a> — functional interactions · the non-functionals that matter (latency, a11y, network) · what you cut</li>
+      <li><a href="#architecture">A — Architecture &amp; components</a> — the component tree · where state lives · the controlled-input data flow</li>
+      <li><a href="#data">D — Data model</a> — query vs results vs UI state · the response cache shape · the active-index model</li>
+      <li><a href="#interface">I — Interface &amp; API</a> — the props API of a reusable combobox · the suggestions endpoint</li>
+      <li><a href="#optimizations">O — Optimizations: debounce vs throttle, caching &amp; prefetch</a> — when each, with code · the client cache · prefetch</li>
+      <li><a href="#race">The out-of-order response race</a> ★★ — the bug everyone ships, and the two fixes · this is where the interview happens</li>
+      <li><a href="#keyboard">Keyboard navigation &amp; the ARIA combobox</a> ★ — arrows/Enter/Escape · role=combobox/listbox/option · aria-activedescendant · live regions</li>
+      <li><a href="#backend">The backend, briefly</a> — the trie, and why it's not your problem today</li>
+      <li><a href="#qa">Interview Q&amp;A</a></li>
+      <li><a href="#takeaways">What to remember</a></li>
+    </ul>
+  </div>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="prompt">The prompt</h2>
+
+    <p>The interviewer gives you one line:</p>
+
+    <p style="font-size:1.15rem; font-weight:700; color:#111827; border-left:4px solid #8b5cf6; padding-left:1rem;">
+      "Design an autocomplete component — like the search box on Google or Amazon. The user types, and they see
+      suggestions."
+    </p>
+
+    <p>
+      That's it, and it's vague on purpose. Before designing anything, do two things. First, <strong>name the round</strong>
+      so scope is locked: this is a frontend problem, the backend is an API contract, and you'll say so out loud (the
+      senior line above). Second, <strong>separate the two things people call "autocomplete,"</strong> because which one
+      you're building changes the whole design:
+    </p>
+
+    <table>
+      <thead><tr><th></th><th>Search autocomplete (suggestions)</th><th>Autocomplete select (from a known set)</th></tr></thead>
+      <tbody>
+        <tr><td>Example</td><td>Google search box, Amazon product search</td><td>A country picker, an @-mention menu, a tag selector</td></tr>
+        <tr><td>Source of options</td><td>A server that <em>ranks and returns</em> suggestions per query</td><td>A finite list, often already on the client, filtered locally</td></tr>
+        <tr><td>What "select" does</td><td>Fills the query / navigates to a results page — free text is allowed</td><td>Commits one canonical value — free text usually isn't valid</td></tr>
+        <tr><td>The hard part</td><td>The <strong>async request lifecycle</strong> — debounce, cancel, ordering, cache</td><td>Fast local filtering + the same keyboard/a11y model</td></tr>
+      </tbody>
+    </table>
+
+    <p>
+      Say which you're building and why: <em>"I'll design the search-suggestions flavour — server-backed, free-text
+      allowed — because that's where the interesting async problems live. The keyboard and accessibility model is
+      identical for both, so it transfers to the local-filter case; I'd just swap the network fetch for an in-memory
+      filter."</em> Now the async lifecycle — the meat — is explicitly in scope, and you've shown you know there's more
+      than one shape here.
+    </p>
+
+    <div class="note">
+      Reading the round right is worth stating: nobody is asking you how the suggestion service shards its index or
+      handles a million QPS. If you start estimating query volume and sketching a trie sharded by prefix, you're
+      answering the backend round (tutorial 17's territory) and burning the minutes that should go to the request
+      lifecycle and accessibility. The whole server collapses to one endpoint: <code>GET /suggest?q=…</code>. Draw that
+      box, put a one-line contract on it, and zoom into the browser.
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="requirements">R — Requirements</h2>
+
+    <p>
+      Same first move as every design: pin the surface before you build. For a widget this small the functional list is
+      short, but the non-functional list is where the round announces itself — a typeahead lives or dies on latency,
+      keyboard support, and behaviour on a bad network.
+    </p>
+
+    <h3>Functional — the interactions, not endpoints</h3>
+    <ul>
+      <li>As the user types, show a ranked list of suggestions matching the current query.</li>
+      <li>Show suggestions only after a minimum length (say 1–2 characters) — don't fire on the empty string.</li>
+      <li>Navigate the list with the <strong>keyboard</strong> (up/down arrows), and with the mouse (hover/click).</li>
+      <li>Select a suggestion with <strong>Enter</strong> or click — which fills the input and fires an
+        <code>onSelect</code>. Close the list with <strong>Escape</strong>.</li>
+      <li>Highlight the matching substring in each suggestion (a small but expected touch).</li>
+      <li>Show loading, empty ("no results"), and error states — not just the happy path.</li>
+    </ul>
+    <p>
+      What I'll cut, out loud: <em>"I'll skip recent-searches history, multi-select/tag-input, and grouped/categorized
+      results unless you want one — they're additive and don't change the core lifecycle. I'll design the single-select
+      search box well."</em> Naming the cut is the senior move; it shows you scoped deliberately rather than forgot.
+    </p>
+
+    <h3>Non-functional — this is the real spec</h3>
+    <table>
+      <thead><tr><th>Non-functional</th><th>The question to ask</th><th>Why it changes the design</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Latency / responsiveness</strong></td><td>"How fast must suggestions feel? Is p95 under ~100&nbsp;ms the bar?"</td><td>Drives debounce timing, client caching, and prefetch. Autocomplete that lags behind the keystrokes is worse than none.</td></tr>
+        <tr><td><strong>Network conditions</strong></td><td>"Should this hold up on slow/flaky 3G?"</td><td>This is where debounce, request <em>cancellation</em>, and the out-of-order guard earn their place — a slow network is exactly when responses arrive scrambled.</td></tr>
+        <tr><td><strong>Accessibility</strong></td><td>"WCAG AA — full keyboard and screen-reader support via the combobox pattern?"</td><td>A typeahead is a composite widget; a11y here is real work (roles, <code>aria-activedescendant</code>, live regions), not one attribute. First-class scored dimension.</td></tr>
+        <tr><td><strong>Request volume / cost</strong></td><td>"Is a request per keystroke acceptable, or is the backend cost-sensitive?"</td><td>The frontend's version of estimation: it decides how aggressively you debounce and cache to collapse keystrokes into requests.</td></tr>
+        <tr><td><strong>Result count &amp; freshness</strong></td><td>"How many suggestions — ~10? Do they change fast, or can I cache per query?"</td><td>Small, stable result sets are cacheable on the client; that turns backspacing and re-typing into zero network.</td></tr>
+        <tr><td><strong>Devices</strong></td><td>"Desktop, mobile, or both? On-screen keyboard?"</td><td>Mobile has no hover and a soft keyboard that eats screen space; touch targets and virtual-keyboard behaviour matter.</td></tr>
+      </tbody>
+    </table>
+
+    <p>
+      Then assume and move: <em>"I'll assume p95 suggestions under ~100&nbsp;ms perceived, must work on 3G, WCAG AA with
+      full keyboard and screen-reader support, request-per-keystroke is <strong>not</strong> acceptable so I'll debounce
+      and cache, ~10 results per query, desktop and mobile. Good?"</em> Fifteen seconds, and that sentence <em>is</em> the
+      spec — and notice it already commits you to the three techniques (debounce, cache, cancel) that the round is about.
+    </p>
+
+    <div class="senior">
+      The one estimation that earns its place here is the <strong>keystroke-to-request ratio</strong>, and it's worth
+      saying out loud because it motivates everything downstream: <em>"If a user types a 10-character query at ~200&nbsp;ms
+      per keystroke and I fire on every one, that's 10 requests for one search, 9 of them instantly stale. Debouncing at
+      ~200–300&nbsp;ms collapses a burst of typing into roughly one request at the pause, and a client cache makes
+      backspacing free. So before I optimize rendering, I optimize <em>how often I talk to the network</em> — that's the
+      dominant cost and the dominant source of bugs in this widget."</em> That reframes debounce/cache/cancel not as
+      tricks but as the core of the design.
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="architecture">A — Architecture &amp; components</h2>
+
+    <p>
+      The tree is small, which is a trap: the temptation is to build it as one giant component with a dozen
+      <code>useState</code>s. Resist it. Decompose so the reusable, dumb piece (the input + listbox rendering) is separate
+      from the smart piece that owns the async lifecycle, because that seam is exactly what makes the widget testable and
+      lets the <em>same</em> UI work for server search and local filtering.
+    </p>
+
+    <h3>The component tree</h3>
+<pre><code>  &lt;Autocomplete&gt;                    ← the smart container; owns query, results, request lifecycle
+    ├─ &lt;ComboboxInput&gt;               ← the &lt;input&gt;: controlled value, keydown handler, ARIA wiring
+    ├─ &lt;SuggestionList&gt;              ← the popup listbox (role="listbox"); rendered only when open
+    │    └─ &lt;SuggestionItem&gt;         ← one option (role="option"), ×N; highlights the match substring
+    ├─ &lt;StatusRegion&gt;                ← visually-hidden aria-live region: "5 results available" / "no results"
+    └─ (a data hook)  useSuggest(query) ← debounce + fetch + cancel + cache; returns {results, status}
+</code></pre>
+
+    <p>
+      The important seam is that <strong>the async machinery lives in a hook, not in a component's JSX.</strong>
+      <code>useSuggest(query)</code> is where debouncing, the <code>AbortController</code>, the stale-response guard, and
+      the cache all live; the components stay presentational. That split is what you'd say out loud:
+      <em>"I'll pull the whole request lifecycle into a <code>useSuggest</code> hook so the components are dumb — the input
+      renders a value and emits keystrokes, the list renders options and emits selection. The hook is where the hard part
+      lives, and it's unit-testable in isolation without rendering anything."</em>
+    </p>
+
+    <h3>Where does state live?</h3>
+    <p>
+      Everything here is fairly local — a typeahead is a self-contained widget, so almost nothing needs to be global.
+      The principle from tutorial 19 still applies: keep each piece at the lowest owner that needs it.
+    </p>
+
+    <table>
+      <thead><tr><th>State</th><th>Where it lives</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>The input's text (<code>query</code>)</td><td><code>Autocomplete</code> container (controlled input)</td><td>Both the input and the hook need it; it's the single source of truth that drives fetching.</td></tr>
+        <tr><td>The <em>debounced</em> query</td><td>Inside <code>useSuggest</code></td><td>Derived from <code>query</code> on a timer; only the hook cares. Keeps the input responsive while the network lags.</td></tr>
+        <tr><td>Suggestions + status (loading/error)</td><td>Inside <code>useSuggest</code> (it's server state)</td><td>A cached copy of server data — loading/error/stale are cache concerns, so the hook owns them.</td></tr>
+        <tr><td><code>activeIndex</code> (highlighted option)</td><td><code>Autocomplete</code> container</td><td>Pure UI state driven by arrow keys; the input needs it (for <code>aria-activedescendant</code>) and the list needs it (to style the highlight).</td></tr>
+        <tr><td><code>isOpen</code> (is the listbox shown)</td><td><code>Autocomplete</code> container</td><td>Toggled by focus, typing, Escape, and selection; several children read it.</td></tr>
+        <tr><td>The response cache</td><td>Inside <code>useSuggest</code> (a ref / module cache)</td><td>Must survive re-renders, so a <code>useRef</code>-held <code>Map</code> or a server-cache library, not <code>useState</code>.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Data flow — controlled input, one direction</h3>
+    <p>
+      The input is <strong>controlled</strong>: its value is React state, every keystroke updates that state, the state
+      drives the hook, and results flow back down. Draw it and trace one keystroke end to end — that's worth more than
+      any box-drawing.
+    </p>
+
+<pre><code>  keystroke ─▶ setQuery(v) ─▶ query ─▶ useSuggest(query)
+                                 │             │ (debounce → fetch → cancel → guard → cache)
+                                 ▼             ▼
+                          ComboboxInput   {results, status}
+                                                │
+                                                ▼
+                                          SuggestionList ─(hover/click / Enter)─▶ onSelect(item)
+   (data flows DOWN · keystrokes &amp;&amp; selection flow UP · the input value is always React-owned)
+</code></pre>
+
+    <div class="pitfall">
+      The classic shallow answer builds the whole thing as one component with the fetch inlined in a <code>useEffect</code>
+      right next to the JSX. It works in a demo and collapses the moment the interviewer pushes: "where do you cancel?
+      how do you test the debounce? how do you reuse this for a local filter?" — because the lifecycle is tangled into
+      rendering. Pull it into a hook <em>first</em> and every follow-up has a clean home. A layout is not an architecture,
+      and for this widget the architecture <em>is</em> the hook.
+    </div>
+
+    <div class="senior">
+      The structural line that shows you're thinking about the input's responsiveness: <em>"I keep the raw
+      <code>query</code> and the <code>debouncedQuery</code> as two separate values on purpose. The input is bound to the
+      raw query so typing is always instant and never gated on the network; the debounced query is what triggers fetches.
+      Conflating them — debouncing the input value itself — is how you get an input that feels laggy, because now the
+      character you typed doesn't appear until the timer fires."</em> That distinction is subtle, extremely common to get
+      wrong, and instantly reads as someone who has built this.
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="data">D — Data model</h2>
+
+    <p>
+      The client's data model for a typeahead is small but has one subtlety worth naming: it splits cleanly into
+      <strong>server state</strong> (the suggestions, which are a cache of what the server returned) and
+      <strong>client/UI state</strong> (the query text, which option is highlighted, whether the popup is open). Getting
+      that split right is what makes caching and the stale-guard fall out naturally instead of feeling bolted on.
+    </p>
+
+    <h3>The shape the hook holds</h3>
+<pre><code><span class="com">// UI / client state — lives in the container, the client is the source of truth</span>
+<span class="kw">interface</span> <span class="typ">ComboboxUIState</span> {
+  query: <span class="typ">string</span>;          <span class="com">// raw input text, updated every keystroke</span>
+  isOpen: <span class="typ">boolean</span>;        <span class="com">// is the listbox visible</span>
+  activeIndex: <span class="typ">number</span>;     <span class="com">// -1 = none highlighted; else index into results</span>
+}
+
+<span class="com">// Server state — a CACHE of what /suggest returned; the hook owns it</span>
+<span class="kw">interface</span> <span class="typ">Suggestion</span> {
+  id: <span class="typ">string</span>;             <span class="com">// stable key — never use the array index as the React key</span>
+  text: <span class="typ">string</span>;           <span class="com">// what to display &amp;&amp; put in the input on select</span>
+  type?: <span class="typ">string</span>;           <span class="com">// optional: "product" | "category" — for grouping/icons</span>
+}
+
+<span class="kw">interface</span> <span class="typ">SuggestState</span> {
+  results: <span class="typ">Suggestion</span>[];
+  status: <span class="str">"idle"</span> | <span class="str">"loading"</span> | <span class="str">"success"</span> | <span class="str">"error"</span>;
+}
+</code></pre>
+
+    <p>
+      Two things to point out on this shape. First, each suggestion carries a stable <code>id</code> — you'll use it as
+      the React <code>key</code> and as the <code>id</code> of the <code>role="option"</code> element that
+      <code>aria-activedescendant</code> points at, so it has to be stable across renders, not the array index. Second,
+      <code>activeIndex</code> is an <em>index</em>, not a copy of the highlighted suggestion — deriving the active item as
+      <code>results[activeIndex]</code> keeps one source of truth, so a new result set can't leave you pointing at a
+      suggestion that no longer exists (you just reset the index to -1).
+    </p>
+
+    <h3>The cache: keyed by query string</h3>
+    <p>
+      The highest-leverage piece of the data model is the <strong>response cache</strong>: a map from query string to the
+      results for that query. It's what makes backspacing, re-typing, and revisiting a prefix cost zero network requests.
+    </p>
+
+<pre><code><span class="com">// query string → the results the server gave for it. Lives in a ref (survives renders),</span>
+<span class="com">// or use a server-cache library keyed by ["suggest", query] to get this for free.</span>
+<span class="kw">const</span> cache: <span class="typ">Map</span>&lt;<span class="typ">string</span>, <span class="typ">Suggestion</span>[]&gt; = <span class="kw">new</span> <span class="typ">Map</span>();
+
+<span class="com">// On a new debounced query: cache hit → render instantly, no fetch. Miss → fetch, then store.</span>
+<span class="kw">if</span> (cache.has(q)) <span class="kw">return</span> cache.get(q);       <span class="com">// zero-latency path</span>
+</code></pre>
+
+    <div class="note">
+      This is the same machinery as tutorial 19's "server state is a cache" point, and it maps straight onto tutorial 06's
+      cache patterns: the query cache is <strong>cache-aside</strong>, and if you use React Query / SWR keyed by
+      <code>["suggest", query]</code> you also get <strong>request deduplication</strong> (two components asking for the
+      same query collapse to one request) and <strong>stale-while-revalidate</strong> for free. In an interview it's
+      fine to hand-roll a <code>Map</code> to show you understand the mechanism, then say "in production I'd let React
+      Query own this so I get dedup, TTL eviction, and revalidation without writing it."
+    </div>
+
+    <div class="senior">
+      Name the cache's limits before you're asked — bounded and short-lived: <em>"I'd cap the cache (an LRU of, say, the
+      last 50 queries) and give entries a short TTL, because suggestions can go stale — trending queries change, a product
+      goes out of stock. For a search box I'm happy serving a slightly stale cached list instantly and letting it refresh
+      in the background; for something where correctness matters I'd shorten the TTL. The point is the cache is an
+      optimization with an eviction and freshness policy, not an unbounded memory leak that shows yesterday's results."</em>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="interface">I — Interface &amp; API</h2>
+
+    <p>
+      Two contracts, as always in a frontend round: the <strong>props API</strong> of the component (how a consumer uses
+      your combobox) and the <strong>network API</strong> (how the client talks to the suggestion service). The props API
+      is where reusability is won — a good one lets the exact same component do server search or local filtering.
+    </p>
+
+    <h3>The component (props) API — make it source-agnostic</h3>
+<pre><code><span class="kw">interface</span> <span class="typ">AutocompleteProps</span>&lt;<span class="typ">T</span>&gt; {
+  <span class="com">// How to GET options for a query. Return a promise; the component owns debounce/cancel/cache.</span>
+  <span class="com">// This one prop is the whole seam: pass a fetch for server search, or a local filter fn.</span>
+  getSuggestions: (query: <span class="typ">string</span>, signal: <span class="typ">AbortSignal</span>) =&gt; <span class="typ">Promise</span>&lt;<span class="typ">T</span>[]&gt;;
+
+  onSelect: (item: <span class="typ">T</span>) =&gt; <span class="typ">void</span>;        <span class="com">// event UP — parent decides what selecting means</span>
+  onQueryChange?: (query: <span class="typ">string</span>) =&gt; <span class="typ">void</span>;
+
+  renderItem?: (item: <span class="typ">T</span>, active: <span class="typ">boolean</span>) =&gt; <span class="typ">ReactNode</span>;  <span class="com">// customise a row</span>
+  getItemLabel: (item: <span class="typ">T</span>) =&gt; <span class="typ">string</span>;  <span class="com">// text to show in the input on select</span>
+
+  minChars?: <span class="typ">number</span>;      <span class="com">// default 1 — don't fire on empty</span>
+  debounceMs?: <span class="typ">number</span>;    <span class="com">// default ~250</span>
+  placeholder?: <span class="typ">string</span>;
+}
+</code></pre>
+
+    <p>
+      The load-bearing decision is <code>getSuggestions(query, signal)</code>. By making the data source a
+      <em>prop</em> that returns a promise — and threading the <code>AbortSignal</code> through it — the component knows
+      nothing about the network. Pass an implementation that <code>fetch</code>es for the search case; pass one that
+      filters an in-memory array for the country-picker case. Same keyboard model, same ARIA, same rendering. That's the
+      sentence to say: <em>"the component owns the interaction and lifecycle; the caller owns where data comes from,
+      through a single async prop. That's what makes it reusable across server search and local filter."</em> Note also
+      the parent gets <code>onSelect(item)</code> — the component emits <em>intent</em>, not "navigate to this URL"; the
+      parent decides what selection means.
+    </p>
+
+    <h3>The network API — you're the consumer</h3>
+<pre><code><span class="com">// One endpoint. You specify what you need; you're not designing the service.</span>
+GET /api/suggest?q=reac&amp;limit=10
+<span class="com">// →</span> {
+     query: <span class="str">"reac"</span>,                <span class="com">// ECHO the query back — critical for the stale-response guard (see below)</span>
+     suggestions: [
+       { id: <span class="str">"s1"</span>, text: <span class="str">"react"</span>,          type: <span class="str">"query"</span> },
+       { id: <span class="str">"s2"</span>, text: <span class="str">"react native"</span>,   type: <span class="str">"query"</span> },
+       { id: <span class="str">"s3"</span>, text: <span class="str">"react router"</span>,   type: <span class="str">"query"</span> }
+     ]
+   }
+</code></pre>
+
+    <p>
+      Three consumer-side asks worth voicing. <strong>Keep the payload tiny</strong> — id, text, maybe a type for an
+      icon; this response is fetched on nearly every keystroke-pause, so every field is paid for repeatedly over a slow
+      radio. <strong>Cap the count</strong> server-side (<code>limit=10</code>) — nobody keyboard-navigates 500 options.
+      And the one that matters most: <strong>echo the query back in the response.</strong> That single field lets the
+      client verify a response still matches the current input before rendering it — the cheapest possible defence
+      against the out-of-order race we're about to dig into. Ask for it explicitly: <em>"I'd have the endpoint echo the
+      query it answered, so the client can drop responses that no longer match what's in the box."</em>
+    </p>
+
+    <div class="pitfall">
+      Don't over-fetch here out of backend habit. Returning a fat object per suggestion (descriptions, images, prices) so
+      you "have it ready" is a <code>SELECT *</code> on the hottest path in the app — it's requested on every pause in
+      typing. Fetch the label and an id; fetch the rich detail only when the user actually selects or hovers a specific
+      row. Shape the request to what the dropdown renders, nothing more.
+    </div>
+
+    <div class="senior">
+      Tie the two interfaces together: <em>"The network contract I keep minimal and I ask it to echo the query, because
+      that echo is what makes the client-side ordering guard trivial. The component contract I keep source-agnostic —
+      one <code>getSuggestions(query, signal)</code> prop — so the same widget serves a server search box and a local
+      dropdown, and threading the <code>AbortSignal</code> through that prop means cancellation works no matter who
+      supplies the data."</em> Connecting the echoed-query in the network shape to the guard in the component is the move
+      that reads as a frontend engineer who's designed this contract before, not just consumed one.
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="optimizations">O — Optimizations: debounce vs throttle, caching &amp; prefetch</h2>
+
+    <p>
+      This is the deep-dive, and for a typeahead it's almost entirely about the <strong>request lifecycle</strong>: how
+      often you fire, which responses you trust, and how much you can avoid the network altogether. Menu it for the
+      interviewer — <em>"there are four things I'd optimize: how often I fire requests (debounce), which response I'm
+      allowed to render (the ordering guard), avoiding the network (cache + prefetch), and the interaction itself
+      (keyboard + a11y). The ordering guard is the interesting one; want me to start there?"</em> — then go where they
+      point. Nine times out of ten they pick the race. We'll build up to it: first debounce vs throttle, then caching and
+      prefetch, then the race gets its own section because it deserves it.
+    </p>
+
+    <h3>Debounce vs throttle — know exactly when each</h3>
+    <p>
+      Both limit how often a handler runs; they differ in <em>which</em> calls survive, and picking the wrong one is a
+      real mistake. <strong>Debounce</strong> waits for a pause: it fires once, after the events stop for N ms — perfect
+      for "the user finished typing." <strong>Throttle</strong> fires at a steady rate: at most once per N ms while events
+      keep coming — perfect for a stream you want to sample, like scroll or mouse-move.
+    </p>
+
+    <table>
+      <thead><tr><th></th><th>Debounce</th><th>Throttle</th></tr></thead>
+      <tbody>
+        <tr><td>Fires</td><td>Once, N&nbsp;ms after the <em>last</em> event (the pause)</td><td>At most once per N&nbsp;ms <em>during</em> a burst</td></tr>
+        <tr><td>Mental model</td><td>"Wait until they stop"</td><td>"Sample at a fixed rate"</td></tr>
+        <tr><td>If events never stop</td><td>Never fires until they pause</td><td>Keeps firing, one per interval</td></tr>
+        <tr><td>Right for</td><td><strong>Typeahead input</strong>, resize-then-recompute, save-on-idle, validating a field</td><td>Scroll position, mouse-move, drag, resize-while-dragging, rate-limiting a firehose</td></tr>
+        <tr><td>Wrong for</td><td>A continuous stream you must sample (a throttle job) — debounce would starve it</td><td>An input that should fire once when typing stops — throttle fires mid-word on stale prefixes</td></tr>
+      </tbody>
+    </table>
+
+    <p>
+      For the search box the answer is <strong>debounce</strong>, and you should say why not throttle: <em>"I want one
+      request when they pause, not a request every 250&nbsp;ms while they're still typing — throttling a search input
+      fires on half-typed prefixes like 'rea' and 'reac' and wastes requests I'm about to invalidate anyway. Debounce
+      waits for the pause."</em> Here's the debounce, written as a hook so it's testable:
+    </p>
+
+<pre><code><span class="com">// Returns `value` only after it has stopped changing for `delay` ms.</span>
+<span class="com">// The input stays bound to the RAW value (instant); this debounced copy drives fetching.</span>
+<span class="kw">function</span> <span class="typ">useDebounced</span>&lt;<span class="typ">T</span>&gt;(value: <span class="typ">T</span>, delay = <span class="num">250</span>): <span class="typ">T</span> {
+  <span class="kw">const</span> [debounced, setDebounced] = <span class="typ">useState</span>(value);
+  <span class="typ">useEffect</span>(() =&gt; {
+    <span class="kw">const</span> id = setTimeout(() =&gt; setDebounced(value), delay);
+    <span class="kw">return</span> () =&gt; clearTimeout(id);   <span class="com">// each new keystroke clears the pending timer → only the pause survives</span>
+  }, [value, delay]);
+  <span class="kw">return</span> debounced;
+}
+</code></pre>
+
+    <p>
+      The whole debounce is in that <code>clearTimeout</code> cleanup: every keystroke cancels the previous pending timer,
+      so only a genuine pause of <code>delay</code> ms lets the update through. Around 200–300&nbsp;ms is the sweet spot —
+      short enough to feel live, long enough to swallow a burst of fast typing. Mention the tradeoff: too short and you're
+      barely debouncing; too long and suggestions feel laggy behind the keystrokes.
+
+    </p>
+
+    <h3>Caching — turn backspace into zero network</h3>
+    <p>
+      The query cache from the D step is the second lever. Before firing a request for a debounced query, check the cache;
+      a hit renders instantly with no network at all. This is enormous in practice because of how people actually type:
+      they overshoot and backspace, or type a prefix, pause, and extend it — all of which revisit queries you've already
+      answered.
+    </p>
+
+<pre><code><span class="kw">async function</span> load(q: <span class="typ">string</span>, signal: <span class="typ">AbortSignal</span>) {
+  <span class="kw">if</span> (cache.has(q)) <span class="kw">return</span> cache.get(q)!;        <span class="com">// HIT → instant, no request</span>
+  <span class="kw">const</span> res = <span class="kw">await</span> fetch(<span class="str">`/api/suggest?q=`</span> + encodeURIComponent(q), { signal });
+  <span class="kw">const</span> data = <span class="kw">await</span> res.json();
+  cache.set(q, data.suggestions);                <span class="com">// store for next time (bounded LRU + TTL, per the D step)</span>
+  <span class="kw">return</span> data.suggestions;
+}
+</code></pre>
+
+    <h3>Prefetch — hide latency before the keystroke</h3>
+    <p>
+      The third lever spends a little network to make the common case feel instant:
+    </p>
+    <ul>
+      <li><strong>Prefetch on focus.</strong> When the input is focused but empty, fetch the default/trending suggestions
+        so the dropdown is populated the instant they type the first character (or even before).</li>
+      <li><strong>Prefetch the likely next query.</strong> This is a judgment call — occasionally warm the cache for a
+        one-character extension of what they've typed if the backend is cheap. Usually not worth it; mention it as an
+        option, not a default.</li>
+      <li><strong>Prefetch the result destination.</strong> The higher-value prefetch: when a suggestion is highlighted,
+        you can warm the actual search-results page or the selected entity's detail, so pressing Enter feels instant. Same
+        idea as hovering a link and prefetching its route.</li>
+    </ul>
+
+    <div class="senior">
+      The measure-first discipline applies here too: <em>"I wouldn't add prefetch speculatively — it trades backend load
+      and bandwidth for perceived latency, and on a metered mobile connection that trade can be wrong. I'd ship debounce
+      + cache first, measure the real p95 with those in place, and only add prefetch if there's still a perceptible gap.
+      The cache usually buys most of the win for free, because typing is so repetitive."</em> Naming the cost of an
+      optimization before adding it is the same instinct as the backend "measure before you optimize."
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="race">The out-of-order response race — the bug everyone ships</h2>
+
+    <p>
+      <strong>This is where the interview really happens.</strong> Everything so far is table stakes; this is the problem
+      that separates candidates who have shipped a typeahead from those who have read a tutorial about one. It's subtle,
+      it's a genuine production bug, and volunteering it (rather than waiting to be asked) is one of the strongest signals
+      you can send in this round.
+    </p>
+
+    <h3>The bug: newer request, older answer</h3>
+    <p>
+      Debouncing reduces requests but doesn't eliminate concurrency — a pause after "reac" fires request&nbsp;A, then the
+      user types "t", pauses again, and fires request&nbsp;B for "react". Two requests are now in flight. HTTP makes
+      <strong>no promise</strong> about which returns first: B might come back before A. If your code just renders
+      whatever response arrives, the sequence is a disaster:
+    </p>
+
+<pre><code>  t0  user types "reac"   → fire request A (for "reac")
+  t1  user types "react"  → fire request B (for "react")
+  t2  response B arrives  → render "react" suggestions        ✅ correct, newest query
+  t3  response A arrives  → render "reac" suggestions          ❌ STALE — clobbers the newer results!
+      (the input says "react" but the dropdown now shows suggestions for "reac")
+</code></pre>
+
+    <p>
+      The user is staring at an input that reads "react" and a suggestion list for "reac". It's not a crash, it flickers
+      by, and it's <em>maddeningly</em> intermittent because it only happens when A is slower than B — which is exactly
+      what a flaky network makes common. A naive <code>useEffect</code>-per-keystroke that calls <code>setResults</code>
+      on whatever resolves has this bug, and most autocompletes written in an interview under time pressure have it too.
+      Name it out loud: <em>"the trap here is that responses can arrive out of order, and the last one to arrive wins even
+      if it's for an older query. I need to make the newest query win, not the newest response."</em>
+    </p>
+
+    <h3>The two fixes — and use both</h3>
+    <table>
+      <thead><tr><th></th><th>Cancel stale requests (AbortController)</th><th>Guard stale responses (sequence / query check)</th></tr></thead>
+      <tbody>
+        <tr><td>What it does</td><td>Aborts the in-flight A when B starts, so A's response never arrives</td><td>Lets A arrive but <em>ignores</em> it because it no longer matches the current query</td></tr>
+        <tr><td>Mechanism</td><td><code>AbortController</code> + <code>signal</code> passed to <code>fetch</code>; abort on cleanup</td><td>Compare the response's query (or a monotonic request id) against the latest before rendering</td></tr>
+        <tr><td>Bonus win</td><td>Frees the socket/backend work for the abandoned request — saves bandwidth</td><td>Works even for things you <em>can't</em> cancel (a cache hit, a non-abortable API, a resolved promise)</td></tr>
+        <tr><td>Limitation</td><td>A request already delivered can't be un-delivered — abort has a race window of its own</td><td>Doesn't save the wasted network work; the request still completes, you just drop it</td></tr>
+        <tr><td>Verdict</td><td>Primary defence — cancel what you can</td><td>Backstop — the guarantee that even an uncancelled straggler can't clobber you</td></tr>
+      </tbody>
+    </table>
+
+    <p>
+      Belt <em>and</em> braces is the senior answer: cancel to save work and close most of the window, and guard as the
+      hard guarantee that a response for a stale query can never render. Here's both in one hook.
+    </p>
+
+<pre><code><span class="kw">function</span> <span class="typ">useSuggest</span>(rawQuery: <span class="typ">string</span>) {
+  <span class="kw">const</span> query = <span class="typ">useDebounced</span>(rawQuery, <span class="num">250</span>);
+  <span class="kw">const</span> [state, setState] = <span class="typ">useState</span>&lt;<span class="typ">SuggestState</span>&gt;({ results: [], status: <span class="str">"idle"</span> });
+  <span class="kw">const</span> latest = <span class="typ">useRef</span>(<span class="num">0</span>);   <span class="com">// monotonic request id — the sequence guard</span>
+
+  <span class="typ">useEffect</span>(() =&gt; {
+    <span class="kw">if</span> (query.length &lt; <span class="num">1</span>) { setState({ results: [], status: <span class="str">"idle"</span> }); <span class="kw">return</span>; }
+
+    <span class="kw">const</span> seq = ++latest.current;          <span class="com">// this request's ticket number</span>
+    <span class="kw">const</span> controller = <span class="kw">new</span> <span class="typ">AbortController</span>();  <span class="com">// FIX 1: cancellation</span>
+    setState((s) =&gt; ({ ...s, status: <span class="str">"loading"</span> }));
+
+    load(query, controller.signal)
+      .then((results) =&gt; {
+        <span class="com">// FIX 2: the guard — only the NEWEST request is allowed to write state.</span>
+        <span class="com">// A stale straggler has seq &lt; latest.current, so it's dropped here.</span>
+        <span class="kw">if</span> (seq === latest.current) setState({ results, status: <span class="str">"success"</span> });
+      })
+      .catch((err) =&gt; {
+        <span class="kw">if</span> (err.name === <span class="str">"AbortError"</span>) <span class="kw">return</span>;   <span class="com">// aborted on purpose — not an error</span>
+        <span class="kw">if</span> (seq === latest.current) setState((s) =&gt; ({ ...s, status: <span class="str">"error"</span> }));
+      });
+
+    <span class="kw">return</span> () =&gt; controller.abort();      <span class="com">// new query (or unmount) → abort the previous in-flight request</span>
+  }, [query]);
+
+  <span class="kw">return</span> state;
+}
+</code></pre>
+
+    <p>
+      Walk the interviewer through the two lines that matter. The cleanup <code>() =&gt; controller.abort()</code> runs
+      every time <code>query</code> changes, so starting request B <em>aborts</em> request A — A's promise rejects with an
+      <code>AbortError</code> we swallow, and its socket work is freed. The <code>if (seq === latest.current)</code> check
+      is the backstop: even if A somehow already resolved before we aborted (the abort race), its <code>seq</code> is now
+      less than <code>latest.current</code>, so it's <em>forbidden</em> from calling <code>setState</code>. The invariant
+      you state out loud: <strong>"only the most recent request is ever allowed to write results."</strong>
+    </p>
+
+    <div class="note">
+      The query-echo from the network API is an equivalent guard and sometimes cleaner: instead of a sequence counter,
+      compare <code>response.query === currentQuery</code> and drop the response if they differ. The monotonic
+      <code>seq</code> is slightly more robust because two identical queries in quick succession (type, backspace, retype
+      the same thing) would pass a string-equality check but still want the newer one to win. Either is a fine answer;
+      knowing <em>why</em> you'd pick the counter is the senior detail.
+    </div>
+
+    <div class="pitfall">
+      A subtle wrong "fix" is to <strong>only</strong> cancel with <code>AbortController</code> and skip the sequence
+      guard. Abort is not instantaneous — there's a window where the request has already resolved on the network but your
+      abort hasn't taken effect, and in that window the stale <code>.then</code> still runs and clobbers your results.
+      It's rarer, so it survives a quick manual test and ships. Worse, cancellation does nothing for the
+      <strong>cache-hit</strong> path — a synchronous cached result for an old query can resolve and render out of order
+      too. The sequence guard covers both, which is exactly why you keep it even after adding cancellation. "Cancel to be
+      efficient, guard to be correct" is the line.
+    </div>
+
+    <div class="senior">
+      The framing that lands this whole section: <em>"The mental bug is thinking the newest <em>response</em> should win.
+      It shouldn't — the newest <em>request</em> should win, and those are different things the instant the network
+      reorders them. So I make the request the source of truth: I tag each one, I abort the previous when a new one
+      starts, and I refuse to apply any response that isn't from the latest request. That combination means a slow 3G
+      connection can scramble my responses however it likes and the dropdown always matches what's in the box."</em>
+      That's the sentence that tells the interviewer you've been burned by this in production and fixed it properly.
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="keyboard">Keyboard navigation &amp; the ARIA combobox</h2>
+
+    <p>
+      The other half of the deep-dive, and a home game for you. A typeahead that only works with a mouse is broken for
+      keyboard users and invisible to screen-reader users — and accessibility is a <em>scored</em> dimension in this
+      round, not a bonus. There's an established recipe here (the WAI-ARIA <strong>combobox</strong> pattern), and knowing
+      it by name signals you've done this for real.
+    </p>
+
+    <h3>Keyboard model — the keys and exactly what each does</h3>
+    <p>
+      The rule that makes the keyboard model clean: <strong>focus stays in the <code>&lt;input&gt;</code> the entire
+      time.</strong> The arrow keys do <em>not</em> move DOM focus into the list; they move a "virtual" highlight
+      (<code>activeIndex</code>) while the real focus never leaves the input. This is called the
+      <strong>aria-activedescendant pattern</strong>, and it's why the user can keep typing while navigating options.
+    </p>
+
+    <table>
+      <thead><tr><th>Key</th><th>When list is open</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>ArrowDown</code></td><td>Move highlight to next option; from none, highlight the first; wrap to top at the end</td><td>If closed, open the list and highlight the first option</td></tr>
+        <tr><td><code>ArrowUp</code></td><td>Move highlight to previous option; wrap to bottom from the top</td><td>Wrapping is a judgment call — say it either way, just be deliberate</td></tr>
+        <tr><td><code>Enter</code></td><td>Select the highlighted option (fill input, fire <code>onSelect</code>, close)</td><td>If nothing highlighted, submit the raw query as a free-text search</td></tr>
+        <tr><td><code>Escape</code></td><td>Close the list and clear the highlight; keep the typed text</td><td>A second Escape (or a pattern choice) can clear the input</td></tr>
+        <tr><td><code>Home</code> / <code>End</code></td><td>Jump highlight to first / last option</td><td>Nice-to-have; mention it, don't dwell</td></tr>
+        <tr><td><code>Tab</code></td><td>Accept highlight (or just leave) and move focus onward — do <em>not</em> trap Tab</td><td>The list is not a focus trap; Tab must escape the widget normally</td></tr>
+      </tbody>
+    </table>
+
+<pre><code><span class="kw">function</span> onKeyDown(e: <span class="typ">KeyboardEvent</span>) {
+  <span class="kw">switch</span> (e.key) {
+    <span class="kw">case</span> <span class="str">"ArrowDown"</span>:
+      e.preventDefault();                          <span class="com">// stop the caret from jumping to end of input</span>
+      setActiveIndex((i) =&gt; (i + <span class="num">1</span>) % results.length);   <span class="com">// wrap to top</span>
+      setOpen(<span class="kw">true</span>);
+      <span class="kw">break</span>;
+    <span class="kw">case</span> <span class="str">"ArrowUp"</span>:
+      e.preventDefault();
+      setActiveIndex((i) =&gt; (i &lt;= <span class="num">0</span> ? results.length - <span class="num">1</span> : i - <span class="num">1</span>));
+      <span class="kw">break</span>;
+    <span class="kw">case</span> <span class="str">"Enter"</span>:
+      <span class="kw">if</span> (activeIndex &gt;= <span class="num">0</span>) select(results[activeIndex]);
+      <span class="kw">else</span> submitFreeText(query);
+      <span class="kw">break</span>;
+    <span class="kw">case</span> <span class="str">"Escape"</span>:
+      setOpen(<span class="kw">false</span>); setActiveIndex(-<span class="num">1</span>);
+      <span class="kw">break</span>;
+  }
+}
+</code></pre>
+
+    <p>
+      Two details worth calling out: the <code>e.preventDefault()</code> on the arrows stops the browser's default
+      "move the text caret" behaviour so ArrowUp doesn't jump your cursor to the start of the input, and selection is
+      <em>keyboard and mouse sharing one path</em> — a click and an Enter both call the same <code>select(item)</code>, so
+      behaviour can't drift between them.
+    </p>
+
+    <h3>The ARIA combobox pattern — what a screen reader needs</h3>
+    <p>
+      Semantic HTML gets you a real <code>&lt;input&gt;</code> and real <code>&lt;li&gt;</code>s, but a suggestion popup
+      has no native element, so this is the one place ARIA genuinely earns its keep. The combobox pattern is a specific
+      set of roles and relationships; wire them exactly:
+    </p>
+
+<pre><code><span class="com">// The input announces itself as a combobox that controls a listbox popup.</span>
+&lt;input
+  role=<span class="str">"combobox"</span>
+  aria-expanded=<span class="str">"true"</span>              <span class="com">// is the listbox open? toggles with isOpen</span>
+  aria-controls=<span class="str">"suggest-listbox"</span>    <span class="com">// id of the listbox it owns</span>
+  aria-autocomplete=<span class="str">"list"</span>          <span class="com">// suggestions appear in a list (not inline-completed)</span>
+  aria-activedescendant=<span class="str">"opt-s2"</span>    <span class="com">// id of the CURRENTLY highlighted option (or absent)</span>
+/&gt;
+
+<span class="com">// The popup is a listbox; each row is an option with a stable id and selected state.</span>
+&lt;ul id=<span class="str">"suggest-listbox"</span> role=<span class="str">"listbox"</span>&gt;
+  &lt;li id=<span class="str">"opt-s1"</span> role=<span class="str">"option"</span> aria-selected=<span class="str">"false"</span>&gt;react&lt;/li&gt;
+  &lt;li id=<span class="str">"opt-s2"</span> role=<span class="str">"option"</span> aria-selected=<span class="str">"true"</span> &gt;react native&lt;/li&gt;
+&lt;/ul&gt;
+
+<span class="com">// A visually-hidden live region announces result-count changes without moving focus.</span>
+&lt;div aria-live=<span class="str">"polite"</span> class=<span class="str">"sr-only"</span>&gt;5 suggestions available&lt;/div&gt;
+</code></pre>
+
+    <p>
+      The mechanism to explain: focus never leaves the input, so how does a screen reader announce the highlighted row?
+      Through <strong><code>aria-activedescendant</code></strong> — it points at the <code>id</code> of the active
+      <code>&lt;li&gt;</code>, and when you update that attribute as the user arrows down, the screen reader reads out the
+      newly-referenced option even though DOM focus is still on the input. That's the whole trick, and it's why each
+      option needs the stable <code>id</code> from your data model. <code>aria-expanded</code> tells the user the popup
+      opened; <code>aria-selected</code> marks the current option; the <code>aria-live="polite"</code> region announces
+      "5 suggestions available" / "no results" so a non-visual user knows the list changed after they typed.
+    </p>
+
+    <div class="pitfall">
+      Do not build the popup out of <code>&lt;div onClick&gt;</code>s and call it done, and do not put
+      <code>tabindex</code> on the options to move focus into the list. Both break the pattern: divs give the screen
+      reader no role to announce, and moving focus into the list means the user can't keep typing to refine the query. The
+      correct model is counter-intuitive but firm — <strong>focus stays in the input, the highlight is virtual via
+      <code>aria-activedescendant</code></strong>. Getting this specific detail right is a strong senior signal precisely
+      because it's the part most people get wrong.
+    </div>
+
+    <div class="senior">
+      Narrate the pattern by name and by mechanism: <em>"For accessibility I'd implement the ARIA combobox pattern — the
+      input is <code>role=combobox</code> with <code>aria-expanded</code> and <code>aria-controls</code> pointing at a
+      <code>role=listbox</code> popup of <code>role=option</code> rows. Crucially, focus stays in the input and I move a
+      virtual highlight with <code>aria-activedescendant</code>, so a screen-reader user hears each option as they arrow
+      through it while still being able to type. And I'd announce the result count through an <code>aria-live</code>
+      region, because a change that's obvious visually is silent otherwise."</em> Saying "aria-activedescendant" correctly
+      and explaining <em>why</em> focus stays put is one of the highest-value fifteen seconds available in this round.
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="backend">The backend, briefly</h2>
+
+    <p>
+      This is a frontend round, so the server is a one-line contract — but you should be able to speak to what's behind it
+      in thirty seconds if asked, because it shows range. The classic data structure for prefix suggestions is a
+      <strong>trie</strong> (prefix tree): each node is a character, a path from the root spells a prefix, and each node
+      caches its top-<em>k</em> completions ranked by popularity so a lookup is "walk to the prefix node, return its
+      precomputed top-k." That's why suggestions come back in a few milliseconds — the ranking is precomputed, not
+      calculated per request.
+    </p>
+
+    <p>
+      The one-paragraph version to say and then stop: <em>"Behind <code>/suggest</code> is typically a trie or a search
+      index like Elasticsearch. A trie stores completions by prefix with each node caching its top-k ranked results, so a
+      query is an O(length-of-prefix) walk plus returning a precomputed list. It's built offline from query logs, ranked
+      by frequency (with recency and personalization layered on), sharded by prefix at scale, and cached hard because it's
+      read-heavy and rarely changes minute to minute. But that's the backend round — tutorial 17's search-index territory
+      — and here I'd treat it as a fast, cacheable endpoint and stay focused on the client."</em>
+    </p>
+
+    <div class="note">
+      Knowing where to <em>stop</em> is the signal. Mentioning the trie proves you understand the full system; diving into
+      how to shard it, rebalance it, or rebuild it from Kafka streams proves you've forgotten which round you're in.
+      One paragraph, then hand it back: "happy to go deeper on the index if you want, but I'd assumed the client is the
+      focus here."
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="qa">Interview Q&amp;A</h2>
+
+    <details class="qa">
+      <summary>1. Debounce or throttle a search input — and why?</summary>
+      <div class="answer">
+        <p><strong>Debounce.</strong> You want one request when the user pauses, not a steady stream while they're still
+        typing. Debounce waits for a gap of N&nbsp;ms after the <em>last</em> keystroke and fires once; throttle fires at a
+        fixed rate <em>during</em> the burst, which for an input means requests for half-typed prefixes ("rea", "reac")
+        that you're about to invalidate anyway.</p>
+        <p>Throttle is the right tool for a continuous stream you want to sample — scroll position, mouse-move, drag. The
+        one-liner: "debounce = wait until they stop; throttle = sample at a fixed rate. A search box wants the pause, so
+        debounce, around 200–300&nbsp;ms."</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>2. Two requests are in flight and the older one returns last. What happens, and how do you fix it?</summary>
+      <div class="answer">
+        <p>That's the out-of-order response race — the marquee bug. Request A (for "reac") and request B (for "react")
+        are both in flight; HTTP doesn't guarantee order, so A can arrive after B. Naive code renders whatever resolves
+        last, so the dropdown shows "reac" suggestions while the input says "react". It's intermittent and network-dependent,
+        which is why it survives testing and ships.</p>
+        <p>Fix it with <strong>both</strong> mechanisms: <strong>cancel</strong> the previous request with
+        <code>AbortController</code> when a new one starts (saves work, closes most of the window), and <strong>guard</strong>
+        with a monotonic sequence id — tag each request, and only let a response write state if its id is still the latest.
+        The invariant: "the newest <em>request</em> wins, not the newest <em>response</em>." Cancel for efficiency, guard
+        for correctness — the guard also covers cache hits and non-abortable calls that cancellation can't.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>3. Why keep both AbortController and the sequence guard? Isn't one enough?</summary>
+      <div class="answer">
+        <p>They cover different gaps. <code>AbortController</code> stops wasted network work and closes most of the race,
+        but abort isn't instantaneous — a request can already have resolved before the abort lands, and that stale
+        <code>.then</code> still runs. Cancellation also does nothing for a synchronous cache hit, which can resolve out of
+        order too.</p>
+        <p>The sequence guard (<code>if (seq === latest.current)</code>) is the hard guarantee: no matter how a response
+        arrived — slow straggler, cache hit, un-cancellable API — it's forbidden from writing state unless it's from the
+        most recent request. So: cancel to be efficient, guard to be correct. Dropping the guard is the subtle wrong
+        answer.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>4. How does the client avoid hitting the network on every query?</summary>
+      <div class="answer">
+        <p>A <strong>query-keyed cache</strong>: a map from query string to the results the server returned. Before
+        fetching a debounced query, check the cache — a hit renders instantly with zero network. This wins big because
+        typing is repetitive: people overshoot and backspace, or type a prefix, pause, and extend it, all revisiting
+        queries already answered.</p>
+        <p>Keep it bounded (an LRU of the last ~50 queries) with a short TTL, since suggestions go stale. In production
+        I'd let React Query / SWR own it keyed by <code>["suggest", query]</code>, which also gives request deduplication
+        and stale-while-revalidate for free. In an interview, hand-rolling a <code>Map</code> shows you understand the
+        mechanism.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>5. Walk me through the keyboard interaction.</summary>
+      <div class="answer">
+        <p>Focus stays in the input the whole time; the arrows move a <em>virtual</em> highlight (<code>activeIndex</code>),
+        not DOM focus. <strong>ArrowDown/ArrowUp</strong> move the highlight (wrapping is a deliberate choice);
+        <strong>Enter</strong> selects the highlighted option, or submits the raw text as a free-text search if nothing's
+        highlighted; <strong>Escape</strong> closes the list and keeps the typed text; <strong>Tab</strong> leaves the
+        widget normally (never trap it).</p>
+        <p>Two details: <code>preventDefault()</code> on the arrows so the text caret doesn't jump, and click and Enter
+        share one <code>select(item)</code> path so mouse and keyboard behaviour can't drift apart. Keeping focus in the
+        input is what lets the user keep refining the query while navigating results.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>6. How does a screen-reader user experience this? Which ARIA do you use?</summary>
+      <div class="answer">
+        <p>The WAI-ARIA <strong>combobox</strong> pattern. The input is <code>role="combobox"</code> with
+        <code>aria-expanded</code> (is the popup open), <code>aria-controls</code> (the listbox id), and
+        <code>aria-autocomplete="list"</code>. The popup is <code>role="listbox"</code> and each row is
+        <code>role="option"</code> with a stable id and <code>aria-selected</code>.</p>
+        <p>The key mechanism is <strong><code>aria-activedescendant</code></strong> on the input, pointing at the id of the
+        highlighted option. Because focus stays in the input, that attribute is how the screen reader knows which option
+        to announce as the user arrows through — no focus ever moves into the list. A visually-hidden
+        <code>aria-live="polite"</code> region announces "5 suggestions available" / "no results" so a change that's
+        obvious visually isn't silent. Getting the focus-stays-in-input detail right is the strongest a11y signal here.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>7. Why is the input value separate from the debounced query?</summary>
+      <div class="answer">
+        <p>So typing is always instant. The input is a controlled component bound to the <em>raw</em> query, updated on
+        every keystroke, so characters appear immediately. The debounced query is a separate value derived on a timer, and
+        it's what triggers fetches. If you debounce the input value itself, the character you typed doesn't render until
+        the timer fires and the input feels laggy — a very common mistake.</p>
+        <p>Two values, two jobs: raw query drives the UI (instant), debounced query drives the network (throttled).</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>8. What's your component decomposition, and where does the async logic live?</summary>
+      <div class="answer">
+        <p>A smart <code>Autocomplete</code> container, a presentational <code>ComboboxInput</code> and
+        <code>SuggestionList</code>/<code>SuggestionItem</code>, a visually-hidden live region — and, most importantly, a
+        <code>useSuggest(query)</code> <strong>hook</strong> that owns the entire request lifecycle: debounce, fetch,
+        <code>AbortController</code>, the sequence guard, and the cache.</p>
+        <p>Putting the lifecycle in a hook (not inline in JSX) makes it unit-testable without rendering, keeps the
+        components dumb and reusable, and gives every hard follow-up ("where do you cancel? how do you test debounce?") a
+        clean home. The data source is a single <code>getSuggestions(query, signal)</code> prop, so the same widget does
+        server search or local filtering.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>9. The user backspaces quickly from "react" to "rea". Anything special?</summary>
+      <div class="answer">
+        <p>Two things fall out of the design. First, the cache almost certainly already has "rea" (they typed through it on
+        the way up), so it renders instantly with no request. Second, backspacing fires new debounced queries, so the same
+        out-of-order guard applies — an in-flight request for "react" must not clobber the now-current "rea" results, which
+        the sequence guard handles. This is exactly why the guard has to cover the cache-hit path too: a synchronous cached
+        "rea" and a slow network "react" can resolve out of order.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>10. What if the backend is untouched and returns everything unranked, unlimited?</summary>
+      <div class="answer">
+        <p>Then I push what I can to the client and name the cost. I'd cap what I render (top ~10), filter/rank on the
+        client if the payload is small enough, and cache aggressively so I re-request rarely. But I'd flag that a big
+        unranked payload on every keystroke is expensive on mobile and that the right fix is server-side ranking and a
+        <code>limit</code> — the client can paper over it but shouldn't have to. If the full option set is small and
+        static (a country list), just fetch it once and filter locally; that's the local-filter flavour and the network
+        problems disappear entirely.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>11. How would you test this component?</summary>
+      <div class="answer">
+        <p>Split it by the seam. The <code>useSuggest</code> hook is tested in isolation with fake timers and a mocked
+        fetch: assert it debounces (N keystrokes → 1 request), that it aborts the previous request on a new query, and —
+        the important one — that an out-of-order resolution is <em>dropped</em> (resolve request A after B and assert B's
+        results remain). The components are tested with props: render, fire keydowns, assert the highlight moves and
+        <code>onSelect</code> fires. For a11y, assert the roles and that <code>aria-activedescendant</code> tracks the
+        highlighted option's id.</p>
+        <p>That out-of-order test is the one to call out — it's the bug that regresses silently, so it's the test most
+        worth writing.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>12. When would prefetch actually be worth it?</summary>
+      <div class="answer">
+        <p>Prefetch-on-focus is usually worth it: fetch default/trending suggestions when the empty input is focused so the
+        dropdown is ready before the first keystroke — cheap and high-impact. Prefetching the <em>result destination</em>
+        (warming the search-results page or a highlighted entity's detail so Enter feels instant) is worth it when that
+        navigation is the common next step. Prefetching the likely next <em>query</em> is usually not worth it — it spends
+        backend load and bandwidth speculatively.</p>
+        <p>The discipline: don't add any of it speculatively. Ship debounce + cache, measure the real p95, and add prefetch
+        only if a perceptible gap remains — on metered mobile the trade can be actively wrong.</p>
+      </div>
+    </details>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="takeaways">What to remember</h2>
+
+    <h3>The round</h3>
+    <ul>
+      <li><strong>It's a frontend round; the server is a one-line contract</strong> (<code>GET /suggest?q=…</code>). The
+        interest is in the browser: the request lifecycle and accessibility. Drive it with RADIO.</li>
+      <li><strong>Say which autocomplete you're building</strong> — server-backed search (async lifecycle is the meat) vs
+        local filter from a known set (same keyboard/a11y, no network). Pick the search flavour; the model transfers.</li>
+    </ul>
+
+    <h3>The request lifecycle (RADIO's O — where the round is won)</h3>
+    <ul>
+      <li><strong>Debounce, don't throttle</strong> a search input (~200–300&nbsp;ms). Debounce = fire on the pause;
+        throttle = sample a stream. Throttle is for scroll/mouse-move, not typing.</li>
+      <li><strong>Keep the raw query and the debounced query separate.</strong> Input bound to raw (instant typing);
+        debounced value drives fetching. Debouncing the input value itself makes the input feel laggy.</li>
+      <li><strong>The out-of-order race is the marquee bug.</strong> Two in-flight requests can return in the wrong order,
+        so a stale response clobbers newer results. Fix with <em>both</em>: <code>AbortController</code> to cancel the
+        previous request, <em>and</em> a monotonic sequence guard so only the latest request may write state. "The newest
+        <em>request</em> wins, not the newest <em>response</em>." Guard also covers cache hits and non-abortable calls.</li>
+      <li><strong>Cache by query string</strong> (bounded LRU + short TTL) so backspacing and re-typing cost zero network;
+        in production let React Query/SWR own it for dedup + revalidation. Prefetch on focus; measure before prefetching
+        anything more.</li>
+    </ul>
+
+    <h3>Interaction &amp; accessibility (also O)</h3>
+    <ul>
+      <li><strong>Keyboard:</strong> focus stays in the input; arrows move a <em>virtual</em> highlight
+        (<code>activeIndex</code>). Enter selects (or submits free text), Escape closes, Tab escapes normally.
+        <code>preventDefault()</code> the arrows; click and Enter share one <code>select()</code> path.</li>
+      <li><strong>ARIA combobox pattern:</strong> input is <code>role="combobox"</code> + <code>aria-expanded</code> +
+        <code>aria-controls</code>; popup is <code>role="listbox"</code> of <code>role="option"</code>. The key is
+        <strong><code>aria-activedescendant</code></strong> pointing at the highlighted option's id — that's how a screen
+        reader announces the highlight without moving focus. An <code>aria-live</code> region announces the result count.</li>
+    </ul>
+
+    <h3>Structure &amp; the backend</h3>
+    <ul>
+      <li><strong>Put the whole lifecycle in a <code>useSuggest</code> hook</strong>, not inline in JSX — testable in
+        isolation, components stay dumb. Data source is one <code>getSuggestions(query, signal)</code> prop, so the same
+        widget does server search or local filter.</li>
+      <li><strong>The backend (trie / search index) is one paragraph.</strong> Prefix tree caching top-k ranked
+        completions per node, built offline from query logs, sharded by prefix, cached hard. Mention it, then stop —
+        going deeper is answering the backend round (tutorial 17).</li>
+    </ul>
+
+    <div class="senior">
+      If you remember one sentence from this page: <strong>a typeahead is an exercise in making the newest request win.</strong>
+      Debounce decides <em>when</em> you ask, cancellation and the sequence guard decide <em>which answer you're allowed to
+      trust</em>, the cache decides <em>when you don't have to ask at all</em>, and the combobox pattern decides
+      <em>how everyone — including a screen-reader user — drives it</em>. Volunteer the out-of-order race before you're
+      asked, wire <code>aria-activedescendant</code> correctly, and you've demonstrated the two things that separate
+      someone who has shipped this from someone who has read about it.
+    </div>
+  </section>
+
+  <nav class="page-nav">
+    <a href="20-feed-ui.html">← 20 — News Feed UI</a>
+    <a href="22-design-system.html">22 — Design System →</a>
+  </nav>
+
+</main>
+</body>
+</html>

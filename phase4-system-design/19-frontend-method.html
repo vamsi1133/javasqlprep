@@ -1,0 +1,958 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>19 — The Frontend System Design Method (RADIO) | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <div class="breadcrumb"><a href="index.html">← Course Home</a></div>
+    <h1>19 — The Frontend System Design Method (RADIO)</h1>
+    <p>A different round, graded on different things. Draw a load balancer here and you fail it.</p>
+  </div>
+</header>
+
+<main class="container">
+
+  <section>
+    <h2>Why this matters in the interview</h2>
+    <p>
+      Everything in Block B taught you to answer "how do we serve ten million users?" — estimation, sharding, replication,
+      consensus. Then a recruiter schedules you for a <em>frontend</em> system design round, you walk in, draw a load
+      balancer and three database replicas, talk about QPS for fifteen minutes, and you fail. Not because the answer was
+      wrong, but because <strong>you answered a different question than the one being asked.</strong> The frontend round
+      is not the distributed round with React sprinkled on top. It is a genuinely separate interview with its own rubric,
+      its own vocabulary, and its own failure modes — and the single most common way strong backend-leaning candidates
+      lose it is by treating it as the round they studied for. This page exists so that never happens to you. As a React
+      dev with seven years in the browser, you are the <em>favourite</em> to win this round; you just have to recognize
+      that you're in it.
+    </p>
+    <p>
+      The good news is that the frontend round has a method exactly as repeatable as the six-step backend method from
+      tutorial 01, and it has a name candidates actually use: <strong>RADIO</strong> — Requirements, Architecture and
+      components, Data model, Interface and API, Optimizations. It is the frontend analogue of "requirements → estimation
+      → API → data model → high-level design → bottlenecks," and it plays the same role: it stops you freezing at the
+      whiteboard, it makes sure you cover what's graded, and it lets you spend your energy on judgment instead of on
+      remembering what comes next. Pages 20–23 — the feed UI, the typeahead, the design system, the collaborative editor
+      — are all worked transcripts that walk this exact loop. Learn RADIO here, and those four pages become variations on
+      a shape you already own. The rest of this tutorial teaches each letter as a concept: what it is, why the interviewer
+      put it there, how to actually do it, and the one sentence to say out loud that tells them you've done this before.
+    </p>
+  </section>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ul>
+      <li><a href="#different">The round is different — and so is the grading</a> — RADIO vs the backend method · what's actually scored · why backend answers fail</li>
+      <li><a href="#requirements">R — Requirements</a> — functional vs non-functional for a UI · the questions to ask · scoping the surface</li>
+      <li><a href="#architecture">A — Architecture &amp; components</a> — the component tree · data flow · where state lives · container vs presentational</li>
+      <li><a href="#data">D — Data model</a> — client state vs server state · normalization · the store shape · derived state</li>
+      <li><a href="#interface">I — Interface &amp; API</a> — the two interfaces: component props and the network API · pagination · events up, data down</li>
+      <li><a href="#optimizations">O — Optimizations</a> — performance · network · rendering · accessibility · the biggest scoring bucket</li>
+      <li><a href="#clock">Putting RADIO on the clock</a> — the 45-minute time budget · where each letter spends its minutes</li>
+      <li><a href="#qa">Interview Q&amp;A</a></li>
+      <li><a href="#takeaways">What to remember</a></li>
+    </ul>
+  </div>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="different">The round is different — and so is the grading</h2>
+
+    <p>
+      Start with the thesis, because it reframes everything that follows: <strong>the frontend system design round grades
+      the browser half of the system that the backend round deliberately hand-waves.</strong> When a backend interviewer
+      draws a box labelled "client," that box is a rounding error to them — a thing that issues requests. The frontend
+      interviewer <em>zooms all the way into that box</em> and asks: what components is it made of, where does its state
+      live, how does data flow through it, what happens on a slow network, what happens with a screen reader, what
+      happens when the user clicks the like button twice before the first request returns. None of those questions have a
+      QPS number in them. That is the whole shift.
+    </p>
+
+    <h3>What each round is actually about</h3>
+    <p>
+      The two rounds share a skeleton — clarify, design, deep-dive, discuss trade-offs — but almost nothing else. Where
+      the backend round spends its scoring budget on scale and correctness under distribution, the frontend round spends
+      it on <strong>component design, state management, data flow, rendering performance, and accessibility.</strong>
+      Sharding, consensus, and read-replica lag simply do not appear. If you catch yourself reaching for them, you've
+      drifted into the wrong interview.
+    </p>
+
+    <table>
+      <thead><tr><th></th><th>Backend / distributed round (Block B)</th><th>Frontend round (this block)</th></tr></thead>
+      <tbody>
+        <tr><td>The core question</td><td>"How do we serve this at scale, correctly, across machines?"</td><td>"How is this UI built, and how does it stay fast, usable, and correct in one browser?"</td></tr>
+        <tr><td>Scored on</td><td>Estimation, data partitioning, consistency, the deep-dive bottleneck, trade-offs</td><td>Component decomposition, state placement, data flow, rendering/network performance, accessibility, trade-offs</td></tr>
+        <tr><td>Vocabulary that wins</td><td>QPS, sharding, consistent hashing, quorum, fan-out, CAP, replication lag</td><td>Component tree, props/state, normalization, virtualization, debounce, optimistic update, ARIA, code-splitting</td></tr>
+        <tr><td>The "server"</td><td>The whole system — the thing you're designing</td><td>A dependency behind an API contract. You assume it exists and design the client against it.</td></tr>
+        <tr><td>The "client"</td><td>A box that issues requests — hand-waved</td><td>The entire subject of the interview — zoomed all the way in</td></tr>
+        <tr><td>Estimation</td><td>DAU → QPS → storage → bandwidth, with arithmetic</td><td>Rarely numeric. "How many DOM nodes / how big is the payload / what's the frame budget" at most</td></tr>
+        <tr><td>The killer follow-up</td><td>"What breaks at 10× traffic?"</td><td>"What happens on a slow 3G connection / with a screen reader / when this request fails?"</td></tr>
+      </tbody>
+    </table>
+
+    <h3>RADIO is the frontend six-step method</h3>
+    <p>
+      You already internalized a five-to-six-step loop for the backend round in tutorial 01. RADIO is the same idea,
+      re-pointed at the browser. Map them side by side and the round stops feeling foreign — you're doing the same
+      <em>motions</em> (clarify the problem, sketch the structure, define the data, define the contracts, then make it
+      good), just grading different artifacts at each step.
+    </p>
+
+    <table>
+      <thead><tr><th>Backend six-step (tut. 01)</th><th>RADIO step</th><th>What you actually produce</th></tr></thead>
+      <tbody>
+        <tr><td>1. Requirements (functional / non-functional)</td><td><strong>R</strong> — Requirements</td><td>The feature list, the non-functionals that matter for a UI (perf, a11y, devices, offline), the scope you're cutting</td></tr>
+        <tr><td>5. High-level design (the box diagram)</td><td><strong>A</strong> — Architecture &amp; components</td><td>The component tree, data-flow arrows, and where each piece of state lives</td></tr>
+        <tr><td>4. Data model (tables &amp; access patterns)</td><td><strong>D</strong> — Data model</td><td>The client-side entities and store shape; the client-state vs server-state split</td></tr>
+        <tr><td>3. API design (endpoints, shapes)</td><td><strong>I</strong> — Interface &amp; API</td><td><em>Two</em> interfaces: the component props API, and the network API the client consumes</td></tr>
+        <tr><td>6. Bottlenecks &amp; scale</td><td><strong>O</strong> — Optimizations</td><td>Performance, network efficiency, rendering, and accessibility — the deep-dive and the biggest bucket</td></tr>
+        <tr><td>2. Estimation</td><td>(folded into R / O)</td><td>Payload sizes, node counts, frame budgets — used to justify a choice, not as a headline step</td></tr>
+      </tbody>
+    </table>
+
+    <div class="pitfall">
+      <strong>The single most common way to fail this round is to answer the backend round instead.</strong> The tell is
+      when a candidate designs a news feed UI and spends ten minutes on how the feed service shards posts, fans out to
+      followers, and caches timelines in Redis. All true, all irrelevant — the interviewer wanted to know how the feed
+      <em>component</em> virtualizes a 10,000-item list, how it paginates without the scroll jumping, and how it shows an
+      optimistic like. You've spent your best minutes proving you can do the <em>other</em> interview. If the prompt is a
+      screen — "design Twitter's feed," "design an autocomplete," "design a photo grid" — assume it's the frontend round
+      until told otherwise, and put the server behind a one-line API contract you can define in thirty seconds and move on.
+    </div>
+
+    <div class="note">
+      You already have the instincts this round rewards; you're just not used to <em>narrating</em> them. Every day you
+      decide whether a piece of state belongs in a component, in context, or in a server-cache library; whether to
+      debounce an input; whether a list needs virtualizing; whether a control is keyboard-reachable. The frontend round
+      is that daily judgment, spoken out loud and defended. The work of this page is teaching you the vocabulary and the
+      order (RADIO) so the judgment you already have comes out as a structured 45-minute answer instead of a pile of
+      correct-but-unsequenced observations.
+    </div>
+
+    <div class="senior">
+      Open the round by naming it: <em>"Before I design anything — I'm reading this as a frontend system design problem,
+      so I'll focus on the client architecture, state, data flow, performance and accessibility, and treat the backend as
+      an API contract I'll define but not scale. Shout if you actually want me to design the service too."</em> This does
+      three things a junior candidate skips: it proves you know there are two different rounds, it locks scope so you
+      don't waste minutes on the wrong half, and it hands the interviewer an explicit chance to redirect you. Thirty
+      seconds, and you've already signalled that you've been in this room before.
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="requirements">R — Requirements</h2>
+
+    <p>
+      <strong>What it is:</strong> the same first move as the backend round — pin down what you're building before you
+      build it — but the questions you ask are about the <em>experience</em>, not the scale. You still split functional
+      from non-functional. You still scope ruthlessly and say what you're cutting. What changes is the content of both
+      lists.
+    </p>
+    <p>
+      <strong>Why it exists:</strong> the prompt is deliberately vague ("design a news feed"), and a feed for Twitter is
+      a different build from a feed for a photo-sharing app or an enterprise activity stream. The interviewer is watching
+      whether you <em>define the surface</em> before you draw components. Skipping this is the frontend equivalent of
+      coding before reading the ticket, and it reads exactly as junior here as it does in the backend round.
+    </p>
+
+    <h3>Functional requirements — for a UI, these are user-visible behaviours</h3>
+    <p>
+      Not endpoints — <em>interactions</em>. What can the user see and do on this screen? For a feed: view a scrollable
+      list of posts, load more as they scroll, like/unlike a post, compose a new post, open a post's comments. Enumerate
+      the interactions and you've enumerated the components you'll need to design. This is also where you cut: "I'll build
+      viewing, infinite scroll, and liking; I'll stub compose and comments as navigation targets rather than designing
+      them, unless you'd rather I go deep on one of those." Naming the cut is the senior move — same as backend.
+    </p>
+
+    <h3>Non-functional requirements — this is where the round announces itself</h3>
+    <p>
+      The backend round's non-functionals are availability, latency, consistency, durability. The frontend round's are a
+      completely different list, and <strong>reciting it unprompted is one of the fastest ways to signal you know which
+      interview you're in.</strong>
+    </p>
+
+    <table>
+      <thead><tr><th>Non-functional</th><th>The question to ask</th><th>Why it changes the design</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Devices &amp; viewport</strong></td><td>"Desktop, mobile web, or both? Responsive down to what width?"</td><td>Mobile means touch targets, smaller payloads, and a hard performance budget on weak CPUs.</td></tr>
+        <tr><td><strong>Performance budget</strong></td><td>"What matters more — time to first content, or interaction smoothness? Any Core Web Vitals target?"</td><td>Drives SSR vs CSR, code-splitting, virtualization, and whether you optimize load or runtime.</td></tr>
+        <tr><td><strong>Network conditions</strong></td><td>"Should this work on slow/flaky 3G? Any offline expectation?"</td><td>Decides prefetch aggressiveness, optimistic updates, retry/skeleton strategy, caching.</td></tr>
+        <tr><td><strong>Accessibility</strong></td><td>"What's our a11y bar — WCAG AA? Full keyboard + screen-reader support?"</td><td>a11y is a first-class scored dimension here, not a nice-to-have. It shapes markup and interaction from the start.</td></tr>
+        <tr><td><strong>Internationalization</strong></td><td>"Multiple languages? RTL? Localized dates/numbers?"</td><td>RTL and variable text length affect layout; i18n affects bundle and formatting. Usually you scope it <em>out</em>, but say so.</td></tr>
+        <tr><td><strong>Data freshness / real-time</strong></td><td>"Is this real-time (new posts pushed live) or fetch-on-load?"</td><td>Real-time pulls in WebSockets/SSE, optimistic UI, and conflict handling (tutorial 23).</td></tr>
+        <tr><td><strong>Scale of the UI</strong></td><td>"How many items in the list — hundreds, or effectively infinite?"</td><td>The frontend's version of estimation. 10,000 rows means virtualization is mandatory, not optional.</td></tr>
+      </tbody>
+    </table>
+
+    <p>
+      <strong>How you do it:</strong> ask three or four of these, don't recite all seven — you're demonstrating that you
+      know the axes, not filling a form. Then state your assumptions and move: <em>"I'll assume responsive desktop and
+      mobile web, WCAG AA, works on 3G with skeletons, English-only for now, fetch-on-load with pull-to-refresh rather
+      than live push. Good?"</em> That single sentence <em>is</em> the non-functional spec, and it took fifteen seconds.
+    </p>
+
+    <div class="pitfall">
+      Do not turn Requirements into a numbers exercise out of backend habit. There is usually no DAU-to-QPS arithmetic
+      here, and grinding one out wastes the minutes you need for Architecture and Optimizations. The one estimation that
+      <em>does</em> earn its place is <strong>list size and payload weight</strong> — "if a feed page is 20 posts at ~2 KB
+      of JSON each plus images, that's a 40 KB metadata payload and the images dominate, so image loading is my real
+      performance problem" — because that number actually drives a design decision. Estimate only what changes what you'll
+      build.
+    </div>
+
+    <div class="senior">
+      Say the accessibility bar out loud in Requirements, before anyone asks: <em>"I'll target WCAG AA — full keyboard
+      operability and correct semantics for a screen reader — and I'll fold that into each component as I design it rather
+      than bolting it on at the end."</em> Most candidates either forget a11y entirely or treat it as an afterthought in a
+      corner of the whiteboard. Naming it as a requirement <em>up front</em>, and then actually honouring it when you get
+      to the components, is one of the clearest senior signals available in this round — and it's a home-game for you,
+      because you've shipped this before.
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="architecture">A — Architecture &amp; components</h2>
+
+    <p>
+      <strong>What it is:</strong> the frontend round's version of the high-level box diagram, except your boxes are
+      <em>components</em> and your arrows are <em>data flow and events</em>. You produce three things here — a component
+      tree, a statement of where each piece of state lives, and the direction data flows — and this is the step that most
+      directly tests "can this person decompose a UI," which is a top-scored dimension.
+    </p>
+    <p>
+      <strong>Why it exists:</strong> component decomposition is to a frontend engineer what service decomposition is to a
+      backend engineer — it's the structural judgment the whole role rests on. Break the UI into the wrong pieces and
+      every later decision (where state lives, what re-renders, what you can reuse) gets harder. The interviewer is
+      watching whether you carve along the right seams: by <em>responsibility and reuse</em>, not by "boxes I can see on
+      the screen."
+    </p>
+
+    <h3>The component tree — draw this first</h3>
+    <p>
+      Sketch the UI as a tree, top-down, the same way you'd draw services in a backend HLD. Naming the tree forces the
+      decomposition to be explicit and gives the interviewer something concrete to push on.
+    </p>
+
+<pre><code>  &lt;FeedPage&gt;                        ← route-level container; owns data fetching
+    ├─ &lt;Composer&gt;                    ← new-post input; local form state
+    ├─ &lt;FeedList&gt;                    ← the virtualized scroll container
+    │    ├─ &lt;FeedItem&gt;               ← one post (repeated ×N, virtualized)
+    │    │    ├─ &lt;PostHeader&gt;        ← avatar, name, timestamp
+    │    │    ├─ &lt;PostBody&gt;          ← text + media
+    │    │    └─ &lt;PostActions&gt;       ← like / comment / share buttons
+    │    └─ &lt;LoadMoreSentinel&gt;       ← IntersectionObserver trigger for next page
+    └─ &lt;Toast&gt;                       ← transient errors / undo affordances
+</code></pre>
+
+    <p>
+      <strong>How you decide the seams.</strong> A component should have one responsibility, and you should be able to
+      name it. <code>FeedItem</code> renders one post; <code>PostActions</code> owns the interaction buttons; the split
+      exists because actions have their own local state (is-liking, optimistic count) and you don't want that state
+      forcing the whole item to re-render. The two seams interviewers reward you for finding: <strong>reuse</strong>
+      (<code>PostActions</code> is the same on the feed and the detail page — factor it out) and <strong>re-render
+      isolation</strong> (state that changes often lives in a small leaf so the change doesn't ripple upward).
+    </p>
+
+    <h3>Where does state live? — the highest-value question in this step</h3>
+    <p>
+      This is the frontend analogue of "where does this data live" in the backend round, and it's graded just as hard.
+      For every piece of state, you answer: how <em>local</em> can it be? The guiding principle you should say out loud is
+      <strong>lift state to the lowest common ancestor of the components that need it, and no higher.</strong> State
+      that's too global re-renders half the tree on every keystroke; state that's too local has to be awkwardly threaded
+      back up when a sibling needs it.
+    </p>
+
+    <table>
+      <thead><tr><th>State</th><th>Where it lives</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>Composer draft text</td><td><strong>Local</strong> to <code>Composer</code> (<code>useState</code>)</td><td>Nothing else needs it; keeping it local means keystrokes don't re-render the feed.</td></tr>
+        <tr><td>"Is this post liked" + count</td><td><strong>Local</strong> to <code>PostActions</code>, hydrated from server data</td><td>Optimistic toggle is isolated to one leaf; a like on post 5 doesn't touch post 6.</td></tr>
+        <tr><td>The list of posts + pagination cursor</td><td><strong>Container</strong> (<code>FeedPage</code>) or a server-cache library</td><td>Shared by the whole list; it's server state (see the D step), so ideally React Query / SWR owns it.</td></tr>
+        <tr><td>Current theme / logged-in user</td><td><strong>App-global</strong> (Context / store)</td><td>Read in many places, changes rarely — the exact profile Context is good at.</td></tr>
+        <tr><td>"Which post's comment sheet is open"</td><td><strong>Container or URL</strong></td><td>UI state that outlives a leaf; putting it in the URL makes it shareable and back-button-friendly.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Data flow — data down, events up</h3>
+    <p>
+      Draw the arrows. In a React-shaped architecture, data flows <em>down</em> through props and events flow <em>up</em>
+      through callbacks (or dispatches). The container fetches the feed and passes each post down; a like click travels
+      up as an <code>onLike(postId)</code> callback the container (or a mutation hook) handles, then the new data flows
+      back down. Saying "unidirectional data flow" and then actually tracing one interaction end-to-end on your diagram is
+      worth more than any amount of box-drawing.
+    </p>
+
+<pre><code>   server ──fetch──▶ FeedPage ──posts (props)──▶ FeedList ──post──▶ FeedItem
+                        ▲                                              │
+                        └──────── onLike(postId) (event bubbles up) ──┘
+   (data flows DOWN as props · events flow UP as callbacks · one direction)
+</code></pre>
+
+    <h3>Container vs presentational — a useful vocabulary, not a rule</h3>
+    <p>
+      The old container/presentational split — "smart" components that fetch and own state, "dumb" components that only
+      take props and render — is less of a hard rule since hooks (a hook lets any component be "smart"), but the
+      <em>vocabulary</em> is still the clearest way to talk about the seam in an interview. Say: <em>"<code>FeedPage</code>
+      is the container — it owns data fetching and the mutation handlers; everything below it is presentational and driven
+      by props, which keeps the leaves pure, trivially testable, and reusable on the detail page."</em> That sentence
+      communicates your whole architecture in one breath.
+    </p>
+
+    <div class="pitfall">
+      Don't decompose by visual boxes — decompose by responsibility and state. The giveaway of a shallow answer is a tree
+      that mirrors the CSS layout (<code>Header</code>, <code>Sidebar</code>, <code>MainColumn</code>) with no thought to
+      what owns which state or what re-renders when. A layout is not an architecture. Two visually identical regions can
+      be one reusable component; one visual box can be three components because three different things change inside it at
+      three different rates. Carve along the axes of <strong>change</strong> and <strong>reuse</strong>, and justify each
+      seam that way.
+    </div>
+
+    <div class="senior">
+      The line that shows you think about performance <em>structurally</em>, before anyone says the word "slow":
+      <em>"I'm keeping the like state inside <code>PostActions</code> rather than in the container on purpose — if the
+      liked-count lived in the container's post array, toggling one like would re-render the entire list. Colocating the
+      volatile state in the leaf means a like re-renders exactly one button."</em> That's the same instinct as picking a
+      shard key so one hot entity doesn't melt one node — you're bounding the blast radius of a change — and stating it
+      unprompted tells the interviewer you design for render cost the way a backend engineer designs for load.
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="data">D — Data model</h2>
+
+    <p>
+      <strong>What it is:</strong> the shape of the data <em>as the client holds it</em>. Not database tables — that's
+      the backend round's data model. This is the client-side store: what entities you keep in memory, how they're keyed
+      and related, and — the decision that dominates this step — <strong>which of your state is server state and which is
+      client state.</strong>
+    </p>
+    <p>
+      <strong>Why it exists:</strong> most "frontend bugs" in a design are really data-model bugs. Duplicated data that
+      drifts out of sync, a list and a detail view showing different like-counts for the same post, a cache you can't
+      invalidate — all of these come from modelling the client's data badly. Getting this right is what makes the
+      Optimizations step (caching, optimistic updates) possible instead of painful.
+    </p>
+
+    <h3>The split that organizes everything: server state vs client state</h3>
+    <p>
+      This is the single most important distinction in modern frontend architecture, and stating it explicitly instantly
+      separates you from candidates who think "state management" means "put everything in Redux." The two kinds of state
+      have opposite properties and want opposite tools.
+    </p>
+
+    <table>
+      <thead><tr><th></th><th>Server state (server-cache state)</th><th>Client state (UI state)</th></tr></thead>
+      <tbody>
+        <tr><td>What it is</td><td>Data that lives on the server; the client holds a <em>cached copy</em></td><td>Data that only ever exists in the browser</td></tr>
+        <tr><td>Examples</td><td>The feed, a user profile, comments, search results</td><td>Is a modal open, form draft text, selected tab, theme toggle</td></tr>
+        <tr><td>Owned by</td><td>The server — the client's copy can go stale</td><td>The client — it is the source of truth</td></tr>
+        <tr><td>Key problems</td><td>Caching, revalidation, staleness, loading/error states, deduping requests, refetch</td><td>Just… setting and reading it. No network, no staleness.</td></tr>
+        <tr><td>Right tool</td><td><strong>React Query / SWR / RTK Query / Apollo</strong> — a server-cache library</td><td><code>useState</code>, <code>useReducer</code>, Context, or a small store (Zustand/Redux)</td></tr>
+        <tr><td>Wrong tool</td><td>Hand-rolled <code>useEffect</code> + <code>useState</code> fetching, or dumping it in Redux</td><td>A server-cache library (pointless overhead)</td></tr>
+      </tbody>
+    </table>
+
+    <p>
+      <strong>The senior framing:</strong> server state is not really <em>state</em>, it's a <em>cache</em> — and
+      everything you learned about caching in tutorial 06 applies directly in the browser. It goes stale. It needs a
+      revalidation strategy (stale-while-revalidate is the default a library like SWR is literally named after). It needs
+      loading and error states. It needs request deduplication so ten components asking for the same user don't fire ten
+      requests. Treating server data as a cache — rather than as state you manually keep in sync with <code>useEffect</code>
+      — is the whole reason React Query exists, and saying so is a strong signal.
+    </p>
+
+    <div class="note">
+      This maps cleanly onto tutorial 06's cache patterns. A server-cache library is doing <strong>cache-aside with
+      stale-while-revalidate</strong> for you: it serves the cached value instantly (the hit), fires a background refetch
+      (revalidate), and swaps in fresh data when it arrives. Request deduplication is the same <strong>single-flight /
+      request coalescing</strong> fix from the stampede section — ten components mounting at once and all wanting
+      <code>user:42</code> collapse to one network request. You already know this machinery from the backend page; the
+      browser is just another tier of the same cache stack.
+    </div>
+
+    <h3>Normalize shared entities — the client-side "third normal form"</h3>
+    <p>
+      When the same entity appears in multiple places — a user who authored ten posts, a post that shows in the feed and
+      the detail view — do <em>not</em> store copies. Store each entity once, keyed by id, and reference it by id
+      elsewhere. This is exactly database normalization, moved into the client, and it exists for the same reason: to
+      keep a single source of truth so an update in one place is seen everywhere and nothing drifts.
+    </p>
+
+<pre><code><span class="com">// DENORMALIZED — the same author is copied into every post.</span>
+<span class="com">// Update the author's name and you must find and fix N copies. It WILL drift.</span>
+<span class="kw">const</span> bad = {
+  feed: [
+    { id: <span class="str">"p1"</span>, text: <span class="str">"..."</span>, author: { id: <span class="str">"u9"</span>, name: <span class="str">"Ada"</span> } },
+    { id: <span class="str">"p2"</span>, text: <span class="str">"..."</span>, author: { id: <span class="str">"u9"</span>, name: <span class="str">"Ada"</span> } },
+  ],
+};
+
+<span class="com">// NORMALIZED — entities stored once by id; lists hold ids and reference them.</span>
+<span class="com">// Update users["u9"].name in ONE place and every post re-renders correctly.</span>
+<span class="kw">const</span> good = {
+  posts: { p1: { id: <span class="str">"p1"</span>, text: <span class="str">"..."</span>, authorId: <span class="str">"u9"</span>, likedByMe: <span class="kw">false</span>, likeCount: <span class="num">12</span> },
+           p2: { id: <span class="str">"p2"</span>, text: <span class="str">"..."</span>, authorId: <span class="str">"u9"</span>, likedByMe: <span class="kw">true</span>,  likeCount: <span class="num">30</span> } },
+  users: { u9: { id: <span class="str">"u9"</span>, name: <span class="str">"Ada"</span>, avatarUrl: <span class="str">"..."</span> } },
+  feed:  { ids: [<span class="str">"p1"</span>, <span class="str">"p2"</span>], nextCursor: <span class="str">"c_2"</span> },  <span class="com">// the ORDER lives here, separate from the entities</span>
+};
+</code></pre>
+
+    <p>
+      Note the separation in the normalized shape: <code>feed.ids</code> holds the <em>order</em> and the pagination
+      cursor, while <code>posts</code> holds the <em>entities</em>. That split is what lets you append the next page
+      (push ids) without touching stored posts, dedupe a post that appears in two lists, and update one post's like-count
+      in exactly one place. It's the same reason the backend round keeps an index separate from the rows.
+    </p>
+
+    <h3>Derived state — compute, don't store</h3>
+    <p>
+      The last rule of the client data model: if a value can be <em>computed</em> from existing state, do not store it as
+      its own state — derive it during render (memoized if it's expensive). "Number of unread items," "is the form valid,"
+      "the filtered visible list" are all derived. Storing them creates a second source of truth you now have to keep in
+      sync, which is the exact drift problem normalization exists to prevent. Say <em>"that's derived, I'll compute it with
+      a <code>useMemo</code> rather than store it"</em> and you've closed off a whole class of bugs before they're raised.
+    </p>
+
+    <div class="pitfall">
+      Putting server state in Redux (or any client store) is the most common data-model mistake, and it's a costly one to
+      defend. You inherit every hard cache problem by hand: you write the loading flags, the error flags, the "is it
+      stale," the refetch-on-focus, the dedup, the cache eviction — reimplementing React Query badly, in reducers. If an
+      interviewer sees you reach for Redux to hold fetched API data, expect the follow-up "how do you invalidate that when
+      it goes stale?" — and the honest answer is "I wouldn't put it there." Client stores are for client state: cross-cutting
+      UI concerns like theme, auth session, a multi-step wizard. Server data belongs in a server-cache library.
+    </div>
+
+    <div class="senior">
+      Say the split as your opening line for this step: <em>"I'll separate server state from client state. The feed,
+      profiles and comments are server state — I'll model them as a normalized, id-keyed cache managed by React Query, so
+      I get deduping, background revalidation and cache invalidation for free. Client state — open modals, the composer
+      draft, selected tab — stays local or in a small store. Almost nothing needs to be truly global."</em> That one
+      paragraph tells the interviewer you understand the defining problem of modern frontend data, and it makes the
+      Optimizations step (optimistic updates, cache invalidation) fall out naturally instead of feeling bolted on.
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="interface">I — Interface &amp; API</h2>
+
+    <p>
+      <strong>What it is:</strong> the contracts. And the thing to internalize — the reason this letter is worth its own
+      step rather than being folded into Architecture — is that in a frontend design there are <em>two</em> interfaces,
+      and strong candidates address both:
+    </p>
+    <ul>
+      <li><strong>The component interface (props API)</strong> — how your components talk to <em>each other</em>. The
+        props a component accepts, the callbacks it emits. This is API design pointed inward, and it's unique to the
+        frontend round.</li>
+      <li><strong>The network API</strong> — how the client talks to the <em>server</em>. Endpoints, request/response
+        shapes, pagination. This is the same API-design skill as the backend round, but you're the <em>consumer</em>
+        defining what you need, not the producer designing the whole service.</li>
+    </ul>
+    <p>
+      <strong>Why it exists:</strong> the props API is where component <em>reusability</em> is won or lost — a badly
+      shaped prop interface makes a component impossible to reuse and impossible to test. The network API is where
+      client-side performance is won or lost, because pagination shape, over-fetching, and round-trip count are decided
+      here. Both are graded; skipping the props API is the more common miss because backend-leaning candidates don't
+      think of "component props" as an API at all.
+    </p>
+
+    <h3>The component interface — props down, callbacks up</h3>
+    <p>
+      Design each reusable component's props like a public API: minimal, well-typed, and hard to misuse. The pattern is
+      the data-flow direction from the Architecture step made concrete — <strong>data comes in as props, events go out as
+      callbacks.</strong>
+    </p>
+
+<pre><code><span class="com">// PostActions: a small, reusable, presentational component.</span>
+<span class="com">// Data in as props; the only thing it emits is an intent (onLike).</span>
+<span class="kw">interface</span> <span class="typ">PostActionsProps</span> {
+  postId: <span class="typ">string</span>;
+  likeCount: <span class="typ">number</span>;
+  likedByMe: <span class="typ">boolean</span>;
+  onLike: (postId: <span class="typ">string</span>) =&gt; <span class="typ">void</span>;   <span class="com">// event UP — parent decides what "like" means</span>
+  onComment: (postId: <span class="typ">string</span>) =&gt; <span class="typ">void</span>;
+}
+
+<span class="com">// It renders from props and calls back on interaction. No fetching, no store</span>
+<span class="com">// access — which is exactly what makes it reusable on the feed AND the detail page,</span>
+<span class="com">// and trivially testable: render with props, click, assert the callback fired.</span>
+</code></pre>
+
+    <p>
+      Two judgment calls to voice here. First, <strong>keep the leaf presentational</strong>: <code>PostActions</code>
+      takes <code>likedByMe</code> as a prop rather than reading a store, so it has no idea where its data comes from —
+      that's what lets you drop it anywhere. Second, <strong>emit intent, not implementation</strong>: it calls
+      <code>onLike(postId)</code>, not "increment this counter and POST to this URL." The parent owns the meaning of a
+      like. That separation is the props-API equivalent of a clean service boundary.
+    </p>
+
+    <h3>The network API — you're the consumer, so ask for exactly what the UI needs</h3>
+    <p>
+      Define the handful of endpoints the screen needs, with their shapes. You're not designing the whole service; you're
+      specifying the contract you'd want your backend team to build. The senior instinct is to shape the API <em>around
+      the component's needs</em> — request the fields you render and no more, and get the round-trip count down.
+    </p>
+
+<pre><code><span class="com">// GET the feed — cursor-paginated (see below for why cursor, not offset)</span>
+GET /api/feed?cursor=c_2&amp;limit=20
+<span class="com">// →</span> {
+     posts: [ { id, authorId, text, mediaUrl, likeCount, likedByMe, createdAt } ],
+     users: [ { id, name, avatarUrl } ],   <span class="com">// side-loaded → normalize straight into the store</span>
+     nextCursor: <span class="str">"c_3"</span>
+   }
+
+<span class="com">// Like a post — the mutation behind onLike. Idempotent so a double-tap is safe.</span>
+PUT /api/posts/:id/like      <span class="com">// PUT not POST: setting "liked" twice == liked once</span>
+<span class="com">// →</span> { likeCount: <span class="num">31</span>, likedByMe: <span class="kw">true</span> }
+</code></pre>
+
+    <p>
+      Notice the response side-loads <code>users</code> separately from <code>posts</code> — that's the normalized store
+      shape from the D step reaching back into the API design, so the client can drop entities straight into their tables
+      without unpacking nested duplicates. And notice <code>PUT</code> for the like: making the mutation idempotent means
+      the double-tap race (user taps like twice, or the request retries) can't produce a like-count of 2. That's the same
+      idempotency reasoning as tutorial 06, applied to a button.
+    </p>
+
+    <h3>Pagination: cursor, not offset — and know why</h3>
+    <p>
+      For any infinite-scrolling or frequently-changing list, use <strong>cursor-based</strong> pagination
+      (<code>?cursor=c_2</code>), not <strong>offset-based</strong> (<code>?page=3</code> / <code>?offset=40</code>).
+      This comes up in nearly every frontend design and the reasoning is worth having cold.
+    </p>
+
+    <table>
+      <thead><tr><th></th><th>Offset (<code>?offset=40&amp;limit=20</code>)</th><th>Cursor (<code>?cursor=c_2&amp;limit=20</code>)</th></tr></thead>
+      <tbody>
+        <tr><td>How it works</td><td>"Skip 40 rows, take 20"</td><td>"Give me 20 after this stable pointer"</td></tr>
+        <tr><td>New item inserted at top mid-scroll</td><td><strong>Drift</strong> — everything shifts down by one, so row 40 is now what was row 39; you re-see a post or skip one</td><td>Stable — the cursor points at a specific item, unaffected by inserts above it</td></tr>
+        <tr><td>Deep pages performance</td><td>Slow — the DB still scans and discards the skipped rows</td><td>Fast — an indexed seek to the cursor</td></tr>
+        <tr><td>Jump to an arbitrary page</td><td>Trivial (page 7 = offset 120)</td><td>Not supported — you can only go next/prev</td></tr>
+        <tr><td>Best for</td><td>Fixed, page-numbered tables (admin lists, search results with page numbers)</td><td><strong>Infinite scroll, feeds, any real-time list</strong></td></tr>
+      </tbody>
+    </table>
+
+    <p>
+      The one-liner: <em>"Offset pagination drifts when items are inserted or deleted while the user scrolls — they see
+      duplicates or gaps — so for a feed I'll use a cursor, which points at a stable position and is immune to inserts
+      above it. I'd only use offset for a fixed, page-numbered table where jumping to page 7 matters."</em> Tutorial 20
+      builds the whole feed around exactly this decision.
+    </p>
+
+    <div class="pitfall">
+      Don't skip the props API and only design the network endpoints — that's the backend-habit version of this step, and
+      it leaves half the score on the table. The props API is where the interviewer sees whether you can build a
+      <em>reusable</em> component versus a one-off. Equally, don't over-fetch: requesting a fat <code>/user</code> object
+      with 40 fields to render an avatar and a name is the client-side version of a <code>SELECT *</code>, and on mobile
+      it's paid for in bytes over a slow radio. Shape the request to the render.
+    </div>
+
+    <div class="senior">
+      Tie the two interfaces together out loud: <em>"There are two contracts here. The network API I'll shape to the
+      component's needs — side-load users so I can normalize, cursor-paginate the feed so it doesn't drift, and make the
+      like idempotent so a double-tap is safe. The component API I'll keep presentational — <code>PostActions</code> takes
+      data as props and emits <code>onLike</code>, knowing nothing about fetching — because that's what lets me reuse it on
+      the detail page and unit-test it in isolation."</em> Naming <em>both</em> interfaces, and connecting the network shape
+      back to the normalized data model, is the move that reads as a senior frontend engineer rather than a backend
+      engineer visiting.
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="optimizations">O — Optimizations</h2>
+
+    <p>
+      <strong>What it is:</strong> the deep-dive, and the biggest scoring bucket in the round. This is the frontend
+      equivalent of the backend "bottlenecks &amp; scale" step — where the interviewer stops nodding along and starts
+      pushing. But instead of "what breaks at 10× traffic," the pressure is "what happens on a slow network, with a huge
+      list, with a screen reader, when a request fails." You will not have time to cover everything; the skill is to
+      <strong>name the four axes, then go deep on the one or two the interviewer cares about.</strong>
+    </p>
+    <p>
+      <strong>Why it exists:</strong> a UI that's correct but slow, janky, or unusable with a keyboard is a UI that
+      shipped and got complained about. This step is where seven years of actually-shipping-frontend pays off, because
+      these are the problems you've genuinely hit. There are four axes, and you should say them as a menu before diving:
+      <strong>performance (load), performance (runtime/rendering), network efficiency, and accessibility.</strong>
+    </p>
+
+    <h3>Axis 1 — Load performance: get to first content fast</h3>
+    <ul>
+      <li><strong>Code-splitting &amp; lazy loading.</strong> Don't ship the comment sheet, the composer's rich-text
+        editor, and the settings modal in the initial bundle. Route-level and interaction-level <code>React.lazy</code> /
+        dynamic <code>import()</code> so the first paint downloads only what the first screen needs. This is the frontend
+        version of "don't do work on the critical path you don't have to."</li>
+      <li><strong>SSR / streaming vs client-render.</strong> If time-to-first-content is the priority (it usually is for
+        content sites), render on the server so the user sees posts before the JS boots, then hydrate. If it's an
+        app-behind-a-login where interactivity matters more, CSR is fine. Name the trade-off; don't default blindly.</li>
+      <li><strong>Critical assets &amp; fonts.</strong> Preload the hero image, avoid layout-shifting web fonts
+        (CLS), inline critical CSS. These are the Core Web Vitals levers — LCP, CLS, INP — and naming them by acronym
+        signals you've been measured on them.</li>
+    </ul>
+
+    <h3>Axis 2 — Runtime/rendering: keep it smooth after it loads</h3>
+    <ul>
+      <li><strong>List virtualization (windowing) — the marquee technique of this round.</strong> A feed of 10,000 posts
+        must not put 10,000 DOM nodes on the page; the browser can't lay out or paint that, and memory balloons. Render
+        only the ~20 rows in the viewport (plus a small overscan buffer) and recycle nodes as the user scrolls. This is
+        mandatory for any long list and is the answer the interviewer is fishing for the instant you say "infinite
+        scroll." <code>react-window</code> / <code>react-virtual</code> are the names to drop.</li>
+      <li><strong>Avoiding needless re-renders.</strong> The colocated-state decision from the Architecture step is the
+        first line of defense. Beyond it: memoize expensive subtrees (<code>React.memo</code>), memoize expensive
+        computations (<code>useMemo</code>) and stable callbacks (<code>useCallback</code>) so children don't re-render on
+        identity churn, and use stable <code>key</code>s in lists (never the array index for a reorderable list — it
+        breaks reconciliation and state gets attached to the wrong row).</li>
+      <li><strong>Keep the main thread free.</strong> Debounce/throttle high-frequency handlers (scroll, resize,
+        keystroke); move genuinely heavy work (parsing, diffing) off to a Web Worker; batch DOM reads and writes to avoid
+        layout thrash. The frame budget is ~16 ms at 60 fps — that's the "latency number" of this round.</li>
+    </ul>
+
+    <h3>Axis 3 — Network efficiency &amp; perceived performance</h3>
+    <ul>
+      <li><strong>Optimistic updates.</strong> When the user likes a post, update the UI <em>immediately</em> from the
+        client and fire the request in the background; if it fails, roll back and show a toast. The interaction feels
+        instant instead of gated on a round trip. This is a top-three thing to mention, and it's why the like-count lived
+        as isolated leaf state in the Architecture step — so the optimistic toggle is cheap and local.</li>
+      <li><strong>Caching &amp; revalidation.</strong> The server-cache library (D step) serves cached data instantly and
+        revalidates in the background — stale-while-revalidate. Dedupe concurrent requests for the same key. Prefetch the
+        likely-next data (the next page as the sentinel approaches; a post's detail on hover).</li>
+      <li><strong>Right-sizing payloads.</strong> Paginate (don't fetch 10,000 posts), request only rendered fields,
+        compress, and lazy-load images below the fold with <code>loading="lazy"</code> and correctly-sized
+        <code>srcset</code> variants. On mobile, bytes are latency.</li>
+      <li><strong>Handle the race.</strong> For anything type-ahead-driven, out-of-order responses are a real bug: request
+        for "re" returns after request for "reac" and clobbers the newer results. Cancel stale requests
+        (<code>AbortController</code>) or ignore responses that don't match the current query. Tutorial 21 is built around
+        this race.</li>
+    </ul>
+
+    <h3>Axis 4 — Accessibility: a scored dimension, not a bonus</h3>
+    <ul>
+      <li><strong>Semantic HTML first.</strong> A real <code>&lt;button&gt;</code>, not a <code>&lt;div onClick&gt;</code>
+        — you get keyboard operability, focus, and the correct screen-reader role for free. Most a11y wins are "use the
+        right element," and saying that is worth more than reciting ARIA attributes.</li>
+      <li><strong>Keyboard operability.</strong> Everything interactive must be reachable and operable by keyboard, with a
+        visible focus ring and a sensible tab order. For composite widgets (a typeahead, a menu) manage focus and roving
+        <code>tabindex</code> deliberately.</li>
+      <li><strong>Screen readers &amp; ARIA — but only where semantics fall short.</strong> Use the ARIA <em>patterns</em>
+        (a combobox for autocomplete, a dialog for a modal), label controls, and announce dynamic changes with an
+        <code>aria-live</code> region so a screen-reader user knows new posts loaded or a like registered.</li>
+      <li><strong>The rest of the inclusive baseline:</strong> sufficient colour contrast, respect
+        <code>prefers-reduced-motion</code>, don't convey meaning by colour alone, trap focus inside modals and restore it
+        on close.</li>
+    </ul>
+
+    <table>
+      <thead><tr><th>Axis</th><th>The techniques</th><th>Triggered by the follow-up</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Load perf</strong></td><td>Code-splitting, lazy loading, SSR/streaming, preload, Core Web Vitals</td><td>"Why is first load slow / large bundle?"</td></tr>
+        <tr><td><strong>Runtime perf</strong></td><td>Virtualization, memoization, stable keys, debounce/throttle, workers</td><td>"It's a 10,000-item list / it janks while scrolling"</td></tr>
+        <tr><td><strong>Network</strong></td><td>Optimistic updates, SWR caching, prefetch, pagination, cancel stale requests</td><td>"What happens on slow 3G / when the request fails?"</td></tr>
+        <tr><td><strong>Accessibility</strong></td><td>Semantic HTML, keyboard, focus management, ARIA patterns, live regions, contrast</td><td>"How does this work with a screen reader / keyboard only?"</td></tr>
+      </tbody>
+    </table>
+
+    <div class="pitfall">
+      Don't try to list all four axes exhaustively — you'll run out of clock and cover everything shallowly. The move is
+      to <em>menu then dive</em>: <em>"On optimizations I'd look at load performance, runtime rendering, network, and
+      accessibility — which do you want me to go deepest on?"</em> Nine times out of ten the interviewer picks one (usually
+      virtualization or optimistic updates for a feed), and now you're spending your remaining minutes exactly where the
+      score is. Volunteering the menu also proves you know the whole surface even when you only demo part of it.
+    </div>
+
+    <div class="senior">
+      The sentence that shows you optimize from data, not vibes: <em>"I wouldn't add any of this speculatively — I'd
+      measure first. Virtualization only matters past a few hundred rows, memoization can cost more than it saves on cheap
+      components, and a premature Web Worker is complexity for nothing. So I'd instrument with the Profiler and Web Vitals,
+      find the actual bottleneck — usually it's images and bundle size long before it's render — and fix that."</em> This
+      is the exact mirror of the backend "measure before you optimize; the bottleneck is rarely where you guess" instinct,
+      and hearing it in a frontend round tells the interviewer you've optimized real apps rather than memorized a
+      technique list.
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="clock">Putting RADIO on the clock</h2>
+
+    <p>
+      A method you can't fit in 45 minutes is a method you'll abandon under pressure. Here's how RADIO spends the minutes,
+      and — the part that matters most — <strong>where the score actually is.</strong> Unlike the backend round, which
+      spreads its points fairly evenly, the frontend round is heavily back-loaded: Architecture and Optimizations are
+      where you win or lose, and the first two letters are setup you should move through briskly.
+    </p>
+
+    <table>
+      <thead><tr><th>Step</th><th>Minutes</th><th>What you're doing</th><th>Where the points are</th></tr></thead>
+      <tbody>
+        <tr><td><strong>R</strong> — Requirements</td><td>~5</td><td>Clarify functional + non-functional (perf, a11y, devices, real-time), scope the surface, name what you're cutting</td><td>Low but mandatory — skip it and you look junior; over-spend it and you starve the deep-dive</td></tr>
+        <tr><td><strong>A</strong> — Architecture</td><td>~10</td><td>Component tree, data flow (data down / events up), where each piece of state lives</td><td><strong>High</strong> — the core "can you decompose a UI" signal</td></tr>
+        <tr><td><strong>D</strong> — Data model</td><td>~7</td><td>Server-state vs client-state split, normalized store shape, derived state</td><td>Medium-high — the split is a strong signal on its own</td></tr>
+        <tr><td><strong>I</strong> — Interface &amp; API</td><td>~8</td><td>The props API for key components + the network API (cursor pagination, idempotent mutations)</td><td>Medium — don't skip the props API</td></tr>
+        <tr><td><strong>O</strong> — Optimizations</td><td>~13</td><td>Menu the four axes, then deep-dive the one or two the interviewer picks</td><td><strong>Highest</strong> — this is the deep-dive; budget the most time for it</td></tr>
+        <tr><td>Buffer / trade-offs / Q&amp;A</td><td>~2</td><td>The interviewer's follow-ups; naming what you'd do differently</td><td>Ongoing — trade-offs score throughout, not just at the end</td></tr>
+      </tbody>
+    </table>
+
+    <p>
+      Two habits keep you on schedule. <strong>Timebox R and D on purpose</strong> — they're setup, and the classic
+      failure is a candidate who spends twenty minutes perfecting the component tree and never reaches a single
+      optimization, which is where most of the points live. And <strong>let the interviewer pull you into the deep
+      dive</strong>: get through R-A-D-I at a brisk narrated pace, then hand them the menu at O and go where they point.
+      The person across the table is steering toward the thing they want to grade; the sooner you're there, the better you
+      score.
+    </p>
+
+    <div class="senior">
+      The framing that keeps the whole thing coherent, and a good thing to say as you start: <em>"I'll work through RADIO —
+      requirements, architecture, data, interface, then optimizations — and I'll move quickly through the first four so we
+      have real time for optimizations, since that's usually the most interesting part. Stop me anywhere you want to go
+      deeper."</em> It shows you have a plan, it shows you know where the depth lives, and it explicitly invites the
+      interviewer to drive — which is exactly the collaborative posture this round rewards.
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="qa">Interview Q&amp;A</h2>
+
+    <details class="qa">
+      <summary>1. How is a frontend system design round different from a backend one?</summary>
+      <div class="answer">
+        <p>Same skeleton — clarify, design, deep-dive, trade-offs — but the graded artifacts are completely different. The
+        backend round scores estimation, sharding, consistency, and scale ("what breaks at 10× traffic?"). The frontend
+        round scores <strong>component decomposition, where state lives, data flow, rendering/network performance, and
+        accessibility</strong> ("what happens on slow 3G, with a huge list, with a screen reader?").</p>
+        <p>The tell for which one you're in: if the prompt is a <em>screen</em> — a feed, an autocomplete, a photo grid —
+        it's frontend, and you should treat the server as a one-line API contract rather than something to scale. The
+        fastest way to fail is to answer the backend round by reflex: drawing load balancers and talking QPS when the
+        interviewer wanted to know how the feed component virtualizes 10,000 rows.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>2. What does RADIO stand for, and how does it map to the backend method?</summary>
+      <div class="answer">
+        <p><strong>R</strong>equirements, <strong>A</strong>rchitecture and components, <strong>D</strong>ata model,
+        <strong>I</strong>nterface and API, <strong>O</strong>ptimizations. It's the frontend analogue of the six-step
+        backend loop: Requirements maps to requirements, Architecture to the high-level box diagram (but the boxes are
+        components), Data model to the data model (but it's the client store, not DB tables), Interface to API design (but
+        there are <em>two</em> interfaces — component props and the network API), and Optimizations to bottlenecks/scale.
+        Estimation folds in rather than being a headline step.</p>
+        <p>The value of the acronym is the same as the backend method's: it stops you freezing, guarantees you cover what's
+        graded, and lets you spend energy on judgment instead of remembering what comes next.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>3. Why do backend-style answers fail this round?</summary>
+      <div class="answer">
+        <p>Because they answer a question nobody asked. The frontend interviewer draws the client as the <em>whole
+        subject</em> and hand-waves the server; a candidate who spends ten minutes sharding the feed service, fanning out
+        to followers, and caching timelines in Redis has produced a correct answer to the <em>other</em> interview and
+        spent their best minutes on it. It's not that the backend content is wrong — it's off-topic, and off-topic reads as
+        "doesn't understand what this round is."</p>
+        <p>The fix is the opening sentence: name the round, say you'll treat the backend as an API contract, and invite the
+        interviewer to redirect if they actually want the service designed too.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>4. What's the difference between server state and client state, and why does it matter so much?</summary>
+      <div class="answer">
+        <p><strong>Server state</strong> is a cached copy of data the server owns — the feed, profiles, comments. Its hard
+        problems are all cache problems: staleness, revalidation, loading/error states, request deduplication. The right
+        tool is a server-cache library (React Query, SWR, RTK Query, Apollo) that solves those for you. <strong>Client
+        state</strong> is data that only exists in the browser — is a modal open, draft text, selected tab — and the client
+        <em>is</em> the source of truth; <code>useState</code>/Context/a small store is enough.</p>
+        <p>It matters because the most common data-model mistake is putting server state in Redux, which means hand-rolling
+        every cache concern (loading flags, staleness, dedup, invalidation) badly in reducers. Saying "server state is a
+        cache, not state" and picking tools accordingly is one of the strongest signals in the round.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>5. Where should a given piece of state live?</summary>
+      <div class="answer">
+        <p>The principle: <strong>lift state to the lowest common ancestor of the components that need it, and no higher.</strong>
+        Composer draft text → local to the composer (nothing else needs it, and keeping it local means keystrokes don't
+        re-render the feed). A post's like toggle → local to that post's actions leaf (so a like on post 5 doesn't
+        re-render post 6). The list of posts → the container or, better, a server-cache library, since it's server state.
+        Theme/auth → app-global Context (read widely, changes rarely).</p>
+        <p>Too global and you re-render half the tree on every change; too local and you thread state awkwardly back up
+        when a sibling needs it. Colocating volatile state in a small leaf is also your first performance optimization — it
+        bounds what re-renders, the same way a good shard key bounds what one write touches.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>6. Why normalize the client-side store?</summary>
+      <div class="answer">
+        <p>So each entity has one source of truth. If the same author is copied into every post, updating their name means
+        finding and fixing N copies, and one you miss drifts — the feed shows the old name, the detail view shows the new
+        one. Store each entity once keyed by id, keep lists as arrays of ids that reference them, and an update in one
+        place is seen everywhere. It's database normalization moved into the browser, for the same reason.</p>
+        <p>Keep the <em>order</em> (and pagination cursor) separate from the <em>entities</em> — <code>feed.ids</code> holds
+        the sequence, <code>posts</code> holds the objects. That lets you append a page, dedupe a post that appears in two
+        lists, and update one post's like-count in exactly one place.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>7. Cursor vs offset pagination — which and why?</summary>
+      <div class="answer">
+        <p><strong>Cursor</strong> for any feed, infinite scroll, or frequently-changing list. Offset (<code>?offset=40</code>)
+        means "skip 40, take 20," so when a new item is inserted at the top while the user scrolls, everything shifts and
+        they see a duplicate or skip a post — the list <em>drifts</em>. A cursor points at a stable item and is immune to
+        inserts above it; it's also faster at deep pages (an indexed seek instead of scanning and discarding skipped rows).</p>
+        <p>The trade-off: cursors can't jump to an arbitrary page. So offset still wins for a fixed, page-numbered table
+        (admin lists, search results with page numbers) where "go to page 7" is a real feature and the data isn't shifting
+        underneath.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>8. What is an optimistic update and when would you use one?</summary>
+      <div class="answer">
+        <p>Update the UI immediately from the client as if the request already succeeded, fire it in the background, and
+        roll back (with a toast) if it fails. Liking a post, sending a chat message, checking a to-do — the interaction
+        feels instant instead of gated on a round trip, which is a big perceived-performance win, especially on slow
+        networks.</p>
+        <p>Use it when the operation almost always succeeds and a rare rollback is acceptable (a like). Avoid it, or make
+        the pending state explicit, when a wrong-then-corrected value would be alarming or costly — anything money-shaped,
+        or where showing success that later reverses would mislead. This is why the like-count is isolated leaf state in
+        the architecture: it makes the optimistic toggle cheap, local, and easy to roll back.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>9. There are 10,000 items in the list — what do you do?</summary>
+      <div class="answer">
+        <p><strong>Virtualize (window) the list.</strong> Never put 10,000 DOM nodes on the page — the browser can't lay
+        out or paint that and memory balloons. Render only the ~20 rows in the viewport plus a small overscan buffer, and
+        recycle nodes as the user scrolls (<code>react-window</code> / <code>react-virtual</code>). Combine it with
+        cursor-paginated fetching so you're not loading 10,000 items over the network either, and an
+        <code>IntersectionObserver</code> sentinel to trigger the next page.</p>
+        <p>Say the reasoning, not just the library: the DOM node count, not the array length, is what kills scroll
+        performance, so the fix is to decouple "how many items exist" from "how many are rendered." That's the marquee
+        technique of this round and the interviewer is usually fishing for it the moment you say "infinite scroll."</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>10. How do you handle accessibility in a design round?</summary>
+      <div class="answer">
+        <p>Treat it as a scored requirement, named up front, and fold it into each component rather than bolting it on.
+        The baseline, in priority order: <strong>semantic HTML first</strong> (a real <code>&lt;button&gt;</code> gives you
+        keyboard operability, focus, and the right screen-reader role for free — most a11y wins are "use the right
+        element"); <strong>full keyboard operability</strong> with a visible focus ring and sensible tab order;
+        <strong>ARIA patterns where semantics fall short</strong> (combobox for autocomplete, dialog for a modal), labelled
+        controls, and an <code>aria-live</code> region to announce dynamic changes; then contrast,
+        <code>prefers-reduced-motion</code>, and focus trapping in modals.</p>
+        <p>Naming a11y as a requirement before anyone asks, and then actually honouring it component by component, is one of
+        the clearest senior signals in the round — most candidates forget it entirely.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>11. How do you avoid unnecessary re-renders?</summary>
+      <div class="answer">
+        <p>Structure first, memoize second. The structural fix is state colocation — keep volatile state (a like toggle) in
+        a small leaf so a change doesn't ripple up through the whole tree. Then, where profiling shows it's needed:
+        <code>React.memo</code> to skip re-rendering a subtree whose props didn't change, <code>useMemo</code>/<code>useCallback</code>
+        to keep expensive values and callback identities stable so memoized children aren't re-rendered by reference churn,
+        and stable list <code>key</code>s (never the array index for a reorderable list — it misattaches state to the wrong
+        row during reconciliation).</p>
+        <p>Say "measure first" out loud: memoization isn't free, and wrapping cheap components in <code>React.memo</code>
+        can cost more than it saves. Reach for the Profiler, find the component that actually re-renders too often, and fix
+        that one.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>12. The interviewer says "make it faster." Where do you start?</summary>
+      <div class="answer">
+        <p>Ask what "faster" means — load or runtime — because they have different fixes, then measure before touching
+        anything. If it's <strong>load</strong>: check bundle size and code-split, lazy-load below-the-fold assets and
+        routes, consider SSR/streaming for first content, and look at images (almost always the heaviest thing). If it's
+        <strong>runtime</strong>: profile for re-renders and long tasks, virtualize long lists, debounce high-frequency
+        handlers, move heavy work off the main thread.</p>
+        <p>The senior move is refusing to optimize speculatively: <em>"I'd instrument with the Profiler and Web Vitals and
+        fix the actual bottleneck — which is usually images and bundle size long before it's render logic — rather than
+        sprinkling <code>useMemo</code> everywhere."</em> Same instinct as the backend round: the bottleneck is rarely
+        where you'd guess, so measure.</p>
+      </div>
+    </details>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="takeaways">What to remember</h2>
+
+    <h3>The round</h3>
+    <ul>
+      <li><strong>It's a different interview, graded differently.</strong> Component decomposition, state placement, data
+        flow, rendering/network performance, and accessibility — <em>not</em> QPS, sharding, or consensus. The server is a
+        one-line API contract you assume exists.</li>
+      <li><strong>Answering the backend round is the #1 way to fail.</strong> If the prompt is a screen, it's the frontend
+        round. Draw a load balancer here and you've spent your best minutes on the wrong interview.</li>
+      <li><strong>Name the round in your first sentence</strong> — "I'll treat this as frontend system design and the
+        backend as an API contract; stop me if you want the service too." It locks scope and signals you've done this.</li>
+    </ul>
+
+    <h3>RADIO</h3>
+    <ul>
+      <li><strong>R — Requirements.</strong> Functional = user-visible interactions (they enumerate your components).
+        Non-functional = devices, performance budget, network, <strong>accessibility</strong>, i18n, real-time, list
+        size. Estimate only list size and payload weight — the numbers that change a decision. Scope and cut out loud.</li>
+      <li><strong>A — Architecture.</strong> Draw the component tree; carve by <strong>responsibility and reuse</strong>,
+        not by visual boxes. State lives at the <strong>lowest common ancestor that needs it, and no higher</strong>.
+        Data down as props, events up as callbacks. "Container vs presentational" is the vocabulary for the seam.</li>
+      <li><strong>D — Data model.</strong> Split <strong>server state (a cache — React Query/SWR)</strong> from
+        <strong>client state (useState/store)</strong>. Server state is not state, it's a cache: stale-while-revalidate,
+        dedup, invalidate. <strong>Normalize</strong> shared entities by id; keep order separate from entities; derive,
+        don't store. Don't put server data in Redux.</li>
+      <li><strong>I — Interface.</strong> <em>Two</em> contracts. The <strong>props API</strong> (data in, intent out —
+        keeps leaves reusable and testable) and the <strong>network API</strong> (side-load for normalization,
+        <strong>cursor pagination</strong> so lists don't drift, idempotent mutations so a double-tap is safe). Don't
+        over-fetch.</li>
+      <li><strong>O — Optimizations.</strong> The deep-dive and the biggest bucket. <strong>Menu the four axes, then dive
+        where they point</strong>: load perf (code-split, SSR, Core Web Vitals), runtime (<strong>virtualize long
+        lists</strong>, memoize, stable keys, off-main-thread), network (<strong>optimistic updates</strong>, SWR cache,
+        prefetch, cancel stale requests), accessibility (semantic HTML, keyboard, ARIA patterns, live regions). Measure
+        before optimizing.</li>
+    </ul>
+
+    <h3>The clock</h3>
+    <ul>
+      <li><strong>~5 R · ~10 A · ~7 D · ~8 I · ~13 O.</strong> The round is back-loaded — Architecture and Optimizations
+        are where the points are. Timebox R and D so you don't starve the deep-dive; let the interviewer pull you into O.</li>
+      <li><strong>Trade-offs score throughout, not just at the end</strong> — name the cost of every choice as you make it,
+        the same discipline as every other page in this phase.</li>
+    </ul>
+
+    <div class="senior">
+      The one line that ties the whole page together: <strong>the frontend round zooms into the box the backend round
+      hand-waves.</strong> Everything you already do by instinct — deciding where a piece of state belongs, whether to
+      debounce, whether a list needs virtualizing, whether a control is keyboard-reachable — is exactly what's being
+      graded. RADIO isn't new knowledge for you; it's a structure that turns seven years of shipping React into a
+      sequenced, narrated, 45-minute answer. Learn the order, name the trade-offs, and this becomes the round you're the
+      favourite to win.
+    </div>
+  </section>
+
+  <nav class="page-nav">
+    <a href="18-streaming-aggregation.html">← 18 — Ad-Click Aggregator</a>
+    <a href="20-feed-ui.html">20 — News Feed UI →</a>
+  </nav>
+
+</main>
+</body>
+</html>

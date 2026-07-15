@@ -1,0 +1,1002 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>20 — Design a News Feed UI | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <div class="breadcrumb"><a href="index.html">← Course Home</a></div>
+    <h1>20 — Design a News Feed UI</h1>
+    <p>The frontend round's most common prompt, walked end to end as RADIO. The server is one API contract; the browser is the whole interview.</p>
+  </div>
+</header>
+
+<main class="container">
+
+  <section>
+    <h2>Why this matters in the interview</h2>
+    <p>
+      "Design a news feed" is to the frontend round what "design a URL shortener" is to the backend round: the canonical
+      warm-up that every interviewer has in their back pocket, and the one a strong candidate is expected to make look
+      easy. You already designed the <em>backend</em> of this exact product in tutorial 10 — fan-out on write versus read,
+      the celebrity problem, timeline caching. <strong>Forget almost all of it.</strong> This is the other interview. The
+      interviewer has drawn the client as the whole subject and hand-waved the server to a box that returns pages of
+      posts, and every minute you spend on how the feed service shards is a minute spent proving you can do the round you
+      weren't asked to do. What they actually want to watch is how you build the <em>component</em>: how it renders ten
+      thousand posts without melting the browser, how it paginates without the scroll jumping, how a like feels instant,
+      how images load without the layout lurching. That is a home game for you — seven years in the browser is exactly the
+      experience this round rewards — so the whole task here is to turn instinct into a narrated, sequenced answer.
+    </p>
+    <p>
+      We walk it as <strong>RADIO</strong> from tutorial 19 — Requirements, Architecture and components, Data model,
+      Interface and API, Optimizations — because that structure keeps you honest and back-loads your time onto the
+      deep-dive where the points live. Four techniques are the marquee of a feed answer and the interviewer is fishing for
+      each: <strong>list virtualization</strong> (windowing — you render twenty DOM nodes for a ten-thousand-item list),
+      <strong>cursor pagination</strong> (and being able to say precisely why offset drifts when new posts arrive),
+      <strong>optimistic updates with rollback</strong> (the like that feels instant), and a <strong>normalized client
+      cache</strong> (one copy of each post, so the feed and the detail view never disagree). Hit those four with the
+      reasoning and not just the library names, treat the backend as a one-line contract, and this becomes the round
+      you're the favourite to win. Everything below is the say-it-out-loud version of that answer.
+    </p>
+    <div class="senior">Open by naming the round and locking scope, exactly as tutorial 19 taught: <em>"I'm reading this as a frontend system design problem, so I'll design the client — component architecture, where state lives, data flow, and then performance, network and accessibility — and treat the feed backend as an API contract I'll define but not scale. I know how I'd fan out and cache timelines server-side, but I'll assume that exists behind a paginated endpoint unless you want me to design it too."</em> Thirty seconds, and you've told the interviewer you know there are two rounds and you're deliberately in this one.</div>
+  </section>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ul>
+      <li><a href="#prompt">The prompt</a> — the vague one-liner, and reading it as a frontend round</li>
+      <li><a href="#requirements">R — Requirements</a> — functional interactions · non-functional (perf, a11y, network, real-time) · the one estimation that earns its place</li>
+      <li><a href="#architecture">A — Architecture &amp; components</a> — the component tree · where state lives · data down / events up</li>
+      <li><a href="#data">D — Data model</a> — server state vs client state · the normalized store · order separate from entities</li>
+      <li><a href="#interface">I — Interface &amp; API</a> — the props API · the network API · <strong>cursor vs offset, and why offset drifts</strong></li>
+      <li><a href="#optimizations">O — Optimizations</a> — the four axes, menued before the deep-dive</li>
+      <li><a href="#virtualization">Deep dive: infinite scroll &amp; list virtualization</a> — windowing · DOM nodes, not array length · the sentinel</li>
+      <li><a href="#optimistic">Deep dive: optimistic updates &amp; rollback</a> — the instant like · snapshot, mutate, roll back · the cache write</li>
+      <li><a href="#images">Deep dive: image loading &amp; perceived performance</a> — CLS · lazy loading · skeletons · the perception of speed</li>
+      <li><a href="#qa">Interview Q&amp;A</a></li>
+      <li><a href="#takeaways">What to remember</a></li>
+    </ul>
+  </div>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="prompt">The prompt</h2>
+
+    <p>The interviewer gives you the whole thing in one breath:</p>
+
+    <p style="font-size:1.15rem; font-weight:700; color:#111827; border-left:4px solid #8b5cf6; padding-left:1rem;">
+      "Design the news feed for a social app — think Twitter or Instagram. Focus on the frontend."
+    </p>
+
+    <p>
+      "Focus on the frontend" is doing a lot of work in that sentence, and sometimes the interviewer doesn't even say it —
+      you're expected to infer it from the fact that you're in a frontend loop. Either way, the load-bearing decisions are
+      all unstated. Is this a text feed (Twitter) or a media-first grid (Instagram)? Does it update live as new posts
+      arrive, or only when you pull to refresh? Mobile web, desktop, or both? How long is the list — hundreds of items or
+      effectively infinite? Are you building the <em>viewer</em>, the <em>composer</em>, or both?
+    </p>
+    <p>
+      As in every case study, the vagueness is the first thing graded, and the senior move is to make the problem smaller
+      and sharper before you draw a single component — and to say what you're cutting so the interviewer knows the
+      omission is a choice, not a gap. The one difference from the backend rounds: <strong>the clarifying questions here
+      are about the <em>experience</em>, not the scale.</strong> Nobody is going to hand you a DAU figure, and if you
+      invent one so you can perform the estimation ritual, you've announced you're in the wrong interview.
+    </p>
+
+    <div class="note">If the interviewer <em>does</em> start pushing on how the timeline is assembled server-side — fan-out, ranking, caching — that's your cue that they want a full-stack answer, and tutorial 10 is your script for that half. But let them pull you there. The default reading of "design a news feed" in a frontend loop is the client, and you should commit to the client until told otherwise.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="requirements">R — Requirements</h2>
+
+    <p>
+      Pin down the surface before you build it — same first move as every round, but the questions are about behaviour and
+      experience, not throughput. Ask three or four, state your assumptions, and move; you're demonstrating that you know
+      the axes, not filling in a form.
+    </p>
+
+    <h3>Functional requirements — for a UI, these are user-visible interactions</h3>
+    <p>
+      Enumerate what the user can <em>see and do</em>, because that list <em>is</em> your component list. For a feed:
+    </p>
+    <ul>
+      <li><strong>View a scrollable list of posts</strong> — author, text, media, timestamp, like/comment counts.</li>
+      <li><strong>Infinite scroll</strong> — more posts load automatically as you approach the bottom.</li>
+      <li><strong>Like / unlike a post</strong> — and see the count change immediately.</li>
+      <li><strong>See new posts</strong> that arrive while you're reading — at minimum a "12 new posts" pill, ideally with
+        pull-to-refresh.</li>
+      <li><strong>Open a post</strong> to a detail view (comments, full thread) — a navigation target.</li>
+    </ul>
+    <p>
+      Now cut, out loud: <em>"I'll build viewing, infinite scroll, liking, and the new-posts affordance in depth. I'll
+      treat composing a post, the comment thread, and the profile page as navigation targets rather than designing them —
+      unless you'd rather I go deep on one of those instead."</em> Naming the cut is the senior move; it's the frontend
+      equivalent of saying which subsystems you're descoping in a backend design.
+    </p>
+
+    <h3>Non-functional requirements — this is where the round announces itself</h3>
+    <p>
+      The backend non-functionals (availability, latency, consistency, durability) don't apply. The frontend list is a
+      different one, and reciting a few of them unprompted is one of the fastest ways to signal which interview you know
+      you're in.
+    </p>
+
+    <table>
+      <thead><tr><th>Non-functional</th><th>The question to ask</th><th>Why it changes the design</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Devices &amp; viewport</strong></td><td>"Mobile web, desktop, or both? Native-app-like on mobile?"</td><td>Mobile means touch targets, a hard CPU/perf budget, and images dominating the payload over a slow radio.</td></tr>
+        <tr><td><strong>List size</strong></td><td>"How long can the feed get — hundreds, or effectively infinite?"</td><td>The frontend's version of estimation. Effectively infinite ⇒ virtualization is mandatory, not optional.</td></tr>
+        <tr><td><strong>Real-time / freshness</strong></td><td>"Do new posts appear live, or on pull-to-refresh?"</td><td>Live push pulls in a socket/poll and prepend logic — and it's exactly what makes offset pagination drift.</td></tr>
+        <tr><td><strong>Network conditions</strong></td><td>"Must this work on flaky 3G? Any offline expectation?"</td><td>Decides optimistic updates, prefetch aggressiveness, skeleton vs spinner, retry behaviour.</td></tr>
+        <tr><td><strong>Performance budget</strong></td><td>"Does time-to-first-post matter more, or scroll smoothness?"</td><td>Load optimization (SSR, code-split) vs runtime optimization (virtualization, memoization) are different work.</td></tr>
+        <tr><td><strong>Accessibility</strong></td><td>"What's the a11y bar — WCAG AA, keyboard, screen reader?"</td><td>A scored dimension here. A virtualized list and an <code>aria-live</code> new-posts announcement need deliberate handling.</td></tr>
+      </tbody>
+    </table>
+
+    <p>
+      Then collapse it into one sentence of assumptions and move: <em>"I'll assume responsive mobile-web and desktop, an
+      effectively infinite list so virtualization is in, new posts arrive live but I surface them with a pill rather than
+      injecting them mid-scroll, works on 3G with skeletons and optimistic likes, WCAG AA. Good?"</em> That single
+      sentence is the entire non-functional spec, and it took fifteen seconds.
+    </p>
+
+    <h3>The one estimation that earns its place</h3>
+    <p>
+      There's no DAU-to-QPS arithmetic here, and grinding one out wastes minutes you need for the deep-dive. The estimate
+      that <em>does</em> change a decision is <strong>DOM weight and payload weight</strong>:
+    </p>
+
+<pre><code>A feed page = 20 posts.
+  JSON per post   ≈ 1–2 KB  → ~30 KB metadata per page   (cheap)
+  Image per post  ≈ 100–300 KB → 2–6 MB of media per page (DOMINATES)
+
+An "infinite" scroll after 10 minutes = ~500 posts loaded.
+  500 posts as raw DOM: each post ≈ 30–50 DOM nodes
+    → 15,000–25,000 nodes → layout/paint jank, memory bloat, GC pauses
+  500 posts virtualized: ~20 visible + overscan ≈ 30 nodes on the page. Flat.
+</code></pre>
+
+    <p>
+      Two numbers, two decisions: images are the performance problem (so image loading gets a deep-dive), and DOM node
+      count grows without bound unless you window the list (so virtualization is mandatory). That's estimation used to
+      justify a choice — the only kind that belongs in this round.
+    </p>
+
+    <div class="pitfall">Don't turn Requirements into a numbers exercise out of backend habit, and don't skip it out of eagerness to draw components. The failure at both ends looks junior: the candidate who computes fan-out QPS for a frontend prompt has misread the room, and the candidate who starts sketching a component tree before scoping the surface is coding before reading the ticket. Ask a few questions, estimate only DOM/payload weight, state assumptions, move.</div>
+
+    <div class="senior">Name accessibility as a requirement before anyone asks, and flag the one that's genuinely hard here: <em>"I'll target WCAG AA and fold it into each component. The two non-obvious pieces in a feed are that a virtualized list must stay keyboard- and screen-reader-navigable even though most rows aren't in the DOM, and that new posts arriving should be announced through an <code>aria-live</code> region rather than silently appearing. I'll come back to both in optimizations."</em> Most candidates forget a11y entirely; naming the specific feed-shaped a11y risks up front is a clear senior tell.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="architecture">A — Architecture &amp; components</h2>
+
+    <p>
+      The frontend high-level design: your boxes are components, your arrows are data flow and events. Produce three
+      things — the component tree, a statement of where each piece of state lives, and the direction data flows. This is
+      the step that most directly tests "can you decompose a UI," which is a top-scored signal.
+    </p>
+
+    <h3>The component tree — draw this first</h3>
+
+<pre><code>  &lt;FeedPage&gt;                         ← route container; owns the feed query + mutations
+    ├─ &lt;NewPostsPill&gt;                 ← "12 new posts" — appears when live items arrive
+    ├─ &lt;VirtualFeedList&gt;              ← the windowed scroll container (the hard part)
+    │    ├─ &lt;FeedItem&gt;                ← one post, repeated ×20-ish (only visible ones mount)
+    │    │    ├─ &lt;PostHeader&gt;         ← avatar, name, timestamp, overflow menu
+    │    │    ├─ &lt;PostBody&gt;           ← text + &lt;PostMedia&gt; (lazy-loaded image)
+    │    │    └─ &lt;PostActions&gt;        ← like / comment / share — owns optimistic like state
+    │    └─ &lt;LoadMoreSentinel&gt;        ← IntersectionObserver target; triggers next page
+    └─ &lt;Toast&gt;                        ← rollback errors / undo affordances
+</code></pre>
+
+    <p>
+      <strong>How you justify the seams.</strong> Each component has one nameable responsibility, and the two seams
+      interviewers reward are <strong>reuse</strong> and <strong>re-render isolation</strong>. <code>FeedItem</code> and
+      <code>PostActions</code> are the same on the feed and on the post-detail page, so they're factored out — reuse.
+      And <code>PostActions</code> is its own leaf specifically because the like toggle changes often; keeping that
+      volatile state in a small leaf means a like on post 5 re-renders one button, not the whole list. <code>VirtualFeedList</code>
+      is separate from <code>FeedPage</code> because windowing is a self-contained concern with its own scroll math — the
+      page shouldn't know how the list is rendered, only what data to feed it.
+    </p>
+
+    <h3>Where does state live? — the highest-value question in this step</h3>
+    <p>
+      For every piece of state, answer: how <em>local</em> can it be? Say the principle out loud —
+      <strong>lift state to the lowest common ancestor that needs it, and no higher.</strong> Too global re-renders half
+      the tree on every change; too local forces awkward threading when a sibling needs it.
+    </p>
+
+    <table>
+      <thead><tr><th>State</th><th>Where it lives</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>The list of posts + pagination cursor</td><td><strong>Server-cache library</strong> (React Query / SWR), read by <code>FeedPage</code></td><td>It's server state — a cached copy of data the server owns. The library gives caching, dedup, background revalidation, and the infinite-query cursor for free.</td></tr>
+        <tr><td>"Is this post liked" + like count</td><td><strong>The normalized cache entry</strong>, toggled optimistically via <code>PostActions</code></td><td>One source of truth so the feed and detail view agree; the optimistic write is isolated to one entry so post 5's like doesn't touch post 6.</td></tr>
+        <tr><td>Scroll position / which rows are windowed</td><td><strong>Local</strong> to <code>VirtualFeedList</code></td><td>Pure view state the virtualizer derives from scrollTop; nothing above the list needs it.</td></tr>
+        <tr><td>"12 new posts buffered, not yet shown"</td><td><strong><code>FeedPage</code></strong> (or the query cache, held aside)</td><td>Buffered live items live above the list but below the app; showing them is a user action, so you don't inject mid-scroll.</td></tr>
+        <tr><td>Logged-in user / theme</td><td><strong>App-global</strong> (Context)</td><td>Read in many places, changes rarely — the exact profile Context is good at.</td></tr>
+      </tbody>
+    </table>
+
+    <p>
+      Notice that <em>almost nothing is truly global</em>. That observation is itself a signal: candidates who reach for a
+      single Redux store to hold the feed, the scroll position, and the like states have misunderstood where each kind of
+      state wants to live. Most of this feed's "state" is a server cache; the rest is local view state.
+    </p>
+
+    <h3>Data flow — data down, events up</h3>
+    <p>
+      Draw the arrows and trace one interaction end to end. Data flows <em>down</em> as props; events flow <em>up</em> as
+      callbacks. A like doesn't mutate anything in place — it fires an intent upward, the mutation layer updates the cache,
+      and the new data flows back down.
+    </p>
+
+<pre><code>  server ──fetch page──▶ FeedPage ──posts (props)──▶ VirtualFeedList ──post──▶ FeedItem
+                            ▲                                                      │
+                            └──────────── onLike(postId) (event bubbles up) ──────┘
+                            │
+                     useLikeMutation writes the cache → new data flows back DOWN
+  (data DOWN as props · events UP as callbacks · one direction · cache is the pivot)
+</code></pre>
+
+    <h3>Container vs presentational — the vocabulary for the seam</h3>
+    <p>
+      Say it plainly: <em>"<code>FeedPage</code> is the container — it owns the feed query and the mutation hooks.
+      Everything below it is presentational, driven by props, which keeps the leaves pure, trivially testable, and reusable
+      on the detail page."</em> Hooks blur the hard rule (any component can be "smart"), but the vocabulary is still the
+      clearest way to name the boundary in one breath.
+    </p>
+
+    <div class="pitfall">Don't decompose by visual boxes — decompose by responsibility, state, and re-render rate. The shallow-answer tell is a tree that mirrors the CSS layout (<code>Header</code>, <code>Feed</code>, <code>Sidebar</code>) with no thought to what owns which state or what re-renders when. The reason <code>PostActions</code> is its own component is <em>not</em> that it looks like a distinct region — it's that its state changes on every tap and you want that change to stop at one leaf. Carve along the axes of change and reuse, and justify each seam that way.</div>
+
+    <div class="senior">The line that shows you design for render cost structurally: <em>"I'm isolating the like state in <code>PostActions</code> and virtualizing the list on purpose — both are about bounding the blast radius of a change. A like re-renders one button, not the feed; a scroll only mounts and unmounts a handful of rows, not thousands. That's the same instinct as picking a shard key so one hot entity doesn't melt one node — I'm deciding, up front, what a single change is allowed to touch."</em> Connecting a render-cost decision to a backend blast-radius decision reads as someone who thinks about performance the same way in both halves of the stack.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="data">D — Data model</h2>
+
+    <p>
+      The shape of the data <em>as the client holds it</em> — not database tables. Two decisions dominate this step:
+      splitting server state from client state, and normalizing the store so the same post never exists in two places
+      that can drift.
+    </p>
+
+    <h3>Server state vs client state</h3>
+    <p>
+      State the split explicitly — it instantly separates you from candidates who think "state management" means "put
+      everything in Redux." The feed is <strong>server state</strong>: a cached copy of data the server owns, whose hard
+      problems are all cache problems — staleness, revalidation, loading/error states, request dedup, pagination. The
+      right tool is a server-cache library (React Query, SWR, RTK Query, Apollo), <em>not</em> a hand-rolled
+      <code>useEffect</code> fetch and <em>not</em> Redux. The composer draft, which post's menu is open, the scroll
+      position — those are <strong>client state</strong>, and the client is their source of truth.
+    </p>
+    <p>
+      <strong>The senior framing:</strong> server state is not really state, it's a cache, and everything from tutorial 06
+      applies in the browser. A server-cache library is doing cache-aside with stale-while-revalidate for you: serve the
+      cached page instantly, revalidate in the background, dedupe concurrent requests for the same key (ten
+      <code>FeedItem</code>s asking for <code>user:42</code> collapse to one request — the single-flight fix). Say "the
+      feed is a cache, not state" and you've named the defining problem of modern frontend data.
+    </p>
+
+    <h3>Normalize the store — the client-side "third normal form"</h3>
+    <p>
+      The same post appears in the feed, in a "liked posts" list, in the detail view, in search results. Do <em>not</em>
+      store copies. Store each entity once, keyed by id, and hold <em>lists as arrays of ids</em> that reference it. This
+      is database normalization moved into the client, for the same reason: one source of truth, so an update in one place
+      is seen everywhere and nothing drifts.
+    </p>
+
+<pre><code><span class="com">// DENORMALIZED — the like lives inside each list copy. Like a post in the feed</span>
+<span class="com">// and the detail view still shows the old count. Two truths for one post. It WILL drift.</span>
+<span class="kw">const</span> bad = {
+  feed:   [ { id: <span class="str">"p1"</span>, likeCount: <span class="num">12</span>, likedByMe: <span class="kw">false</span>, author: { id: <span class="str">"u9"</span>, name: <span class="str">"Ada"</span> } } ],
+  detail: { id: <span class="str">"p1"</span>, likeCount: <span class="num">12</span>, likedByMe: <span class="kw">false</span>, author: { id: <span class="str">"u9"</span>, name: <span class="str">"Ada"</span> } },
+};
+
+<span class="com">// NORMALIZED — one post entity, one user entity; lists hold ids and the ORDER.</span>
+<span class="com">// Toggle posts["p1"].likedByMe in ONE place and every view re-renders correctly.</span>
+<span class="kw">const</span> good = {
+  posts: {
+    p1: { id: <span class="str">"p1"</span>, authorId: <span class="str">"u9"</span>, text: <span class="str">"..."</span>, mediaUrl: <span class="str">"..."</span>,
+          likeCount: <span class="num">12</span>, likedByMe: <span class="kw">false</span>, commentCount: <span class="num">3</span>, createdAt: <span class="str">"..."</span> },
+  },
+  users: { u9: { id: <span class="str">"u9"</span>, name: <span class="str">"Ada"</span>, avatarUrl: <span class="str">"..."</span> } },
+  feed:  { ids: [<span class="str">"p1"</span>, <span class="str">"p2"</span>, <span class="str">"p3"</span>], nextCursor: <span class="str">"c_3"</span> },  <span class="com">// ORDER + cursor, separate from entities</span>
+};
+</code></pre>
+
+    <p>
+      The split that makes this work: <code>feed.ids</code> holds the <em>order and the pagination cursor</em>, while
+      <code>posts</code> holds the <em>entities</em>. That separation is what lets you append the next page (push ids onto
+      the array) without touching any stored post, prepend a new live post by unshifting one id, dedupe a post that
+      appears in two lists, and update one post's like-count in exactly one place. It's the same reason the backend keeps
+      an index separate from the rows — and, as you'll see in the pagination section, it's also what makes cursor
+      pagination clean and offset pagination a mess.
+    </p>
+
+    <div class="note">React Query / Apollo give you two flavours of this. Apollo (and RTK Query with <code>normalizedComparator</code>-style setups) normalizes by <code>__typename:id</code> under the hood, so writing one entity updates every query that references it automatically. React Query is document-cache by default — each query key holds its own copy — so if you want cross-list consistency you either normalize yourself or write to every relevant cache key on mutation. Knowing <em>which</em> your library does, and therefore how a like propagates, is a strong "I've shipped this" detail.</div>
+
+    <h3>Derived state — compute, don't store</h3>
+    <p>
+      If a value can be computed from existing state, don't store it as its own state — derive it during render
+      (<code>useMemo</code> if it's expensive). "Total visible posts," "has a next page" (<code>!!nextCursor</code>),
+      "is the new-posts pill showing" (<code>bufferedIds.length &gt; 0</code>) are all derived. Storing them creates a
+      second source of truth you now have to keep in sync — the exact drift problem normalization exists to prevent.
+    </p>
+
+    <div class="pitfall">Putting the feed in Redux is the most common data-model mistake here, and it's costly to defend. You inherit every cache problem by hand: loading flags, error flags, "is it stale," refetch-on-focus, dedup, the infinite-scroll cursor merge, cache eviction — reimplementing React Query badly, in reducers. If an interviewer sees you reach for Redux to hold fetched posts, the follow-up is "how do you invalidate that when it goes stale, and how do you dedupe two components fetching the same page?" — and the honest answer is "I wouldn't put it there." Client stores are for client state.</div>
+
+    <div class="senior">Open this step with the split as one paragraph: <em>"I'll separate server state from client state. The feed, posts, users and comments are server state — I'll model them as a normalized, id-keyed cache managed by React Query or Apollo, with lists holding ids and the cursor separately from the entities, so I get dedup, background revalidation, and single-source-of-truth updates for free. Client state — the composer draft, an open menu, scroll position — stays local. Almost nothing is truly global."</em> That paragraph makes the whole Optimizations step — optimistic updates, cache invalidation, prepending live posts — fall out naturally instead of feeling bolted on.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="interface">I — Interface &amp; API</h2>
+
+    <p>
+      Two contracts, and strong candidates address both: the <strong>component interface</strong> (props in, callbacks
+      out — how components talk to each other) and the <strong>network interface</strong> (endpoints and shapes — how the
+      client talks to the server). Backend-leaning candidates design only the second and leave half the score on the
+      table, because they don't think of component props as an API at all.
+    </p>
+
+    <h3>The component interface — data in as props, intent out as callbacks</h3>
+
+<pre><code><span class="com">// PostActions: small, reusable, presentational. Data in; the only thing it emits</span>
+<span class="com">// is an intent (onLike). It has no idea where the data comes from or what a like DOES.</span>
+<span class="kw">interface</span> <span class="typ">PostActionsProps</span> {
+  postId: <span class="typ">string</span>;
+  likeCount: <span class="typ">number</span>;
+  likedByMe: <span class="typ">boolean</span>;
+  onLike: (postId: <span class="typ">string</span>) =&gt; <span class="typ">void</span>;      <span class="com">// event UP — parent owns the meaning of "like"</span>
+  onOpenComments: (postId: <span class="typ">string</span>) =&gt; <span class="typ">void</span>;
+}
+</code></pre>
+
+    <p>
+      Two judgment calls to voice. <strong>Keep the leaf presentational</strong>: <code>PostActions</code> takes
+      <code>likedByMe</code> as a prop rather than reading the cache, so you can drop it on the feed <em>and</em> the detail
+      page and unit-test it by rendering with props and asserting the callback fired. <strong>Emit intent, not
+      implementation</strong>: it calls <code>onLike(postId)</code>, not "optimistically increment and POST to this URL."
+      The container owns what a like means. That's the props-API equivalent of a clean service boundary.
+    </p>
+
+    <h3>The network interface — you're the consumer; ask for exactly what the UI renders</h3>
+
+<pre><code><span class="com">// GET the feed — cursor-paginated (see below for exactly why cursor, not offset)</span>
+GET /api/feed?cursor=c_3&amp;limit=20
+<span class="com">// →</span> {
+     posts: [ { id, authorId, text, mediaUrl, likeCount, likedByMe, commentCount, createdAt } ],
+     users: [ { id, name, avatarUrl } ],   <span class="com">// side-loaded → drop straight into the normalized store</span>
+     nextCursor: <span class="str">"c_4"</span>                   <span class="com">// null when there are no more pages</span>
+   }
+
+<span class="com">// Like a post — the mutation behind onLike. Idempotent, so a double-tap is safe.</span>
+PUT /api/posts/:id/like        <span class="com">// PUT not POST: "liked" set twice == liked once</span>
+<span class="com">// →</span> { likeCount: <span class="num">31</span>, likedByMe: <span class="kw">true</span> }   <span class="com">// server returns the authoritative count</span>
+</code></pre>
+
+    <p>
+      Three decisions to point at. The response <strong>side-loads <code>users</code> separately from <code>posts</code></strong>
+      — that's the normalized store shape from the D step reaching back into the API, so the client drops entities straight
+      into their tables without unpacking nested duplicates. <strong><code>PUT</code> for the like</strong> makes the
+      mutation idempotent, so the double-tap race (or a retry) can't produce a count of 2 — the same idempotency reasoning
+      as tutorial 06, applied to a button. And you <strong>request only rendered fields</strong> — asking for a 40-field
+      user object to show an avatar and a name is the client-side <code>SELECT *</code>, and on mobile it's paid for in
+      bytes over a slow radio.
+    </p>
+
+    <h3>Cursor vs offset pagination — and exactly why offset drifts</h3>
+    <p>
+      This comes up in nearly every frontend design and it's the single most probed line of a feed answer, so have the
+      reasoning cold. For an infinite-scrolling, frequently-changing list, use <strong>cursor-based</strong> pagination
+      (<code>?cursor=c_3</code>), never <strong>offset-based</strong> (<code>?offset=40</code> / <code>?page=3</code>).
+    </p>
+
+    <p>
+      <strong>Offset means "skip N rows, take the next 20."</strong> That's a position counted from the top of the list —
+      and the top of a feed is the <em>least</em> stable point in the whole system, because new posts are prepended there
+      constantly. Walk the drift concretely. The user loads page 1 (offset 0, posts A–T) and scrolls. While they read,
+      <strong>three new posts are prepended</strong> at the top. Now they hit the bottom and the client asks for page 2 —
+      <code>?offset=20&amp;limit=20</code>:
+    </p>
+
+<pre><code>TIME 0 — user loads page 1:            server list = [ A B C D … T | U V W X … ]
+         offset 0, limit 20  → returns   A B C D … T   (positions 0–19)
+         user has now seen:              A B C D … T
+
+TIME 1 — 3 new posts arrive at the top: server list = [ N1 N2 N3 A B C … R | S T U … ]
+                                                          ↑ everything shifted DOWN by 3
+
+TIME 2 — user scrolls to bottom, asks for page 2:
+         offset 20, limit 20  → "skip the first 20, take 20"
+         but positions 20–39 are now      R S T U V …
+                                          ↑↑↑ R, S, T were positions 17-19 before —
+                                              the user ALREADY SAW them. DUPLICATES.
+         and if posts had been DELETED instead, positions would shift the other way
+         and the user would SKIP posts they never saw. GAPS.
+</code></pre>
+
+    <p>
+      That's the drift: offset addresses items by <em>position from the top</em>, and inserts/deletes above the read
+      window change every position below them, so the second page overlaps (duplicate posts) or jumps (missing posts).
+      On an infinite feed with live prepends, it's not a rare edge case — it's the steady state.
+    </p>
+    <p>
+      <strong>A cursor addresses items by a stable pointer instead of a count.</strong> The cursor <code>c_3</code>
+      encodes "the position <em>after</em> post T" — usually T's <code>(createdAt, id)</code>, encoded — and "give me 20
+      after T" returns the same 20 posts no matter how many items were inserted above T. The pointer is anchored to an
+      item, and items don't move relative to themselves. New posts prepended at the top simply don't affect a query that
+      says "after T." That's why the normalized store keeps <code>nextCursor</code> next to <code>feed.ids</code>: the
+      cursor <em>is</em> the "where am I" bookmark, and it survives anything happening above it.
+    </p>
+
+    <table>
+      <thead><tr><th></th><th>Offset (<code>?offset=40&amp;limit=20</code>)</th><th>Cursor (<code>?cursor=c_3&amp;limit=20</code>)</th></tr></thead>
+      <tbody>
+        <tr><td>Addresses items by</td><td>Position counted from the top</td><td>A stable pointer to a specific item</td></tr>
+        <tr><td>New item prepended mid-scroll</td><td><strong>Drifts</strong> — positions shift, next page shows duplicates (or gaps on delete)</td><td>Stable — "after T" is unaffected by inserts above T</td></tr>
+        <tr><td>Deep-page DB cost</td><td>Slow — the DB scans and discards the skipped rows</td><td>Fast — an indexed seek straight to the cursor</td></tr>
+        <tr><td>Jump to an arbitrary page</td><td>Trivial (page 7 = offset 120)</td><td>Not supported — only next / prev</td></tr>
+        <tr><td>Best for</td><td>Fixed, page-numbered tables (admin lists, search results with page numbers)</td><td><strong>Infinite scroll, feeds, any live or reordering list</strong></td></tr>
+      </tbody>
+    </table>
+
+    <p>
+      The one-liner to say: <em>"Offset pagination addresses items by position from the top, and the top of a feed is
+      where new posts land — so by the time the user scrolls to page 2, every position has shifted and they see duplicates,
+      or gaps if something was deleted. A cursor points at a stable item — 'give me 20 after this post' — so it's immune to
+      inserts above it, and it's an indexed seek instead of scan-and-discard at deep pages. I'd only use offset for a
+      fixed, page-numbered table where jumping to page 7 is a real feature and the data isn't shifting underneath."</em>
+    </p>
+
+    <div class="pitfall">Two subtler cursor gotchas worth pre-empting, because they're the interviewer's next question. First: the cursor must be built on a <strong>stable, unique sort key</strong> — <code>(createdAt, id)</code>, not <code>createdAt</code> alone, or two posts with the same timestamp can straddle the page boundary and one gets skipped. Second: <strong>new posts still don't appear in an already-loaded feed on their own</strong> — cursor pagination only fixes drift while paging <em>forward</em>; surfacing live items at the top is a separate mechanism (the "12 new posts" pill that prepends buffered ids), which is exactly why we modelled it as its own state in the Architecture step.</div>
+
+    <div class="senior">Tie the two interfaces together: <em>"There are two contracts. The network API I shape to the component: side-load users so I can normalize, cursor-paginate so the feed doesn't drift as new posts arrive, and make the like idempotent so a double-tap is safe. The component API I keep presentational — <code>PostActions</code> takes data as props and emits <code>onLike</code>, knowing nothing about fetching — so it's reusable on the detail page and testable in isolation. And I'd point out the network shape and the store shape are the same decision: the API side-loads because the client normalizes."</em> Naming both interfaces and connecting the wire format back to the cache is the move that reads as a senior frontend engineer rather than a backend engineer visiting.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="optimizations">O — Optimizations</h2>
+
+    <p>
+      <strong>This is where the interview really happens.</strong> Optimizations is the deep-dive and the biggest scoring
+      bucket, and it's where seven years of shipping frontend pays off, because these are problems you've actually hit.
+      You will not have time to cover everything, so the skill is to <strong>menu the axes, then go deep on the one or two
+      the interviewer picks.</strong> Say the menu out loud:
+    </p>
+
+    <table>
+      <thead><tr><th>Axis</th><th>For a feed, that means</th><th>Triggered by the follow-up</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Runtime / rendering</strong></td><td><strong>List virtualization</strong> (the marquee), memoization, stable keys, colocated state</td><td>"It's an infinite list — how does it stay smooth at 5,000 posts?"</td></tr>
+        <tr><td><strong>Network &amp; perceived perf</strong></td><td><strong>Optimistic likes</strong>, SWR caching, prefetch the next page, cancel stale requests</td><td>"What happens on slow 3G / when the like request fails?"</td></tr>
+        <tr><td><strong>Load performance</strong></td><td>Code-split routes, SSR/stream first content, image priority, Core Web Vitals</td><td>"Why is first content slow / the bundle large?"</td></tr>
+        <tr><td><strong>Images &amp; layout stability</strong></td><td><strong>Lazy loading</strong>, reserved dimensions (no CLS), responsive <code>srcset</code>, skeletons</td><td>"The layout jumps as images load — and images are your payload"</td></tr>
+        <tr><td><strong>Accessibility</strong></td><td>Semantic <code>&lt;article&gt;</code>/<code>&lt;button&gt;</code>, keyboard, <code>aria-live</code> for new posts, focus in a virtualized list</td><td>"How does this work with a screen reader / keyboard only?"</td></tr>
+      </tbody>
+    </table>
+
+    <p>
+      For a feed the interviewer almost always steers to <strong>virtualization</strong> or <strong>optimistic
+      updates</strong> — so those get their own deep-dive sections below, followed by image loading and perceived
+      performance because images <em>are</em> the feed's payload. But name the menu first: it proves you know the whole
+      surface even when you only demo part of it, and it hands the interviewer the wheel.
+    </p>
+
+    <div class="pitfall">Don't list all five axes exhaustively — you'll run out of clock and cover everything shallowly. And don't optimize speculatively. The failure mode is a candidate who sprinkles <code>useMemo</code> everywhere and adds a Web Worker nobody needs. Virtualization only matters past a few hundred rows; memoizing a cheap component can cost more than it saves. Menu the axes, let the interviewer pick, and go deep exactly there.</div>
+
+    <div class="senior">The framing that shows you optimize from data, not vibes: <em>"I wouldn't add any of this blind — I'd measure first with the React Profiler and Web Vitals, and in a feed the bottleneck is almost always images and bundle size long before it's render logic. So my first two fixes are lazy-loading images with reserved dimensions and code-splitting; virtualization comes in the moment the list is long enough that DOM node count dominates. That ordering — cheapest, highest-impact fix first, verified by measurement — is the same 'the bottleneck is rarely where you guess' instinct as the backend round."</em> Hearing that in a frontend round tells the interviewer you've optimized real apps, not memorized a technique list.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="virtualization">Deep dive: infinite scroll &amp; list virtualization</h2>
+
+    <p>
+      The instant you say "infinite scroll," the interviewer is waiting to hear "virtualization." These are two separate
+      mechanisms and strong candidates keep them straight: <strong>infinite scroll</strong> is about the
+      <em>network</em> (fetch the next page as the user nears the bottom), and <strong>virtualization</strong> is about the
+      <em>DOM</em> (render only the rows on screen). You need both, and conflating them is a common tell.
+    </p>
+
+    <h3>Infinite scroll — the sentinel, not a scroll handler</h3>
+    <p>
+      To load more, you need to know when the user is near the bottom. The naive answer is a <code>scroll</code> listener
+      computing <code>scrollHeight − scrollTop − clientHeight</code> on every scroll event — which fires dozens of times a
+      second and thrashes layout. The modern answer is an <strong><code>IntersectionObserver</code> sentinel</strong>: an
+      empty <code>&lt;div&gt;</code> just past the last row that the browser tells you about when it enters the viewport,
+      off the main thread, with no scroll math.
+    </p>
+
+<pre><code><span class="com">// LoadMoreSentinel — fires fetchNextPage when it scrolls into view.</span>
+<span class="kw">function</span> <span class="typ">LoadMoreSentinel</span>({ onReach, hasNextPage }) {
+  <span class="kw">const</span> ref = <span class="typ">useRef</span>(<span class="kw">null</span>);
+  <span class="typ">useEffect</span>(() =&gt; {
+    <span class="kw">if</span> (!hasNextPage) <span class="kw">return</span>;
+    <span class="kw">const</span> io = <span class="kw">new</span> <span class="typ">IntersectionObserver</span>(
+      ([entry]) =&gt; { <span class="kw">if</span> (entry.isIntersecting) onReach(); },
+      { rootMargin: <span class="str">"600px"</span> },   <span class="com">// fire BEFORE it's visible → next page is ready by</span>
+    );                              <span class="com">// the time the user gets there. Prefetch, not react.</span>
+    io.observe(ref.current);
+    <span class="kw">return</span> () =&gt; io.disconnect();
+  }, [onReach, hasNextPage]);
+  <span class="kw">return</span> &lt;div ref={ref} aria-hidden=<span class="str">"true"</span> /&gt;;
+}
+</code></pre>
+
+    <p>
+      The <code>rootMargin: "600px"</code> is the senior touch — you trigger the fetch a screen <em>before</em> the sentinel
+      is actually visible, so the next page is loading (or loaded, from cache) by the time the user scrolls to it and the
+      feed never shows a spinner. Pair it with React Query's <code>useInfiniteQuery</code>, which manages the pages array
+      and threads <code>nextCursor</code> through for you.
+    </p>
+
+    <h3>Virtualization (windowing) — render 20 nodes for a 10,000-item list</h3>
+    <p>
+      Here is the core insight, and you should say it in exactly these terms: <strong>it's the number of DOM nodes, not
+      the length of your data array, that kills the browser.</strong> The browser must lay out, paint, and keep in memory
+      every node on the page; a post is 30–50 nodes, so 500 posts is ~20,000 nodes and the main thread chokes on layout
+      and garbage collection. Virtualization <em>decouples how many items exist from how many are rendered.</em>
+    </p>
+    <p>
+      You keep the full data array in memory (it's cheap — a few hundred KB of JSON), but you only mount the ~20 rows
+      currently in the viewport, plus a small <strong>overscan</strong> buffer above and below so fast scrolling doesn't
+      flash blank. As the user scrolls, you unmount rows leaving the viewport and mount rows entering it — recycling a
+      constant handful of DOM nodes. To keep the scrollbar honest, a single tall spacer element (or top/bottom padding)
+      reserves the full scroll height as if all rows were present.
+    </p>
+
+<pre><code>  data array: 10,000 posts in memory (cheap)     what's actually in the DOM:
+
+     ┌─ post 0                                    ┌──────────────────────┐
+     │  post 1        (not rendered)              │  (spacer: height of  │
+     │  …                                         │   rows 0…N, ~0 nodes)│
+     │  post 4,981  ┐                              ├──────────────────────┤
+     │  post 4,982  │ overscan (buffer)            │  post 4,981  overscan│
+     ├─ post 4,983  ┐                              │  post 4,982          │
+     │  post 4,984  │                              │  post 4,983 ┐        │  ← ~20 real
+     │  …           │ VIEWPORT (visible ~20 rows)  │  …          │ visible │    FeedItem
+     │  post 5,002  ┘                              │  post 5,002 ┘        │    nodes
+     │  post 5,003  ┐ overscan (buffer)            │  post 5,003  overscan│
+     │  post 5,004  ┘                              ├──────────────────────┤
+     │  …                                          │  (spacer: height of  │
+     └─ post 9,999   (not rendered)                │   rows below)        │
+                                                   └──────────────────────┘
+   DOM node count is CONSTANT (~30 rows) no matter how long the data grows.
+</code></pre>
+
+    <p>
+      You don't hand-roll this in an interview — name <strong><code>react-window</code></strong> /
+      <strong><code>@tanstack/react-virtual</code></strong> and describe what they do. But you must be able to explain the
+      one genuinely hard part, because it's the follow-up: <strong>variable row heights.</strong> A fixed-height list is
+      easy — row <code>i</code> sits at <code>i × rowHeight</code>. A feed isn't fixed-height: a post with three lines of
+      text and no image is short; one with a photo is tall. So the virtualizer must <strong>measure each row after it
+      renders</strong> and cache its height, estimating unmeasured rows and correcting the total scroll height as real
+      measurements come in. <code>react-virtual</code>'s <code>measureElement</code> does exactly this. Saying "variable
+      heights are the hard part, and I'd let the virtualizer measure-and-cache rather than guess" is the detail that
+      separates someone who's used windowing from someone who's only read about it.
+    </p>
+
+    <div class="pitfall">Virtualization quietly breaks three things you must address or the interviewer will. <strong>(1) Ctrl-F / in-page find and SEO</strong> — off-screen rows aren't in the DOM, so browser find and crawlers can't see them; fine for an authed feed, a real problem for public content (mitigate with SSR of the first page). <strong>(2) Accessibility &amp; focus</strong> — a screen reader and the Tab key can only reach mounted rows, and if focus is inside a row that unmounts as you scroll, focus is lost; you manage this with the virtualizer's a11y support and by not unmounting a focused row. <strong>(3) Anchoring / scroll jump</strong> — when a row's measured height differs from its estimate, or an image loads and grows a row, everything below shifts; the virtualizer must anchor to the current top row and compensate, or the feed janks under the user.</div>
+
+    <div class="senior">Say the decoupling out loud, then bound it: <em>"The thing that kills a long list is DOM node count, not array length, so I virtualize — keep all the data in memory but only mount the ~20 visible rows plus overscan, and recycle nodes as they scroll. The hard part for a feed specifically is variable row heights, so I'd use a virtualizer that measures each row and caches it rather than assuming a fixed height. And I wouldn't reach for it at all under a few hundred rows — below that the DOM is fine and virtualization just adds scroll-jump and a11y complexity for nothing. It's a tool I turn on when node count actually dominates, not a default."</em> Naming <em>when not to virtualize</em> is what makes it read as judgment rather than a memorized keyword.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="optimistic">Deep dive: optimistic updates &amp; rollback</h2>
+
+    <p>
+      A like that waits for a server round trip before the heart fills feels broken, especially on a slow network. The fix
+      is the <strong>optimistic update</strong>: update the UI <em>immediately</em> from the client as if the request had
+      already succeeded, fire it in the background, and <strong>roll back</strong> if it fails. This is a top-three thing
+      to raise for a feed, and it's why the like state was modelled as an isolated, normalized cache entry back in the
+      Architecture and Data steps — so the toggle is cheap, local, and trivially reversible.
+    </p>
+
+    <h3>The pattern: snapshot → mutate → settle</h3>
+    <p>
+      Every correct optimistic update is the same three-beat shape, and the middle beat — snapshotting the previous value
+      so you can restore it — is the one candidates forget. You can't roll back to a value you didn't save.
+    </p>
+
+<pre><code><span class="com">// Optimistic like with React Query. The shape is: onMutate (snapshot + apply),</span>
+<span class="com">// onError (restore the snapshot), onSettled (re-sync with the server's truth).</span>
+<span class="kw">const</span> likeMutation = <span class="typ">useMutation</span>({
+  mutationFn: (postId) =&gt; api.put(<span class="str">`/posts/</span>${postId}<span class="str">/like`</span>),
+
+  onMutate: <span class="kw">async</span> (postId) =&gt; {
+    <span class="com">// 1. Cancel in-flight refetches so they can't overwrite our optimistic write.</span>
+    <span class="kw">await</span> queryClient.cancelQueries({ queryKey: [<span class="str">"post"</span>, postId] });
+
+    <span class="com">// 2. SNAPSHOT the current value — this is the rollback token. Don't skip it.</span>
+    <span class="kw">const</span> previous = queryClient.getQueryData([<span class="str">"post"</span>, postId]);
+
+    <span class="com">// 3. Apply the optimistic change to the ONE normalized entry.</span>
+    queryClient.setQueryData([<span class="str">"post"</span>, postId], (p) =&gt; ({
+      ...p, likedByMe: <span class="kw">true</span>, likeCount: p.likeCount + <span class="num">1</span>,
+    }));
+
+    <span class="kw">return</span> { previous };   <span class="com">// hand the snapshot to onError</span>
+  },
+
+  onError: (_err, postId, ctx) =&gt; {
+    <span class="com">// 4. ROLL BACK to the snapshot, then toast so the user knows it didn't stick.</span>
+    queryClient.setQueryData([<span class="str">"post"</span>, postId], ctx.previous);
+    toast(<span class="str">"Couldn't like that — try again"</span>);
+  },
+
+  onSettled: (_data, _err, postId) =&gt; {
+    <span class="com">// 5. Reconcile with the server's authoritative count (someone else may have</span>
+    <span class="com">//    liked it too). Invalidate → background refetch → cache holds the truth.</span>
+    queryClient.invalidateQueries({ queryKey: [<span class="str">"post"</span>, postId] });
+  },
+});
+</code></pre>
+
+    <p>
+      Because the store is <strong>normalized</strong>, the optimistic write targets one entry — <code>post:p1</code> —
+      and every view referencing it (the feed row, the detail page, a "liked posts" list) updates together. If you'd
+      denormalized, you'd have to find and patch the same post in every list, and miss one, and it would drift. This is
+      the payoff of the D step made concrete: optimistic updates are <em>easy</em> on a normalized cache and <em>painful</em>
+      on a denormalized one.
+    </p>
+
+    <h3>Why cancel, and why re-sync</h3>
+    <ul>
+      <li><strong>Cancel in-flight queries (<code>onMutate</code>).</strong> If a background feed refetch is already in
+        flight when you like, it could land <em>after</em> your optimistic write and clobber it with stale
+        pre-like data. Cancelling first closes that race.</li>
+      <li><strong>Re-sync on settle (<code>onSettled</code>).</strong> Your optimistic <code>+1</code> assumed nothing else
+        changed, but another user may have liked the same post in the same second. Invalidating after the mutation lets a
+        background refetch replace your guess with the server's authoritative count — the client's <code>+1</code> is a
+        placeholder, the server's number is the truth.</li>
+    </ul>
+
+    <h3>When NOT to be optimistic</h3>
+    <p>
+      Optimism is a bet that the request will succeed, so use it where that bet is safe and a rare rollback is harmless —
+      likes, follows, bookmarks, reordering. <strong>Don't</strong> use it, or make the pending state explicit, when a
+      wrong-then-corrected value would mislead or cost something: anything money-shaped (tutorial 13's ledger is the
+      opposite philosophy — there you'd never show success you can't guarantee), a post that might be rejected by content
+      moderation, or a payment. The rule of thumb to say: <em>"optimistic where the failure is rare and the rollback is
+      cheap; pessimistic where being briefly wrong is worse than being briefly slow."</em>
+    </p>
+
+    <div class="pitfall">The two failures interviewers probe. <strong>Forgetting the snapshot</strong> — candidates apply the change and set up an <code>onError</code> that "reverts" by subtracting 1, which is wrong if the request that failed was itself a double-fire or the value changed underneath; always roll back to the <em>captured previous value</em>, not by inverting the operation. And <strong>the flicker on re-sync</strong> — if <code>onSettled</code> refetches and the server returns the same number your optimistic write already showed, a naive implementation flashes a spinner or re-renders a jump; invalidate quietly in the background (stale-while-revalidate) so the already-correct UI doesn't visibly churn.</div>
+
+    <div class="senior">The line that shows you've shipped this: <em>"The optimistic update is three beats — snapshot the current value, apply the change to the one normalized entry, and on error roll back to the snapshot with a toast; on settle I invalidate to reconcile with the server's authoritative count, because my <code>+1</code> was a placeholder, not the truth. The reason it's clean is the normalized cache: I patch <code>post:p1</code> once and every view updates. And I'd only do it where the bet is safe — a like, not a payment. For money I want the opposite: never show success I can't guarantee."</em> Naming the snapshot, the reconcile, and the where-not-to in one breath is a complete, senior answer.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="images">Deep dive: image loading &amp; perceived performance</h2>
+
+    <p>
+      The estimation in the Requirements step already told you where the bytes are: metadata is ~30 KB a page, images are
+      2–6 MB. <strong>Images are the feed's payload, so image loading is the feed's real performance problem</strong> —
+      and it's also the biggest source of the janky, lurching experience that makes a feed feel cheap. This section is
+      about two things: getting images on screen efficiently, and making the whole feed <em>feel</em> fast even when the
+      network isn't.
+    </p>
+
+    <h3>Layout stability — reserve the space before the image loads</h3>
+    <p>
+      The single worst feed bug, and the one with its own Core Web Vitals metric (<strong>CLS — Cumulative Layout
+      Shift</strong>), is content jumping as images load. A post renders with a zero-height image, text flows up to fill
+      the gap, then the image arrives, pushes everything down, and the user — who was reading — loses their place or taps
+      the wrong thing. The fix is to <strong>reserve the image's box before it loads</strong> by giving the browser the
+      aspect ratio up front:
+    </p>
+
+<pre><code><span class="com">// The server sends width/height (or an aspect ratio) with each post's media.</span>
+<span class="com">// The browser reserves the exact box, so text never reflows when the image arrives.</span>
+&lt;img
+  src={post.mediaUrl}
+  width={post.mediaWidth} height={post.mediaHeight}   <span class="com">// intrinsic size → reserved box, CLS = 0</span>
+  loading=<span class="str">"lazy"</span>                                     <span class="com">// don't fetch until near the viewport</span>
+  decoding=<span class="str">"async"</span>                                    <span class="com">// decode off the main thread</span>
+  srcSet={<span class="str">`</span>${post.mediaUrl}<span class="str">?w=400 400w, </span>${post.mediaUrl}<span class="str">?w=800 800w`</span>}
+  sizes=<span class="str">"(max-width: 600px) 400px, 800px"</span>           <span class="com">// send phones the small variant</span>
+  alt={post.altText}                                  <span class="com">// a11y — real alt text, not ""</span>
+/&gt;
+</code></pre>
+
+    <p>
+      Every attribute there is a decision worth naming. <code>width</code>/<code>height</code> (or a CSS
+      <code>aspect-ratio</code>) reserve the box and kill CLS. <code>loading="lazy"</code> means below-the-fold images
+      don't compete for bandwidth with the ones the user can actually see. <code>srcset</code>/<code>sizes</code> ship a
+      phone a 400px-wide image instead of the 800px desktop one — often the biggest single byte saving on mobile, where
+      bytes <em>are</em> latency. And modern formats (<strong>AVIF/WebP</strong> with a fallback) cut image weight 30–50%
+      for free.
+    </p>
+
+    <h3>Perceived performance — feeling fast beats being fast</h3>
+    <p>
+      Perceived performance is the discipline of managing the user's <em>perception</em> of speed, which is often a bigger
+      lever than raw milliseconds. The techniques:
+    </p>
+    <ul>
+      <li><strong>Skeletons over spinners.</strong> A gray placeholder in the shape of a post tells the user "content is
+        coming and here's roughly what," which feels faster and more stable than a spinner — and because the skeleton has
+        the post's dimensions, it doubles as CLS insurance. A spinner says "wait"; a skeleton says "almost there."</li>
+      <li><strong>Blur-up / LQIP placeholders.</strong> Show a tiny blurred thumbnail (a few hundred bytes, often inlined
+        as a data URI in the post JSON) instantly, then swap in the full image when it loads. The user sees <em>something
+        real</em> in the image's box immediately instead of a blank rectangle.</li>
+      <li><strong>Prefetch the next page.</strong> The <code>rootMargin</code> on the sentinel already loads the next page
+        of data before the user reaches it; do the same for images — the feed should feel bottomless because the next
+        screen is always already there.</li>
+      <li><strong>Optimistic interactions.</strong> The instant like from the previous section is perceived performance —
+        it removes the round trip from the user's experience of the tap.</li>
+      <li><strong>Stable, jank-free scroll.</strong> Reserved image boxes + virtualization anchoring mean the content
+        under the user's thumb never jumps. A feed that doesn't shift <em>feels</em> higher quality than one that's
+        technically faster but lurches.</li>
+    </ul>
+
+    <p>
+      The through-line: <strong>the user doesn't have a stopwatch, they have a feeling.</strong> A feed that shows a
+      skeleton in 100 ms, a blurred image immediately, never shifts layout, and responds to a tap instantly <em>feels</em>
+      faster than one that's a bit quicker on raw metrics but flashes blank rectangles and jumps around. Optimize the
+      perception, backed by the real numbers where they matter (images, bundle).
+    </p>
+
+    <div class="pitfall">Two image mistakes that read as inexperience. <strong>Lazy-loading the above-the-fold images too</strong> — <code>loading="lazy"</code> on the first two or three posts <em>delays</em> your LCP (Largest Contentful Paint) because the browser waits to fetch the very image that is the hero content; eager-load or <code>fetchpriority="high"</code> the first screen, lazy-load the rest. And <strong>not sizing images at all</strong> — shipping a 2000px original to a 400px-wide phone slot wastes 90% of the bytes and the decode time, then downscales it anyway. Serve responsive variants; the CDN or an image service (or Next/Image) generates them.</div>
+
+    <div class="senior">Close the whole optimizations arc by connecting it back to the estimate: <em>"I'd anchor image work in the numbers — a feed page is ~30 KB of JSON and several MB of images, so images are my payload and my perceived-speed problem in one. So: reserve every image box to keep CLS at zero, lazy-load below the fold but eager-load the first screen so I don't hurt LCP, ship responsive AVIF/WebP variants so a phone gets phone-sized bytes, and cover the loading gap with a skeleton and a blur-up placeholder. The user judges the feed on whether it flashes and jumps, not on a Lighthouse number — so I optimize the perception, backed by the byte math where it counts."</em> Grounding perceived-performance polish in the payload estimate is the move that ties the case study together.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="qa">Interview Q&amp;A</h2>
+
+    <details class="qa">
+      <summary>1. Walk me through how you'd design a news feed UI.</summary>
+      <div class="answer">
+        <p>Name the round first: <em>"I'll treat this as frontend system design — client architecture, state, data flow,
+        performance — and assume the feed backend exists behind a paginated API."</em> Then RADIO. <strong>R:</strong> view
+        + infinite scroll + like + new-posts affordance; cut compose/comments to nav targets; estimate DOM and payload
+        weight (images dominate, node count grows unboundedly). <strong>A:</strong> component tree with a virtualized list
+        and an isolated <code>PostActions</code> leaf; state at the lowest ancestor that needs it. <strong>D:</strong>
+        feed is server state in a normalized, id-keyed cache, order/cursor separate from entities. <strong>I:</strong>
+        props API (data in, <code>onLike</code> out) plus a cursor-paginated, side-loaded network API. <strong>O:</strong>
+        menu the axes, then deep-dive virtualization and optimistic likes, plus image loading.</p>
+        <p>The whole answer is back-loaded onto O deliberately — that's where the points are — and every step names a
+        trade-off as it's made.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>2. Cursor vs offset pagination — which, and why exactly does offset drift?</summary>
+      <div class="answer">
+        <p><strong>Cursor</strong>, always, for a feed. Offset addresses items by <em>position counted from the top</em>
+        ("skip 40, take 20"), and the top of a feed is where new posts are constantly prepended. So between loading page 1
+        and scrolling to page 2, inserts above the read window shift every position below them: <code>offset=20</code> now
+        points at rows the user already saw (duplicates), or — if items were deleted — past rows they never saw (gaps).</p>
+        <p>A cursor addresses items by a <em>stable pointer</em> — "give me 20 after post T," where the cursor encodes
+        T's <code>(createdAt, id)</code>. Items don't move relative to themselves, so inserts above T don't affect the
+        query; it's also an indexed seek instead of scan-and-discard at deep pages. Offset only wins for fixed,
+        page-numbered tables where "jump to page 7" is a real feature and the data isn't shifting underneath.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>3. There are 10,000 posts in the feed — what do you do?</summary>
+      <div class="answer">
+        <p><strong>Virtualize (window) the list.</strong> The killer isn't the array length — it's the DOM node count; a
+        post is 30–50 nodes, so 10,000 posts is hundreds of thousands of nodes and the browser chokes on layout, paint,
+        and GC. Keep all the data in memory but mount only the ~20 rows in the viewport plus a small overscan buffer,
+        recycling nodes as the user scrolls, with a spacer reserving the full scroll height. Name
+        <code>react-window</code> / <code>@tanstack/react-virtual</code>.</p>
+        <p>The follow-up is variable row heights (a text post vs a photo post), which is the genuinely hard part — the
+        virtualizer must measure each row after render and cache it, correcting the total height as measurements arrive.
+        And virtualization breaks Ctrl-F, SEO, and focus for off-screen rows, so I'd mention SSR-ing the first page and
+        managing focus deliberately.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>4. Infinite scroll and virtualization — aren't those the same thing?</summary>
+      <div class="answer">
+        <p>No, and keeping them straight is a signal. <strong>Infinite scroll is a network concern</strong>: fetch the next
+        page as the user nears the bottom — I'd use an <code>IntersectionObserver</code> sentinel with a
+        <code>rootMargin</code> so the page prefetches before the user arrives, not a <code>scroll</code> handler that
+        thrashes layout. <strong>Virtualization is a DOM concern</strong>: render only the visible rows regardless of how
+        many are loaded.</p>
+        <p>You need both. Infinite scroll without virtualization loads 5,000 posts into 5,000 DOM nodes and janks;
+        virtualization without infinite scroll windows a list you can't grow. Together: fetch pages lazily via the
+        sentinel, keep them in a normalized cache, and window the render.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>5. How does an optimistic like work, and how do you roll it back?</summary>
+      <div class="answer">
+        <p>Three beats. <strong>Snapshot</strong> the current cache value for that post (the rollback token — the beat
+        people forget), <strong>apply</strong> the optimistic change to the one normalized entry (<code>likedByMe=true</code>,
+        <code>likeCount+1</code>) so the UI updates instantly, and on error <strong>roll back</strong> to the snapshot with
+        a toast. Also cancel in-flight refetches in <code>onMutate</code> so a background fetch can't clobber the optimistic
+        write, and on settle invalidate to reconcile with the server's authoritative count (someone else may have liked it
+        too — my <code>+1</code> was a placeholder).</p>
+        <p>It's clean specifically because the cache is normalized: I patch <code>post:p1</code> once and the feed row, the
+        detail page, and any other list referencing it all update together. And I'd only be optimistic where the failure is
+        rare and rollback is cheap — a like, not a payment.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>6. Why normalize the client cache, and what breaks if you don't?</summary>
+      <div class="answer">
+        <p>So each post has one source of truth. If the same post is copied into the feed list, the detail view, and a
+        "liked" list, then liking it updates one copy and the others drift — the feed shows 13 likes, the detail page shows
+        12. Store each entity once keyed by id, keep lists as arrays of ids, and an update in one place is seen everywhere.
+        Keep the order and cursor (<code>feed.ids</code>, <code>nextCursor</code>) separate from the entities
+        (<code>posts</code>) so you can append a page, prepend a live post, or dedupe without touching stored objects.</p>
+        <p>The concrete payoff: optimistic updates and cache invalidation become one-line writes on a normalized store and
+        a find-and-patch-every-list nightmare on a denormalized one. Apollo normalizes by id automatically; React Query is
+        document-cache by default, so you either normalize yourself or write to each relevant key.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>7. New posts arrive while the user is scrolling. What do you do with them?</summary>
+      <div class="answer">
+        <p>Don't inject them mid-scroll — that shifts content under the user's thumb and they lose their place (and it's
+        the exact drift offset pagination causes, self-inflicted). Buffer the new posts' ids aside and surface a
+        <strong>"12 new posts" pill</strong>; when the user taps it, prepend the buffered ids to <code>feed.ids</code> and
+        scroll to top. That keeps the reading position stable and makes showing new content a user choice.</p>
+        <p>How the new posts arrive is a separate decision: WebSocket or SSE for true real-time, or polling on an interval
+        for "good enough" freshness. For a feed, near-real-time via poll or SSE is usually plenty, and I'd say so rather
+        than reaching for a socket reflexively. For a screen reader I'd announce "12 new posts available" via an
+        <code>aria-live="polite"</code> region so it isn't a silent visual-only change.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>8. Where should each piece of the feed's state live?</summary>
+      <div class="answer">
+        <p>Lowest common ancestor that needs it, and no higher. The <strong>posts + cursor</strong> are server state — a
+        server-cache library (React Query/SWR), not the component and not Redux. The <strong>like toggle</strong> lives in
+        the normalized cache entry so all views agree and the optimistic write is isolated. <strong>Scroll/window
+        position</strong> is local to the virtualized list. The <strong>buffered "new posts"</strong> sit in the page or
+        aside in the cache. <strong>User/theme</strong> is app-global Context.</p>
+        <p>The observation to voice: almost nothing here is truly global. Candidates who put the whole feed in one Redux
+        store have misread where each kind of state wants to live — most of a feed's "state" is a server cache, and the
+        rest is local view state.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>9. Images make the feed feel slow and janky. How do you fix it?</summary>
+      <div class="answer">
+        <p>Images are the payload — a page is ~30 KB of JSON and several MB of images — so this is the real performance
+        problem. Kill layout shift (CLS) by <strong>reserving each image's box</strong> with its intrinsic
+        width/height or an aspect ratio before it loads, so text never reflows when the image arrives. <strong>Lazy-load
+        below the fold</strong> (<code>loading="lazy"</code>) but eager-load the first screen so you don't hurt LCP. Ship
+        <strong>responsive <code>srcset</code> variants</strong> in modern formats (AVIF/WebP) so a phone gets
+        phone-sized bytes.</p>
+        <p>Then cover the gap with perceived-performance tricks: a <strong>skeleton</strong> in the post's shape (which is
+        also CLS insurance) and a <strong>blur-up LQIP</strong> so the user sees something real in the box immediately.
+        The user judges the feed on whether it flashes and jumps, not on a raw metric.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>10. The interviewer says "make it faster." Where do you start?</summary>
+      <div class="answer">
+        <p>Ask what "faster" means — load or runtime — then measure before touching anything. For a feed the honest answer
+        is that the bottleneck is almost always <strong>images and bundle size long before render logic</strong>, so I'd
+        instrument with the React Profiler and Web Vitals rather than sprinkle <code>useMemo</code>. Load fixes:
+        code-split routes, lazy-load below-the-fold images/assets, SSR the first screen for fast first content. Runtime
+        fixes: virtualize the long list, memoize genuinely expensive subtrees, keep high-frequency handlers off the main
+        thread.</p>
+        <p>The senior move is refusing to optimize speculatively — virtualization is pointless under a few hundred rows,
+        memoizing a cheap component costs more than it saves. Cheapest high-impact fix first, verified by measurement.
+        Same instinct as the backend round: the bottleneck is rarely where you'd guess.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>11. How do you keep a virtualized, infinite feed accessible?</summary>
+      <div class="answer">
+        <p>Start with semantics: each post is an <code>&lt;article&gt;</code>, actions are real <code>&lt;button&gt;</code>s
+        (keyboard operability and the right role for free). The feed-specific hazards are two. <strong>Virtualization hides
+        rows from the accessibility tree and from Tab</strong> — off-screen rows aren't in the DOM, so a screen reader and
+        keyboard can only reach mounted rows, and if focus is inside a row that unmounts on scroll, focus is lost; use the
+        virtualizer's a11y support and avoid unmounting a focused row. <strong>New posts arriving is a silent visual
+        change</strong> — announce it through an <code>aria-live="polite"</code> region ("12 new posts available") so it
+        isn't invisible to a screen reader.</p>
+        <p>Then the baseline: visible focus rings, sufficient contrast, real <code>alt</code> text on images,
+        <code>prefers-reduced-motion</code> for any transition. Naming the virtualization-vs-a11y tension unprompted is a
+        strong senior signal — most candidates don't realize windowing breaks the accessibility tree.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>12. This is a frontend round — should you ever talk about the backend at all?</summary>
+      <div class="answer">
+        <p>Briefly, as a contract, and only to justify a client decision. You should define the feed endpoint's shape
+        (cursor-paginated, side-loaded users, idempotent like) because those choices are what make your client design
+        work — that's the "I — Interface" step. What you <em>don't</em> do is scale it: no fan-out, no timeline caching, no
+        sharding, unless the interviewer explicitly asks (then tutorial 10 is your script). </p>
+        <p>The tell you've got the balance right: you can say "I'd want the API to cursor-paginate and side-load users, and
+        I know how I'd build that service, but I'll treat it as given and spend my time on the client." That shows range
+        without spending your best minutes on the wrong round.</p>
+      </div>
+    </details>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="takeaways">What to remember</h2>
+
+    <h3>The frame</h3>
+    <ul>
+      <li><strong>It's the frontend round.</strong> Name it in your first sentence and treat the feed backend as a one-line
+        API contract. You built the fan-out backend in tutorial 10 — don't rebuild it here; the client is the whole
+        subject.</li>
+      <li><strong>Clarify the experience, not the scale.</strong> No DAU-to-QPS. The only estimation that earns its place is
+        DOM weight and payload weight — which tells you images are the payload and node count grows unbounded.</li>
+    </ul>
+
+    <h3>RADIO for a feed</h3>
+    <ul>
+      <li><strong>R.</strong> Functional = view, infinite scroll, like, new-posts pill (they enumerate your components).
+        Non-functional = devices, list size, real-time, network, perf budget, a11y. Scope and cut out loud.</li>
+      <li><strong>A.</strong> Component tree carved by responsibility and re-render rate; isolate the like in a small leaf.
+        State at the lowest ancestor that needs it. Data down as props, events up as callbacks, cache as the pivot.</li>
+      <li><strong>D.</strong> The feed is <strong>server state = a cache</strong> (React Query/SWR), not Redux.
+        <strong>Normalize</strong>: one entity per id, lists hold ids, order/cursor kept separate from entities. Derive,
+        don't store.</li>
+      <li><strong>I.</strong> Two contracts — the <strong>props API</strong> (data in, intent out) and the
+        <strong>network API</strong> (side-load users, idempotent like, and <strong>cursor pagination</strong>).</li>
+      <li><strong>O.</strong> Menu the axes, then deep-dive where they point.</li>
+    </ul>
+
+    <h3>The four techniques the interviewer is fishing for</h3>
+    <ul>
+      <li><strong>List virtualization.</strong> DOM node count, not array length, kills the browser. Mount ~20 visible rows
+        + overscan, recycle on scroll, reserve full scroll height. Variable row heights = measure-and-cache. Don't
+        virtualize under a few hundred rows.</li>
+      <li><strong>Cursor pagination.</strong> Offset addresses items by position from the top, which shifts as posts are
+        prepended → duplicates (or gaps on delete). A cursor points at a stable item — "20 after post T" — immune to
+        inserts above it, and an indexed seek at depth.</li>
+      <li><strong>Optimistic updates.</strong> Snapshot → apply to the one normalized entry → roll back to the snapshot on
+        error; cancel in-flight fetches, reconcile on settle. Clean because the cache is normalized. Likes yes, money
+        no.</li>
+      <li><strong>Normalized cache.</strong> One copy per entity so the feed and detail view never drift; it's what makes
+        optimistic updates and invalidation one-line writes.</li>
+    </ul>
+
+    <h3>Images &amp; perceived performance</h3>
+    <ul>
+      <li><strong>Reserve every image box</strong> (CLS = 0), <strong>lazy-load below the fold</strong> but eager-load the
+        first screen (LCP), ship <strong>responsive AVIF/WebP variants</strong>. Skeletons and blur-up placeholders cover
+        the loading gap. The user judges the feed on flashing and jumping, not on a metric.</li>
+      <li><strong>Measure before optimizing</strong> — the bottleneck is images and bundle size long before render logic.
+        Same instinct as the backend round.</li>
+    </ul>
+
+    <div class="senior">
+      The one line that ties the page together: <strong>a news feed is four techniques and one contract.</strong>
+      Virtualize the render, cursor-paginate the fetch, make the like optimistic, normalize the cache — and put the server
+      behind a paginated endpoint you define in thirty seconds. Everything else is narrating the trade-offs you already
+      make by instinct. Hit those four with the <em>why</em> and not just the library name, name what each costs, and
+      you've given the answer this round is graded on.
+    </div>
+  </section>
+
+  <nav class="page-nav">
+    <a href="19-frontend-method.html">← 19 — Frontend Method (RADIO)</a>
+    <a href="21-autocomplete.html">21 — Autocomplete →</a>
+  </nav>
+
+</main>
+</body>
+</html>

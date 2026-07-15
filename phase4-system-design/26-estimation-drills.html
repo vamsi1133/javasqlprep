@@ -1,0 +1,815 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>26 — Back-of-Envelope Estimation | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <div class="breadcrumb"><a href="index.html">← Course Home</a></div>
+    <h1>26 — Back-of-Envelope Estimation</h1>
+    <p>Numbers you can produce in ten seconds, out loud, without stalling — and how to know which one matters.</p>
+  </div>
+</header>
+
+<main class="container">
+
+  <section>
+    <h2>Why this matters in the interview</h2>
+    <p>
+      Estimation is the one part of a system design round where you can be objectively, checkably right or wrong, and
+      interviewers use it as a cheap signal for seniority. Not because the exact numbers matter — nobody cares whether you
+      said 12,000 QPS or 15,000 — but because a candidate who can say <em>"a billion writes a day is about ten thousand
+      writes a second, and at 1 KB each that's ten megabytes a second, so roughly a terabyte a day, call it a petabyte
+      over three years"</em> in one unbroken breath has clearly done this before. The candidate who freezes, reaches for
+      a calculator, or multiplies 86,400 by hand for thirty seconds has told you the opposite. The arithmetic is trivial;
+      the fluency is the tell.
+    </p>
+    <p>
+      The point of estimation is never the number itself — it's <strong>finding the number that drives the design.</strong>
+      You run the arithmetic to discover that this system is 100:1 read-heavy (so the whole game is caching and read
+      replicas), or that it stores a petabyte (so it can't live on one Postgres box and you need blob storage plus
+      sharding), or that the write QPS is 50 (so any single database handles it and you should stop over-engineering).
+      A senior candidate does the math and then says <em>"so the thing that drives this design is X"</em> — the math is
+      just how you earn the right to that sentence. This page gives you the numbers to memorize, the mechanical method to
+      turn a DAU figure into QPS/storage/bandwidth, the verbal script to do it without stalling, and 15 timed drills to
+      make it reflex. Do the drills out loud on a timer. Talking is the skill being graded.
+    </p>
+  </section>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ul>
+      <li><a href="#numbers">Part 1 — The numbers to know cold</a> — latency ladder · powers of two &amp; data sizes · 86,400 ≈ 10⁵ · standard QPS/size assumptions</li>
+      <li><a href="#method">Part 2 — The method</a> — DAU → requests/day → average QPS → peak QPS → storage/day → storage/5yr → bandwidth · how to round</li>
+      <li><a href="#outloud">Part 3 — Estimating out loud without stalling</a> — the verbal script · state, round, move · naming the driving number</li>
+      <li><a href="#drills">Part 4 — 15 timed drills</a> — QPS, storage, bandwidth, cache memory, server count, keyspace — worked</li>
+      <li><a href="#qa">Interview Q&amp;A</a> — meta-questions about the technique itself</li>
+      <li><a href="#takeaways">What to remember</a> — the memorize-this list</li>
+    </ul>
+  </div>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="numbers">Part 1 — The numbers to know cold</h2>
+    <p>
+      There is a small set of numbers that you should be able to recall the way you recall your phone number — no
+      derivation, no hesitation. Everything else in estimation is multiplication and rounding built on top of these.
+      Memorize this part. It's maybe fifteen facts, and they pay for themselves in every single design round you'll ever
+      sit.
+    </p>
+
+    <h3>1.1 The latency ladder — orders of magnitude, not exact numbers</h3>
+    <p>
+      This is the famous "latency numbers every programmer should know" table, compressed to what actually gets used in an
+      interview. Do <strong>not</strong> memorize the exact nanoseconds — memorize the <em>ratios</em> and the handful of
+      round numbers you'll actually quote (RAM ~100 ns, SSD ~100 µs, disk seek ~10 ms, same-datacenter round trip ~0.5 ms,
+      cross-country ~50–70 ms). The lesson of the table is the <em>gaps</em>: memory is ~1000× faster than SSD, SSD is
+      ~100× faster than spinning disk, and a round trip across the country is enough time to read from RAM a million times.
+    </p>
+
+    <table>
+      <thead><tr><th>Operation</th><th>Rough latency</th><th>Relative to L1</th><th>What it implies</th></tr></thead>
+      <tbody>
+        <tr><td>L1 cache reference</td><td>~1 ns</td><td>1×</td><td>Free. The CPU baseline.</td></tr>
+        <tr><td>L2 cache reference</td><td>~4 ns</td><td>~4×</td><td>Still effectively free.</td></tr>
+        <tr><td>Branch mispredict</td><td>~5 ns</td><td>~5×</td><td>Why tight-loop micro-opt exists — rarely your interview concern.</td></tr>
+        <tr><td>Main memory (RAM)</td><td>~100 ns</td><td>~100×</td><td><strong>The number to anchor on.</strong> A cache hit in Redis is basically this plus a network hop.</td></tr>
+        <tr><td>Read 1 MB sequentially from RAM</td><td>~10 µs</td><td>~10,000×</td><td>Memory bandwidth is huge; scanning RAM is cheap.</td></tr>
+        <tr><td>SSD random read</td><td>~100 µs (0.1 ms)</td><td>~100,000×</td><td>~1000× slower than RAM. This is why a DB "disk" hit still isn't catastrophic on SSD.</td></tr>
+        <tr><td>Round trip within a datacenter</td><td>~0.5 ms</td><td>~500,000×</td><td><strong>The cost of one network hop.</strong> Every service-to-service call, every Redis call, pays this.</td></tr>
+        <tr><td>Read 1 MB sequentially from SSD</td><td>~1 ms</td><td>~1,000,000×</td><td>~100× slower than the same read from RAM.</td></tr>
+        <tr><td>Disk seek (spinning HDD)</td><td>~10 ms</td><td>~10,000,000×</td><td>~100× slower than SSD. This is why random I/O on HDD is the classic bottleneck.</td></tr>
+        <tr><td>Read 1 MB sequentially from HDD</td><td>~20–30 ms</td><td>—</td><td>Sequential is fine; the seek is the killer.</td></tr>
+        <tr><td>Round trip, same continent</td><td>~10–20 ms</td><td>—</td><td>Speed of light in fibre is real and unbeatable.</td></tr>
+        <tr><td>Round trip, cross-country (US)</td><td>~50–70 ms</td><td>—</td><td><strong>Why you put a CDN near the user.</strong> You cannot make this faster; you can only avoid it.</td></tr>
+        <tr><td>Round trip, intercontinental</td><td>~150 ms+</td><td>—</td><td>Why multi-region write coordination is painful — every consensus round is 150 ms.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="senior">
+      The interview-useful compression of this whole table is three sentences: <em>"RAM is nanoseconds, SSD is
+      microseconds, disk seek and cross-country network are both milliseconds — so a network round trip and a disk seek
+      cost about the same, and both are ten thousand times more expensive than reading from memory."</em> That last
+      equivalence is the one that scores: it's <em>why</em> a cache hit (RAM + one network hop ≈ 0.5 ms) beats a database
+      read that seeks (10 ms) by ~20×, and it's why the answer to "make it faster" is almost always "remove a hop or
+      remove a seek," not "buy a faster CPU."
+    </div>
+
+    <h3>1.2 Powers of two and the data-size ladder</h3>
+    <p>
+      You need to convert between "number of things" and "bytes" constantly, so you need the powers of two that map to
+      data sizes cold. The trick every senior engineer uses: <strong>2¹⁰ ≈ 10³ (a thousand), 2²⁰ ≈ 10⁶ (a million),
+      2³⁰ ≈ 10⁹ (a billion), 2⁴⁰ ≈ 10¹² (a trillion).</strong> That is the entire conversion table between binary and
+      decimal orders of magnitude, and it lets you jump straight from "2³² user IDs" to "about 4 billion."
+    </p>
+
+    <table>
+      <thead><tr><th>Power of 2</th><th>Exact-ish</th><th>Decimal shorthand</th><th>Data-size name</th></tr></thead>
+      <tbody>
+        <tr><td>2¹⁰</td><td>1,024</td><td>~1 thousand (10³)</td><td>1 KB</td></tr>
+        <tr><td>2²⁰</td><td>1,048,576</td><td>~1 million (10⁶)</td><td>1 MB</td></tr>
+        <tr><td>2³⁰</td><td>~1.07 billion</td><td>~1 billion (10⁹)</td><td>1 GB</td></tr>
+        <tr><td>2³²</td><td>~4.29 billion</td><td>~4 billion</td><td>the classic "max unsigned 32-bit int" — run out of IPv4/int IDs here</td></tr>
+        <tr><td>2⁴⁰</td><td>~1.1 trillion</td><td>~1 trillion (10¹²)</td><td>1 TB</td></tr>
+        <tr><td>2⁵⁰</td><td>—</td><td>~10¹⁵</td><td>1 PB (petabyte)</td></tr>
+        <tr><td>2⁶⁴</td><td>~1.8 × 10¹⁹</td><td>~2 × 10¹⁹</td><td>max unsigned 64-bit — effectively unbounded; you will never exhaust it</td></tr>
+      </tbody>
+    </table>
+
+    <p>The byte-size building blocks you multiply with all the time:</p>
+    <ul>
+      <li><strong>ASCII char / small int</strong> — 1 byte. A short string of N chars ≈ N bytes.</li>
+      <li><strong>Timestamp, 64-bit ID, long</strong> — 8 bytes. Round it to <strong>10 bytes</strong> in your head; it makes the arithmetic cleaner and the error is noise.</li>
+      <li><strong>UUID</strong> — 16 bytes raw, 36 chars as a string. A short URL code, a tweet ID: call it ~10–20 bytes.</li>
+      <li><strong>A "row" of metadata</strong> (a few IDs, a timestamp, some flags) — ~100 bytes. A good default when you don't want to itemize fields.</li>
+      <li><strong>A tweet / short text post</strong> — ~200–300 bytes of text; call it ~1 KB with all metadata and indexing overhead.</li>
+      <li><strong>A typical web page / API JSON response</strong> — ~1–100 KB.</li>
+      <li><strong>A thumbnail</strong> ~10 KB · <strong>a photo</strong> ~200 KB–2 MB (use <strong>1 MB</strong>) · <strong>a high-res photo</strong> ~5 MB.</li>
+      <li><strong>A minute of video</strong> — very roughly <strong>~50 MB</strong> at decent quality (varies wildly with bitrate; state your assumption). An hour ≈ a few GB.</li>
+    </ul>
+
+    <h3>1.3 The one time-conversion that unlocks everything: 86,400 ≈ 10⁵</h3>
+    <p>
+      The single most useful rounding in all of estimation. There are <strong>86,400 seconds in a day</strong>, and you
+      round that to <strong>10⁵ (100,000)</strong>. That's it. Once you internalize "seconds in a day ≈ 100,000," every
+      per-day-to-per-second conversion becomes a matter of subtracting five from the exponent.
+    </p>
+
+<pre><code>  Seconds in a day = 24 × 3600 = 86,400  ≈  <strong>10⁵</strong>   (you are ~15% high — say so, it doesn't matter)
+
+  So, to go from "per day" to "per second", divide by 100,000:
+
+     1,000,000 requests/day     →  1e6 / 1e5   =  10  requests/sec
+     100,000,000 requests/day   →  1e8 / 1e5   =  1,000  requests/sec
+     1,000,000,000 requests/day →  1e9 / 1e5   =  10,000  requests/sec
+
+  Memorize the anchor:   <strong>1 billion/day  ≈  ~10,000 per second.</strong>
+  (Real answer is 11,574/s. Rounding 86,400 to 100,000 makes you ~15% low on QPS,
+   which is a conservative, safe direction to be wrong in. Mention it once, move on.)
+</code></pre>
+
+    <p>Other time anchors worth having ready so you never compute them live:</p>
+    <ul>
+      <li><strong>Seconds in a day ≈ 10⁵</strong> (86,400). The one that matters.</li>
+      <li><strong>Seconds in a month ≈ 2.5 million</strong> (~2.6 × 10⁶). Handy for monthly bandwidth bills.</li>
+      <li><strong>Seconds in a year ≈ 31.5 million ≈ 3 × 10⁷</strong>. Also: <strong>π × 10⁷</strong> is a famous mnemonic (31.4M vs 31.5M actual).</li>
+      <li><strong>Days in a year ≈ 365, round to ~400 or ~300</strong> depending on which side you want to err. Many people just use <strong>×400</strong> for day→year so it cancels nicely with other roundings.</li>
+      <li><strong>3 years ≈ 1,000 days · 5 years ≈ ~2,000 days.</strong> Storage questions love "over 5 years"; multiply daily storage by ~2,000.</li>
+    </ul>
+
+    <div class="note">
+      Why round 86,400 <em>up</em> to 100,000 rather than down to 80,000? Because dividing by a bigger number gives a
+      smaller QPS, which is the <strong>conservative</strong> direction — you'd rather slightly under-state load in the
+      arithmetic and then explicitly add a peak multiplier on top than accidentally over-state it and design for traffic
+      that isn't there. More importantly, 10⁵ is a clean power of ten, so the exponent arithmetic stays trivial and you
+      never stall. Clean beats precise. Every time.
+    </div>
+
+    <h3>1.4 The standard assumptions you're allowed to just declare</h3>
+    <p>
+      Interviewers expect you to <em>invent</em> the input numbers — that's part of the exercise. The move is to state a
+      reasonable assumption confidently and move on, not to agonize. These are the defaults that no interviewer will
+      argue with:
+    </p>
+    <table>
+      <thead><tr><th>Quantity</th><th>Default to assume</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>Peak-to-average QPS ratio</td><td><strong>×2 to ×3</strong> (use ×2, sometimes ×5 for spiky consumer apps)</td><td>Traffic isn't flat over 24h; design for the peak, not the average.</td></tr>
+        <tr><td>Read:write ratio (social / content)</td><td><strong>100:1</strong> (sometimes 10:1 or 1000:1)</td><td>The number that decides whether the design is about caching or about write throughput. Ask for it or assume it, always.</td></tr>
+        <tr><td>Active hours in a day</td><td>Often modeled as <strong>~10⁵ s (whole day)</strong>, or ~50,000 s if you want to concentrate traffic</td><td>Using the whole day and then applying a peak multiplier is cleaner.</td></tr>
+        <tr><td>DAU as fraction of total users</td><td><strong>~20–50%</strong> of registered users are daily-active</td><td>If given "1B registered," maybe 200M DAU. State it.</td></tr>
+        <tr><td>Actions per user per day</td><td><strong>a handful to a few dozen</strong> — e.g. reads 20–50/day, writes 1–5/day</td><td>Twitter: opens feed ~10×/day, posts ~0.1×/day. Declare it per app.</td></tr>
+        <tr><td>Bytes per typical request/object</td><td><strong>~1 KB</strong> text row · <strong>~1 MB</strong> photo · <strong>~50 MB</strong> per min of video</td><td>Round to a clean power of ten; the object size drives storage, the request rate drives QPS.</td></tr>
+        <tr><td>Cache hot-set fraction</td><td><strong>~20% of data serves ~80% of reads</strong> (Pareto)</td><td>You only need to cache the hot 20% to get most of the benefit — this sizes your Redis.</td></tr>
+        <tr><td>What one commodity server handles</td><td><strong>~1,000–10,000 QPS</strong> for simple requests; <strong>~64–256 GB RAM</strong>; a few TB SSD</td><td>Divide total QPS by ~1,000 for a rough server count. Very workload-dependent — say so.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="senior">
+      Say the assumption out loud <em>as</em> an assumption, with a number attached, and then never look back: <em>"I'll
+      assume 100 million daily active users, each opening the feed 10 times a day, so a billion feed reads a day — and I'll
+      assume a 100:1 read-to-write ratio, so ten million writes a day. Stop me if you'd rather use different numbers."</em>
+      That last clause is the senior move: it signals you know these are levers, invites the interviewer to steer if they
+      have a specific case in mind, and lets you proceed without waiting. Never ask "um, how many users should I assume?"
+      — supplying the assumption yourself is the thing being tested.
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="method">Part 2 — The method</h2>
+    <p>
+      Every estimation you'll ever be asked to do runs down the same assembly line. Learn the pipeline once and you can
+      apply it to a URL shortener, a chat app, or a video platform without thinking about the structure — you just plug in
+      the app-specific numbers at the top and turn the crank. The pipeline is:
+    </p>
+
+<pre><code>  DAU
+   │  × actions per user per day
+   ▼
+  requests/day
+   │  ÷ 10⁵  (seconds in a day)
+   ▼
+  average QPS
+   │  × 2–3  (peak multiplier)
+   ▼
+  <strong>peak QPS</strong>  ────────────────▶  drives compute: server count, connection pools, cache sizing
+   │
+   │  (separately) requests/day × bytes/object
+   ▼
+  storage/day
+   │  × ~400 (→ /year)  or  × ~2000 (→ /5yr)
+   ▼
+  <strong>total storage</strong>  ───────────▶  drives storage tier: one DB vs sharding vs blob store
+   │
+   │  (separately) QPS × bytes/object
+   ▼
+  <strong>bandwidth</strong> (bytes/sec)  ────▶  drives network / CDN decisions
+</code></pre>
+
+    <p>
+      Three independent outputs — <strong>QPS, storage, bandwidth</strong> — off one set of inputs. Notice they branch:
+      QPS comes from the request <em>rate</em>, storage comes from rate × <em>object size × time</em>, bandwidth comes from
+      rate × object size. You almost never need all three to full precision; you compute the one or two that will drive the
+      design and wave at the rest.
+    </p>
+
+    <h3>2.1 Worked example, end to end — a Twitter-like service</h3>
+    <p>
+      Watch the whole pipeline run once with real numbers. This is the pattern you'll reuse in every drill below.
+    </p>
+
+<pre><code>  <span class="com">ASSUMPTIONS (declare these, don't derive them):</span>
+    DAU                 = 200,000,000        (200M)
+    feed reads / user   = 10 / day
+    posts / user        = 0.1 / day          (most users lurk)
+    bytes per post      = 1 KB                (text + metadata)
+
+  <span class="com">── QPS ──────────────────────────────────────────────</span>
+    read requests/day   = 200M × 10   = 2 × 10⁹   (2 billion reads/day)
+    avg read QPS        = 2e9 / 1e5   = 20,000 reads/sec
+    peak read QPS       = 20,000 × 2  = ~40,000 reads/sec
+
+    write requests/day  = 200M × 0.1  = 2 × 10⁷   (20 million writes/day)
+    avg write QPS       = 2e7 / 1e5   = 200 writes/sec
+    peak write QPS      = 200 × 2     = ~400 writes/sec
+
+    <strong>read : write  =  20,000 : 200  =  100 : 1</strong>   ← THE DRIVING NUMBER
+
+  <span class="com">── STORAGE (of the posts themselves) ────────────────</span>
+    per day   = 2e7 writes × 1 KB      = 2 × 10¹⁰ bytes = 20 GB / day
+    per year  = 20 GB × 365            ≈ 7 TB / year
+    per 5 yr  = 20 GB × ~2000          ≈ 40 TB over 5 years
+
+  <span class="com">── BANDWIDTH (serving reads) ────────────────────────</span>
+    read egress = 20,000 reads/sec × 1 KB = 2 × 10⁷ B/s = 20 MB/sec
+                (per post; a real feed returns ~20 posts, so ×20 → ~400 MB/s)
+</code></pre>
+
+    <p>
+      Now the payoff sentence, which is the entire reason you did the arithmetic: <strong>the read:write ratio is 100:1, so
+      this is a read-heavy system and the design is dominated by serving reads cheaply</strong> — caching, read replicas,
+      fan-out-on-write so reads are pre-computed. Meanwhile 40 TB over five years is small enough that storage is a
+      non-issue you can handle with a sharded database; you don't need anything exotic. Two sentences, both earned by the
+      math, both steering the rest of the interview.
+    </p>
+
+    <h3>2.2 How to round — the actual technique</h3>
+    <p>
+      Rounding is not sloppiness; it's the skill. The goal is to keep every intermediate number to <strong>one significant
+      figure and a power of ten</strong> so the arithmetic stays in your head. The rules:
+    </p>
+    <ul>
+      <li><strong>Round inputs to one significant figure first.</strong> 86,400 → 100,000. 365 → 400 (or 300). 24 → 25 or 20.
+        512 → 500. Do the rounding <em>before</em> you multiply, not after.</li>
+      <li><strong>Work in powers of ten via exponents.</strong> Don't multiply 200,000,000 × 10; write 2×10⁸ × 10¹ = 2×10⁹.
+        Adding exponents is the whole trick — it's why you converted everything to scientific notation in your head.</li>
+      <li><strong>Let roundings cancel.</strong> If you rounded seconds/day <em>up</em> to 10⁵ (making QPS low), and you round
+        the peak multiplier a bit high, they offset. Being deliberately loose in opposite directions keeps the final answer
+        honest without precision.</li>
+      <li><strong>Carry units, not just numbers.</strong> "2×10⁹ reads/day ÷ 10⁵ s/day = 2×10⁴ reads/s." The units divide
+        out and tell you the answer is a rate. This catches the classic error of dividing when you should multiply.</li>
+      <li><strong>Sanity-check against an anchor.</strong> You have "1 billion/day ≈ 10,000/s" memorized — so any per-day
+        figure lets you eyeball the QPS instantly and catch an order-of-magnitude slip before you commit to it.</li>
+    </ul>
+
+    <div class="pitfall">
+      The most common estimation errors in interviews are <strong>order-of-magnitude slips, not arithmetic mistakes</strong>
+      — dropping or adding a zero, confusing millions with billions, or forgetting a unit (writing "20 GB" when you meant
+      "20 GB per day," which is a 2000× difference over five years). Defend against this by <em>always</em> writing the unit
+      and the time window on every number — "20 GB/<strong>day</strong>", "40,000 QPS <strong>peak</strong>" — and by
+      keeping numbers in scientific notation so a missing zero is visibly a wrong exponent rather than an invisible extra
+      digit. Say the exponent out loud: "two times ten to the nine" is much harder to get wrong than "two billion... or was
+      it two hundred million?"
+    </div>
+
+    <div class="note">
+      You do not have to compute all three outputs for every question. Read the prompt for which one is being probed: a URL
+      shortener question is really a <em>QPS + read:write</em> question (storage is trivial); a photo-storage question is a
+      <em>storage</em> question (QPS is modest); a video-streaming question is a <em>bandwidth</em> question (that's the
+      whole point). Spend your ninety seconds on the number that decides the architecture and name the others in one line.
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="outloud">Part 3 — Estimating out loud without stalling</h2>
+    <p>
+      Here is the thing nobody tells you: the estimation section is graded on <strong>fluency and narration</strong>, not
+      on the answer. An interviewer watching you compute 40,000 QPS in silence for ninety seconds learns nothing and gets
+      bored; an interviewer listening to you talk through the same computation in thirty seconds sees exactly how you
+      think. The failure mode isn't a wrong number — it's the <em>stall</em>: the long silence, the visible mental
+      long-division, the "hang on, let me just...". You avoid it with a script.
+    </p>
+
+    <h3>3.1 The three-beat script for every number</h3>
+    <p>Each number you produce follows the same three beats. Say them in this order, every time:</p>
+    <ol>
+      <li><strong>State the assumption</strong> — "I'll assume 100 million daily actives, each posting twice a day." Own it. Don't ask permission.</li>
+      <li><strong>Round and compute out loud</strong> — "so that's 200 million posts a day; seconds in a day is about ten to the five; so ~2,000 writes a second average, call it ~5,000 at peak." Narrate the rounding <em>as</em> you round.</li>
+      <li><strong>Name what it means and move on</strong> — "that's low, a single database handles it, so writes aren't my problem here — the reads are." Then stop. Don't refine.</li>
+    </ol>
+
+    <p>The connective phrases that keep you moving and buy you thinking time without sounding like stalling:</p>
+    <ul>
+      <li><em>"Let me round aggressively — precision doesn't matter here, the order of magnitude does."</em> (Grants you permission to be loose, out loud.)</li>
+      <li><em>"Call it roughly..."</em> / <em>"on the order of..."</em> / <em>"ballpark..."</em> (Signals you know it's an estimate.)</li>
+      <li><em>"Seconds in a day is about ten to the five..."</em> (You've memorized this; deploying it fast looks expert.)</li>
+      <li><em>"I'm rounding 86,400 up to 100,000, so I'll be about 15% low on QPS, which is fine — it's the conservative direction."</em> (Naming your own error is a flex.)</li>
+      <li><em>"So the number that actually matters here is..."</em> (The transition to the payoff. This is the sentence they're waiting for.)</li>
+    </ul>
+
+    <h3>3.2 A full narration, transcribed</h3>
+    <p>This is what the whole thing sounds like spoken. Read it aloud once; it's ~40 seconds of talking.</p>
+
+<pre><code>  <span class="com">"Let me size this before I design it.</span>
+
+   I'll assume 100 million daily active users, and each opens the app
+   about 20 times a day — so that's 2 billion reads a day.
+
+   Seconds in a day is roughly ten to the five, so 2 billion over
+   ten-to-the-five is about 20,000 reads per second average. Peak is maybe
+   2 to 3x, so call it ~50,000 QPS at peak. I'm rounding hard — the shape
+   is what matters.
+
+   Writes: say each user posts once a day, so 100 million writes a day,
+   which is ~1,000 a second. So my read-to-write ratio is about 20 to 1.
+
+   <strong>So the number that drives this design is the read:write ratio — this is
+   read-heavy, so I'm going to spend my effort on caching and read replicas,
+   and writes will comfortably fit on a primary. Storage I'll check quickly:
+   100 million posts a day at ~1 KB is ~100 GB a day, ~35 TB a year — big
+   enough that I'll need to shard eventually, not big enough to worry about
+   today."</strong>
+
+  <span class="com">→ ~40 seconds. Three numbers, one driving insight, zero stalls.</span>
+</code></pre>
+
+    <div class="senior">
+      The single highest-leverage habit: <strong>always end the estimation by naming the driving number and what it
+      changes about the design.</strong> Juniors compute QPS and storage because the template says to, then move on having
+      learned nothing from their own arithmetic. Seniors compute exactly enough to say <em>"so this is a read-heavy /
+      storage-bound / write-bound system, which means the interesting part is X."</em> The estimation isn't a checkbox you
+      tick before the real design — it's how you <em>discover</em> what the real design is about. If you finish the numbers
+      and can't say what they changed, you did the arithmetic for nothing.
+    </div>
+
+    <div class="pitfall">
+      Do not reach for a calculator, and do not do long division on the whiteboard. Both read as "I can't do this in my
+      head," which is exactly the thing the section tests. If you catch yourself about to compute 86,400 × 365 by hand,
+      stop — that's a signal you skipped a rounding step. Round the inputs to clean powers of ten <em>first</em>, and the
+      arithmetic collapses to adding exponents, which nobody needs a calculator for. The mental move is "make it easy, then
+      compute," never "compute the hard thing precisely."
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="drills">Part 4 — 15 timed drills</h2>
+    <p>
+      This is the gym. Cover the answer, set a <strong>90-second timer</strong>, and do each one <em>out loud</em> using
+      the three-beat script — assumption, round-and-compute, name the driver. The answers show the full arithmetic and end
+      by naming the number that drives the design, because reproducing that final sentence is the actual goal. Your
+      numbers won't match mine exactly and that's fine; if you're within one order of magnitude and you named the right
+      driver, you passed. Do these until the pipeline is muscle memory.
+    </p>
+
+    <details class="qa">
+      <summary>Drill 1 — QPS for a Twitter-like feed. 200M DAU. What's your read and write QPS, and which drives the design?</summary>
+      <div class="answer">
+        <p><strong>Assumptions:</strong> 200M DAU · each opens the feed ~10×/day (reads) · each posts ~0.1×/day (writes) · most users lurk.</p>
+<pre><code>  reads/day   = 200M × 10   = 2 × 10⁹
+  avg read QPS = 2e9 / 1e5   = 20,000/s
+  peak (×2)    = ~40,000/s
+
+  writes/day  = 200M × 0.1  = 2 × 10⁷
+  avg write QPS = 2e7 / 1e5  = 200/s
+  peak (×2)    = ~400/s
+
+  read : write = 100 : 1
+</code></pre>
+        <p><strong>Driver:</strong> the 100:1 read:write ratio. This is a read-heavy system — the design is about serving
+        reads cheaply (caching, read replicas, fan-out-on-write to pre-compute feeds). 400 writes/sec is trivial and fits
+        on a single primary; stop worrying about the write path. <em>"So the whole game here is reads."</em></p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Drill 2 — Storage for a photo service. 100M users upload 2 photos/day. How much storage over 5 years?</summary>
+      <div class="answer">
+        <p><strong>Assumptions:</strong> 100M DAU · 2 uploads/user/day · ~1 MB per photo (after compression; add thumbnails ~10% overhead, ignore for now).</p>
+<pre><code>  photos/day  = 100M × 2    = 2 × 10⁸  (200 million/day)
+  bytes/day   = 2e8 × 1 MB  = 2 × 10⁸ MB = 2 × 10¹⁴ B = 200 TB/day
+  per year    = 200 TB × 365 ≈ 73 PB/year   (round: ~70 PB)
+  per 5 years = 200 TB × ~2000 ≈ 400 PB
+</code></pre>
+        <p><strong>Driver:</strong> storage, and it's enormous — <strong>hundreds of petabytes</strong>. This immediately
+        rules out storing blobs in a database: photos go to object storage (S3/blob store), and only the <em>metadata</em>
+        (owner, URL, timestamp — ~100 bytes/photo → ~7 TB over 5 years, tiny) goes in a database. <em>"The petabyte number
+        forces the metadata/blob split — that's the first architectural decision this makes for me."</em> Add a replication
+        factor of 3 for durability and you're at ~1.2 EB raw; tier cold photos to cheaper storage.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Drill 3 — Bandwidth for video streaming. Netflix-scale: 100M concurrent streams at 5 Mbps. What egress bandwidth?</summary>
+      <div class="answer">
+        <p><strong>Assumptions:</strong> 100M concurrent viewers at peak · average bitrate 5 Mbps (1080p-ish, adaptive).</p>
+<pre><code>  total = 100M × 5 Mbps
+        = 10⁸ × 5 × 10⁶ bits/s
+        = 5 × 10¹⁴ bits/s
+        = 5 × 10¹³ bytes/s   (÷8, round 8→10)
+        ≈ 50 TB/s of egress
+</code></pre>
+        <p><strong>Driver:</strong> bandwidth, and it's astronomical — <strong>tens of terabytes per second</strong>. No
+        origin datacenter serves this; it's physically why video is a <strong>CDN problem</strong>, not a compute problem.
+        The design is: encode once, push copies to thousands of edge caches near users (even into ISPs — Netflix's Open
+        Connect appliances live inside ISP networks), and serve ~95%+ of bytes from the edge. <em>"The bandwidth number is
+        so large it makes the CDN the entire system — origin serves almost nothing."</em></p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Drill 4 — Cache memory for a hot set. 500M items, each 1 KB, 80/20 access. How much Redis RAM to cache the hot set?</summary>
+      <div class="answer">
+        <p><strong>Assumptions:</strong> 500M total items · ~1 KB each · Pareto: ~20% of items serve ~80% of reads, so cache the hot 20%.</p>
+<pre><code>  full dataset  = 5 × 10⁸ × 1 KB = 5 × 10¹¹ B = 500 GB
+  hot 20%       = 500 GB × 0.2   = 100 GB
+  + overhead    ≈ 100 GB × ~1.3  ≈ 130 GB  (Redis per-key metadata, fragmentation)
+</code></pre>
+        <p><strong>Driver:</strong> the hot-set size, ~100 GB. That doesn't fit one commodity Redis node comfortably
+        (~64 GB is a common ceiling before you're nervous), so you <strong>shard across ~2–4 Redis nodes</strong> (or use
+        Redis Cluster), and you get to serve ~80% of reads from RAM while only paying for 20% of the data in memory.
+        <em>"The 80/20 rule is what makes the cache affordable — I don't cache 500 GB, I cache 100 GB and still catch most
+        traffic."</em> If you needed to cache <em>everything</em>, you'd re-examine whether Redis is even the right tier.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Drill 5 — Number of app servers. 50,000 peak QPS, each server handles ~1,000 QPS. How many servers (with headroom)?</summary>
+      <div class="answer">
+        <p><strong>Assumptions:</strong> 50,000 QPS at peak · one commodity server sustains ~1,000 QPS for a lightweight request (very workload-dependent — say so) · you never run servers at 100%.</p>
+<pre><code>  bare minimum = 50,000 / 1,000        = 50 servers
+  run at ~50%  = 50 / 0.5              = 100 servers  (headroom for spikes + failures)
+  + N+2 across 3 AZs, round up         ≈ ~120 servers
+</code></pre>
+        <p><strong>Driver:</strong> the per-server QPS assumption, which you should state and caveat loudly — <em>"assuming
+        ~1,000 QPS per box, which depends entirely on what the request does; if each request makes 3 DB calls it's more
+        like 200 QPS and I need 5× the fleet."</em> The senior moves here: never size to 100% (leave headroom for traffic
+        spikes and for losing a node), spread across availability zones so one AZ failure doesn't halve you, and note that
+        the real bottleneck is usually the <em>downstream</em> (database connections, not app CPU) — so the honest answer
+        is "~100 app servers, but the constraint is probably the database, let me check that next."</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Drill 6 — URL-shortener keyspace. How many short codes do you need over 10 years, and how long is the code?</summary>
+      <div class="answer">
+        <p><strong>Assumptions:</strong> 100M new URLs/day (generous — this is a big service) · retain for 10 years · codes are base62 (a–z, A–Z, 0–9).</p>
+<pre><code>  urls/day    = 10⁸
+  per year    = 10⁸ × 365   ≈ 3.65 × 10¹⁰  (round ~4 × 10¹⁰)
+  10 years    ≈ 4 × 10¹¹    (~400 billion codes needed)
+
+  how many chars of base62?  each char = 62 values ≈ ~10^1.79
+    62⁶ = 5.6 × 10¹⁰   (56 billion  — not enough)
+    62⁷ = 3.5 × 10¹²   (3.5 trillion — plenty)
+
+  → 7 base62 characters covers it with ~1000× headroom.
+</code></pre>
+        <p><strong>Driver:</strong> the keyspace vs code length trade-off. <strong>7 characters</strong> gives ~3.5 trillion
+        codes — comfortably more than the ~400 billion you need, with room to spare so you're not forced to lengthen codes
+        later. <em>"I'll use 7-character base62 codes; that's 62⁷ ≈ 3.5 trillion, which covers a decade at 100M/day with
+        1000× headroom, and 7 characters keeps the URL short."</em> Note the read side is where the real load is — a URL
+        shortener is ~100:1 read-heavy, so the shortening is trivial and the redirect path is what you cache.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Drill 7 — Storage QPS vs bandwidth for a chat app. 1B messages/day. What write QPS and storage/year?</summary>
+      <div class="answer">
+        <p><strong>Assumptions:</strong> 1 billion messages/day · ~1 KB per message stored (text + metadata; media stored separately as blobs).</p>
+<pre><code>  writes/day   = 10⁹
+  avg write QPS = 10⁹ / 10⁵ = 10,000/s
+  peak (×3)    = ~30,000/s
+
+  storage/day  = 10⁹ × 1 KB = 10¹² B = 1 TB/day
+  storage/year = 1 TB × 365 ≈ 365 TB/year  (~0.4 PB/yr)
+</code></pre>
+        <p><strong>Driver:</strong> the <strong>write QPS (~10,000–30,000/s)</strong> — this is a write-heavy system, the
+        mirror image of the feed. That rules out a single primary comfortably taking all writes; you shard messages (by
+        chat ID or user ID) and you reach for a write-optimized store (Cassandra's LSM-tree, per tutorial 03) over a
+        B-tree Postgres if the write rate keeps climbing. <em>"1 billion messages a day is ~10k writes/sec — write-heavy,
+        so I shard by conversation and pick an LSM-based store; the read pattern (recent messages in one chat) shards
+        cleanly by the same key."</em> Storage (~0.4 PB/yr) is real but secondary; tier old messages to cold storage.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Drill 8 — Cache memory for active sessions. 50M concurrent users, 1 KB session each. How much RAM?</summary>
+      <div class="answer">
+        <p><strong>Assumptions:</strong> 50M concurrent active sessions at peak · ~1 KB per session (user ID, token, a few flags, expiry).</p>
+<pre><code>  memory = 50 × 10⁶ × 1 KB
+         = 5 × 10⁷ × 10³ B
+         = 5 × 10¹⁰ B
+         = 50 GB   (+ ~30% overhead ≈ 65 GB)
+</code></pre>
+        <p><strong>Driver:</strong> the total, ~50–65 GB — which comfortably fits in RAM on <strong>one or two Redis
+        nodes</strong>, so session storage is a solved problem, not an architectural challenge. The insight to voice:
+        session data is small (1 KB) and the count is bounded by <em>concurrent</em> users (not total registered), so it's
+        always modest. <em>"Sessions are tiny and bounded by concurrency, so ~50 GB — a single replicated Redis holds all
+        of it; I'll set a TTL equal to the session timeout so expiry is automatic."</em> Contrast with drill 4: same 1 KB
+        objects, but 500M of them needed sharding — the <em>count</em> is what moves the answer.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Drill 9 — Bandwidth for an image-heavy feed (Instagram). 500M DAU, 50 images viewed/day at 200 KB. Egress?</summary>
+      <div class="answer">
+        <p><strong>Assumptions:</strong> 500M DAU · ~50 images viewed per user per day · ~200 KB per image (feed-resolution, not full-res).</p>
+<pre><code>  images/day  = 500M × 50   = 2.5 × 10¹⁰
+  bytes/day   = 2.5e10 × 200 KB = 2.5e10 × 2e5 B = 5 × 10¹⁵ B = 5 PB/day
+  avg egress  = 5e15 B / 1e5 s  = 5 × 10¹⁰ B/s = 50 GB/s
+  peak (×2)   ≈ 100 GB/s
+</code></pre>
+        <p><strong>Driver:</strong> bandwidth, ~50–100 GB/s. Like video (drill 3) this is a <strong>CDN problem</strong> —
+        you cannot and should not serve 5 PB/day of images from origin. The design: images live in blob storage, are served
+        through a CDN, and you generate multiple resolutions on upload so the feed pulls the 200 KB version, not the 5 MB
+        original. <em>"5 petabytes a day of egress means the CDN hit ratio is the single most important number in this
+        system — every percent of cache-miss is another ~50 GB/s hammering the origin."</em> (Echoes the hit-ratio math
+        from tutorial 06 — a 99% vs 95% CDN hit rate is a 5× difference in origin load.)</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Drill 10 — Database rows and index size. 1B users, 100 rows each. Row count, table size, and does the index fit in RAM?</summary>
+      <div class="answer">
+        <p><strong>Assumptions:</strong> 1B users · ~100 rows/user (orders, events, whatever) · ~200 bytes/row · index is on an 8-byte key + pointer ≈ ~20 bytes/entry.</p>
+<pre><code>  rows        = 10⁹ × 100    = 10¹¹  (100 billion rows)
+  table size  = 10¹¹ × 200 B = 2 × 10¹³ B = 20 TB
+  index size  = 10¹¹ × 20 B  = 2 × 10¹² B = 2 TB
+</code></pre>
+        <p><strong>Driver:</strong> the row count (10¹¹) and the 2 TB index. A 20 TB table with 100 billion rows does
+        <strong>not</strong> live on one machine — you shard (by user ID), and each shard holds a slice whose index fits in
+        that node's RAM. The point to make: <em>"the B-tree index is 2 TB, which won't fit in a single box's RAM, so
+        lookups would hit disk — that alone forces sharding so each shard's index stays memory-resident."</em> This is the
+        estimate that justifies partitioning (tutorial 04): you shard not because you ran out of disk but because you ran
+        out of <em>RAM for the index</em>, and once the index spills to disk your P99 falls off a cliff.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Drill 11 — Peak QPS from a spiky event. A flash sale: 10M users hit "buy" in a 60-second window. Peak QPS?</summary>
+      <div class="answer">
+        <p><strong>Assumptions:</strong> 10M users all converge in ~60 seconds · each retries ~2–3× when it's slow (so effective load is higher) · this is NOT an "average over a day" problem — the whole point is the spike.</p>
+<pre><code>  naive avg   = 10M / 60 s ≈ 167,000 requests/s
+  but they cluster in the first ~10 s, not uniform:
+              ≈ 10M / 10 s = 10⁶ requests/s at the true peak
+  × retries (×3 under load)  ≈ 3 × 10⁶ requests/s
+</code></pre>
+        <p><strong>Driver:</strong> the <strong>peak</strong>, and the lesson is that averaging over the window
+        <em>hides</em> it — real flash-sale traffic isn't uniform, it front-loads into the first few seconds, and failed
+        requests retry and amplify. <em>"The daily-average framing is a trap here; this is a thundering-herd problem where
+        peak is 10–30× the naive average, so I design for the spike: a queue to absorb it, a rate limiter / virtual waiting
+        room to shed it, and inventory reservations so I'm not taking 3 million writes/sec at the database."</em> Naming
+        that the <em>peak, not the average, drives everything</em> is the entire point of this drill (ties to tutorial 14,
+        ticket booking).</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Drill 12 — Bandwidth into your ingest pipeline. IoT: 10M devices each send a 100-byte reading every 10 seconds. Ingest QPS and bandwidth?</summary>
+      <div class="answer">
+        <p><strong>Assumptions:</strong> 10M devices · one 100-byte reading every 10 s each.</p>
+<pre><code>  QPS        = 10M / 10 s   = 10⁷ / 10 = 10⁶ readings/s   (1 million writes/sec)
+  bandwidth  = 10⁶ × 100 B  = 10⁸ B/s  = 100 MB/s ingest
+  storage/day = 10⁶ /s × 10⁵ s × 100 B = 10¹¹ × 100 = 10¹³ B = 10 TB/day (raw)
+</code></pre>
+        <p><strong>Driver:</strong> the <strong>ingest write QPS (~1 million/s)</strong> — that is far past any single
+        database, so this is a streaming-aggregation problem (tutorial 18): readings land in Kafka (millions/sec is what
+        it's built for), a stream processor rolls them up into time-windowed aggregates, and you store the
+        <em>aggregates</em>, not every raw point. <em>"A million writes a second means I never touch a database on the hot
+        path — Kafka absorbs it, and I down-sample to per-minute aggregates so my 10 TB/day of raw becomes megabytes of
+        rollups I actually query."</em> The bandwidth (100 MB/s) is modest; the QPS is the whole story.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Drill 13 — Does it fit in memory? "Design an autocomplete." 10M search terms, avg 20 chars. Can the whole index live in RAM?</summary>
+      <div class="answer">
+        <p><strong>Assumptions:</strong> 10M distinct terms · ~20 bytes/term · a trie roughly ~2–5× the raw string size for node pointers (call it ~3×).</p>
+<pre><code>  raw terms  = 10⁷ × 20 B   = 2 × 10⁸ B = 200 MB
+  trie (~3×) ≈ 600 MB
+  + top-k completions cached per prefix, metadata ≈ ~1–2 GB total
+</code></pre>
+        <p><strong>Driver:</strong> the total, ~1–2 GB — which <strong>easily fits in RAM on one box</strong>, and that's
+        the whole answer. <em>"The entire autocomplete index is a couple of gigabytes, so it fits in memory on every node
+        — I replicate the trie to each server rather than sharding it, and rebuild it from a batch job periodically."</em>
+        The senior instinct: before designing a distributed anything, <em>check whether it fits in memory</em>, because "it
+        all fits in RAM on one machine" collapses an entire category of complexity. Most datasets that <em>feel</em> huge
+        (a dictionary, a product catalogue, a geo-index of a city) are actually a few GB.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Drill 14 — Availability budget. Your SLA is 99.9%. How much downtime is that per year, and what does it force?</summary>
+      <div class="answer">
+        <p><strong>No arithmetic to derive — these are worth memorizing outright</strong> (the "nines" table):</p>
+<pre><code>  99%     "two nines"   →  ~3.65 days/year   (~14 min/day)
+  99.9%   "three nines" →  ~8.76 hours/year  (~1 min/day)
+  99.99%  "four nines"  →  ~52 minutes/year  (~8.6 s/day)
+  99.999% "five nines"  →  ~5.3 minutes/year
+
+  Mnemonic: each extra 9 divides downtime by 10. Anchor on
+  "four nines ≈ 52 minutes/year" and multiply/divide from there.
+</code></pre>
+        <p><strong>Driver:</strong> what the budget <em>forbids</em>. 99.9% is 8.76 hours/year — a human can be paged and
+        fix things by hand. 99.99% is 52 minutes/year — <em>no human is that fast</em>, so recovery must be automated
+        (health checks, auto-failover). <em>"Four nines forces automated failover because 52 minutes a year is less than
+        one bad on-call response."</em> And the multiplication trap: serial dependencies multiply, so <strong>five 99.9%
+        services in series ≈ 99.5% overall</strong> (~1.8 days/year) — you cannot hit four nines by chaining three-nines
+        components, which is an argument for fewer hops or for making a dependency non-blocking (put it behind a queue and
+        it leaves your availability equation entirely). Ties to tutorial 06's availability math.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Drill 15 — The reverse drill: given "storage = 100 PB," what must the inputs have been? (Sanity-checking backwards.)</summary>
+      <div class="answer">
+        <p>This is the skill that catches order-of-magnitude slips: run the pipeline <em>backwards</em> to see if a result is
+        even plausible. Suppose you computed 100 PB/year and want to check it.</p>
+<pre><code>  100 PB/year = 10¹⁷ B/year
+  per day     = 10¹⁷ / 365 ≈ 3 × 10¹⁴ B/day  (~300 TB/day)
+
+  if objects are ~1 MB (photos):  3e14 / 1e6 = 3 × 10⁸ objects/day  (300M/day)
+  → 300M uploads/day. At 2/user that's 150M DAU. Plausible for a big photo app? Yes.
+
+  if objects are ~1 KB (text rows): 3e14 / 1e3 = 3 × 10¹¹ rows/day
+  → 300 billion text rows/day. Plausible? NO — that's 100× any real service.
+    So if you got 100 PB/yr from 1 KB objects, you slipped a few zeros somewhere.
+</code></pre>
+        <p><strong>Driver:</strong> the plausibility check itself. <em>"Let me sanity-check that backwards — 100 PB a year
+        is 300 TB a day, which at 1 MB a photo is 300 million photos a day; that's a top-five photo service, so the number's
+        in the right ballpark."</em> Doing this once, out loud, after a big estimate is a strong senior signal: it shows you
+        don't trust your own arithmetic blindly and you know what a <em>reasonable</em> answer looks like. If the reverse
+        check produces something absurd (300 billion rows/day), you caught a zero-slip before the interviewer did.</p>
+      </div>
+    </details>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="qa">Interview Q&amp;A</h2>
+    <p>The drills above are the practice. These are the meta-questions about the <em>technique</em> — how to deploy
+      estimation in a real round.</p>
+
+    <details class="qa">
+      <summary>1. How precise do my estimates actually need to be?</summary>
+      <div class="answer">
+        <p><strong>Within one order of magnitude is a pass; the exact figure is irrelevant.</strong> No interviewer checks
+        whether you said 40,000 or 45,000 QPS — they're checking whether you know it's ~10⁴ and not ~10⁶, because the design
+        for 10,000 QPS (one beefy database) is completely different from the design for a million QPS (shard everything).
+        The precision that matters is the <em>exponent</em>. Getting the exponent right and the leading digit roughly right
+        is the entire bar. Spending time refining 40,000 to 42,300 is actively bad — it's precision the problem doesn't
+        support, and it signals you don't understand that estimation is about orders of magnitude.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>2. The interviewer didn't give me any numbers. What do I do?</summary>
+      <div class="answer">
+        <p><strong>Invent them, out loud, confidently — that's the test.</strong> "How many users?" is not a question to ask
+        the interviewer; it's a number you supply: <em>"I'll assume 100 million daily active users — stop me if you had a
+        specific scale in mind."</em> Vagueness is deliberate; the interviewer wants to see you take an ambiguous prompt and
+        pin it down to concrete numbers you can compute with. Asking "what should I assume?" hands the work back to them and
+        reads as not knowing that assuming <em>is</em> the job. The one thing you should genuinely ask is anything that
+        <em>flips the design</em> — "is this consumer-scale or internal-tool-scale?" — because 100M DAU and 10K DAU are
+        different problems. Otherwise, declare and proceed.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>3. Should I compute QPS, storage, AND bandwidth every time?</summary>
+      <div class="answer">
+        <p>No — that's the junior tell (mechanically filling in the template). Compute the <strong>one or two numbers that
+        drive this specific design</strong> and name the rest in a sentence. A URL shortener is a QPS + read:write question;
+        storage is trivially small, so you say "storage is a non-issue, a few TB, moving on." A photo service is a storage +
+        bandwidth question; the QPS is modest, so you don't belabor it. Video is a pure bandwidth question. Reading the
+        prompt to know <em>which</em> number is load-bearing — and skipping the arithmetic on the ones that aren't — is
+        itself a seniority signal. It shows you're estimating to make a decision, not to fill a checklist.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>4. I froze mid-calculation and lost my place. How do I recover gracefully?</summary>
+      <div class="answer">
+        <p>Restate the anchor and rebuild from it — never sit in silence. Out loud: <em>"Let me reset — a billion a day is
+        about ten thousand a second, and I've got two billion reads a day, so that's ~20,000 a second."</em> The memorized
+        anchors ("1 billion/day ≈ 10⁴/s", "seconds/day ≈ 10⁵", "4 nines ≈ 52 min/yr") exist precisely so you always have a
+        known-solid place to restart from. The recovery move is to <em>narrate the reset</em> — "let me redo that cleanly"
+        — which reads as composure, not failure. What kills you is the silent stall; talking through a restart is
+        completely fine and interviewers barely register it.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>5. When does estimation actually change the architecture vs. just being a ritual?</summary>
+      <div class="answer">
+        <p>It changes the architecture at the <strong>order-of-magnitude thresholds</strong>, and knowing those thresholds
+        is the real value. A few worth carrying: <strong>~tens of thousands of QPS</strong> is where a single database
+        stops coping and you need caching + replicas or sharding. <strong>~single-digit TB</strong> is where data stops
+        fitting comfortably on one node and sharding enters. <strong>~tens of GB/s of egress</strong> makes it a CDN
+        problem, full stop. <strong>~1M writes/sec</strong> means you can't touch a database on the hot path and it's a
+        streaming problem. When your estimate lands near one of these thresholds, the number genuinely decided something;
+        when it lands far from all of them ("500 QPS, 2 TB"), the honest and senior thing to say is <em>"these numbers are
+        comfortable, nothing here is stressed, so I won't over-engineer it"</em> — which is itself a valuable conclusion the
+        arithmetic earned you.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>6. Do I need to memorize the exact latency numbers?</summary>
+      <div class="answer">
+        <p>No — memorize the <strong>ratios and a handful of anchors</strong>, not the table. The four anchors that carry
+        their weight: RAM ~100 ns, SSD ~100 µs, disk seek ~10 ms, same-DC round trip ~0.5 ms, cross-country ~50–70 ms. The
+        <em>insight</em> you're actually deploying is the gaps between them — "memory is ~1000× faster than SSD," "a network
+        round trip costs about the same as a disk seek," "cross-country latency is unbeatable, so cache near the user." You
+        quote latency numbers to justify a decision ("a cache hit is 0.5 ms vs a 10 ms disk read, so the cache saves ~20×"),
+        and for that you need the order of magnitude and the ratio, never the precise nanoseconds. Anyone reciting exact
+        figures is signalling they memorized a blog post, not that they understand the hierarchy.</p>
+      </div>
+    </details>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="takeaways">What to remember</h2>
+
+    <h3>The numbers to have memorized cold</h3>
+    <ul>
+      <li><strong>Seconds in a day ≈ 10⁵</strong> (86,400). The master key. To go per-day → per-second, subtract 5 from the exponent.</li>
+      <li><strong>1 billion/day ≈ 10,000/second.</strong> The QPS anchor — eyeball every per-day figure against it.</li>
+      <li><strong>Powers of 2 → 10:</strong> 2¹⁰ ≈ 10³ (KB), 2²⁰ ≈ 10⁶ (MB), 2³⁰ ≈ 10⁹ (GB), 2⁴⁰ ≈ 10¹² (TB), 2⁵⁰ ≈ 10¹⁵ (PB). 2³² ≈ 4 billion, 2⁶⁴ ≈ effectively infinite.</li>
+      <li><strong>Latency ladder:</strong> RAM ~100 ns · SSD ~100 µs · disk seek ~10 ms · same-DC round trip ~0.5 ms · cross-country ~50–70 ms. Memory ~1000× faster than SSD; a network hop ≈ a disk seek.</li>
+      <li><strong>Object sizes:</strong> text row ~1 KB · metadata row ~100 B · photo ~1 MB · thumbnail ~10 KB · minute of video ~50 MB · 64-bit ID/timestamp ~10 B.</li>
+      <li><strong>The nines:</strong> 99% ≈ 3.6 days/yr · 99.9% ≈ 8.8 h/yr · 99.99% ≈ 52 min/yr · 99.999% ≈ 5 min/yr. Each 9 divides downtime by 10.</li>
+      <li><strong>Standard assumptions:</strong> peak = ×2–3 average · read:write often 100:1 · 20% of data serves 80% of reads · one commodity box ~1,000–10,000 QPS · ~64 GB RAM before you shard a cache · 5 years ≈ ~2,000 days.</li>
+    </ul>
+
+    <h3>The method, compressed</h3>
+    <ul>
+      <li><strong>The pipeline:</strong> DAU × actions → requests/day ÷ 10⁵ → avg QPS × (2–3) → peak QPS. Separately: requests/day × object size × time → storage; QPS × object size → bandwidth.</li>
+      <li><strong>Round to one significant figure and a power of ten, before multiplying.</strong> Work in exponents. Carry units. Let opposite roundings cancel.</li>
+      <li><strong>Three-beat script per number:</strong> state the assumption → round and compute out loud → name what it means, then stop.</li>
+      <li><strong>Always end with the driving number:</strong> "so this is read-heavy / storage-bound / write-bound / bandwidth-bound, which means the interesting part is X." The arithmetic exists to earn that sentence.</li>
+    </ul>
+
+    <h3>The thresholds where a number actually changes the design</h3>
+    <ul>
+      <li><strong>~tens of thousands of QPS</strong> → one database stops coping → caching + replicas or sharding.</li>
+      <li><strong>~single-digit TB / index bigger than one node's RAM</strong> → sharding (you shard for RAM-resident indexes, not just for disk).</li>
+      <li><strong>~tens of GB/s egress</strong> → it's a CDN problem; origin serves almost nothing.</li>
+      <li><strong>~1M writes/sec</strong> → no database on the hot path; Kafka + stream aggregation, store rollups.</li>
+      <li><strong>Numbers far from every threshold</strong> → say "nothing here is stressed, I won't over-engineer it." That restraint is also a senior signal.</li>
+    </ul>
+
+    <div class="senior">
+      The one habit that makes all of this land: <strong>never present an estimate without immediately saying what it
+      decides.</strong> A number on the whiteboard with no consequence attached is noise; a number followed by "so the
+      design is dominated by X" is judgment. Do the arithmetic fast and loose to earn the right to that second sentence,
+      then say it. Fluent numbers plus a named driver, in under a minute, out loud, with no calculator and no stall — that
+      is the entire skill this page exists to build. Drill it until it's reflex.
+    </div>
+  </section>
+
+  <nav class="page-nav">
+    <a href="25-lld-case-studies.html">← 25 — LLD Case Studies</a>
+    <a href="27-tradeoff-flashcards.html">27 — Trade-off Flashcards →</a>
+  </nav>
+
+</main>
+</body>
+</html>

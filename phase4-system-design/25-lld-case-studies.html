@@ -1,0 +1,965 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>25 — LLD Case Studies: Parking Lot · Elevator · BookMyShow | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <div class="breadcrumb"><a href="index.html">← Course Home</a></div>
+    <h1>25 — LLD Case Studies</h1>
+    <p>Parking lot, elevator, BookMyShow — worked three ways with one recipe. The round where you write real Java on a whiteboard and get graded on the classes, not the boxes.</p>
+  </div>
+</header>
+
+<main class="container">
+
+  <section>
+    <h2>Why this matters in the interview</h2>
+    <p>
+      The low-level design round is a different animal from the distributed one, and it catches strong backend candidates
+      off guard because it rewards a skill they've stopped practising: turning a vague English sentence into a clean set
+      of Java classes, in real time, out loud, without freezing. Enterprise loops — Optum, JPMC, Goldman, and most
+      product companies with a mature interview process — run this as a distinct 45-to-60-minute session. You will be
+      asked to "design a parking lot" or "design an elevator," and what's actually being measured is whether your object
+      model is <em>coherent</em>: do responsibilities sit in the right place, are the seams where requirements change
+      guarded by interfaces, and can you talk about concurrency without hand-waving. It is the round where your seven
+      years either show or don't, because a mid-level candidate produces classes that work and a senior candidate
+      produces classes that <em>absorb the next requirement</em> the interviewer is about to throw at them.
+    </p>
+    <p>
+      There are only three or four problems that come up over and over — parking lot, elevator, a ticket/seat booker,
+      occasionally a vending machine or a rate limiter — and they are all the same problem wearing different costumes,
+      which is exactly why <a href="24-lld-solid-patterns.html">page 24</a>'s recipe is worth more than memorising any
+      one of them. This page works the three canonical ones end to end in Java, and for each it does the same five things
+      in the same order: clarify the scope, extract the classes, sketch the core design, name the one design pattern that
+      earns its place, and — the part most candidates skip and every good interviewer probes — say precisely where the
+      concurrency bug lives and how the object model contains it. Do not read this page as three problems to memorise.
+      Read it as the recipe applied three times, so that on the fourth problem you've never seen, you already know the moves.
+    </p>
+    <div class="senior">The framing line to open this round with, before you write a single class: <em>"I'm going to spend the first few minutes on requirements and nouns before I write any code, because in LLD the object model is the answer and a wrong model is expensive to unwind on a whiteboard. I'll start with the interfaces at the seams where I expect requirements to change — pricing, scheduling, allocation — and keep the concrete classes thin. And I'll flag the concurrency-sensitive operations as I go rather than bolting thread-safety on at the end."</em> That sentence tells the interviewer you've done this before, and it buys you the two quiet minutes you need to actually think.</div>
+  </section>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ul>
+      <li><a href="#recipe">The shared recipe</a> — nouns → classes, verbs → methods, variation points → interfaces</li>
+      <li><a href="#parking">1. Parking Lot</a> — allocation, pricing strategy, the spot-assignment race</li>
+      <li><a href="#elevator">2. Elevator System</a> — state machine, scheduling, the request queue</li>
+      <li><a href="#bookmyshow">3. BookMyShow</a> — seat inventory, the double-booking problem, holds &amp; expiry</li>
+      <li><a href="#pressure">4. What "good" looks like under time pressure</a></li>
+      <li><a href="#qa">Interview Q&amp;A</a></li>
+      <li><a href="#takeaways">What to remember</a></li>
+    </ul>
+  </div>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="recipe">The shared recipe</h2>
+
+    <p>
+      This is <a href="24-lld-solid-patterns.html">page 24</a>'s method in three lines, restated here because you are
+      about to apply it three times and it should be muscle memory by the end of the page:
+    </p>
+
+    <table>
+      <thead><tr><th>In the prompt…</th><th>…becomes in the model</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Nouns</strong> — the things ("a car parks in a spot on a floor")</td>
+          <td><strong>Classes / entities</strong> — <code>Vehicle</code>, <code>ParkingSpot</code>, <code>Floor</code></td>
+          <td>Each noun that has state or identity is a class. Nouns that are just values (a colour, a size) become enums or fields.</td>
+        </tr>
+        <tr>
+          <td><strong>Verbs</strong> — the actions ("park", "assign", "pay", "book")</td>
+          <td><strong>Methods</strong> — <code>park(vehicle)</code>, <code>assignSpot()</code>, <code>book(seats)</code></td>
+          <td>A verb tells you the method <em>and</em> which class owns it: the class that holds the state the verb changes.</td>
+        </tr>
+        <tr>
+          <td><strong>Variation points</strong> — "the fee <em>depends on</em>…", "we <em>might</em> support…"</td>
+          <td><strong>Interfaces</strong> — <code>PricingStrategy</code>, <code>SpotAssignmentStrategy</code></td>
+          <td>Anywhere the requirement can change is a seam. Put an interface there so the change is a new class, not an edit to an old one (Open/Closed).</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>
+      The verbs test is the one that separates good models from bad. "The system calculates the fee" is a trap — <em>which
+      object</em> calculates it? The one holding the data the calculation needs. Misplace a verb and you get an anemic
+      domain model: dumb data classes with all the logic marooned in one god-service. The interviewer sees that instantly.
+    </p>
+
+    <p>
+      And the six patterns from page 24 map onto these problems so cleanly it's almost a lookup table — you don't reach
+      for a pattern because you want to show one off, you reach for it because a variation point demands it:
+    </p>
+
+    <table>
+      <thead><tr><th>Pattern</th><th>Use it when the prompt says…</th><th>Shows up in</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Strategy</strong></td><td>"…the X depends on / could be one of several…"</td><td>Parking fee, seat pricing, elevator scheduling</td></tr>
+        <tr><td><strong>State</strong></td><td>"…the thing moves through phases and behaves differently in each…"</td><td>Elevator (moving/idle), booking (held/confirmed), spot (free/occupied)</td></tr>
+        <tr><td><strong>Factory</strong></td><td>"…create the right kind of X from some input…"</td><td>Vehicle from ticket type, spot from vehicle size</td></tr>
+        <tr><td><strong>Observer</strong></td><td>"…when X happens, notify / update Y…"</td><td>Display boards, seat-availability push, elevator panel lights</td></tr>
+        <tr><td><strong>Singleton</strong> (carefully)</td><td>"…there is one central coordinator…"</td><td><code>ParkingLot</code>, <code>ElevatorController</code> — but say why, and prefer injection</td></tr>
+        <tr><td><strong>Builder</strong></td><td>"…an object with many optional attributes…"</td><td>A <code>Show</code> or <code>Booking</code> with lots of fields</td></tr>
+      </tbody>
+    </table>
+
+    <div class="note">You will not use all six in any one problem, and using too many is itself a red flag — it reads as pattern-fishing. The rule from page 24 holds: <strong>introduce a pattern only when you can name the specific requirement change it protects against.</strong> "I'll make pricing a strategy so hourly, flat-rate, and weekend pricing are three classes instead of three branches in one method" is a reason. "I'll add a factory because factories are good" is not.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="parking">1. Parking Lot</h2>
+
+    <p>
+      The canonical LLD warm-up. It looks trivial and it is not — the trap is that it's <em>so</em> familiar you start
+      writing classes before you've scoped it, and then the interviewer adds "oh, and motorcycles can park in car spots
+      but not vice versa" and your model buckles. Slow down. Scope first.
+    </p>
+
+    <h3>Clarify the scope</h3>
+    <p>
+      Ask these before you draw anything. Each answer removes or adds a class, so getting them up front is what keeps the
+      model from thrashing:
+    </p>
+    <table>
+      <thead><tr><th>Question</th><th>Why it matters</th><th>Assume</th></tr></thead>
+      <tbody>
+        <tr><td>"Multiple floors, or one flat lot?"</td><td>Multiple floors adds a <code>Floor</code> class and makes "find a spot" a two-level search.</td><td><strong>Multiple floors</strong> — it's the more interesting model and barely more code.</td></tr>
+        <tr><td>"Different vehicle sizes and matching spot sizes?"</td><td>This is the heart of the allocation logic. Motorcycle / car / truck → compact / regular / large, with fit rules.</td><td><strong>Yes, three sizes.</strong> A smaller vehicle may use a larger spot; not vice versa.</td></tr>
+        <tr><td>"How is the fee calculated?"</td><td>Flagged as the variation point → a strategy. Hourly? Flat? Different by vehicle type? Weekend surge?</td><td><strong>Hourly, but pluggable.</strong> Ask for it — it's where the pattern lives.</td></tr>
+        <tr><td>"Do we track where a specific car is parked, for exit?"</td><td>Yes → the <code>Ticket</code> holds the assigned spot, and exit is O(1).</td><td><strong>Yes</strong>, ticket-based entry/exit.</td></tr>
+        <tr><td>"Payment methods, real gates, license-plate cameras?"</td><td>Rabbit holes. Model a <code>Payment</code> seam but don't build a POS.</td><td><strong>Out of scope</strong> — say so explicitly.</td></tr>
+      </tbody>
+    </table>
+
+    <p>
+      <strong>Functional:</strong> a vehicle enters, the system finds and assigns a fitting free spot and issues a ticket;
+      a vehicle exits, the system computes the fee from the parked duration, takes payment, and frees the spot; the system
+      can report free-spot counts per floor per size. <strong>Non-functional:</strong> the assign-a-spot operation must be
+      correct under concurrent entries (two cars, one last spot), and lookups should be O(1) not a scan of every spot.
+    </p>
+
+    <h3>Nouns → classes, verbs → methods</h3>
+    <p>
+      Underline the nouns in the requirements: parking <em>lot</em>, <em>floor</em>, <em>spot</em>, <em>vehicle</em>,
+      <em>ticket</em>, <em>fee</em>, <em>payment</em>. Underline the verbs: <em>park</em>/<em>enter</em>,
+      <em>assign</em>, <em>find</em> (a spot), <em>exit</em>, <em>calculate</em> (fee), <em>free</em>. That underlining
+      <em>is</em> the class list and the method list — say that out loud, it's the recipe made visible.
+    </p>
+
+    <table>
+      <thead><tr><th>Class</th><th>Responsibility (single, ideally)</th><th>Key methods</th></tr></thead>
+      <tbody>
+        <tr><td><code>ParkingLot</code></td><td>Top-level coordinator; owns floors; entry/exit orchestration. One per lot.</td><td><code>park(vehicle)</code>, <code>unpark(ticket)</code></td></tr>
+        <tr><td><code>ParkingFloor</code></td><td>Owns the spots on one level; finds a free fitting spot on <em>this</em> floor.</td><td><code>findFreeSpot(size)</code>, <code>freeCount(size)</code></td></tr>
+        <tr><td><code>ParkingSpot</code></td><td>One physical spot; its size and free/occupied state. Assign/release is the guarded op.</td><td><code>assign(vehicle)</code>, <code>release()</code>, <code>isFree()</code></td></tr>
+        <tr><td><code>Vehicle</code> (abstract)</td><td>A parked thing; carries its size. <code>Car</code>/<code>Bike</code>/<code>Truck</code> subclass it.</td><td><code>getSize()</code></td></tr>
+        <tr><td><code>Ticket</code></td><td>The entry record: vehicle, assigned spot, entry time. Immutable once issued.</td><td>— (value object)</td></tr>
+        <tr><td><code>PricingStrategy</code> (interface)</td><td>The variation point. Turn duration + vehicle into a fee.</td><td><code>price(ticket, exitTime)</code></td></tr>
+        <tr><td><code>SpotAssignmentStrategy</code> (interface)</td><td>Which free spot to hand out (nearest, cheapest floor, first-fit).</td><td><code>pickSpot(floors, size)</code></td></tr>
+      </tbody>
+    </table>
+
+    <div class="senior">Point at the two interfaces as you draw them: <em>"Notice I've made pricing and spot-selection interfaces even though I only have one implementation of each right now. That's deliberate — those are the two places the requirements will move. The interviewer is very likely to say 'now add weekend surge pricing' or 'now prefer spots near the elevator,' and when they do, my answer is 'that's a new strategy class, nothing else changes' instead of me editing a method I already wrote. I'm paying one interface up front to avoid a rewrite live on the whiteboard."</em> Anticipating the follow-up in the model itself is the single most senior move in this round.</div>
+
+    <h3>The core design in Java</h3>
+
+<pre><code><span class="kw">enum</span> <span class="typ">VehicleSize</span> { MOTORCYCLE, COMPACT, LARGE }   <span class="com">// ordinal encodes "fits in"</span>
+
+<span class="kw">abstract class</span> <span class="typ">Vehicle</span> {
+    <span class="kw">private final</span> <span class="typ">String</span> plate;
+    <span class="kw">private final</span> <span class="typ">VehicleSize</span> size;
+    <span class="com">// ctor, getSize()...</span>
+}
+<span class="kw">class</span> <span class="typ">Motorcycle</span> <span class="kw">extends</span> <span class="typ">Vehicle</span> { <span class="com">/* size = MOTORCYCLE */</span> }
+<span class="kw">class</span> <span class="typ">Car</span>        <span class="kw">extends</span> <span class="typ">Vehicle</span> { <span class="com">/* size = COMPACT   */</span> }
+<span class="kw">class</span> <span class="typ">Truck</span>      <span class="kw">extends</span> <span class="typ">Vehicle</span> { <span class="com">/* size = LARGE     */</span> }
+
+<span class="kw">class</span> <span class="typ">ParkingSpot</span> {
+    <span class="kw">private final</span> <span class="typ">String</span> id;
+    <span class="kw">private final</span> <span class="typ">VehicleSize</span> size;
+    <span class="kw">private</span> <span class="typ">Vehicle</span> parked;              <span class="com">// null == free</span>
+
+    <span class="com">// A COMPACT vehicle fits a COMPACT or LARGE spot, never a smaller one.</span>
+    <span class="kw">boolean</span> <span class="typ">canFit</span>(<span class="typ">Vehicle</span> v) { <span class="kw">return</span> v.getSize().ordinal() &lt;= size.ordinal(); }
+
+    <span class="com">// The guarded operation. See the concurrency section — this is THE race.</span>
+    <span class="kw">synchronized boolean</span> <span class="typ">tryAssign</span>(<span class="typ">Vehicle</span> v) {
+        <span class="kw">if</span> (parked != <span class="kw">null</span> || !canFit(v)) <span class="kw">return</span> <span class="kw">false</span>;
+        parked = v;
+        <span class="kw">return</span> <span class="kw">true</span>;
+    }
+    <span class="kw">synchronized void</span> <span class="typ">release</span>() { parked = <span class="kw">null</span>; }
+    <span class="kw">boolean</span> <span class="typ">isFree</span>() { <span class="kw">return</span> parked == <span class="kw">null</span>; }
+}
+
+<span class="kw">interface</span> <span class="typ">PricingStrategy</span> {          <span class="com">// ← the variation point, made a seam</span>
+    <span class="typ">Money</span> <span class="typ">price</span>(<span class="typ">Ticket</span> t, <span class="typ">Instant</span> exit);
+}
+<span class="kw">class</span> <span class="typ">HourlyPricing</span> <span class="kw">implements</span> <span class="typ">PricingStrategy</span> {
+    <span class="kw">public</span> <span class="typ">Money</span> <span class="typ">price</span>(<span class="typ">Ticket</span> t, <span class="typ">Instant</span> exit) {
+        <span class="kw">long</span> hrs = Math.max(<span class="num">1</span>, Duration.between(t.entryTime(), exit).toHours());
+        <span class="kw">return</span> ratePerHour.times(hrs);
+    }
+}
+</code></pre>
+
+<pre><code><span class="kw">class</span> <span class="typ">ParkingLot</span> {
+    <span class="kw">private final</span> <span class="typ">List&lt;ParkingFloor&gt;</span> floors;
+    <span class="kw">private final</span> <span class="typ">PricingStrategy</span> pricing;            <span class="com">// injected, not new'd</span>
+    <span class="kw">private final</span> <span class="typ">SpotAssignmentStrategy</span> assignment;   <span class="com">// injected</span>
+
+    <span class="kw">public</span> <span class="typ">Ticket</span> <span class="typ">park</span>(<span class="typ">Vehicle</span> v) {
+        <span class="typ">ParkingSpot</span> spot = assignment.pickAndAssign(floors, v);  <span class="com">// atomic; see below</span>
+        <span class="kw">if</span> (spot == <span class="kw">null</span>) <span class="kw">throw new</span> <span class="typ">LotFullException</span>(v.getSize());
+        <span class="kw">return new</span> <span class="typ">Ticket</span>(v, spot, Instant.now());
+    }
+
+    <span class="kw">public</span> <span class="typ">Money</span> <span class="typ">unpark</span>(<span class="typ">Ticket</span> t) {
+        <span class="typ">Money</span> fee = pricing.price(t, Instant.now());
+        t.spot().release();                              <span class="com">// free it AFTER pricing</span>
+        <span class="kw">return</span> fee;
+    }
+}
+</code></pre>
+
+    <p>
+      Notice what <em>isn't</em> here: no <code>if (vehicle instanceof Truck)</code> ladders, no giant
+      <code>calculateFee()</code> with a switch on vehicle type, no <code>balance</code>-style mutable count that can drift
+      from reality. Free-count is derived or maintained atomically alongside assignment, never as a second source of truth
+      you update by hand.
+    </p>
+
+    <h3>Where a pattern earns its place</h3>
+    <p>
+      <strong>Strategy, twice.</strong> <code>PricingStrategy</code> is the obvious one and the interviewer is fishing for
+      it: the moment they say "weekend rates" or "trucks pay double," you add a class, and the <code>ParkingLot</code>
+      never changes. <code>SpotAssignmentStrategy</code> is the subtler, higher-value one — "assign the nearest spot to the
+      entrance" vs "spread load across floors" vs "first-fit" is a policy that will change, so make it a strategy too. A
+      light touch of <strong>Factory</strong> (a <code>VehicleFactory</code> turning a gate scan into the right
+      <code>Vehicle</code> subclass) is defensible; a full <strong>Observer</strong> setup for the "spots available" display
+      boards is a nice mention if you have time, over-engineering if you build it out. <strong>Singleton</strong> for
+      <code>ParkingLot</code> is a classic trap: yes, there's one lot, but say <em>"conceptually one instance, but I'd
+      inject it rather than use a static <code>getInstance()</code>, because a hard singleton is untestable and I've been
+      burned by that."</em>
+    </p>
+
+    <h3>The concurrency concern: the last-spot race</h3>
+    <p>
+      Here is the bug the interviewer is really waiting for, and it's the same shape as the seat-booking race in
+      <a href="#bookmyshow">BookMyShow</a> and the overselling problem in
+      <a href="14-ticket-booking.html">14 — Ticket Booking</a>. Two cars arrive at the same instant and there is exactly
+      one compact spot left. Naive code:
+    </p>
+<pre><code><span class="com">// BROKEN — check-then-act across two operations.</span>
+<span class="typ">ParkingSpot</span> spot = floor.findFreeSpot(size);  <span class="com">// both threads see the SAME free spot</span>
+<span class="kw">if</span> (spot != <span class="kw">null</span>) spot.assign(vehicle);      <span class="com">// both assign it → one car is overwritten</span>
+</code></pre>
+    <p>
+      Both threads call <code>findFreeSpot</code>, both get the same spot, both assign — one vehicle silently loses its
+      spot, or two tickets point at one physical space and someone gets towed. The fix is to make <strong>find-and-assign
+      a single atomic operation</strong>, never two steps with a gap. Three ways, in ascending scope, and you should be
+      able to name all three and pick per context:
+    </p>
+    <ol>
+      <li><strong>In-memory, single JVM:</strong> the <code>tryAssign()</code> above is <code>synchronized</code> and does
+        the check <em>and</em> the mutation atomically, so exactly one thread can flip a free spot to occupied — the same
+        compare-and-set discipline as an idempotency key's <code>INSERT … ON CONFLICT</code>. The assignment strategy
+        iterates candidate spots and stops at the first <code>tryAssign()</code> that returns <code>true</code>. To avoid a
+        coarse lock over the whole lot, hold the free spots per floor per size in a concurrent structure and only lock the
+        individual spot. Say <em>"the lock is on the spot, not the lot — I don't want every entry serialised behind one
+        mutex."</em></li>
+      <li><strong>Multi-node / persisted:</strong> the JVM lock is worthless across servers. Push the invariant into the
+        database exactly as in <a href="13-payments-orders.html">13</a> and <a href="14-ticket-booking.html">14</a>: a
+        conditional update — <code>UPDATE spots SET vehicle_id = ? WHERE id = ? AND vehicle_id IS NULL</code> — and check
+        the affected-row count. One row updated, you won; zero rows, someone beat you, try the next spot. The database's
+        row lock is the atomic compare-and-set.</li>
+      <li><strong>Optimistic version:</strong> a <code>@Version</code> column on the spot; two writers collide and the
+        loser gets an <code>OptimisticLockException</code> and retries against a different spot. Good when contention is
+        low (most spots are free most of the time), which for a parking lot is usually true.</li>
+    </ol>
+
+    <div class="pitfall">The mistake that reads as inexperience is maintaining a separate <code>int freeCount</code> that you decrement on park and increment on unpark, <em>as a source of truth</em>. Under concurrency it drifts from the actual spot states — a lost update on the counter — and now your display board says "3 free" when the lot is full. Either derive the count from the spots, or maintain it with the same atomic operation that flips the spot, never as an independent second write. It's the mutable-balance-column mistake from <a href="13-payments-orders.html">13</a> in a different costume.</div>
+
+    <div class="senior">Say the boundary out loud: <em>"If this is one process, a lock on the spot object is enough and I wouldn't over-build it. The moment there are multiple app servers, in-memory locks are a lie and the only correct place for the invariant is the database — a conditional update or a version column. I'd ask which one we are before choosing, because designing for a distributed lot when it's a single JVM is wasted complexity, and designing for a single JVM when it's distributed is a correctness bug."</em> Naming that fork — and refusing to pick blindly — is exactly the judgment this round grades.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="elevator">2. Elevator System</h2>
+
+    <p>
+      The elevator flips the parking lot's emphasis. Parking is about <em>allocation under contention</em>; the elevator
+      is about a <em>state machine</em> and a <em>scheduling policy</em>. There is no double-booking bug to catch here —
+      the concurrency is a producer/consumer request queue, not a race for a scarce resource. Recognising that the two
+      problems stress different muscles is itself a signal that you understand what LLD is testing.
+    </p>
+
+    <h3>Clarify the scope</h3>
+    <table>
+      <thead><tr><th>Question</th><th>Why it matters</th><th>Assume</th></tr></thead>
+      <tbody>
+        <tr><td>"One elevator car, or a bank of them?"</td><td>A bank adds a dispatcher that picks <em>which</em> car serves a hall call — a second scheduling layer.</td><td>Start with <strong>one car</strong>, then extend to a bank in follow-up. Say you're doing that on purpose.</td></tr>
+        <tr><td>"Two request types — buttons inside vs hall buttons outside?"</td><td>Yes, and they differ: inside requests name a floor; hall requests name a floor <em>and a direction</em>.</td><td><strong>Both.</strong> Model them as distinct request types.</td></tr>
+        <tr><td>"What scheduling policy? FCFS, or the elevator (SCAN) algorithm?"</td><td>The variation point → a strategy. FCFS is naive and jerky; SCAN sweeps in one direction serving everything.</td><td><strong>SCAN by default, pluggable.</strong> Ask — it's where the pattern lives.</td></tr>
+        <tr><td>"Capacity / weight limits, door timings, emergency/maintenance modes?"</td><td>Real but bottomless. Model states for them; don't simulate physics.</td><td>Model <strong>OUT_OF_SERVICE</strong> and door states; skip weight sensors.</td></tr>
+      </tbody>
+    </table>
+    <p>
+      <strong>Functional:</strong> a rider presses a hall button (floor + direction) or a car button (destination); the
+      system schedules the car to serve all pending requests efficiently; the car moves floor by floor, opens doors when
+      it arrives at a requested floor, and idles when there's nothing to do. <strong>Non-functional:</strong> requests
+      arrive concurrently from many riders and must be enqueued safely; the car's behaviour must be a well-defined state
+      machine so "what happens if a request comes in while moving down" has one unambiguous answer.
+    </p>
+
+    <h3>Nouns → classes, verbs → methods</h3>
+    <p>
+      Nouns: <em>elevator</em> (car), <em>controller</em>/dispatcher, <em>request</em>, <em>floor</em>, <em>button</em>,
+      <em>door</em>, <em>direction</em>, <em>state</em>. Verbs: <em>request</em>, <em>schedule</em>/<em>dispatch</em>,
+      <em>move</em>, <em>stop</em>, <em>open</em>/<em>close</em> (doors), <em>idle</em>. The word <em>state</em> appearing
+      as a noun is your cue: the car <em>is</em> a state machine, and that's the pattern.
+    </p>
+
+    <table>
+      <thead><tr><th>Class</th><th>Responsibility</th><th>Key methods</th></tr></thead>
+      <tbody>
+        <tr><td><code>ElevatorController</code></td><td>Receives all requests; runs the scheduling strategy; drives the car(s). The coordinator.</td><td><code>submit(Request)</code>, <code>step()</code></td></tr>
+        <tr><td><code>ElevatorCar</code></td><td>Physical car: current floor, direction, door state, its own pending stops. Executes one move at a time.</td><td><code>moveOneFloor()</code>, <code>openDoors()</code>, <code>currentFloor()</code></td></tr>
+        <tr><td><code>Request</code> (interface)</td><td>A demand for service. <code>HallRequest</code>(floor, dir) and <code>CarRequest</code>(floor) implement it.</td><td><code>targetFloor()</code>, <code>direction()</code></td></tr>
+        <tr><td><code>SchedulingStrategy</code> (interface)</td><td>The variation point: given car state + pending requests, what's the next floor to serve?</td><td><code>nextStop(car, pending)</code></td></tr>
+        <tr><td><code>ElevatorState</code> (interface)</td><td>State pattern: MovingUp / MovingDown / Idle / DoorsOpen / OutOfService — each defines legal behaviour.</td><td><code>next(car)</code>, <code>canAccept(Request)</code></td></tr>
+        <tr><td><code>Direction</code> (enum)</td><td>UP / DOWN / IDLE — a value, so it's an enum, not a class.</td><td>—</td></tr>
+      </tbody>
+    </table>
+
+    <h3>The core design in Java</h3>
+
+<pre><code><span class="kw">enum</span> <span class="typ">Direction</span> { UP, DOWN, IDLE }
+
+<span class="kw">interface</span> <span class="typ">Request</span> {
+    <span class="kw">int</span> <span class="typ">targetFloor</span>();
+    <span class="typ">Direction</span> <span class="typ">direction</span>();     <span class="com">// IDLE for a car (inside) request</span>
+}
+<span class="kw">record</span> <span class="typ">HallRequest</span>(<span class="kw">int</span> floor, <span class="typ">Direction</span> direction) <span class="kw">implements</span> <span class="typ">Request</span> {
+    <span class="kw">public int</span> <span class="typ">targetFloor</span>() { <span class="kw">return</span> floor; }
+}
+<span class="kw">record</span> <span class="typ">CarRequest</span>(<span class="kw">int</span> floor) <span class="kw">implements</span> <span class="typ">Request</span> {
+    <span class="kw">public int</span> <span class="typ">targetFloor</span>() { <span class="kw">return</span> floor; }
+    <span class="kw">public</span> <span class="typ">Direction</span> <span class="typ">direction</span>() { <span class="kw">return</span> Direction.IDLE; }
+}
+
+<span class="com">// STATE PATTERN: each state knows what the car may legally do next.</span>
+<span class="kw">interface</span> <span class="typ">ElevatorState</span> {
+    <span class="typ">ElevatorState</span> <span class="typ">next</span>(<span class="typ">ElevatorCar</span> car);   <span class="com">// advance one tick; may return a new state</span>
+    <span class="kw">boolean</span> <span class="typ">canAccept</span>(<span class="typ">Request</span> r);
+}
+</code></pre>
+
+    <p>
+      The <strong>State pattern</strong> is what keeps this clean. Instead of one <code>move()</code> method with a nest of
+      <code>if (direction == UP &amp;&amp; !pending.isEmpty() &amp;&amp; ...)</code>, each state is a small class that answers "what do
+      I do now, and what state do I become?" The illegal transitions (open the doors while moving) are simply not
+      expressible, because <code>MovingUp</code> has no <code>openDoors</code> path — it can only become <code>DoorsOpen</code>
+      by first arriving:
+    </p>
+
+<pre><code><span class="kw">class</span> <span class="typ">MovingUp</span> <span class="kw">implements</span> <span class="typ">ElevatorState</span> {
+    <span class="kw">public</span> <span class="typ">ElevatorState</span> <span class="typ">next</span>(<span class="typ">ElevatorCar</span> car) {
+        <span class="typ">Integer</span> stop = car.scheduler().nextStop(car);
+        <span class="kw">if</span> (stop == <span class="kw">null</span>)            <span class="kw">return new</span> <span class="typ">Idle</span>();          <span class="com">// nothing pending</span>
+        <span class="kw">if</span> (stop == car.floor())      <span class="kw">return new</span> <span class="typ">DoorsOpen</span>(car);   <span class="com">// arrived → serve</span>
+        car.moveOneFloor(Direction.UP);
+        <span class="kw">return this</span>;                                              <span class="com">// keep climbing</span>
+    }
+    <span class="kw">public boolean</span> <span class="typ">canAccept</span>(<span class="typ">Request</span> r) { <span class="kw">return true</span>; }         <span class="com">// queue it; scheduler orders it</span>
+}
+
+<span class="kw">class</span> <span class="typ">ElevatorController</span> {
+    <span class="kw">private final</span> <span class="typ">ElevatorCar</span> car;
+    <span class="com">// thread-safe queue: rider threads produce, the control loop consumes</span>
+    <span class="kw">private final</span> <span class="typ">BlockingQueue&lt;Request&gt;</span> inbox = <span class="kw">new</span> <span class="typ">LinkedBlockingQueue</span>&lt;&gt;();
+
+    <span class="kw">public void</span> <span class="typ">submit</span>(<span class="typ">Request</span> r) { inbox.offer(r); }   <span class="com">// called from ANY thread</span>
+
+    <span class="com">// The single control loop — the ONLY thread that mutates car state.</span>
+    <span class="kw">public void</span> <span class="typ">run</span>() {
+        <span class="kw">while</span> (running) {
+            inbox.drainTo(car.pending());     <span class="com">// pull all new requests in</span>
+            car.tick();                       <span class="com">// state.next(car): one step of the machine</span>
+        }
+    }
+}
+</code></pre>
+
+    <h3>Where a pattern earns its place</h3>
+    <p>
+      <strong>State</strong> for the car's lifecycle (Idle/MovingUp/MovingDown/DoorsOpen/OutOfService) — this is the
+      textbook case and the interviewer wants to see it, because the alternative is a giant conditional that becomes
+      unmaintainable the instant you add a fifth state. <strong>Strategy</strong> for the scheduling policy: FCFS vs SCAN
+      vs "look ahead / LOOK" is exactly a swappable algorithm, and when the interviewer says "make it prioritise the
+      direction of travel," you hand them a new <code>ScanScheduler</code> and change nothing else. <strong>Observer</strong>
+      genuinely fits here for the panel lights and floor displays — "when the car reaches a floor, update the indicator on
+      every floor" is textbook publish/subscribe, and it's one of the rare problems where mentioning Observer isn't
+      over-reach. For a <em>bank</em> of elevators, add a top-level dispatcher whose job is "assign this hall call to the
+      best car" — itself a strategy (nearest car, least-loaded, same-direction).
+    </p>
+
+    <div class="senior">The line that shows you've thought past the single car: <em>"For a bank of N elevators I'd split the two decisions. The dispatcher answers 'which car serves this hall call' — that's a strategy over car states. Each car independently answers 'what's my next stop given my own queue' — that's the per-car scheduler. Keeping those two policies separate means I can change how cars are assigned without touching how a car sequences its own stops. Conflating them into one scheduler is the design that gets ugly at the first follow-up."</em></div>
+
+    <h3>The concurrency concern: one writer, many producers</h3>
+    <p>
+      This problem's concurrency is <em>not</em> a race for a scarce resource — it's the classic producer/consumer shape,
+      and the senior move is to design the race <em>out of existence</em> rather than lock your way through it. Many rider
+      threads press buttons concurrently (the producers); the car's physical state is mutated by exactly <strong>one</strong>
+      control-loop thread (the single consumer). The only shared mutable point is the request queue, so:
+    </p>
+    <ul>
+      <li><strong>The inbox is a <code>BlockingQueue</code></strong> — thread-safe by construction, so button presses from
+        any thread just <code>offer()</code> into it with no lock you write yourself. Producers never touch car state
+        directly.</li>
+      <li><strong>Exactly one thread mutates the car.</strong> Because only the control loop advances the state machine and
+        reads the pending set, the car's fields need no synchronization at all — there is no second writer to race. This is
+        the same insight as an actor or a single-writer event loop (and, not coincidentally, how a browser's single JS
+        thread avoids UI races). Say <em>"I'd rather have one owner of the mutable state than many threads sharing it
+        behind locks — it's simpler and it's correct by design."</em></li>
+      <li><strong>Deduping requests</strong> (pressing "5" twice shouldn't enqueue two stops) is a <code>Set</code> of
+        pending floors, updated only on the control loop — no lock needed for the same reason.</li>
+    </ul>
+
+    <div class="pitfall">Candidates over-engineer this one. They reach for a <code>synchronized</code> on every car method, or a lock around the whole controller, because "concurrency means locks." That's backwards. The elegant answer is a <em>single-writer</em> design where the only synchronized handoff is a standard thread-safe queue, and everything downstream of it is single-threaded and therefore trivially correct. Recognising that you can eliminate the race instead of guarding it is the more senior instinct — and it contrasts sharply with parking and BookMyShow, where you genuinely <em>are</em> racing for a scarce resource and cannot design the contention away.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="bookmyshow">3. BookMyShow (movie ticket booking)</h2>
+
+    <p>
+      This is the LLD sibling of <a href="14-ticket-booking.html">14 — Ticket Booking</a>, and the two are worth studying
+      together: page 14 is the <em>distributed</em> version (scale, seat holds across a cluster, the flash-sale thundering
+      herd); this is the <em>object model</em> version (the classes, and the double-booking race at the level of a
+      <code>Seat</code>). The concurrency concern here is the whole point of the problem — this is the one where the race
+      is unavoidable and correctness is the grade. It's the parking-lot last-spot race with money and disappointed fans
+      attached.
+    </p>
+
+    <h3>Clarify the scope</h3>
+    <table>
+      <thead><tr><th>Question</th><th>Why it matters</th><th>Assume</th></tr></thead>
+      <tbody>
+        <tr><td>"Seat-level booking, or just a count of tickets?"</td><td>Seat-level is the interesting design — it's where the double-booking race lives. A pure count is a different, easier problem.</td><td><strong>Seat-level</strong> — specific seats in a specific hall.</td></tr>
+        <tr><td>"Do we hold seats while the user pays, with an expiry?"</td><td>This is the crux. A hold is a temporary reservation; if payment doesn't complete, the seat must free itself.</td><td><strong>Yes</strong> — a 5-minute hold, then auto-release. Ask for it; it's the heart of the design.</td></tr>
+        <tr><td>"One theatre or many; one show or many?"</td><td>Sets the entity hierarchy: City → Theatre → Screen → Show → Seat. Model it; don't over-normalise verbally.</td><td><strong>Many</strong> theatres, each with screens, each screen running shows.</td></tr>
+        <tr><td>"Dynamic/tiered pricing (recliner vs regular, weekend surge)?"</td><td>The pricing variation point → strategy, same as parking.</td><td><strong>Tiered + pluggable.</strong></td></tr>
+        <tr><td>"Real payment gateway, search, recommendations?"</td><td>Model a <code>Payment</code> seam; the rest is scope creep.</td><td><strong>Payment as an interface</strong>; search/reco out of scope.</td></tr>
+      </tbody>
+    </table>
+    <p>
+      <strong>Functional:</strong> browse shows for a movie in a city; see the seat map for a show with live availability;
+      select seats and <em>hold</em> them; pay within the hold window to <em>confirm</em>; if the window lapses, seats
+      release automatically. <strong>Non-functional — and this is the whole grade:</strong> a seat must never be sold
+      twice, even when two users select it in the same millisecond; the seat map must reflect held/booked state so users
+      aren't fighting over already-taken seats; holds must expire reliably even if the user closes the tab.
+    </p>
+
+    <h3>Nouns → classes, verbs → methods</h3>
+    <p>
+      Nouns: <em>movie</em>, <em>theatre</em>, <em>screen</em>, <em>show</em>, <em>seat</em>, <em>booking</em>,
+      <em>hold</em>, <em>user</em>, <em>payment</em>, <em>price</em>. Verbs: <em>search</em>, <em>select</em>/<em>hold</em>,
+      <em>book</em>/<em>confirm</em>, <em>pay</em>, <em>cancel</em>, <em>release</em> (expiry). The two verbs that carry the
+      design are <em>hold</em> and <em>confirm</em> — everything hard is in the gap between them.
+    </p>
+
+    <table>
+      <thead><tr><th>Class</th><th>Responsibility</th><th>Key methods</th></tr></thead>
+      <tbody>
+        <tr><td><code>Movie</code>, <code>Theatre</code>, <code>Screen</code></td><td>The static catalogue hierarchy. Mostly value/entity data.</td><td>getters; <code>Screen</code> owns its physical seat layout</td></tr>
+        <tr><td><code>Show</code></td><td>A movie on a screen at a time. Owns the <em>bookable</em> seat states for that showing.</td><td><code>seatMap()</code>, <code>availableSeats()</code></td></tr>
+        <tr><td><code>ShowSeat</code></td><td>One seat <em>in one show</em> — the unit of contention. Holds AVAILABLE/HELD/BOOKED + who + hold-expiry. Distinct from the physical <code>Seat</code>.</td><td><code>tryHold(user)</code>, <code>confirm()</code>, <code>release()</code></td></tr>
+        <tr><td><code>BookingService</code></td><td>Orchestrates hold → pay → confirm; enforces "all-or-nothing" over a set of seats.</td><td><code>hold(show, seats, user)</code>, <code>confirm(bookingId, payment)</code></td></tr>
+        <tr><td><code>Booking</code></td><td>The record: user, show, seats, state (HELD/CONFIRMED/EXPIRED/CANCELLED), created-at.</td><td>state transitions</td></tr>
+        <tr><td><code>PricingStrategy</code> (interface)</td><td>Seat tier + show + day → price. Same seam as parking.</td><td><code>price(showSeat, show)</code></td></tr>
+        <tr><td><code>PaymentGateway</code> (interface)</td><td>External payment seam; keeps the booking flow testable.</td><td><code>charge(booking, method)</code></td></tr>
+      </tbody>
+    </table>
+
+    <div class="senior">Call out the <code>Seat</code> vs <code>ShowSeat</code> split deliberately, because getting it wrong quietly breaks everything: <em>"The physical seat A12 exists once, but its bookability is per-show — A12 can be free for the 6pm and sold for the 9pm. So the thing I lock and book is a <code>ShowSeat</code>, the intersection of a seat and a show, not the physical <code>Seat</code>. Modelling the physical seat as the bookable unit is the mistake that makes two shows fight over the same row." </em>That one distinction is a senior tell — juniors almost always conflate the two.</div>
+
+    <h3>The core design in Java</h3>
+
+<pre><code><span class="kw">enum</span> <span class="typ">SeatStatus</span> { AVAILABLE, HELD, BOOKED }
+
+<span class="kw">class</span> <span class="typ">ShowSeat</span> {                       <span class="com">// seat ∩ show — THE unit of contention</span>
+    <span class="kw">private final</span> <span class="typ">String</span> id;             <span class="com">// (showId, seatNo)</span>
+    <span class="kw">private</span> <span class="typ">SeatStatus</span> status = SeatStatus.AVAILABLE;
+    <span class="kw">private</span> <span class="typ">String</span> heldBy;               <span class="com">// user/booking holding it</span>
+    <span class="kw">private</span> <span class="typ">Instant</span> holdExpiry;
+
+    <span class="com">// The guarded transition. Atomic check-and-set — this is THE race.</span>
+    <span class="kw">synchronized boolean</span> <span class="typ">tryHold</span>(<span class="typ">String</span> user, <span class="typ">Duration</span> window) {
+        <span class="kw">if</span> (status == SeatStatus.BOOKED) <span class="kw">return false</span>;
+        <span class="kw">if</span> (status == SeatStatus.HELD &amp;&amp; Instant.now().isBefore(holdExpiry))
+            <span class="kw">return false</span>;                  <span class="com">// someone else holds it, unexpired</span>
+        status = SeatStatus.HELD;         <span class="com">// free, OR an expired hold we may steal</span>
+        heldBy = user;
+        holdExpiry = Instant.now().plus(window);
+        <span class="kw">return true</span>;
+    }
+    <span class="kw">synchronized boolean</span> <span class="typ">confirm</span>(<span class="typ">String</span> user) {
+        <span class="kw">if</span> (status != SeatStatus.HELD || !user.equals(heldBy)) <span class="kw">return false</span>;
+        status = SeatStatus.BOOKED;       <span class="com">// point of no return</span>
+        <span class="kw">return true</span>;
+    }
+    <span class="kw">synchronized void</span> <span class="typ">releaseIfExpired</span>() {
+        <span class="kw">if</span> (status == SeatStatus.HELD &amp;&amp; Instant.now().isAfter(holdExpiry)) {
+            status = SeatStatus.AVAILABLE; heldBy = <span class="kw">null</span>;
+        }
+    }
+}
+</code></pre>
+
+<pre><code><span class="kw">class</span> <span class="typ">BookingService</span> {
+    <span class="kw">private final</span> <span class="typ">PricingStrategy</span> pricing;
+    <span class="kw">private final</span> <span class="typ">PaymentGateway</span> gateway;
+
+    <span class="com">// Hold MANY seats all-or-nothing: if any seat fails, roll back the ones we got.</span>
+    <span class="kw">public</span> <span class="typ">Booking</span> <span class="typ">hold</span>(<span class="typ">Show</span> show, <span class="typ">List&lt;String&gt;</span> seatIds, <span class="typ">String</span> user) {
+        <span class="typ">List&lt;ShowSeat&gt;</span> got = <span class="kw">new</span> <span class="typ">ArrayList</span>&lt;&gt;();
+        <span class="com">// Lock seats in a CONSISTENT ORDER (by id) to prevent deadlock (see below)</span>
+        <span class="kw">for</span> (<span class="typ">String</span> sid : seatIds.stream().sorted().toList()) {
+            <span class="typ">ShowSeat</span> seat = show.seat(sid);
+            <span class="kw">if</span> (seat.tryHold(user, HOLD_WINDOW)) got.add(seat);
+            <span class="kw">else</span> { got.forEach(<span class="typ">ShowSeat</span>::release); <span class="com">// roll back partial holds</span>
+                   <span class="kw">throw new</span> <span class="typ">SeatUnavailableException</span>(sid); }
+        }
+        <span class="kw">return</span> Booking.held(show, got, user);
+    }
+
+    <span class="kw">public</span> <span class="typ">Booking</span> <span class="typ">confirm</span>(<span class="typ">Booking</span> b, <span class="typ">PaymentMethod</span> pm) {
+        gateway.charge(b, pm);                       <span class="com">// idempotency-key'd (see 13)</span>
+        b.seats().forEach(s -&gt; s.confirm(b.user()));  <span class="com">// held → booked</span>
+        <span class="kw">return</span> b.confirmed();
+    }
+}
+</code></pre>
+
+    <h3>Where a pattern earns its place</h3>
+    <p>
+      <strong>State</strong> on the <code>ShowSeat</code> (AVAILABLE → HELD → BOOKED, with the timed HELD → AVAILABLE
+      release) and on the <code>Booking</code> — the transitions are the correctness rules, so encoding them as an explicit
+      machine means an illegal jump (BOOKED back to AVAILABLE) is simply unreachable. <strong>Strategy</strong> for pricing,
+      exactly as in parking. <strong>Observer</strong> for the live seat map — "when a seat is held or booked, push the
+      update to everyone watching this show's map" is real publish/subscribe and worth a sentence. <strong>Factory/Builder</strong>
+      for assembling a <code>Show</code> or a <code>Booking</code> with its many fields is a fine mention. And the
+      <strong>hold-with-expiry</strong> pattern itself — reserve, then confirm-or-auto-release — is the reusable idea the
+      interviewer wants you to name; it's identical to the seat-hold in <a href="14-ticket-booking.html">14</a> and cousin
+      to the authorize/capture split in <a href="13-payments-orders.html">13</a>.
+    </p>
+
+    <h3>The concurrency concern: double-booking, the whole ballgame</h3>
+    <p>
+      Two users click seat A12 for the 9pm show at the same instant. Both must not get it. This is the
+      <a href="14-ticket-booking.html">overselling problem</a> at object granularity, and it is <em>the</em> thing being
+      tested — do not let the interviewer have to ask. The naive version is the same check-then-act bug as the parking lot:
+    </p>
+<pre><code><span class="com">// BROKEN — a gap between the check and the write.</span>
+<span class="kw">if</span> (seat.isAvailable())        <span class="com">// both threads see AVAILABLE</span>
+    seat.setStatus(HELD);      <span class="com">// both set HELD → seat sold twice</span>
+</code></pre>
+    <p>
+      The fix is the same recipe as parking and payments — push the check-and-set into one atomic operation — but say all
+      four layers, because a strong answer distinguishes the single-JVM toy from the real system:
+    </p>
+    <ol>
+      <li><strong>In-memory:</strong> <code>tryHold()</code> is <code>synchronized</code> on the <code>ShowSeat</code>, so
+        the read of <code>status</code> and the write happen with no gap — exactly one thread flips AVAILABLE→HELD, the
+        other gets <code>false</code>. The lock is per seat, so unrelated seats never contend.</li>
+      <li><strong>Persisted, the real answer — three flavours, pick and defend one:</strong>
+        <ul>
+          <li><strong>Optimistic (usually best here):</strong> a <code>@Version</code> column on the seat row.
+            <code>UPDATE show_seats SET status='HELD', held_by=?, version=version+1 WHERE id=? AND status='AVAILABLE'</code>.
+            One row affected = you won; zero = someone beat you. No lock held across the user's think-time. Contention per
+            seat is low, so optimistic wins.</li>
+          <li><strong>Pessimistic:</strong> <code>SELECT … FOR UPDATE</code> on the seat rows inside the transaction. Simple
+            and correct, but holds a DB lock — fine for the brief hold operation, bad if you hold it across payment.</li>
+          <li><strong>Unique constraint:</strong> a <code>seat_locks(show_seat_id PK)</code> table; <code>INSERT</code>
+            wins or throws a duplicate-key. The insert <em>is</em> the compare-and-set, same primitive as the idempotency
+            key in <a href="13-payments-orders.html">13</a>.</li>
+        </ul>
+      </li>
+      <li><strong>Never hold a DB lock across the payment.</strong> Payment takes seconds-to-minutes; a row lock held that
+        long serialises the whole show and melts under a popular release. This is <em>why</em> the design is hold-then-pay:
+        the <strong>hold is a soft reservation</strong> (a status + expiry, no lock held), the user pays against the hold,
+        and confirm flips HELD→BOOKED. Say <em>"I decouple the hold from the payment precisely so I'm never holding a lock
+        while a human types their card number."</em></li>
+      <li><strong>Expiry needs a reaper, and it must itself be race-safe.</strong> A background sweep (or a lazy
+        check-on-read) releases holds past <code>holdExpiry</code>. The subtle bug: a hold expires at the same moment its
+        owner pays. Guard it — the confirm and the release both go through the seat's atomic transition, and the DB version
+        check means only one of "steal the expired seat" vs "confirm it" can win. Mention <a href="14-ticket-booking.html">14</a>'s
+        note that a TTL on a Redis hold key is the distributed version of this reaper.</li>
+    </ol>
+
+    <div class="pitfall">Two deadlock-and-drift traps interviewers plant. First: booking multiple seats by locking them <em>in request order</em> — user A locks {12,15}, user B locks {15,12}, and they deadlock holding one seat each. Fix: always acquire seats in a <strong>consistent global order</strong> (sort by id), as the <code>hold()</code> code does. Second: an all-or-nothing multi-seat hold that grabs three of four seats and then finds the fourth taken — you must <strong>roll back the three you got</strong>, or you've stranded seats in a held state nobody owns. Both bugs are invisible in a single-seat happy path and both are exactly what a good interviewer pushes into.</div>
+
+    <div class="senior">The synthesis line that ties all three case studies together — say it and you've shown the interviewer the pattern behind the patterns: <em>"The last parking spot, the last seat, the money in a ledger — these are the same problem. A scarce resource, two writers, and a check-then-act gap that loses one of them. The answer is always to collapse the check and the write into one atomic operation: a synchronized transition in one JVM, a conditional update or a version column or a unique constraint across machines. I never validate in application code and then write, because the gap between them is where the double-booking lives."</em></div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="pressure">4. What "good" looks like under time pressure</h2>
+
+    <p>
+      You have 45 minutes, a whiteboard, and an interviewer watching you think. You will not finish a "complete" design and
+      you are not meant to — the round is scored on <em>how you work</em>, not on lines of code. Here is what separates the
+      candidates who pass from the ones who wrote more:
+    </p>
+
+    <table>
+      <thead><tr><th>Move</th><th>What the strong candidate does</th><th>What sinks the weak one</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Start with requirements, not classes</strong></td>
+          <td>Spends 5 minutes clarifying scope and stating what's cut. Writes the noun list and verb list on the board first.</td>
+          <td>Starts drawing <code>class Car</code> in minute one, then re-does the model when a requirement lands.</td>
+        </tr>
+        <tr>
+          <td><strong>Interfaces at the seams first</strong></td>
+          <td>Declares <code>PricingStrategy</code>, <code>SchedulingStrategy</code> as interfaces before any concrete class, and names the requirement each protects.</td>
+          <td>Writes concrete classes with logic hard-coded, then can't absorb "now add weekend pricing" without edits.</td>
+        </tr>
+        <tr>
+          <td><strong>Breadth before depth</strong></td>
+          <td>Gets a thin, complete skeleton of every core class up first, then deepens whichever one the interviewer probes.</td>
+          <td>Perfects <code>equals()</code>/<code>hashCode()</code> and getters on one class while the design has no shape.</td>
+        </tr>
+        <tr>
+          <td><strong>Don't gold-plate</strong></td>
+          <td>Says <em>"I'll stub payment behind an interface and not build it — it's not what's being tested."</em> Leaves it and moves on.</td>
+          <td>Builds a full payment state machine and runs out of time before the seat-booking race — the actual grade.</td>
+        </tr>
+        <tr>
+          <td><strong>Verbalise trade-offs</strong></td>
+          <td>Says the alternative and why they didn't pick it: <em>"optimistic over pessimistic locking here, because seat contention is low."</em></td>
+          <td>Presents one design as if it were the only option; can't answer "why not X?"</td>
+        </tr>
+        <tr>
+          <td><strong>Flag concurrency proactively</strong></td>
+          <td>Marks the guarded operation as they write it: <em>"this <code>tryHold</code> is the race — I'll come back to how it's enforced."</em></td>
+          <td>Writes single-threaded code and has to be asked "what about two users at once?"</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>
+      <strong>A concrete 45-minute budget</strong>, because a plan stops you from rat-holing:
+    </p>
+<pre><code>  0–5   min   Clarify scope. Functional + non-functional. State what you cut.
+  5–10  min   Nouns → classes, verbs → methods. Write both lists on the board.
+ 10–15  min   Interfaces at the seams (strategy/state). Draw the class skeleton.
+ 15–30  min   Flesh out the 2–3 core classes. Enums, key method signatures.
+ 30–40  min   THE deep dive: concurrency. The guarded op + how it's enforced.
+ 40–45  min   Trade-offs, extensions ("bank of elevators", "distributed"), Q&amp;A.
+</code></pre>
+
+    <p>
+      Two more things worth internalising. First: <strong>method signatures over method bodies.</strong> On a whiteboard,
+      <code>boolean tryHold(String user, Duration window)</code> with a one-line comment about what it guarantees is worth
+      more than ten lines of body — the signature communicates the design; the body is just typing. Write bodies only for
+      the one or two methods where the logic <em>is</em> the point (the atomic transition, the SCAN step). Second:
+      <strong>narrate continuously.</strong> Silence is the enemy — the interviewer is grading your reasoning, and reasoning
+      they can't hear scores nothing. Say what you're about to do, do it, say why. A quiet candidate with a perfect model
+      loses to a talking candidate with a good-enough one.
+    </p>
+
+    <div class="senior">The meta-move that works on every LLD problem, including ones you've never seen: <em>"I don't try to produce the final design in one pass. I get a rough, complete skeleton — every core class present but thin — and then I ask the interviewer which part they want me to go deep on, because that tells me where the points are. And I state my assumptions loudly as I go, so that if I've mis-scoped, they can correct me in minute five instead of minute forty."</em> That turns the round into a collaboration you're steering rather than a test you're failing quietly — which is precisely the seniority signal the interviewer is trying to detect.</div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="qa">Interview Q&amp;A</h2>
+
+    <details class="qa">
+      <summary>"Walk me through how you go from the prompt 'design a parking lot' to classes, in the first five minutes."</summary>
+      <div class="answer">
+        <p>
+          I don't write a class in the first five minutes — I clarify and extract. I ask the scope questions first:
+          multiple floors, multiple vehicle sizes with fit rules, how the fee is computed, whether we track a specific
+          car for exit. Each answer changes the class list, so I want them before I commit ink.
+        </p>
+        <p>
+          Then I underline the nouns and verbs in the requirements out loud. Nouns — lot, floor, spot, vehicle, ticket,
+          fee — become classes; nouns that are just values, like size or colour, become enums. Verbs — park, assign, find,
+          exit, calculate — become methods, and each verb tells me <em>which</em> class owns it: the one holding the state
+          the verb changes. <code>assign</code> lives on <code>ParkingSpot</code> because the spot owns its occupied state.
+        </p>
+        <p>
+          Last, I look for the phrases that signal change — "the fee <em>depends on</em>," "we <em>might</em> assign the
+          nearest spot" — and I put an interface at each: <code>PricingStrategy</code>, <code>SpotAssignmentStrategy</code>.
+          Now the skeleton is: a coordinator (<code>ParkingLot</code>), an entity tree (floor/spot), a value object
+          (<code>Ticket</code>), and two strategy seams. That's the recipe — nouns to classes, verbs to methods, variation
+          points to interfaces — and it's the same recipe for elevator and BookMyShow.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"Two cars arrive at once and there's one spot left. How do you make sure only one gets it?"</summary>
+      <div class="answer">
+        <p>
+          This is a check-then-act race, and the fix is to collapse the check and the act into one atomic operation
+          instead of two steps with a gap. The broken version does <code>findFreeSpot()</code> then <code>assign()</code> —
+          both threads find the same spot and both assign it.
+        </p>
+        <p>
+          In a single JVM, I make <code>tryAssign()</code> on the spot <code>synchronized</code>: it verifies the spot is
+          free <em>and</em> flips it to occupied without releasing the monitor, so exactly one thread wins and the other
+          gets <code>false</code> and tries the next spot. I lock the spot, not the whole lot, so unrelated entries don't
+          serialise.
+        </p>
+        <p>
+          Across multiple servers, the JVM lock is meaningless, so I push the invariant into the database: a conditional
+          update — <code>UPDATE spots SET vehicle=? WHERE id=? AND vehicle IS NULL</code> — and I check the affected-row
+          count. One row means I won; zero means someone beat me. Or an optimistic <code>@Version</code> column and retry
+          on conflict, which suits a parking lot because contention is low — most spots are free. It's the exact same
+          primitive as an idempotency key's <code>INSERT … ON CONFLICT</code>, and the exact same problem as not
+          overselling a seat.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"Why is the elevator a State pattern and not just a few if-statements?"</summary>
+      <div class="answer">
+        <p>
+          Because the car <em>behaves differently depending on what it's doing</em>, and that "depends on the current
+          mode" is the exact smell that State addresses. With if-statements, every method grows a branch for every state —
+          <code>move()</code> needs "am I going up, down, idle, doors open, out of service?" — and adding a sixth state
+          means editing every one of those methods and hoping you covered every combination. That's an Open/Closed
+          violation and it's where the bugs breed.
+        </p>
+        <p>
+          With State, each mode is a small class that answers two questions: what do I do on the next tick, and what state
+          do I become? <code>MovingUp.next()</code> either keeps climbing, arrives and becomes <code>DoorsOpen</code>, or
+          runs out of work and becomes <code>Idle</code>. The illegal transitions — open the doors mid-flight — aren't
+          expressible, because <code>MovingUp</code> has no path to <code>DoorsOpen</code> that skips arriving. Adding
+          <code>OutOfService</code> is a new class, not a sweep through existing methods. The transition rules become the
+          type structure instead of scattered conditionals.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"How does the elevator handle many people pressing buttons at once — where are the locks?"</summary>
+      <div class="answer">
+        <p>
+          There basically aren't any I write by hand, and that's the point. This isn't a race for a scarce resource like
+          the parking spot — it's producer/consumer. Many rider threads press buttons (producers); exactly one control-loop
+          thread mutates the car's state and advances the machine (the single consumer).
+        </p>
+        <p>
+          The only shared mutable point is the request inbox, and I make that a <code>BlockingQueue</code>, which is
+          thread-safe by construction — button presses just <code>offer()</code> into it. Everything downstream of the queue
+          runs on the single control thread: the pending-stops set, the current floor, the state — none of it needs
+          synchronization because there is no second writer to race. It's the single-writer / actor model, the same reason a
+          browser's one JS thread doesn't have UI data races.
+        </p>
+        <p>
+          The senior framing is that I <em>designed the race out of existence</em> rather than guarding it with locks.
+          Reaching for <code>synchronized</code> on every car method — which many candidates do — is both unnecessary and a
+          sign you haven't seen that single-ownership of mutable state is simpler and safer than shared-plus-locked.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"In BookMyShow, why do you distinguish a Seat from a ShowSeat?"</summary>
+      <div class="answer">
+        <p>
+          Because bookability is per-show, not per-seat. Physical seat A12 exists once in the hall, but it can be free for
+          the 6pm showing and sold for the 9pm. If I model the physical <code>Seat</code> as the thing I lock and book,
+          then booking A12 for the 6pm would appear to book it for the 9pm too — two shows fighting over one object.
+        </p>
+        <p>
+          So the bookable unit is <code>ShowSeat</code>: the intersection of a seat and a show, carrying its own
+          AVAILABLE/HELD/BOOKED status and hold expiry. The physical <code>Seat</code> is static layout data; the
+          <code>ShowSeat</code> is the per-showing state I contend over. Conflating them is one of the most common LLD
+          mistakes on this problem, and getting it right is a clear senior signal.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"Why hold seats and confirm separately, instead of just booking on click?"</summary>
+      <div class="answer">
+        <p>
+          Because payment takes time — seconds if it's a saved card, minutes if the user is typing one — and I refuse to
+          hold a database lock across a human's think-time. If "book on click" took a row lock and kept it through payment,
+          one slow payer would serialise the entire show, and under a popular release the whole thing melts.
+        </p>
+        <p>
+          So the hold is a <em>soft</em> reservation: a status flip to HELD with an expiry timestamp, no lock held. The user
+          pays against that hold, and confirm flips HELD→BOOKED. The atomic guarded operation is brief — just the status
+          transition — and the slow part (payment) happens with nothing locked. If payment doesn't complete in the window,
+          a reaper releases the seat. It's structurally the same as authorize-then-capture in a payment system: reserve
+          cheaply now, commit expensively later, and make the reservation expire on its own.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"A user holds four seats, three succeed, the fourth is taken. What happens?"</summary>
+      <div class="answer">
+        <p>
+          All-or-nothing: I roll back the three I already held. If I don't, those three sit in a HELD state that no booking
+          owns — stranded until their expiry, invisible to the next user, which is a real availability bug that looks like
+          "the site says these seats are taken but nobody bought them." So the <code>hold()</code> method accumulates the
+          seats it acquires, and on the first failure it releases everything it got before throwing.
+        </p>
+        <p>
+          The subtler trap in the same code is deadlock. If user A locks seats in the order {12, 15} and user B locks
+          {15, 12}, they can each grab one and wait forever for the other. The fix is to always acquire seats in a
+          consistent global order — sort the seat ids before locking — so a cycle can't form. Both bugs are invisible in
+          the single-seat happy path and both are exactly what a good interviewer probes.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"Optimistic or pessimistic locking for the seat booking — which and why?"</summary>
+      <div class="answer">
+        <p>
+          Optimistic, for most theatres, because per-seat contention is low — any given seat is usually contended by zero
+          or one users, not a crowd. A <code>@Version</code> column with a conditional update
+          (<code>… WHERE id=? AND status='AVAILABLE'</code>) lets writers proceed without holding a lock; the rare collision
+          makes one writer's update affect zero rows, and they retry against another seat. No lock is held across the hold
+          window.
+        </p>
+        <p>
+          I'd flip to pessimistic (<code>SELECT … FOR UPDATE</code>) only for a genuine flash-sale where a single hot show
+          has thousands of users fighting for the same front-row block in the same second — there, optimistic retries
+          thrash and a short pessimistic lock (held only for the brief hold transition, never across payment) can be
+          calmer. The honest answer is "optimistic by default, and I'd measure contention before adding the complexity of
+          pessimistic or a queue." That's also the <a href="14-ticket-booking.html">page-14</a> answer at scale — a waiting
+          room / virtual queue in front of the truly hot events.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"When would you NOT use a design pattern here?"</summary>
+      <div class="answer">
+        <p>
+          When I can't name the specific requirement change it protects against. A pattern is insurance against a variation,
+          and if there's no variation, it's just indirection that makes the code harder to read. If the fee is a flat rate
+          that will never change, I don't need a <code>PricingStrategy</code> interface with one implementation — that's
+          ceremony. I add the seam when the interviewer signals the variation ("what if trucks pay double?") or when the
+          domain obviously has one.
+        </p>
+        <p>
+          The failure mode I actively avoid is pattern-fishing: sprinkling Factory, Singleton, and Observer to look
+          sophisticated. It reads as the opposite — someone who reaches for machinery before understanding the problem. The
+          strong move is to introduce each pattern with its justification ("pricing is a strategy so surge pricing is a new
+          class, not an edit") and to explicitly decline the ones that don't earn their place. Restraint is a seniority
+          signal too.
+        </p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>"You're running low on time and only have the class skeleton. What do you do?"</summary>
+      <div class="answer">
+        <p>
+          I stop adding classes and go deep on the one thing that's actually graded: the concurrency-sensitive operation.
+          For any of these problems that's the atomic guarded transition — <code>tryAssign</code>, <code>tryHold</code> —
+          and how it's enforced across machines. A complete-looking skeleton plus a correct, well-explained double-booking
+          fix beats a half-built payment subsystem every time, because the interviewer is testing whether I can find and
+          contain the race, not whether I can type getters.
+        </p>
+        <p>
+          Then I verbalise the extensions I'd make with more time — "bank of elevators splits into a dispatcher plus
+          per-car scheduler," "distributed version pushes the lock into the DB" — so the interviewer knows I see the rest of
+          the design even though I didn't draw it. Naming what you'd do next is almost as good as doing it, and it's far
+          better than silently running out of time mid-getter.
+        </p>
+      </div>
+    </details>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="takeaways">What to remember</h2>
+
+    <p>
+      Three problems, one recipe, one race. If you remember nothing else, remember that the object model is the answer and
+      the guarded transition is the grade.
+    </p>
+
+    <ul>
+      <li><strong>The recipe, every time:</strong> nouns → classes, verbs → methods, variation points → interfaces. A verb
+        belongs to the class that owns the state it changes — misplace it and you get an anemic model with the logic
+        marooned in a god-service. This is the whole of <a href="24-lld-solid-patterns.html">page 24</a>, applied.</li>
+
+      <li><strong>Interfaces at the seams, before concrete classes.</strong> Pricing, scheduling, spot-assignment are the
+        places requirements move. Put an interface there and the follow-up ("add weekend pricing," "prefer nearest spot")
+        is a new class, not a live rewrite. Anticipating the follow-up in the model is the top senior move in this round.</li>
+
+      <li><strong>The three problems stress different muscles.</strong> Parking = allocation under contention (the
+        last-spot race). Elevator = state machine + scheduling, with producer/consumer concurrency you design <em>away</em>.
+        BookMyShow = the double-booking race, unavoidable and the whole grade. Knowing which is which is itself a signal.</li>
+
+      <li><strong>One race, three costumes.</strong> Last parking spot, last seat, money in a ledger — all check-then-act on
+        a scarce resource with two writers. The fix is always the same: collapse check-and-set into one atomic operation.
+        Never validate in application code and then write; the gap between them is where the bug lives.</li>
+
+      <li><strong>Name all four concurrency layers.</strong> (1) In-JVM: a <code>synchronized</code> transition on the
+        contended object, locked per-object not globally. (2) Persisted-optimistic: a <code>@Version</code> column /
+        conditional update, best when contention is low (usually). (3) Persisted-pessimistic: <code>SELECT … FOR UPDATE</code>,
+        for genuine hot spots, held briefly. (4) Unique constraint: the <code>INSERT … ON CONFLICT</code> as compare-and-set.
+        Pick per context and say why — a distributed design on a single JVM is wasted; a single-JVM lock across machines is a
+        correctness bug.</li>
+
+      <li><strong>Never hold a lock across a human or a payment.</strong> That's why booking is hold-then-confirm: a soft
+        reservation (status + expiry, no lock) now, commit later, auto-release on timeout via a race-safe reaper. Same shape
+        as authorize/capture in <a href="13-payments-orders.html">13</a> and the seat-hold in
+        <a href="14-ticket-booking.html">14</a>.</li>
+
+      <li><strong>Model the intersection, not the physical thing.</strong> <code>ShowSeat</code> (seat ∩ show), not
+        <code>Seat</code>, is the bookable unit — bookability is per-show. Conflating them is the classic BookMyShow error.</li>
+
+      <li><strong>Patterns map to prompts:</strong> "depends on" → Strategy (pricing, scheduling); "moves through phases" →
+        State (elevator, seat/booking lifecycle); "notify when X" → Observer (display boards, live seat map); "one
+        coordinator" → Singleton, but inject it, don't <code>getInstance()</code>. Introduce a pattern only when you can name
+        the change it protects against — pattern-fishing reads as junior.</li>
+
+      <li><strong>Single-writer beats shared-plus-locked.</strong> The elevant's elegant answer is one control thread owning
+        all mutable car state, fed by a thread-safe queue — the race is designed out, not guarded. Recognising when you can
+        eliminate contention rather than lock it is a senior instinct.</li>
+
+      <li><strong>Deadlock &amp; drift, the planted traps:</strong> acquire multiple resources in a consistent global order
+        (sort seat ids) or two users deadlock; roll back partial multi-seat holds or you strand seats; never keep a
+        <code>freeCount</code> as an independent source of truth — derive it or update it atomically with the resource, or it
+        drifts (the mutable-balance-column mistake again).</li>
+
+      <li><strong>Under time pressure:</strong> requirements before classes, breadth before depth, signatures over bodies,
+        don't gold-plate, narrate continuously, and get a thin complete skeleton up before deepening whatever the interviewer
+        probes. A complete skeleton plus a correct race fix beats a half-built payment module. The round grades <em>how you
+        think</em>, so let them hear it.</li>
+    </ul>
+
+    <div class="senior">One last calibration for this round specifically: the interviewer is deciding whether you can be handed a fuzzy problem and trusted to produce a model a team can live in. That's not "knows the most patterns" — it's "puts responsibilities in the right place, guards the seams that will move, finds the concurrency bug before being asked, and says the trade-off out loud." Show restraint where restraint is right, reach for the pattern only when it earns its place, and treat the whiteboard as a conversation you're steering. That's the hire.</div>
+  </section>
+
+  <nav class="page-nav">
+    <a href="24-lld-solid-patterns.html">← 24 — LLD: SOLID &amp; Patterns</a>
+    <a href="26-estimation-drills.html">26 — Estimation Drills →</a>
+  </nav>
+
+</main>
+</body>
+</html>

@@ -1,0 +1,768 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>27 — Trade-off Flashcards | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <div class="breadcrumb"><a href="index.html">← Course Home</a></div>
+    <h1>27 — Trade-off Flashcards</h1>
+    <p>The last page. A revision deck of "why X over Y" — the deciding factor, and the sentence to say out loud.</p>
+  </div>
+</header>
+
+<main class="container">
+
+  <section>
+    <h2>Why this matters in the interview</h2>
+    <p>
+      At 7 years in, you are not graded on knowing that two options exist — the interviewer assumes that. You are graded on
+      <strong>picking one and defending it in a sentence</strong>. The weak answer lists both sides ("SQL is consistent,
+      NoSQL scales") and stops, leaving the interviewer to do the choosing. The strong answer names the <em>one variable</em>
+      that decides it ("do my access patterns fit a fixed schema with joins, or are they a single denormalized read by key?")
+      and commits. Every card below is built the same way: the matchup, the deciding factor, and the say-it-out-loud line
+      that lands the point. Reveal the answer, then cover it and try to reproduce the deciding factor from memory.
+    </p>
+    <p>
+      This is your night-before deck. It is deliberately dense and repetitive — the same theme ("what does this bound?",
+      "what's the one number that flips it?", "name the race you're accepting") recurs across storage, consistency,
+      caching, and messaging, because it is the <em>same senior move</em> wearing different clothes. Where a card touches a
+      topic you can go deeper on, it links the tutorial in parentheses. Don't read this to learn the material for the first
+      time — read the earlier pages for that. Read this to rehearse the decision until it's reflex.
+    </p>
+  </section>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ul>
+      <li><a href="#data">Data &amp; storage</a> — SQL vs NoSQL · normalized vs denormalized · B-tree vs LSM · row vs column · offset vs cursor · optimistic vs pessimistic locking</li>
+      <li><a href="#consistency">Consistency &amp; replication</a> — strong vs eventual · CP vs AP · sync vs async replication · leader-follower vs multi-leader · 2PC vs saga · quorum</li>
+      <li><a href="#apis">Communication &amp; APIs</a> — REST vs gRPC vs GraphQL · SSE vs WebSockets · long polling vs WebSockets · sync vs async · JWT vs session</li>
+      <li><a href="#caching">Caching</a> — cache-aside vs write-through · write-through vs write-behind · CDN push vs pull · TTL vs invalidation · local vs distributed · LRU vs LFU</li>
+      <li><a href="#architecture">Architecture</a> — monolith vs microservices · orchestration vs choreography · stateless vs stateful · L4 vs L7 · gateway vs mesh</li>
+      <li><a href="#async">Async &amp; messaging</a> — queue vs log · at-least-once vs exactly-once · fan-out on write vs read · push vs pull · backpressure</li>
+      <li><a href="#scaling">Scaling &amp; partitioning</a> — horizontal vs vertical · hash vs range · consistent hashing vs mod-N · sharding vs replication · load-balancer algorithms</li>
+      <li><a href="#frontend">Frontend</a> — CSR vs SSR · client vs server state · optimistic vs pessimistic UI · debounce vs throttle · virtualization vs pagination</li>
+      <li><a href="#takeaways">What to remember</a></li>
+    </ul>
+  </div>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="data">Data &amp; storage</h2>
+
+    <details class="qa">
+      <summary>SQL vs NoSQL — when do you pick each?</summary>
+      <div class="answer">
+        <p><strong>Deciding factor: your access patterns, not your data volume.</strong> Do you need ad-hoc queries, joins
+        across entities, and multi-row transactions? SQL. Do you have one or two known read patterns, each satisfiable by a
+        single lookup on a partition key? NoSQL. "It's big data" is <em>not</em> the reason — a sharded Postgres holds
+        plenty, and DynamoDB is chosen for its predictable single-digit-ms key lookups and horizontal write scaling, not its
+        capacity.</p>
+        <p>Say it: <em>"I'll start with Postgres because I want transactions and my access patterns aren't frozen yet. I'd
+        move a specific high-volume, single-access-pattern table — the feed, the session store, the event log — to a
+        key-value or wide-column store when its write throughput or its need to scale horizontally outgrows one primary."</em>
+        The senior move is that it's a per-table decision, not a religion. (See 03.)</p>
+        <table>
+          <thead><tr><th></th><th>SQL (Postgres, MySQL)</th><th>NoSQL (Dynamo, Cassandra, Mongo)</th></tr></thead>
+          <tbody>
+            <tr><td>Schema</td><td>Fixed, enforced, migrations</td><td>Flexible, per-item</td></tr>
+            <tr><td>Query</td><td>Joins, ad-hoc, aggregations</td><td>By key / partition; you model per query</td></tr>
+            <tr><td>Transactions</td><td>Multi-row ACID, native</td><td>Limited / single-partition / eventual</td></tr>
+            <tr><td>Scale writes</td><td>Vertical + read replicas; sharding is manual</td><td>Horizontal, built in</td></tr>
+            <tr><td>Pick when</td><td>Relationships, correctness, unknown queries</td><td>One hot access pattern, huge write volume, flexible shape</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Normalized vs denormalized — which schema?</summary>
+      <div class="answer">
+        <p><strong>Deciding factor: read:write ratio and how expensive the join is at read time.</strong> Normalize to make
+        writes cheap and correct (one fact, one place, no update anomalies); denormalize to make reads cheap (the data is
+        pre-joined, one lookup returns the whole view). Normalized is the default because correctness is the default;
+        denormalize when a specific read is hot and the join is killing you.</p>
+        <p>Say it: <em>"I'll normalize the source of truth and denormalize into a read model when the read pattern demands
+        it — accepting that I now own keeping the copy in sync, usually via an event or CDC. Denormalization trades write
+        complexity and storage for read latency."</em> This is the same trade-off as fan-out-on-write (10) and materialized
+        views. (See 03.)</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>B-tree vs LSM-tree — which storage engine?</summary>
+      <div class="answer">
+        <p><strong>Deciding factor: is the workload read-heavy or write-heavy?</strong> B-trees (Postgres, MySQL/InnoDB)
+        update in place — great reads, random-write I/O, so writes are the ceiling. LSM-trees (Cassandra, RocksDB, LevelDB)
+        buffer writes in memory and flush sequentially — brilliant write throughput, but reads may touch several SSTables
+        (mitigated by bloom filters, 06) and background compaction steals I/O.</p>
+        <p>Say it: <em>"Write-heavy ingest — time series, event logs, a feed — I want an LSM engine for sequential writes.
+        Read-heavy, transactional, range-scan work I want a B-tree. The one-liner is: B-tree optimizes reads and pays on
+        writes; LSM optimizes writes and pays on reads and compaction."</em> (See 03.)</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Row store vs column store — OLTP or OLAP?</summary>
+      <div class="answer">
+        <p><strong>Deciding factor: do you read whole rows or whole columns?</strong> Row stores keep a record's fields
+        together — perfect for "fetch this order" (OLTP). Column stores keep each column together — perfect for "sum revenue
+        over 2 billion rows" (OLAP), because you scan only the columns you need and they compress viciously (adjacent values
+        are similar).</p>
+        <p>Say it: <em>"Transactional serving path → row store. Analytics, aggregations, dashboards → columnar (Redshift,
+        ClickHouse, Parquet). Don't run analytics on your OLTP primary; ship it to a column store via CDC."</em> (See 03, 18.)</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Offset vs cursor (keyset) pagination — how do you page?</summary>
+      <div class="answer">
+        <p><strong>Deciding factor: does the underlying list change while users page, and how deep do they go?</strong>
+        <code>OFFSET 100000 LIMIT 20</code> makes the database scan and discard 100k rows (slow at depth) and skips or
+        duplicates items when rows are inserted mid-scroll. Cursor pagination remembers the last seen key
+        (<code>WHERE (created_at, id) &lt; (?, ?) ORDER BY ... LIMIT 20</code>) — O(1) via the index, and stable under
+        inserts.</p>
+        <p>Say it: <em>"Cursor pagination for anything infinite-scroll or high-volume — it's index-seek fast at any depth
+        and immune to shifting data. Offset only for small, bounded, jump-to-page-N admin tables where deep pages and
+        concurrent inserts don't happen."</em> (See 04, 10.)</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Optimistic vs pessimistic locking — how do you handle concurrent writes?</summary>
+      <div class="answer">
+        <p><strong>Deciding factor: contention probability.</strong> Pessimistic (<code>SELECT ... FOR UPDATE</code>) grabs
+        the lock up front — correct under heavy contention, but it serializes and can deadlock. Optimistic (a
+        <code>version</code> column; the update says <code>WHERE version = ?</code> and fails if someone else moved it)
+        assumes conflicts are rare, does no locking, and retries the loser. Cheap when writes rarely collide, wasteful when
+        they always do.</p>
+        <p>Say it: <em>"Optimistic (version check + retry) by default, because most rows aren't contended and I avoid holding
+        locks. I switch to pessimistic for genuine hotspots — decrementing the last ticket, moving money on one account —
+        where the conflict rate is high enough that retry storms cost more than just serializing."</em> (See 05, 14.)</p>
+      </div>
+    </details>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="consistency">Consistency &amp; replication</h2>
+
+    <details class="qa">
+      <summary>Strong vs eventual consistency — which do you promise?</summary>
+      <div class="answer">
+        <p><strong>Deciding factor: what's the cost of a user reading stale data for a few hundred milliseconds?</strong>
+        Strong consistency (every read sees the latest write) costs latency and availability — a read must reach the leader
+        or a quorum. Eventual consistency lets replicas lag, buying low latency and availability, at the price of a window
+        where readers see the old value.</p>
+        <p>Say it: <em>"I default to eventual and buy strong only where a stale read causes real harm. A like count can be
+        seconds stale; an account balance at withdrawal cannot. The trick is to scope strong consistency to the few
+        operations that need it rather than paying for it globally."</em> The senior tell is read-your-own-writes: users
+        forgive seeing someone else's stale post, never their own vanished edit — so route the writer's own reads to the
+        leader. (See 05.)</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>CAP — CP vs AP under a partition?</summary>
+      <div class="answer">
+        <p><strong>Deciding factor: during a network partition, is it worse to return an error or to return possibly-wrong
+        data?</strong> CAP only bites <em>during</em> a partition; then you choose. CP (refuse writes / errors on the
+        minority side) keeps data correct but sacrifices availability — pick it for money, inventory, bookings. AP (keep
+        serving, reconcile later) keeps you up but may serve or accept conflicting data — pick it for feeds, carts,
+        presence, likes.</p>
+        <p>Say it: <em>"CAP is a choice you only make during a partition, and it's per-operation, not per-system. Checkout
+        is CP — I'd rather show an error than double-sell. The product catalogue is AP — serve slightly stale rather than go
+        down. Also note PACELC: even with no partition, I'm trading latency for consistency on every request."</em> (See 05.)</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Synchronous vs asynchronous replication — how do replicas follow the leader?</summary>
+      <div class="answer">
+        <p><strong>Deciding factor: can you tolerate losing the last few acknowledged writes on failover (RPO)?</strong>
+        Sync replication waits for a replica to confirm before acking the client — zero data loss on failover, but every
+        write pays the slowest replica's latency and a slow replica stalls writes. Async acks immediately and ships to
+        replicas after — fast writes, but a leader crash loses whatever hadn't replicated yet.</p>
+        <p>Say it: <em>"Async by default for latency; semi-sync (wait for one of N replicas) where I need RPO near zero
+        without paying full synchronous cost. Fully synchronous cross-region replication means every write eats a
+        round-the-world round trip — I'd only accept that for a ledger."</em> (See 05.)</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Leader-follower vs multi-leader (vs leaderless) — how many can accept writes?</summary>
+      <div class="answer">
+        <p><strong>Deciding factor: do you need to accept writes in more than one region/place at once?</strong>
+        Single-leader is simple and gives a clean ordering — all writes serialize through one node — but that node is a write
+        bottleneck and a failover point. Multi-leader accepts writes in several places (multi-region, offline-capable apps)
+        but hands you <strong>write conflicts</strong> — the hardest problem in the space, requiring conflict resolution
+        (last-write-wins, CRDTs, app-level merge). Leaderless (Dynamo/Cassandra) uses quorums and read-repair.</p>
+        <p>Say it: <em>"Single-leader unless I genuinely need local writes in multiple regions. Multi-leader's cost isn't the
+        replication, it's conflict resolution — two people editing the same doc offline. If I can partition the data so each
+        key is only written in one region, I dodge conflicts entirely, and that's usually the better move."</em> (See 05.)</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>2PC vs saga — how do you keep a multi-service operation consistent?</summary>
+      <div class="answer">
+        <p><strong>Deciding factor: can you hold locks across services, and do the steps span databases you don't control?</strong>
+        Two-phase commit gives atomicity but holds locks through a blocking coordinator — one slow/failed participant stalls
+        everyone, and it doesn't scale or cross service boundaries well. A saga is a sequence of local transactions, each
+        with a <em>compensating</em> action to undo it; no distributed locks, but you get eventual consistency and must
+        design the rollbacks.</p>
+        <p>Say it: <em>"I avoid 2PC across microservices — the blocking coordinator is a liability. I'd use a saga:
+        local commit per service, compensating transactions to unwind, and idempotent steps. It's more code and it's
+        eventually consistent, but it doesn't hold cross-service locks."</em> Mention orchestration vs choreography for
+        driving it (see Architecture). (See 05, 13.)</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Quorum reads/writes — why R + W &gt; N?</summary>
+      <div class="answer">
+        <p><strong>Deciding factor: how do you get strong-ish consistency from replicas with no leader?</strong> With N
+        replicas, if you write to W and read from R such that <code>R + W &gt; N</code>, the read set and write set must
+        overlap in at least one node that has the latest value — so a read is guaranteed to see the most recent
+        acknowledged write. Tune the split: <code>W = N, R = 1</code> for fast reads / slow durable writes;
+        <code>W = 1, R = N</code> for fast writes / slow reads; <code>W = R = ⌈(N+1)/2⌉</code> for balance.</p>
+        <p>Say it: <em>"Quorum is how leaderless systems fake strong consistency: pick R and W so <code>R + W &gt; N</code>
+        and the sets overlap. It's still not linearizable — concurrent writes need conflict resolution — but a reader can't
+        miss the newest durable value."</em> (See 05.)</p>
+      </div>
+    </details>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="apis">Communication &amp; APIs</h2>
+
+    <details class="qa">
+      <summary>REST vs gRPC vs GraphQL — which API style?</summary>
+      <div class="answer">
+        <p><strong>Deciding factor: who is the caller, and what's the shape of the data need?</strong> REST for public,
+        cacheable, resource-shaped APIs over HTTP where broad compatibility matters. gRPC for internal service-to-service
+        calls where you want low latency, binary Protobuf, streaming, and a typed contract. GraphQL when many clients need
+        <em>different slices</em> of a rich, connected graph and you want to kill over-/under-fetching and N round trips.</p>
+        <table>
+          <thead><tr><th></th><th>REST</th><th>gRPC</th><th>GraphQL</th></tr></thead>
+          <tbody>
+            <tr><td>Wire</td><td>JSON/HTTP 1.1</td><td>Protobuf/HTTP 2</td><td>JSON/HTTP (one endpoint)</td></tr>
+            <tr><td>Best at</td><td>Public, cacheable, simple</td><td>Internal, fast, streaming</td><td>Client-driven, varied shapes</td></tr>
+            <tr><td>Caching</td><td>Easy (HTTP/CDN)</td><td>Hard (binary, POST-like)</td><td>Hard (POST, per-query)</td></tr>
+            <tr><td>Cost</td><td>Over/under-fetch, chatty</td><td>Not browser-native, opaque</td><td>Server complexity, N+1, caching</td></tr>
+          </tbody>
+        </table>
+        <p>Say it: <em>"gRPC between my services for the typed contract and speed, REST at the public edge for cacheability
+        and ubiquity, and GraphQL specifically when a mobile client would otherwise make eight REST calls to render one
+        screen. GraphQL moves the cost to the server — resolver N+1 and caching — so it's not free."</em> (See 02.)</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>SSE vs WebSockets — which for server-to-client push?</summary>
+      <div class="answer">
+        <p><strong>Deciding factor: is the traffic one-directional (server → client) or truly bidirectional?</strong>
+        Server-Sent Events are one-way, ride plain HTTP, auto-reconnect for free, and are dead simple — perfect for a
+        notification feed, live scores, a progress stream, LLM token streaming. WebSockets are full-duplex over a persistent
+        upgraded connection — use them only when the client also sends a steady stream: chat, multiplayer, collaborative
+        editing.</p>
+        <p>Say it: <em>"If the client only receives, I'll use SSE — it's HTTP, it reconnects itself, and it's far less to
+        operate. I reach for WebSockets when I need low-latency messages in <em>both</em> directions. Picking WebSockets for
+        a one-way feed is over-engineering."</em> (See 02, 11.)</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Long polling vs WebSockets — how do you deliver "real-time"?</summary>
+      <div class="answer">
+        <p><strong>Deciding factor: message frequency and latency tolerance.</strong> Long polling (hold the request open
+        until data or timeout, then reconnect) works everywhere, needs no special infra, but each message costs a full
+        request cycle and it's clumsy at high frequency. WebSockets hold one connection open for instant push in both
+        directions, at the cost of stateful connections you must manage, scale, and route (sticky sessions / a pub-sub
+        fabric).</p>
+        <p>Say it: <em>"Long polling is the pragmatic fallback — low-frequency updates, hostile proxies, or when I can't run
+        a WebSocket tier. Once messages are frequent or latency-sensitive, WebSockets win, but now I own connection state,
+        fan-out, and reconnection. The progression is polling → long polling → SSE → WebSockets, and I pick the least
+        machinery that meets the latency bar."</em> (See 02, 11.)</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Synchronous vs asynchronous communication — call it or queue it?</summary>
+      <div class="answer">
+        <p><strong>Deciding factor: does this need to finish before I respond to the user?</strong> Synchronous
+        request-response is simple, gives an immediate answer, and propagates errors directly — but it couples caller to
+        callee's availability and latency (a slow dependency is now your slow response). Async (queue/event) decouples,
+        absorbs spikes, and survives a down dependency — at the cost of eventual consistency, idempotency work, and a
+        "processing…" UI state.</p>
+        <p>Say it: <em>"I walk the write path asking, per step, 'must this happen before I return 200?' The critical path
+        stays synchronous and fast; everything else — email, transcoding, indexing, notifications — goes on a queue. Async
+        isn't free: I've bought eventual consistency and I now need idempotent consumers."</em> (See 06.)</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>JWT vs session cookie — how do you keep users logged in?</summary>
+      <div class="answer">
+        <p><strong>Deciding factor: can you tolerate not being able to instantly revoke a credential?</strong> Sessions
+        store state server-side (a session ID in a cookie, data in Redis) — trivially revocable, but every request hits the
+        session store and you must share it across instances. JWTs are self-contained and signed — stateless, no lookup,
+        great for cross-service auth — but you <strong>can't revoke one before it expires</strong> without rebuilding the
+        stateful blocklist you were trying to avoid.</p>
+        <p>Say it: <em>"Stateless JWTs with short expiry plus refresh tokens when I want services to verify auth without a
+        central lookup. Server-side sessions when instant revocation matters — logout-everywhere, banned users, admin
+        panels. The JWT's virtue (no server state) is exactly its flaw (no easy revocation), so I keep access-token TTL
+        short."</em></p>
+      </div>
+    </details>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="caching">Caching</h2>
+
+    <details class="qa">
+      <summary>Cache-aside vs write-through — how does the cache stay populated?</summary>
+      <div class="answer">
+        <p><strong>Deciding factor: is the data read right after it's written, and do you want the app or the cache to own
+        the DB?</strong> Cache-aside (the default): app checks cache, on miss reads DB and populates, and on write
+        <em>deletes</em> the key. Only data someone actually asked for gets cached, but the first read after a write is a
+        miss. Write-through: every write goes through the cache, which synchronously writes the DB — cache is never stale and
+        the just-written value is hot, but you pay two hops per write and cache things nobody reads.</p>
+        <p>Say it: <em>"Cache-aside by default, and I delete the key on write rather than update it — delete is idempotent,
+        so a concurrent-write race costs one extra DB read instead of pinning a stale value forever. I'd use write-through
+        for config or catalogue data that's written once and read immediately, paired with a TTL."</em> (See 06.)</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Write-through vs write-behind — sync or async to the DB?</summary>
+      <div class="answer">
+        <p><strong>Deciding factor: can you lose recent writes if a cache node dies?</strong> Write-through writes the DB
+        synchronously before acking — durable and consistent, but slow writes. Write-behind (write-back) acks from the cache
+        immediately and flushes to the DB asynchronously in batches — the fastest writes there are, and it coalesces (1,000
+        counter increments become one DB write) — but a crash before the flush <strong>loses those writes</strong>.</p>
+        <p>Say it: <em>"Write-behind only where loss is acceptable and I can coalesce: view counts, 'last seen', analytics
+        counters. Never for money. The moment durability matters, I'm write-through or I write the DB first."</em> (See 06.)</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>TTL vs explicit invalidation — how do you keep the cache fresh?</summary>
+      <div class="answer">
+        <p><strong>Deciding factor: how much staleness can this data tolerate, and can you find every writer?</strong> TTL
+        is dead simple and self-healing — any missed invalidation, any out-of-band DBA write, corrects itself within the
+        TTL — but you're explicitly serving stale data for up to N seconds. Explicit invalidation gives millisecond
+        freshness but requires finding <em>every</em> code path that mutates the data, forever, and fan-out is brutal (which
+        40,000 cached feeds contained that deleted tweet?).</p>
+        <p>Say it: <em>"I treat TTL as a correctness budget, not a performance knob — a 60-second TTL is me saying 60 seconds
+        of staleness is fine. I add explicit invalidation only where it isn't, which is almost always read-your-own-writes.
+        Versioned keys (<code>user:42:v7</code>) are a third option that sidesteps invalidation races entirely."</em> (See 06.)</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Local (in-process) vs distributed cache — where does the cache live?</summary>
+      <div class="answer">
+        <p><strong>Deciding factor: can the copies be allowed to disagree?</strong> A local cache (Caffeine, a map in the
+        process) is nanoseconds fast with zero network — but every instance has its <em>own</em> copy, so they go stale
+        independently and a user hitting refresh sees the old value from some pods and the new from others. A distributed
+        cache (Redis) is one shared truth over ~0.5–1 ms of network — consistent and centrally evictable, but a network hop
+        and an operational dependency.</p>
+        <p>Say it: <em>"Local caches are the fastest thing I have and the most dangerous — I only use them for immutable
+        data, or where bounded staleness is genuinely fine, or with a pub-sub invalidation broadcast. For anything that must
+        agree across instances, it goes in Redis. Often I layer both: local L1 in front of shared L2."</em> (See 06, 08.)</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>LRU vs LFU eviction — what do you throw out when full?</summary>
+      <div class="answer">
+        <p><strong>Deciding factor: is your hot set stable over time, or does a scan blow it away?</strong> LRU (least
+        recently used) approximates "what's hot now" cheaply and adapts fast — but one batch job reading a million cold rows
+        evicts your entire hot set. LFU (least frequently used) resists that scan (a single cold read can't beat a key read
+        10,000 times) but clings to yesterday's popular key long after it cooled, unless you age the counters.</p>
+        <p>Say it: <em>"LRU is the sane default and what most systems ship. I'd consider LFU when I have a stable hot set
+        threatened by periodic scans. In practice Redis's sampled-LRU or LFU-with-decay covers both — and random eviction is
+        within a few percent of LRU with zero bookkeeping."</em> (See 06.)</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>CDN push vs pull — how does content reach the edge?</summary>
+      <div class="answer">
+        <p><strong>Deciding factor: how big is the catalogue and how predictable is demand?</strong> Pull (origin-pull):
+        the CDN fetches from your origin on the first request for an asset and caches it — zero pre-work, self-managing, but
+        the first user in each region pays a cache-miss round trip to origin. Push: you upload assets to the CDN ahead of
+        time — no cold-miss latency and origin never gets hit, but you manage distribution and store everything at the edge
+        whether it's requested or not.</p>
+        <p>Say it: <em>"Pull for the common case — a large catalogue with a long tail, where pre-pushing everything wastes
+        edge storage. Push for a small set of critical, predictably-hot assets (a launch, a big video) where I can't afford
+        the first-request miss. Pull is lazy and self-healing; push is eager and controlled."</em> (See 02.)</p>
+      </div>
+    </details>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="architecture">Architecture</h2>
+
+    <details class="qa">
+      <summary>Monolith vs microservices — how do you slice the system?</summary>
+      <div class="answer">
+        <p><strong>Deciding factor: organizational scale and independent-deploy pressure, not "which is modern."</strong>
+        A monolith is one deployable — simplest to build, test, and reason about; in-process calls, one database,
+        transactions for free. It hurts when many teams contend over one codebase and one deploy pipeline. Microservices buy
+        independent deploys, independent scaling, and team autonomy — at the cost of network calls, distributed transactions
+        (sagas), eventual consistency, and a mountain of operational overhead (tracing, service discovery, versioning).</p>
+        <p>Say it: <em>"I'd start with a well-structured monolith — a modular monolith — and extract a service only when a
+        real force demands it: a component needs independent scaling, a team needs an independent deploy cadence, or a
+        boundary needs isolation. Microservices are an <em>organizational</em> solution to a scaling-the-org problem, and
+        you pay in distributed-systems complexity. Don't buy that bill before you have the problem."</em> (See 01.)</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Orchestration vs choreography — how do you drive a saga / workflow?</summary>
+      <div class="answer">
+        <p><strong>Deciding factor: how many steps, and do you need a single place to see and control the flow?</strong>
+        Orchestration uses a central coordinator that tells each service what to do next — the flow is explicit, visible, and
+        easy to change or monitor, but the orchestrator is a component you own and a potential bottleneck. Choreography has
+        services react to each other's events with no central brain — loosely coupled and resilient, but the end-to-end flow
+        is emergent and hard to follow, debug, or change.</p>
+        <p>Say it: <em>"Choreography for two or three simple, stable steps — just publish events. Orchestration once the
+        workflow has real branching, compensation, and needs to be observable — an order saga with payment, inventory, and
+        shipping. I'd rather have one place that owns 'what happens next' than chase the logic across eight event
+        handlers."</em> (See 05, 13.)</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Stateless vs stateful services — where does the state go?</summary>
+      <div class="answer">
+        <p><strong>Deciding factor: can any instance handle any request?</strong> Stateless services keep no per-client
+        state in the process — any instance serves any request, so they scale horizontally trivially, restart freely, and
+        need no sticky routing. Stateful services (a WebSocket tier, an in-memory game session) hold connection or session
+        state, which enables low-latency local access but forces sticky sessions, complicates scaling and failover, and
+        makes a lost node a lost session.</p>
+        <p>Say it: <em>"I keep application services stateless and push state to a shared store (Redis, the DB) so I can scale
+        by adding boxes and lose one without losing data. Where state must be local — persistent connections, real-time
+        sessions — I isolate it in its own tier with sticky routing and plan for connection re-establishment on failover."</em></p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>L4 vs L7 load balancing — which layer routes?</summary>
+      <div class="answer">
+        <p><strong>Deciding factor: do you need to route on request content?</strong> An L4 (transport) balancer forwards by
+        IP/port without looking inside — extremely fast, protocol-agnostic, but it can't route by URL path, header, or
+        cookie. An L7 (application) balancer terminates the connection and reads the HTTP request — so it can do
+        path-based routing, sticky sessions, TLS termination, and header rewrites — at higher CPU cost and lower raw
+        throughput.</p>
+        <p>Say it: <em>"L7 at the edge for smart routing — send <code>/api</code> here, <code>/images</code> there, do
+        sticky sessions and TLS termination. L4 where I just need to spread raw connections as fast as possible with no
+        inspection. Often both: L4 in front, L7 behind."</em> (See 02.)</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>API gateway vs service mesh — north-south or east-west?</summary>
+      <div class="answer">
+        <p><strong>Deciding factor: are you governing traffic <em>into</em> the system or <em>between</em> services?</strong>
+        An API gateway sits at the edge (north-south): auth, rate limiting, routing, request shaping for external clients — one
+        front door. A service mesh (sidecars, e.g. Envoy/Istio) handles service-to-service traffic (east-west): mTLS,
+        retries, timeouts, circuit breaking, and observability, transparently, without app code changes.</p>
+        <p>Say it: <em>"Gateway for everything crossing the trust boundary from clients; mesh for the cross-cutting
+        resilience and security concerns between internal services so I'm not re-implementing retries and mTLS in every
+        service. They're complementary, not alternatives — different traffic axes."</em></p>
+      </div>
+    </details>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="async">Async &amp; messaging</h2>
+
+    <details class="qa">
+      <summary>Message queue vs log (SQS/RabbitMQ vs Kafka) — which broker?</summary>
+      <div class="answer">
+        <p><strong>Deciding factor: does more than one consumer care about the same message, and do you need replay?</strong>
+        A queue is a to-do list — consuming <em>destroys</em> the message (ack = delete), competing consumers split the work,
+        one job to one worker. A log is a tape — consuming just moves a per-group offset; messages stay for the retention
+        window, N consumer groups each read the whole stream independently, and you can rewind to <strong>replay</strong>.</p>
+        <p>Say it: <em>"For 'send this email' I use SQS/RabbitMQ — one task, one worker, delete on completion, retries and a
+        DLQ for free, zero ops. I reach for Kafka when an event has multiple independent consumers, or when I need replay —
+        order events feeding billing, search, and analytics. Kafka is a commitment; I want a reason for it, not a
+        reflex."</em> (See 06.)</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>At-least-once vs exactly-once delivery — what do you design for?</summary>
+      <div class="answer">
+        <p><strong>Deciding factor: there is no real exactly-once across a network boundary — so the question is how you
+        tolerate duplicates.</strong> At-most-once (ack before processing) silently loses messages on a crash. At-least-once
+        (ack after processing) may process twice on redelivery. "Exactly-once" holds only <em>within</em> Kafka; the moment
+        the side effect leaves (charge a card, send an email), you can't atomically do it and record that you did.</p>
+        <p>Say it: <em>"Exactly-once delivery is a myth at the boundary. What's real is at-least-once plus an idempotent
+        consumer, which is observationally equivalent. My consumer writes a dedup key — the message ID or a natural key — in
+        the <em>same local transaction</em> as the side effect; a duplicate hits a unique-constraint violation, I ack and
+        move on."</em> (See 06.)</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Fan-out on write vs fan-out on read — how do you build the feed?</summary>
+      <div class="answer">
+        <p><strong>Deciding factor: the follower distribution — specifically, do you have celebrities?</strong> Fan-out on
+        write (push) copies each new post into every follower's precomputed timeline — reads are a single fast lookup, but a
+        celebrity's post triggers millions of writes and the write amplification is brutal. Fan-out on read (pull) assembles
+        the timeline by querying who you follow at read time — cheap writes, but every read does a scatter-gather and is
+        slow for users following thousands.</p>
+        <table>
+          <thead><tr><th></th><th>Fan-out on write (push)</th><th>Fan-out on read (pull)</th></tr></thead>
+          <tbody>
+            <tr><td>Write cost</td><td>High (one write per follower)</td><td>Low (one write)</td></tr>
+            <tr><td>Read cost</td><td>Low (precomputed)</td><td>High (gather at read)</td></tr>
+            <tr><td>Breaks on</td><td>Celebrities (millions of writes)</td><td>Users following many; hot reads</td></tr>
+          </tbody>
+        </table>
+        <p>Say it: <em>"Hybrid, and I'd say so explicitly: fan-out on write for the common case, so most timelines are
+        precomputed and reads are cheap; but for celebrity accounts I fan-out on read and merge their recent posts in at
+        query time. That kills the write-amplification tail while keeping normal reads fast."</em> (See 10.)</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Push vs pull consumers — who initiates delivery?</summary>
+      <div class="answer">
+        <p><strong>Deciding factor: does the consumer need to control its own pace (backpressure)?</strong> Push (broker
+        sends as messages arrive) gives low latency but can overwhelm a slow consumer — the broker must handle flow control.
+        Pull (consumer polls for the next batch when ready) lets the consumer set its own rate and batch efficiently — that's
+        why Kafka is pull-based — at a small latency cost and some wasted empty polls.</p>
+        <p>Say it: <em>"Pull when the consumer needs backpressure and batching — it can't be swamped because it asks for work
+        when it's ready. Push when latency matters more than the consumer's ability to self-throttle. Kafka chose pull
+        precisely so a slow consumer just lags rather than falling over."</em> (See 06, 12.)</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Backpressure — buffer vs shed load?</summary>
+      <div class="answer">
+        <p><strong>Deciding factor: is the overload a brief spike or sustained beyond capacity?</strong> Buffering (a queue)
+        absorbs a <em>temporary</em> spike — depth and latency grow, but nothing fails, and consumers drain it. But an
+        unbounded buffer under <em>sustained</em> overload just moves the failure: latency climbs until everything times out
+        (bufferbloat). Load shedding drops or rejects work early (429s, drop low-priority) to protect the system that's
+        genuinely past capacity.</p>
+        <p>Say it: <em>"The ladder is: buffer the spike → scale consumers → throttle the producer → shed load. Fail fast
+        beats fail slow — a fast 429 is recoverable, a request stuck 30 seconds behind a full buffer isn't. I shed by
+        priority and drop work whose deadline has already passed."</em> (See 06, 09.)</p>
+      </div>
+    </details>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="scaling">Scaling &amp; partitioning</h2>
+
+    <details class="qa">
+      <summary>Horizontal vs vertical scaling — bigger box or more boxes?</summary>
+      <div class="answer">
+        <p><strong>Deciding factor: have you hit the biggest single box, and can the workload be split?</strong> Vertical
+        (a bigger machine) is the simplest thing that works — no code changes, no distribution — but there's a hard ceiling,
+        it's a single point of failure, and cost climbs non-linearly. Horizontal (more machines) is effectively unbounded and
+        fault-tolerant, but only works if the workload shards cleanly, and it drags in load balancing, distributed state, and
+        coordination.</p>
+        <p>Say it: <em>"Scale up first — it's cheap in engineering time and buys a lot of runway. Scale out when I hit the
+        ceiling, need fault tolerance, or the load is naturally partitionable. Stateless app tiers scale out trivially;
+        the database is the hard part, which is why I delay sharding it as long as read replicas and a bigger primary
+        hold."</em> (See 04.)</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Hash vs range partitioning — how do you split the keyspace?</summary>
+      <div class="answer">
+        <p><strong>Deciding factor: do you need range/scan queries, or just even load?</strong> Hash partitioning (shard on
+        <code>hash(key)</code>) spreads load evenly and avoids hotspots — but destroys locality, so "all events between
+        Monday and Friday" becomes a scatter-gather across every shard. Range partitioning keeps ordered keys together, so
+        range scans hit one or few shards — but a monotonically increasing key (timestamp, auto-increment ID) sends all new
+        writes to the last shard, a guaranteed hotspot.</p>
+        <p>Say it: <em>"Hash for even distribution when I only look up by key — user by ID, session. Range when I need
+        ordered scans — time series, alphabetical browse — accepting I must watch for a hot tail shard on monotonic keys,
+        which I fix by prefixing the key with something high-cardinality."</em> (See 04.)</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Consistent hashing vs mod-N hashing — how do you assign keys to nodes?</summary>
+      <div class="answer">
+        <p><strong>Deciding factor: how often does the node count change?</strong> Plain <code>hash(key) % N</code> is
+        simple and perfectly even — but when N changes (a node added or dies), <em>almost every</em> key remaps to a
+        different node, so your entire cache is invalidated at once. Consistent hashing places nodes on a ring so adding or
+        removing one only remaps the keys in that node's arc — roughly <code>1/N</code> of keys move, not all of them.
+        Virtual nodes smooth out the distribution.</p>
+        <p>Say it: <em>"Consistent hashing any time membership changes at runtime — distributed caches, Dynamo-style stores —
+        because <code>mod N</code> would remap everything on a single node failure and dump the whole load on the database.
+        Plain <code>mod N</code> is fine only for a fixed, never-changing node set."</em> (See 04, 08.)</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Sharding vs replication — which scaling problem are you solving?</summary>
+      <div class="answer">
+        <p><strong>Deciding factor: are you out of write/storage capacity, or out of read capacity / availability?</strong>
+        They solve different problems and you usually need both. Replication copies the <em>same</em> data to more nodes —
+        scales reads, adds availability and durability — but every replica holds the full dataset, so it does nothing for
+        write throughput or storage limits. Sharding splits <em>different</em> data across nodes — scales writes and storage
+        — but adds routing, cross-shard queries, and rebalancing pain.</p>
+        <p>Say it: <em>"Replicas first — they scale reads and give me failover, and most systems are read-heavy. I shard only
+        when writes or dataset size outgrow one primary, because sharding is where cross-shard joins, distributed
+        transactions, and hot-shard problems begin. In production you shard <em>and</em> replicate each shard."</em> (See 04.)</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Round-robin vs least-connections vs consistent-hash — which LB algorithm?</summary>
+      <div class="answer">
+        <p><strong>Deciding factor: are requests uniform, variable in cost, or do you need session affinity?</strong>
+        Round-robin is simplest and fine when requests are cheap and uniform, but it ignores that one box may be stuck on
+        slow requests. Least-connections routes to the least-busy server — better when request cost varies widely.
+        Consistent-hash (by client IP or key) sends the same client to the same server — needed for sticky sessions or
+        cache locality.</p>
+        <p>Say it: <em>"Round-robin as the default; least-connections when request durations are uneven so I don't pile onto
+        a saturated box; consistent-hash when I need affinity — a stateful WebSocket tier or maximizing local cache hits.
+        And I want health checks under all of them so I stop routing to a dead node."</em> (See 02.)</p>
+      </div>
+    </details>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="frontend">Frontend</h2>
+
+    <details class="qa">
+      <summary>CSR vs SSR (vs SSG) — where do you render?</summary>
+      <div class="answer">
+        <p><strong>Deciding factor: does this page need fast first paint and SEO, or is it an app behind a login?</strong>
+        Client-side rendering ships a JS bundle that renders in the browser — great for rich, interactive, authenticated
+        apps, but slow first paint and weak SEO (the crawler sees an empty shell). Server-side rendering returns finished
+        HTML — fast first contentful paint and SEO-friendly — at the cost of server compute per request and a
+        time-to-interactive gap while JS hydrates. SSG pre-renders at build time — fastest of all, for content that doesn't
+        change per request.</p>
+        <p>Say it: <em>"SSG for marketing and docs — render once, serve from a CDN. SSR for content that's dynamic but
+        SEO- and first-paint-sensitive — a product page. CSR for the app behind auth where SEO is irrelevant and
+        interactivity dominates. Modern frameworks blur this with per-route streaming SSR, so I choose per route, not per
+        app."</em> (See 19, 20.)</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Client state vs server state — where does the data belong?</summary>
+      <div class="answer">
+        <p><strong>Deciding factor: is this data owned by the server (and merely cached in the client) or purely a UI
+        concern?</strong> Server state (the user list, a post) is asynchronous, shared, can go stale, and needs caching,
+        refetching, and invalidation — that's React Query / SWR territory, not <code>useState</code>. Client state (is this
+        modal open, the current form input, the active tab) is synchronous, local, and owned entirely by the UI — plain
+        component state or a small store.</p>
+        <p>Say it: <em>"The classic mistake is dumping server data into Redux and hand-writing loading/error/caching. I keep
+        server state in a data-fetching cache that owns staleness and refetch, and reserve client state tools for genuine UI
+        state. Conflating the two is where most frontend state bugs live."</em> (See 20.)</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Optimistic vs pessimistic UI updates — when do you show the result?</summary>
+      <div class="answer">
+        <p><strong>Deciding factor: how likely is the write to fail, and how bad is a rollback?</strong> Optimistic UI
+        updates the screen <em>immediately</em>, before the server confirms, then reconciles — it feels instant (a like, a
+        message send), but you must handle rollback when the request fails and briefly show possibly-wrong state. Pessimistic
+        waits for the server's OK before updating — always truthful, never a rollback, but the UI feels laggy on every
+        action.</p>
+        <p>Say it: <em>"Optimistic for high-frequency, low-stakes, rarely-failing actions — likes, toggles, sending a chat —
+        because the perceived latency win is huge and the failure is cheap to undo. Pessimistic for money and destructive or
+        rarely-repeated actions, where showing a success that then reverses is worse than a spinner."</em> (See 20.)</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Debounce vs throttle — how do you rate-limit an event?</summary>
+      <div class="answer">
+        <p><strong>Deciding factor: do you want the final value after activity stops, or a steady sample during it?</strong>
+        Debounce waits until the event has <em>stopped</em> firing for X ms, then runs once — perfect for a search-as-you-type
+        box (fire the query when the user pauses, not on every keystroke). Throttle runs at most once per X ms <em>during</em>
+        continuous firing — perfect for scroll/resize/mousemove handlers where you want regular updates, not just the last
+        one.</p>
+        <p>Say it: <em>"Debounce when only the final state matters and I want to collapse a burst into one call — typeahead,
+        autosave. Throttle when I need periodic updates throughout — infinite-scroll triggers, drag, resize. One word:
+        debounce = 'wait until they're done', throttle = 'at most every N ms'."</em> (See 21.)</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>Virtualization vs pagination — how do you render a huge list?</summary>
+      <div class="answer">
+        <p><strong>Deciding factor: is it a continuous feed the user scrolls, or a dataset they navigate?</strong>
+        Virtualization (windowing) renders only the rows currently in view and recycles DOM nodes as you scroll — keeps a
+        10,000-row feed at 60fps with a tiny DOM, but complicates focus, find-in-page, and variable-height rows. Pagination
+        loads a bounded page at a time — simpler, shareable/bookmarkable page URLs, bounded memory — but interrupts the flow
+        with page controls.</p>
+        <p>Say it: <em>"Virtualize a continuous scroll of many uniform rows — a chat log, a feed — so the DOM stays small
+        regardless of list length. Paginate (or its infinite-scroll variant with cursor paging) when the data is naturally
+        chunked or when I want addressable pages. Under the hood both need cursor pagination on the API, not
+        offset."</em> (See 20.)</p>
+      </div>
+    </details>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="takeaways">What to remember</h2>
+    <p>
+      The meta-lesson of this whole deck, and the single habit that reads as senior: <strong>don't recite both sides — name
+      the one variable that decides, then commit.</strong> A mid-level answer is "X is faster, Y is more consistent." A
+      senior answer is "the deciding factor here is the read:write ratio / the conflict rate / whether I have celebrities /
+      whether I can tolerate a stale read — and given ours, it's X." The interviewer is testing whether you can compress a
+      trade-off to its pivot and defend a choice, not whether you can list features.
+    </p>
+    <ul>
+      <li><strong>Every card has a pivot.</strong> SQL vs NoSQL → access patterns, not volume. Strong vs eventual → cost of a
+        stale read. Fan-out write vs read → do you have celebrities. Cache-aside vs write-through → is it read-after-write.
+        2PC vs saga → can you hold cross-service locks. Consistent hashing vs mod-N → how often membership changes. Learn the
+        pivot, and the answer falls out.</li>
+      <li><strong>Almost everything defaults to the simple side, and you earn the complex side.</strong> Monolith before
+        microservices. Single-leader before multi-leader. Replicas before shards. Scale up before out. Cache-aside before
+        the exotic patterns. Sync before async. Say the default, then name the specific force that would make you flip.</li>
+      <li><strong>Name the cost you're accepting, out loud.</strong> "Async, which buys me eventual consistency and forces
+        idempotent consumers." "Write-behind, which can lose data — never for money." "Optimistic UI, so I must handle
+        rollback." Naming the downside you're choosing is the strongest signal; pretending it isn't there is the weakest.</li>
+      <li><strong>Most of these are per-operation, not per-system.</strong> Consistency, CAP, sync-vs-async, and caching are
+        chosen per endpoint. Checkout is CP; the catalogue is AP. The same app is strongly consistent for balances and
+        eventually consistent for like counts. Saying "it depends on the operation" and then scoping it is a senior move.</li>
+      <li><strong>Recurring themes across all eight categories:</strong> jitter/randomness breaks synchronized load; the
+        read:write ratio drives storage and caching; idempotency is how you survive at-least-once anything; the partition/
+        shard key simultaneously buys you ordering and exposes you to hot spots; and the cheapest work is the work you move
+        off the critical path.</li>
+    </ul>
+    <div class="senior">
+      Close the loop in the room: <em>"For each of these I'd state the deciding factor, make the call, and name the one cost
+      I'm taking on — because at this level the interview isn't 'do you know the options', it's 'can you choose and defend
+      one under real constraints'."</em> That sentence, said once near the end, is worth more than another comparison table.
+      You've reached the end of the course — now go practice saying these out loud, because talking is the skill being graded.
+    </div>
+  </section>
+
+  <nav class="page-nav">
+    <a href="26-estimation-drills.html">← 26 — Estimation Drills</a>
+    <a href="index.html">Course Home →</a>
+  </nav>
+
+</main>
+</body>
+</html>

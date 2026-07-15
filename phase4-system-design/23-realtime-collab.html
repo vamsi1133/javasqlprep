@@ -1,0 +1,1047 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>23 — Design a Real-Time Collaborative UI | Interview Prep</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <div class="breadcrumb"><a href="index.html">← Course Home</a></div>
+    <h1>23 — Design a Real-Time Collaborative UI</h1>
+    <p>Two people typing in the same document at the same time. The whole round is: whose edit wins, and how does nobody notice the fight.</p>
+  </div>
+</header>
+
+<main class="container">
+
+  <section>
+    <h2>Why this matters in the interview</h2>
+    <p>
+      This is the frontend round with the highest ceiling and the deepest trap door. "Design Google Docs" (or Figma, or
+      Notion, or a shared whiteboard) sounds like it's about editing text, and a weak candidate spends forty minutes on a
+      toolbar and a contenteditable div. The strong candidate knows within the first minute that the entire interview is
+      about <strong>one hard problem wearing a friendly costume: two clients mutate the same state concurrently, over an
+      unreliable network, and must converge to the same result without a server referee blocking every keystroke.</strong>
+      Everything else — the cursors, the avatars, the toolbar — is set dressing around that problem. Name it out loud in
+      the first ninety seconds and you've already separated yourself from the field.
+    </p>
+    <p>
+      Here's the good news and the honest calibration in one breath: the deep theory here — Operational Transformation and
+      CRDTs — is <strong>awareness-level for a frontend round, and you should say so.</strong> Almost no interviewer will
+      ask a React engineer to implement OT's transform function or a CRDT's merge on a whiteboard; if one does, they're
+      running a specialist round and you'd know from the job description. What they <em>will</em> grade is whether you know
+      the three families of conflict resolution exist, can explain the intuition and the trade-off of each, know which
+      real products use which, and can reason about the parts a frontend engineer actually owns: the transport, the
+      optimistic local apply, presence and cursors, and — the thing that quietly separates senior from mid —
+      <strong>what happens when the network drops mid-edit and comes back.</strong> This page walks the whole thing through
+      RADIO (tutorial 19), stays honest about what's awareness-level versus what you must own, and hands you the sentences
+      to say out loud.
+    </p>
+    <div class="senior">The opening frame, memorised: <em>"Before I draw anything — the core of this problem is concurrent
+      editing: multiple people mutating one shared document at once, over a lossy network, with no time for a server to
+      lock and referee each keystroke. So the spine of my design is (1) a real-time transport, (2) an optimistic local
+      apply so my own typing is never laggy, and (3) a conflict-resolution strategy so everyone converges to the same
+      document. I'll design the client in depth and treat the sync server as a contract. The convergence algorithm —
+      last-write-wins vs OT vs CRDT — I'll cover at the level of trade-offs and which one I'd reach for, and flag that
+      actually implementing OT or a CRDT is its own specialism; stop me if you want to go deeper there than awareness."</em>
+      That sentence does the interviewer's scoping for them and tells them you know exactly where the depth lives.</div>
+  </section>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ul>
+      <li><a href="#prompt">1. The prompt</a> — the deliberately vague version and what it's really asking</li>
+      <li><a href="#requirements">R — Requirements</a> — functional + the non-functionals that define this round ★</li>
+      <li><a href="#architecture">A — Architecture &amp; components</a> — the editor, the local model, the sync engine</li>
+      <li><a href="#data">D — Data model</a> — the document, operations, and the presence channel</li>
+      <li><a href="#interface">I — Interface &amp; API</a> — transport: <strong>WebSockets vs SSE on the client</strong> + the message protocol ★</li>
+      <li><a href="#conflict">O · Deep dive: conflict resolution</a> — <strong>LWW vs OT vs CRDT at awareness depth</strong> ★★ the heart of the page</li>
+      <li><a href="#presence">O · Deep dive: presence &amp; remote cursors</a> — the cheap, high-impact feature</li>
+      <li><a href="#offline">O · Deep dive: offline edits &amp; reconnect</a> — buffer, replay, rebase ★★</li>
+      <li><a href="#localfirst">Local-first thinking</a> — the frame that ties it together</li>
+      <li><a href="#tradeoffs">Trade-offs</a> — every real decision and when you'd flip it</li>
+      <li><a href="#qa">Interview Q&amp;A</a></li>
+      <li><a href="#takeaways">What to remember</a></li>
+    </ul>
+  </div>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="prompt">1. The prompt</h2>
+    <p>
+      The interviewer says: <em>"Design a collaborative document editor — like Google Docs. Multiple users can edit the
+      same document at the same time and see each other's changes live."</em> That's it. As always the prompt is
+      deliberately underspecified, and as always the first move is to <em>not</em> start drawing. But before you clarify,
+      do the reframe out loud, because it's the highest-value sentence in the round and it steers everything the
+      interviewer asks next.
+    </p>
+    <p>
+      The reframe: this is not a text-editor problem, it's a <strong>distributed-state-convergence problem that happens to
+      render as text.</strong> Strip the document away and the shape is: N clients each hold a replica of one logical
+      object; each applies local mutations instantly (or the app feels broken); those mutations propagate to the others;
+      and every replica must end up identical no matter what order the mutations arrived in. That is the same shape as a
+      multiplayer game's world state, a shared spreadsheet, a Figma canvas, or a Trello board. Recognising the archetype
+      tells the interviewer you've seen the pattern, not just the product.
+    </p>
+    <div class="note">
+      Scope check to do immediately, because it changes the difficulty by an order of magnitude: <strong>plain text vs
+      rich text, and how many concurrent editors per document.</strong> A shared to-do list where fields rarely collide is
+      a different (much easier) build from a rich-text editor where two people bold overlapping ranges of the same
+      sentence. And "3 collaborators" (a doc) is a different scale from "500 cursors on one Figma file." Pin both before
+      you commit to a conflict strategy — the answer to "which algorithm" depends entirely on them.
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="requirements">R — Requirements</h2>
+
+    <p>
+      Same first move as every RADIO round: pin the surface before you build it. Split functional from non-functional,
+      scope ruthlessly, and say what you're cutting. For a collaborative editor the non-functionals aren't optional
+      colour — <strong>they <em>are</em> the design</strong>, because latency tolerance and offline expectation are what
+      decide your conflict strategy.
+    </p>
+
+    <h3>Functional — the user-visible behaviours</h3>
+    <ul>
+      <li>Multiple users edit one document simultaneously and see each other's edits appear live (target: sub-200&nbsp;ms).</li>
+      <li>My own typing is <strong>never</strong> laggy — local edits apply instantly, before any server round trip.</li>
+      <li>I can see <strong>who else is here</strong> (presence: avatars) and <strong>where they are</strong> (remote
+        cursors and selections).</li>
+      <li>The document survives reload and everyone who opens it sees the same content (persistence + convergence).</li>
+      <li>Edits made while briefly offline aren't lost — they sync when the connection returns.</li>
+    </ul>
+    <p>
+      What I'd <strong>cut and say so</strong>: rich-text formatting complexity (I'll design for plain text or a simple
+      character model and note where rich text makes conflict resolution harder), comments/suggestions mode, permissions
+      and sharing, version history UI, and the document list. "I'll go deep on the concurrent-editing core for a plain-ish
+      text model and treat formatting, comments, and access control as extensions I can speak to if you want." Naming the
+      cut is the senior move — it shows you know the core is the whole interview.
+    </p>
+
+    <h3>Non-functional — this list <em>is</em> the round</h3>
+    <table>
+      <thead><tr><th>Non-functional</th><th>The question to ask</th><th>Why it decides the design</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Local latency</strong></td><td>"Must my own keystrokes feel instant?" (yes, always)</td><td>Forces an optimistic local-apply model. You can never gate the user's own typing on a server ack. This alone rules out a naive request/response design.</td></tr>
+        <tr><td><strong>Convergence</strong></td><td>"After the dust settles, must every replica be byte-identical?"</td><td>Yes — this is the correctness bar. It's what pushes you from "last-write-wins is fine" toward OT or CRDT for anything text-shaped.</td></tr>
+        <tr><td><strong>Concurrency level</strong></td><td>"How many simultaneous editors per doc? 3, or 300?"</td><td>Low concurrency + coarse-grained fields survives simple strategies. High concurrency on fine-grained text needs OT/CRDT.</td></tr>
+        <tr><td><strong>Offline</strong></td><td>"Edit on a plane, sync on landing? Or just survive a 5-second WiFi blip?"</td><td>Full offline is a hard requirement that strongly favours CRDTs and local-first. A brief blip only needs a reconnect buffer.</td></tr>
+        <tr><td><strong>Conflict granularity</strong></td><td>"Plain text, rich text, or structured (cells, shapes, list items)?"</td><td>Structured/coarse fields collide rarely (field-level LWW works). Free text collides constantly (needs positional transforms).</td></tr>
+        <tr><td><strong>Persistence &amp; history</strong></td><td>"Durable across reload? Do we need an edit history / undo across sessions?"</td><td>Decides whether the server stores the op log, periodic snapshots, or both — and shapes undo (which is surprisingly hard when it's collaborative).</td></tr>
+      </tbody>
+    </table>
+
+    <p>
+      Then state your assumptions and move: <em>"I'll assume a Google-Docs-style rich-ish text doc, a handful of
+      concurrent editors (say up to ~20, not 500), sub-200&nbsp;ms perceived sync, my own edits always instant, graceful
+      survival of short disconnects with a stretch goal of true offline, and byte-identical convergence as the correctness
+      bar. Good?"</em> That single paragraph is the whole non-functional spec, and it already telegraphs that you'll need
+      optimistic apply plus a real conflict-resolution algorithm.
+    </p>
+
+    <div class="senior">
+      Say the number that drives everything, the way you'd state the read:write ratio in a backend round:
+      <em>"The parameter that actually picks my algorithm is conflict granularity crossed with concurrency. If edits are
+      coarse — separate cells, separate list items — collisions are rare and I can get away with field-level
+      last-write-wins. If it's free-flowing text where two people insert into the same paragraph, positions shift under
+      each other and I need OT or a CRDT. So before I pick, I'm pinning: how fine-grained is a conflict, and how many
+      people hit the same spot at once."</em> That's the senior instinct — derive the algorithm from the requirement
+      instead of name-dropping CRDT because it's trendy.
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="architecture">A — Architecture &amp; components</h2>
+
+    <p>
+      The architecture insight that carries this whole design: <strong>separate the editor UI from the document state from
+      the sync engine.</strong> Most candidates fuse them and drown. The React tree that renders text is one concern; the
+      in-memory model of the document is a second; the thing that ships local changes out and merges remote changes in is
+      a third — and that third box, the sync engine, is where the interview actually lives. Drawing this three-layer split
+      first is the single strongest structural signal you can give.
+    </p>
+
+    <h3>The component / module tree</h3>
+<pre><code>  &lt;DocumentPage&gt;                     ← route container; owns the session lifecycle
+    ├─ &lt;PresenceBar&gt;                  ← avatars of who's here (from presence channel)
+    ├─ &lt;Toolbar&gt;                      ← bold/italic/etc → dispatches ops, mostly local UI state
+    ├─ &lt;Editor&gt;                       ← the contenteditable / textarea surface
+    │    ├─ &lt;RemoteCursorsLayer&gt;      ← overlay: other people's carets + selections
+    │    └─ &lt;RemoteSelectionsLayer&gt;   ← overlay: highlighted ranges, colour-per-user
+    └─ &lt;ConnectionStatus&gt;             ← "Saved" / "Reconnecting…" / "Offline" indicator
+
+  ── not components, but the layers under them (the real design) ──
+  DocumentModel     ← the local source of truth (text + a conflict-friendly structure)
+  SyncEngine        ← applies local ops optimistically, sends them, receives + merges remote ops
+  Transport         ← the WebSocket wrapper: connect, heartbeat, reconnect, buffer
+</code></pre>
+
+    <p>
+      The reason to split <code>Editor</code> from <code>DocumentModel</code> from <code>SyncEngine</code>: the editor
+      should be a thin, dumb view over the model — it renders the current document and emits <em>intents</em>
+      ("insert 'x' at position 12"), nothing more. It does not know the network exists. The <code>SyncEngine</code> turns
+      those intents into operations, applies them to the model <em>immediately</em> (that's the no-lag requirement), and
+      independently reconciles with the server. That boundary is what lets you swap the whole conflict strategy — LWW, OT,
+      a CRDT library — without touching a line of the editor.
+    </p>
+
+    <h3>The core loop — one local edit and one remote edit, end to end</h3>
+<pre><code>  LOCAL edit (I type):
+    keystroke ─▶ Editor emits intent ─▶ SyncEngine makes an op
+       │
+       ├─▶ apply to DocumentModel NOW (optimistic) ─▶ UI updates instantly
+       └─▶ Transport.send(op) ─▶ server ─▶ broadcast to peers
+
+  REMOTE edit (you type):
+    server ─▶ Transport.onMessage(op) ─▶ SyncEngine
+       │
+       ├─▶ transform/merge against my un-acked local ops (the hard part)
+       └─▶ apply to DocumentModel ─▶ UI updates + remote cursor moves
+</code></pre>
+
+    <p>
+      Two things to say out loud while you draw this. First, <strong>the local apply and the send are independent
+      branches</strong> — my keystroke hits the screen without waiting for the network, which is the entire reason the app
+      feels native. Second, <strong>the inbound path is where conflicts get resolved</strong>: a remote op can't just be
+      applied blindly, because I may have local edits the server hasn't seen yet, so positions have shifted. Resolving that
+      is the deep dive (<a href="#conflict">conflict resolution</a>).
+    </p>
+
+    <h3>Where does state live?</h3>
+    <table>
+      <thead><tr><th>State</th><th>Where it lives</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>The document content</td><td><strong>DocumentModel</strong> — a single client-side source of truth, mirrored on the server</td><td>It's replicated state, not server-cache-in-the-React-Query-sense. You own a live local replica and converge it; you don't refetch it.</td></tr>
+        <tr><td>My un-acknowledged local ops</td><td><strong>SyncEngine</strong> buffer</td><td>Needed to transform incoming remote ops, and to replay after a reconnect. This buffer is the heart of correctness.</td></tr>
+        <tr><td>My caret / selection</td><td><strong>Local</strong> to the editor, echoed to the presence channel</td><td>It's UI state I own; peers get a throttled copy for their cursor overlay.</td></tr>
+        <tr><td>Other users' cursors + avatars (presence)</td><td><strong>Ephemeral presence store</strong>, separate from the doc</td><td>Presence is transient and lossy-tolerant — it must NOT go through the durable document op log (deep dive below).</td></tr>
+        <tr><td>Connection status</td><td><strong>Transport</strong>, surfaced to a small store</td><td>Drives the "Reconnecting…/Offline" UI and gates whether the send buffer flushes.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="pitfall">
+      The classic wrong turn is making the editor talk to the network directly — <code>onKeyDown</code> fires a
+      <code>fetch</code> / socket send and also mutates the DOM, with no model in between. It works in the demo and
+      collapses the moment two edits race, because there's no place to hold un-acked ops and nothing to transform against.
+      The model-in-the-middle isn't ceremony; it's the only place conflict resolution <em>can</em> happen. If you skip it
+      you've built a design that literally cannot converge.
+    </div>
+
+    <div class="senior">
+      The sentence that shows you've thought about this as state replication, not UI:
+      <em>"I'm treating the document as a replicated data structure with a local replica I mutate optimistically, not as
+      server data I fetch. That reframes the whole problem: my job on the client is to keep a local replica, apply my ops
+      instantly, and run a merge function on inbound ops so all replicas converge. The editor is just a projection of that
+      replica — which means I can change my convergence algorithm without touching the UI."</em> That's the line that
+      tells the interviewer you understand why this round is hard.
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="data">D — Data model</h2>
+
+    <p>
+      Three data models matter here, and keeping them distinct is itself a scoring move because candidates routinely blur
+      them: <strong>(1) the document</strong> — the shared, durable, must-converge state; <strong>(2) the operation</strong>
+      — the unit of change that travels over the wire; and <strong>(3) presence</strong> — the transient who's-here-and-where
+      channel that must stay <em>out</em> of the document.
+    </p>
+
+    <h3>1. The document — an op log, not a blob</h3>
+    <p>
+      Do <strong>not</strong> model the document as "a big string the server owns and clients PUT." You cannot merge two
+      concurrent PUTs of a string without losing one. Instead the durable truth is a <strong>log of operations</strong>;
+      the current text is a <em>projection</em> of replaying that log (identical to the double-entry ledger idea from
+      tutorial 13 — the balance is derived from immutable entries, never stored and mutated). The server keeps the log,
+      periodically snapshots it so new joiners don't replay from the beginning, and hands a new client
+      <em>snapshot + ops-since-snapshot</em>.
+    </p>
+
+<pre><code><span class="com">// An operation — the atomic unit of change. Each is intention-preserving:</span>
+<span class="com">// it says WHAT the user did, so it can be transformed against concurrent ops.</span>
+<span class="kw">type</span> <span class="typ">Op</span> =
+  | { kind: <span class="str">"insert"</span>; pos: <span class="typ">number</span>; text: <span class="typ">string</span> }
+  | { kind: <span class="str">"delete"</span>; pos: <span class="typ">number</span>; len: <span class="typ">number</span> };
+
+<span class="kw">interface</span> <span class="typ">Change</span> {
+  op: <span class="typ">Op</span>;
+  docId: <span class="typ">string</span>;
+  actor: <span class="typ">string</span>;        <span class="com">// which client authored it (client/site id)</span>
+  baseVersion: <span class="typ">number</span>;   <span class="com">// the server version this op was created against</span>
+}
+</code></pre>
+
+    <p>
+      That <code>baseVersion</code> is load-bearing and worth calling out: it tells the server "I made this edit believing
+      the document was at version N." If the server has since advanced to N+3 because other people edited, the server (or
+      client) must <strong>transform my op against the 3 ops I hadn't seen</strong> before applying it. That single field
+      is what makes ordered convergence possible — it's the frontend cousin of an optimistic-concurrency version column in
+      Postgres.
+    </p>
+
+    <h3>2. The client replica</h3>
+    <p>
+      On the client you hold the current text (as a projection) plus the machinery to reconcile: the last server version
+      you've acknowledged, and the buffer of local ops you've applied optimistically but the server hasn't confirmed yet.
+    </p>
+
+<pre><code><span class="kw">interface</span> <span class="typ">ClientDoc</span> {
+  text: <span class="typ">string</span>;              <span class="com">// current projection shown in the editor</span>
+  ackedVersion: <span class="typ">number</span>;      <span class="com">// highest server version I've merged in</span>
+  pending: <span class="typ">Change</span>[];        <span class="com">// applied locally, NOT yet acked — the reconnect/transform buffer</span>
+}
+</code></pre>
+
+    <p>
+      <code>pending</code> is the most important field in the whole design. It's why my typing is instant (I apply then
+      queue), it's what inbound remote ops get transformed against, and it's exactly what I replay after a reconnect. Empty
+      it too eagerly and you lose edits; never empty it and you double-apply. Managing it correctly <em>is</em> the
+      correctness of the client.
+    </p>
+
+    <h3>3. Presence — deliberately separate, deliberately lossy</h3>
+    <p>
+      Cursor positions, selections, and "who's online" are a <strong>different kind of data</strong> and must ride a
+      different channel. They are high-frequency (a cursor moves on every keystroke and mouse move), disposable (a cursor
+      position from 400&nbsp;ms ago is worthless — you only ever want the latest), and <em>must not be persisted</em> — you
+      never want yesterday's cursor positions in the document history.
+    </p>
+
+    <table>
+      <thead><tr><th></th><th>Document ops</th><th>Presence (cursors, selections, online)</th></tr></thead>
+      <tbody>
+        <tr><td>Durability</td><td>Persisted forever (the op log)</td><td>Ephemeral — gone when you disconnect</td></tr>
+        <tr><td>Delivery guarantee</td><td>Must not lose a single op (reliable, ordered)</td><td>Lossy is fine — only the latest matters</td></tr>
+        <tr><td>Frequency</td><td>Per meaningful edit</td><td>Very high — throttle hard (e.g. 20–50&nbsp;ms)</td></tr>
+        <tr><td>Conflict handling</td><td>Transform / merge, must converge</td><td>Last-write-wins per user — no merge needed</td></tr>
+        <tr><td>On reconnect</td><td>Replay the buffer, lose nothing</td><td>Just re-broadcast current state; drop the gap</td></tr>
+      </tbody>
+    </table>
+
+    <div class="pitfall">
+      Routing cursor movements through the durable document op log is a subtle but serious mistake — you'll persist
+      thousands of cursor ops, bloat the log, slow snapshot replay, and pay reliable-delivery cost for data that's
+      worthless a frame later. Presence gets its own channel with last-write-wins-per-user semantics and no persistence.
+      Interviewers who've built this notice immediately whether you separate the two; it's a fast senior tell.
+    </div>
+
+    <div class="senior">
+      The framing: <em>"I model the document as an append-only op log, and the visible text is a projection of that log —
+      same discipline as a ledger, where you never store a mutable balance. That gives me history, undo, and a well-defined
+      merge for free. Presence — cursors and selections — rides a completely separate, ephemeral, lossy channel with
+      last-write-wins per user, because it's high-frequency and worthless the instant it's stale. Conflating those two is
+      the most common structural mistake here."</em>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="interface">I — Interface &amp; API</h2>
+
+    <p>
+      Two interfaces, as always in RADIO — but here the network interface is unusually important, because the
+      <strong>transport choice is a real interview question</strong> and the message protocol <em>is</em> the sync
+      contract. I'll spend most of this step on the transport (WebSockets vs SSE from the client's point of view) and the
+      message protocol, and keep the component-props interface brief.
+    </p>
+
+    <h3>Transport: WebSockets vs SSE — the decision you must be able to defend</h3>
+    <p>
+      The question hiding inside "how do the edits get there in real time?" is which push transport you use. There are
+      three real options — WebSockets, Server-Sent Events (SSE), and long polling — and for a <em>collaborative editor</em>
+      the answer is WebSockets, but the whole point is being able to say <strong>why</strong>, and to know when you'd pick
+      SSE instead. (The backend mechanics of these live in tutorial 02 — Networking &amp; Delivery — and tutorial 11's chat
+      system; here we care about the client's side of the choice.)
+    </p>
+    <p>
+      The deciding axis is <strong>directionality</strong>. A collaborative editor is intensely <em>bidirectional</em>: the
+      client pushes ops up constantly (every edit) and the server pushes ops down constantly (everyone else's edits).
+      That's the exact shape WebSockets exist for — one long-lived, full-duplex TCP connection where both ends send
+      whenever they like. SSE is <em>one-way</em>: server-to-client only. You'd still need a second channel (plain
+      <code>fetch</code>/POST) for the client-to-server ops, so with SSE you're maintaining two half-connections to
+      simulate what one WebSocket gives you natively.
+    </p>
+
+    <table>
+      <thead><tr><th></th><th>WebSockets</th><th>SSE (Server-Sent Events)</th><th>Long polling</th></tr></thead>
+      <tbody>
+        <tr><td>Direction</td><td><strong>Full-duplex</strong> — both ways over one connection</td><td><strong>One-way</strong> — server → client only</td><td>Effectively one-way per request; client re-asks</td></tr>
+        <tr><td>Client→server edits</td><td>Native, same socket</td><td>Needs a <em>separate</em> POST/fetch channel</td><td>Piggybacked on the next poll — laggy</td></tr>
+        <tr><td>Protocol</td><td><code>ws://</code>/<code>wss://</code> — upgraded from HTTP, then its own frames</td><td>Plain HTTP, <code>text/event-stream</code></td><td>Plain HTTP requests</td></tr>
+        <tr><td>Browser API</td><td><code>WebSocket</code></td><td><code>EventSource</code> — dead-simple, auto-reconnect built in</td><td>Just <code>fetch</code> in a loop</td></tr>
+        <tr><td>Auto-reconnect / resume</td><td>You build it (and the <code>Last-Event-ID</code> equivalent) yourself</td><td><strong>Built in</strong> — auto-reconnects and replays via <code>Last-Event-ID</code></td><td>Trivial — it's just the next request</td></tr>
+        <tr><td>Payload</td><td>Text <em>or</em> binary (great for CRDT byte updates)</td><td>Text only (UTF-8)</td><td>Text or binary per request</td></tr>
+        <tr><td>Infra friction</td><td>Some proxies/LBs need explicit upgrade config; stateful connections to manage</td><td>Rides ordinary HTTP/2 — proxy-friendly, easy to scale as it looks like a normal request</td><td>Highest overhead — a request per poll, wasteful</td></tr>
+        <tr><td>Best for</td><td><strong>Collaborative editing, chat, multiplayer</strong> — high-rate bidirectional</td><td>Live feeds, notifications, dashboards, LLM token streams — server-push-only</td><td>Legacy fallback when WS is blocked</td></tr>
+      </tbody>
+    </table>
+
+    <p>
+      So the one-liner: <em>"I'll use WebSockets, because collaborative editing is bidirectional and high-frequency — both
+      sides push constantly, and a WebSocket is one full-duplex connection built for exactly that. SSE is a great fit when
+      push is one-way — notifications, a live feed, streaming LLM tokens — but here I'd have to bolt a separate POST
+      channel on for the client's own edits, which is two things to keep in sync instead of one. Long polling is my
+      fallback only if corporate proxies block WebSockets."</em> Note the SSE positive: it's genuinely better when you only
+      push down, and its free auto-reconnect-with-<code>Last-Event-ID</code> is a real feature — say that, so you don't
+      sound like you're just defaulting to WebSockets.
+    </p>
+
+    <div class="note">
+      SSE has one underrated superpower this design has to reimplement by hand on WebSockets: <strong>resumable streams.</strong>
+      <code>EventSource</code> automatically reconnects and sends a <code>Last-Event-ID</code> header so the server can
+      replay everything you missed. On a WebSocket you own that: you track the last server version you saw and, on
+      reconnect, tell the server "catch me up from version N." You're rebuilding SSE's resume feature — which is a good
+      argument for a thin protocol on top of the socket (below), and a good thing to acknowledge out loud.
+    </div>
+
+    <h3>The message protocol — the real sync contract</h3>
+    <p>
+      Define the handful of message types over the socket. This <em>is</em> the API for this system, more than any REST
+      endpoint. Version everything so reconnect and catch-up work.
+    </p>
+
+<pre><code><span class="com">// ── client → server ──</span>
+{ t: <span class="str">"op"</span>,       change: Change }                  <span class="com">// I made an edit (carries baseVersion)</span>
+{ t: <span class="str">"cursor"</span>,   pos: <span class="typ">number</span>, sel: [<span class="typ">number</span>,<span class="typ">number</span>] }   <span class="com">// presence — throttled, fire-and-forget</span>
+{ t: <span class="str">"resume"</span>,   fromVersion: <span class="typ">number</span> }            <span class="com">// after reconnect: "catch me up from N"</span>
+
+<span class="com">// ── server → client ──</span>
+{ t: <span class="str">"ack"</span>,      version: <span class="typ">number</span> }               <span class="com">// your op is committed at this server version</span>
+{ t: <span class="str">"op"</span>,       change: Change, version: <span class="typ">number</span> } <span class="com">// someone else's edit (already server-ordered)</span>
+{ t: <span class="str">"presence"</span>, actor: <span class="typ">string</span>, pos, sel, color }  <span class="com">// a peer's cursor moved / they joined</span>
+{ t: <span class="str">"sync"</span>,     snapshot: <span class="typ">string</span>, version: <span class="typ">number</span> } <span class="com">// initial load or post-reconnect resync</span>
+</code></pre>
+
+    <p>
+      Two REST endpoints still exist around the edges — <code>GET /docs/:id</code> to bootstrap the snapshot + version
+      before the socket opens, and auth to get a token for the <code>wss://</code> upgrade — but the live editing all flows
+      over the socket. The senior detail is the <strong>server assigns the authoritative version/order</strong>: clients
+      propose ops with a <code>baseVersion</code>, the server is the single sequencer that decides the final order and
+      stamps a monotonic <code>version</code>, and the <code>ack</code> is how a client learns its optimistic op is now
+      canonical. That central sequencer is what makes OT tractable (below).
+    </p>
+
+    <h3>The component interface — brief, because it's the easy half</h3>
+    <p>
+      The editor stays presentational over the model: it takes the current text and remote cursors as props and emits
+      intents. It knows nothing about sockets or versions.
+    </p>
+
+<pre><code><span class="kw">interface</span> <span class="typ">EditorProps</span> {
+  text: <span class="typ">string</span>;
+  remoteCursors: <span class="typ">RemoteCursor</span>[];              <span class="com">// { actor, pos, sel, color, name }</span>
+  onIntent: (i: <span class="typ">EditIntent</span>) =&gt; <span class="typ">void</span>;      <span class="com">// "insert x at 12" — SyncEngine turns this into an Op</span>
+  onCursor: (pos: <span class="typ">number</span>, sel: [<span class="typ">number</span>,<span class="typ">number</span>]) =&gt; <span class="typ">void</span>;
+}
+</code></pre>
+
+    <div class="senior">
+      Tie the transport back to the requirement: <em>"The transport isn't a detail — it's dictated by the access pattern.
+      Bidirectional and high-frequency means WebSockets; if this were a read-only live view — say, watching a doc without
+      editing — I'd downgrade to SSE and get simpler infra and free reconnect. I'd also put a thin versioned protocol on
+      top of the socket so I can resume from a known version after a drop, because that resume behaviour is the one thing
+      SSE gives you for free and a raw WebSocket doesn't."</em>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="conflict">O · Deep dive: conflict resolution — LWW vs OT vs CRDT</h2>
+
+    <p>
+      <strong>This is where the interview really happens.</strong> Every other section supports this one. And here is the
+      single most important calibration on the page, so say it out loud early: <strong>for a frontend round this is
+      awareness-level.</strong> You are expected to know the three families exist, explain the intuition and trade-off of
+      each, and say which you'd reach for and why. You are <em>almost never</em> expected to derive OT's transform
+      functions or hand-write a CRDT merge on the whiteboard — that's a specialist / library-author skill. State that
+      boundary explicitly; it reads as confidence, not evasion.
+    </p>
+
+    <h3>Why there's a conflict at all — the one example to draw</h3>
+    <p>
+      Draw this, because it makes the whole problem concrete in ten seconds. The document is <code>"HAT"</code>. Two users
+      act at the same instant, each against version "HAT":
+    </p>
+<pre><code>  Start:  "HAT"
+  User A: insert "C" at pos 0   → intends "CHAT"
+  User B: delete 1 char at pos 2 (the "T") → intends "HA"
+
+  Naive apply of BOTH ops as-written, in the order they arrive:
+    apply A to "HAT": insert C@0  → "CHAT"
+    apply B to "CHAT": delete@2   → "CHT"   ✗  (B meant to remove the T, deleted the A)
+
+  The bug: B's op said "pos 2", but A inserted a char BEFORE pos 2,
+  so every position after the insert shifted right by one. B's index is now stale.
+</code></pre>
+    <p>
+      That positional drift — indexes computed against one version of the document being applied to a different version —
+      is the entire problem. The three families are three different answers to "what do we do about it."
+    </p>
+
+    <h3>Family 1 — Last-write-wins (LWW): the honest simple option</h3>
+    <p>
+      <strong>Intuition:</strong> attach a timestamp (or a version) to each write; when two writes conflict, the later one
+      wins and the earlier is discarded. No merging — one edit is simply thrown away.
+    </p>
+    <p>
+      <strong>Where it's right:</strong> <em>coarse-grained, rarely-colliding</em> state. A document's title. A cell in a
+      spreadsheet where two people rarely type in the <em>same</em> cell. A shape's colour on a canvas. A user-profile
+      field. If your "document" is really a bag of independent fields and collisions on the <em>same</em> field are rare,
+      LWW is not a cop-out — it's the correct, cheap answer, and reaching for OT here would be over-engineering.
+    </p>
+    <p>
+      <strong>Where it's catastrophic:</strong> free text. Applying LWW to a shared paragraph means the instant two people
+      type near each other, one person's whole edit vanishes — visibly, mid-sentence. It also needs synchronized clocks to
+      even define "later," which is its own distributed-systems trap (a version counter or a logical clock is safer than
+      wall-clock time). LWW throws away data <em>by design</em>; that's fine for a colour, fatal for prose.
+    </p>
+    <div class="note">
+      LWW is what most "collaborative" apps that aren't editors actually use, and admitting that is a senior move. Trello
+      moving a card, a form where two admins edit different fields, a settings panel — field-level last-write-wins with a
+      version check is plenty. Don't reach past it unless the state is fine-grained text. Match the algorithm to the
+      collision rate, not to the fashion.
+    </div>
+
+    <h3>Family 2 — Operational Transformation (OT): rewrite the incoming op</h3>
+    <p>
+      <strong>Intuition:</strong> keep <em>both</em> edits, but before you apply an op that was created against an older
+      version, <em>transform</em> it so its positions account for the ops it didn't know about. In the HAT example, OT
+      takes B's "delete at pos 2", notices A inserted one character before pos 2, and rewrites B's op to "delete at pos 3."
+      Now both apply and everyone lands on <code>"CHA"</code>. The magic is a <code>transform(opX, opY)</code> function
+      that adjusts one op to account for a concurrent one.
+    </p>
+<pre><code>  transform(B, A):  B was "delete@2", A was "insert 1 char @0"
+    A inserted before B's position → shift B right by A's length
+    B' = "delete@3"
+  Result on both replicas: "CHA"   ✓ converged, nobody's edit lost
+</code></pre>
+    <p>
+      <strong>The trade-off:</strong> OT is <em>simple to understand and brutal to implement correctly.</em> You need a
+      transform function for every <em>pair</em> of operation types (insert vs insert, insert vs delete, delete vs delete…),
+      it must satisfy hairy mathematical properties (transform in either order must converge — "TP1/TP2"), and rich text
+      multiplies the op types. It also essentially <strong>requires a central server</strong> to sequence ops into one
+      authoritative order, which is fine for Google Docs (which uses OT) but rules out true peer-to-peer.
+    </p>
+    <p>
+      <strong>Who uses it:</strong> Google Docs, Etherpad, older Office online. It's the battle-tested choice for
+      <em>server-mediated</em> text editing. <strong>Say clearly it's awareness-level:</strong> "OT is what Google Docs
+      uses — the idea is you transform an incoming op's positions against the concurrent ops it didn't see. Implementing
+      the transform functions correctly is famously hard, which is why in practice you'd use a proven library rather than
+      roll it, and why I'd only hand-derive it if this were a specialist round."
+    </p>
+
+    <h3>Family 3 — CRDTs: make conflicts impossible by construction</h3>
+    <p>
+      <strong>Intuition:</strong> design the data structure so that concurrent operations <em>commute</em> — applying them
+      in any order yields the same result — which means you never need a transform and never need a central sequencer.
+      For text, the trick is to stop using integer positions (which shift) and instead give every character a
+      <strong>unique, stable, densely-orderable identifier</strong> that never changes. "Insert after character-id X" is
+      unambiguous no matter what else happened, because X's identity doesn't move even as its integer index does.
+      Deletes become tombstones (mark-not-remove) so a delete and a concurrent insert can't disagree.
+    </p>
+    <p>
+      <strong>The trade-off:</strong> conflicts become impossible <em>by construction</em> and it works
+      <strong>peer-to-peer with no central server</strong> and offline — the properties OT can't give you. The costs:
+      metadata overhead (every character carries an id; tombstones accumulate, though modern CRDTs like Yjs compress this
+      aggressively), and the mental model is less intuitive than OT. You also inherit "true" merges that can be
+      semantically surprising (two people typing in the same spot interleave rather than one winning).
+    </p>
+    <p>
+      <strong>Who uses it:</strong> Figma, Apple Notes, Linear, and anything local-first; libraries are Yjs and Automerge.
+      CRDTs are the modern default when you want offline and/or peer-to-peer. <strong>Awareness-level line:</strong>
+      "CRDTs give every character a stable id so inserts commute — order-independent by construction, so they converge
+      without a server. That's why they're the local-first and P2P choice. I'd reach for Yjs or Automerge rather than build
+      one; writing a correct CRDT is a research-grade exercise, not a whiteboard one."
+    </p>
+
+    <h3>The comparison table — the one to have cold</h3>
+    <table>
+      <thead><tr><th></th><th>Last-write-wins</th><th>Operational Transformation</th><th>CRDT</th></tr></thead>
+      <tbody>
+        <tr><td>Core idea</td><td>Later write wins; earlier discarded</td><td>Transform incoming op's positions against concurrent ops</td><td>Data structure where ops commute; stable per-char ids</td></tr>
+        <tr><td>Loses data?</td><td><strong>Yes, by design</strong> — one edit dropped</td><td>No — both edits preserved</td><td>No — both edits preserved</td></tr>
+        <tr><td>Needs central server?</td><td>No (just a clock/version)</td><td><strong>Yes</strong> — needs a sequencer for ordering</td><td><strong>No</strong> — works peer-to-peer</td></tr>
+        <tr><td>Offline / P2P</td><td>Weak (clock skew)</td><td>Poor — assumes a server</td><td><strong>Excellent</strong> — the reason it exists</td></tr>
+        <tr><td>Implementation cost</td><td>Trivial</td><td><strong>High</strong> — transform per op-pair, tricky proofs</td><td>High to build, but great libraries exist</td></tr>
+        <tr><td>Metadata overhead</td><td>None</td><td>Low (ops are small)</td><td>Higher (ids + tombstones; libs compress)</td></tr>
+        <tr><td>Good for</td><td>Coarse fields, rare collisions</td><td>Server-mediated rich text</td><td>Offline-first, P2P, canvases</td></tr>
+        <tr><td>Used by</td><td>Trello-ish apps, form fields</td><td><strong>Google Docs</strong>, Etherpad</td><td><strong>Figma</strong>, Notion-ish, Yjs/Automerge apps</td></tr>
+      </tbody>
+    </table>
+
+    <div class="senior">
+      The answer that wins this whole section: <em>"For a server-mediated doc editor I'd reach for a CRDT via a library
+      like Yjs — it gives me convergence, offline support, and undo without me hand-rolling transform functions, and it's
+      where the industry has landed for new builds. Historically Google Docs solved this with OT, which also works but is
+      notoriously hard to implement correctly and needs a central sequencer. And if the state were coarse-grained — cells,
+      shapes, separate fields — I wouldn't use either; field-level last-write-wins is the right, cheap answer. I want to be
+      upfront that implementing OT or a CRDT from scratch is a specialist exercise; at design level I'm choosing the family
+      and the library, and I'd only go deeper if you want me to."</em> That hits the trade-off, the real-world anchors, the
+      "match the tool to the collision granularity" judgment, <em>and</em> the honest scope of what you'd implement.
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="presence">O · Deep dive: presence &amp; remote cursors</h2>
+
+    <p>
+      Presence — the coloured avatars up top and the little name-tagged carets floating in the text — is the highest
+      perceived-value-per-effort feature in the whole product. It's what makes collaboration <em>feel</em> alive. And
+      because it rides its own ephemeral channel (from the D step), it's mercifully independent of the hard convergence
+      problem. Two sub-features: <strong>who's here</strong> (roster) and <strong>where they are</strong> (cursors and
+      selections).
+    </p>
+
+    <h3>Cursors: the position-mapping problem</h3>
+    <p>
+      A remote cursor is "user B's caret is at position 42." But there's a subtle trap that connects straight back to
+      conflict resolution: <strong>position 42 in whose version of the document?</strong> If I have local un-acked edits
+      that B hasn't seen, B's "42" points at the wrong character on my screen. So a remote cursor position must be
+      transformed through the same op machinery as edits — when I apply a local insert before a remote cursor, I nudge that
+      cursor right too, exactly as I'd transform an op. (CRDT libraries hand you this for free via "relative positions" /
+      "sticky indexes" that survive edits — another reason to lean on a library.)
+    </p>
+
+    <h3>Rendering cursors without wrecking the editor</h3>
+    <p>
+      You do <strong>not</strong> inject other people's carets into the editable content — that would corrupt the document
+      and the user's own selection. You render them in an <strong>absolutely-positioned overlay layer</strong> on top of
+      the text: compute the pixel rect for a character offset (browsers give you this via Range/<code>getClientRects</code>),
+      and paint a 2px coloured bar plus a name label there. Selections are the same idea over a range of rects. This is
+      why <code>&lt;RemoteCursorsLayer&gt;</code> was a sibling overlay in the component tree, not a child of the text.
+    </p>
+
+<pre><code><span class="com">// Presence state is a simple last-write-wins map, keyed by user.</span>
+<span class="com">// No merge, no history — the latest position per actor is all that matters.</span>
+<span class="kw">type</span> <span class="typ">Presence</span> = <span class="typ">Map</span>&lt;<span class="typ">string</span> <span class="com">/*actor*/</span>, {
+  name: <span class="typ">string</span>;
+  color: <span class="typ">string</span>;          <span class="com">// stable per user for the session → recognisable caret</span>
+  pos: <span class="typ">number</span>;
+  sel: [<span class="typ">number</span>, <span class="typ">number</span>];
+  lastSeen: <span class="typ">number</span>;       <span class="com">// timestamp → drive "idle" fade + disconnect cleanup</span>
+}&gt;;
+</code></pre>
+
+    <h3>Three things that make presence feel good — and cheap</h3>
+    <ul>
+      <li><strong>Throttle hard.</strong> A cursor can move on every keystroke and mousemove — dozens per second. Send at
+        most every ~30–50&nbsp;ms (<code>throttle</code>, not <code>debounce</code>: you want steady updates during motion,
+        not one at the end). It's lossy data, so dropping intermediate positions is not just acceptable, it's correct.</li>
+      <li><strong>Stable colour per user.</strong> Assign each actor a colour on join and keep it for the session so a
+        caret is recognisably "Ada's." Hash the user id to a palette so it's consistent without coordination.</li>
+      <li><strong>Clean up the dead.</strong> When a socket closes, broadcast a "left" so peers remove that avatar and
+        caret immediately; back it with a heartbeat timeout so a silently-dropped client's ghost cursor fades after a few
+        seconds instead of haunting the document. <code>lastSeen</code> drives both the idle fade and the sweep.</li>
+    </ul>
+
+    <div class="pitfall">
+      Forgetting to transform remote cursor positions against your local un-acked edits is the bug that makes cursors
+      "jitter" or sit one character off while you type — it looks janky and it's the exact same positional-drift problem as
+      the HAT example, just applied to a caret instead of an op. If you're using a CRDT library, use its relative-position
+      API for cursors; if you're hand-rolling, run cursors through the same transform path as ops. Don't treat the cursor
+      integer as absolute.
+    </div>
+
+    <div class="senior">
+      <em>"Presence is a separate ephemeral channel with last-write-wins per user, throttled to ~30ms and never persisted.
+      The one gotcha is that a remote cursor position has to be transformed against my own pending edits — otherwise it
+      drifts a character off as I type — so I map it through the same machinery as ops, or use the CRDT's relative-position
+      API. And I render carets in an overlay layer, never inside the editable text, so I don't corrupt the doc or the
+      user's selection."</em> Naming the cursor-transform gotcha unprompted is a strong signal you've actually built this.
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="offline">O · Deep dive: offline edits &amp; reconnect</h2>
+
+    <p>
+      This is the deep dive that quietly separates senior from mid, because it's the part nobody demos and everybody hits
+      in production. The network <em>will</em> drop — a tunnel, a lift, a flaky café WiFi — and the question is what happens
+      to the edits made in the gap. The answer flows directly out of the <code>pending</code> buffer you already designed
+      (D step): <strong>keep applying locally, keep buffering, and replay on reconnect.</strong> A collaborative editor that
+      freezes or loses your paragraph the moment WiFi blips is a broken product.
+    </p>
+
+    <h3>The reconnect protocol — buffer, resume, rebase</h3>
+<pre><code>  WHILE OFFLINE:
+    • editor keeps working — ops apply to the local replica optimistically
+    • each op appended to `pending` (and persisted to IndexedDB for true offline)
+    • the "Offline / Reconnecting…" indicator shows; presence for me goes stale to peers
+
+  ON RECONNECT:
+    1. open the socket, send  { t:"resume", fromVersion: ackedVersion }
+    2. server replies with every op I missed (versions ackedVersion+1 … latest)
+    3. TRANSFORM my `pending` ops against those missed ops   ← the rebase
+    4. send my rebased pending ops; server acks them at new versions
+    5. `pending` drains to empty → indicator flips back to "Saved"
+</code></pre>
+    <p>
+      Step 3 is the crux and worth naming precisely: <strong>it's a rebase</strong>, exactly like <code>git rebase</code>.
+      My local edits were built on version N; the world has moved to N+k; before my edits can land I replay them on top of
+      the newer base, transforming their positions against everything that happened while I was gone. If you're on a CRDT
+      this is nearly free — ops commute, so you just exchange the missing updates and both sides converge with no explicit
+      transform. If you're on OT, you run each pending op through the transform against each missed op. Saying the word
+      "rebase" out loud lands the concept instantly with anyone who uses git.
+    </p>
+
+    <div class="note">
+      The git analogy is worth making explicit because it's exact and your interviewer lives in git: your
+      <code>pending</code> buffer is your unpushed local commits; the server's op log is <code>origin/main</code>; a
+      reconnect is <code>git pull --rebase</code> — fetch what you missed, replay your local work on top, resolve the
+      position shifts. And a CRDT is the world where the rebase can <em>never</em> conflict because the merge is defined to
+      always succeed. That framing turns an exotic-sounding problem into one you solve every day.
+    </div>
+
+    <h3>Levels of offline — scope it honestly</h3>
+    <table>
+      <thead><tr><th>Level</th><th>What it means</th><th>What it costs you</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Blip tolerance</strong></td><td>Survive a few seconds' disconnect without losing edits</td><td>Cheap — just the in-memory <code>pending</code> buffer + resume protocol. Almost free once you have the buffer.</td></tr>
+        <tr><td><strong>Reload survival</strong></td><td>Refresh the tab mid-edit, keep unsynced work</td><td>Persist <code>pending</code> (and a snapshot) to <strong>IndexedDB</strong>; replay on load.</td></tr>
+        <tr><td><strong>True offline</strong></td><td>Edit on a plane for an hour, sync on landing</td><td>Expensive with OT (huge rebase, server must retain history); <strong>this is where CRDTs earn their place</strong> — arbitrary offline divergence merges cleanly.</td></tr>
+      </tbody>
+    </table>
+
+    <p>
+      Say which level you're targeting rather than hand-waving "it works offline." For most doc editors, blip tolerance
+      plus reload survival is the pragmatic bar and it's cheap. True multi-hour offline is a product decision that pulls you
+      firmly toward a CRDT — which is one more reason CRDTs win new builds, and a clean way to connect this deep dive back
+      to the conflict-resolution one.
+    </p>
+
+    <h3>Reconnect hygiene — the details that show experience</h3>
+    <ul>
+      <li><strong>Exponential backoff with jitter</strong> on reconnect attempts (straight from tutorial 06) — don't
+        hammer a struggling server, and don't let a thundering herd of reconnecting clients synchronise into a spike.</li>
+      <li><strong>Idempotent op application.</strong> After a messy reconnect you might receive an op you already applied,
+        or the server might re-ack. Ops carry ids and versions so the client can dedupe — apply-once semantics, the same
+        idempotency discipline as tutorial 13's payments.</li>
+      <li><strong>Never block the user's typing on connection state.</strong> Offline is a background status, not a modal.
+        The editor stays live the entire time; only the little indicator changes.</li>
+    </ul>
+
+    <div class="senior">
+      <em>"Reconnect is a rebase. My local un-acked edits are unpushed commits; on reconnect I fetch the ops I missed,
+      replay mine on top transforming positions, and drain my buffer — <code>git pull --rebase</code>, essentially. For
+      blip tolerance that's just the in-memory buffer; for reload survival I persist pending ops to IndexedDB; for true
+      multi-hour offline I'd use a CRDT so the merge can't fail. And I back reconnect with exponential backoff plus jitter
+      and idempotent, versioned op application so a retried or duplicated op applies exactly once."</em> That paragraph
+      covers buffering, replay, rebase, the offline spectrum, and resilience hygiene in one breath.
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="localfirst">Local-first thinking</h2>
+
+    <p>
+      Everything above quietly assumes one philosophy, and naming it explicitly is a senior flourish that ties the whole
+      answer together: <strong>local-first.</strong> The idea is that the <em>local replica is the primary copy</em> and the
+      network is a synchronisation detail, not a gate. The user reads and writes their own local data instantly, always;
+      sync happens in the background and can fail, retry, or wait without the user ever feeling it. It's the inversion of
+      the traditional web app, where the server is the source of truth and the client is a thin, network-gated view.
+    </p>
+    <p>
+      You've actually been designing local-first the whole page without the label: optimistic local apply (writes hit the
+      local replica first), the <code>pending</code> buffer (local work that outlives the connection), reconnect-as-rebase
+      (sync as a background reconcile), and CRDTs (the data structure that makes offline-primary <em>correct</em>). Local-first
+      is just the name for that stance, and it maps cleanly onto things you already know from tutorial 19: server state as a
+      cache you revalidate, optimistic updates, offline resilience. Here it's turned up to the point where the client can
+      run <em>indefinitely</em> without the server.
+    </p>
+
+    <table>
+      <thead><tr><th></th><th>Traditional (server-authoritative)</th><th>Local-first</th></tr></thead>
+      <tbody>
+        <tr><td>Source of truth</td><td>The server; client is a view</td><td>The <strong>local replica</strong>; server is a sync peer</td></tr>
+        <tr><td>A write</td><td>Round-trips to the server before it's "real"</td><td>Hits local storage instantly; syncs later</td></tr>
+        <tr><td>Offline</td><td>App is broken / read-only</td><td>Fully functional; syncs on reconnect</td></tr>
+        <tr><td>Latency of your own edits</td><td>Network-bound</td><td>Zero — it's local</td></tr>
+        <tr><td>Enabling tech</td><td>REST + a cache</td><td>CRDTs + local persistence (IndexedDB) + a sync engine</td></tr>
+      </tbody>
+    </table>
+
+    <div class="senior">
+      The closing frame for the whole design: <em>"Underneath, this is a local-first architecture — the local replica is
+      the source of truth and the network is a background sync detail, which is exactly why my own edits are never laggy and
+      why offline is a graceful degradation rather than a failure. That's the same instinct as optimistic UI and
+      server-state-as-a-cache from the feed round, pushed to its limit: the client can operate entirely on its own replica,
+      and the server's job is convergence, not gatekeeping."</em>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="tradeoffs">Trade-offs</h2>
+    <p>Every real decision on this page, the alternative, and when you'd flip it — the table to revise from.</p>
+    <table>
+      <thead><tr><th>Decision</th><th>What I chose</th><th>The alternative</th><th>When I'd flip</th></tr></thead>
+      <tbody>
+        <tr><td>Transport</td><td>WebSockets (full-duplex)</td><td>SSE (one-way) + POST channel; long polling</td><td>SSE if the client is a read-only viewer (push-only); long polling only if WS is proxy-blocked.</td></tr>
+        <tr><td>Conflict resolution</td><td>CRDT via a library (Yjs) for new builds</td><td>OT (Google Docs); LWW</td><td>OT if I need Google-Docs-style server-mediated text and have the OT machinery; LWW if state is coarse-grained fields.</td></tr>
+        <tr><td>Document representation</td><td>Op log; text is a projection</td><td>Store the whole document blob</td><td>Never store a mutable blob for concurrent text — you can't merge two blob PUTs. A blob is fine only for single-writer docs.</td></tr>
+        <tr><td>Local apply</td><td>Optimistic — apply before ack</td><td>Pessimistic — wait for server</td><td>Never go pessimistic for the user's own typing; it makes the app feel broken. (Pessimistic is fine for a "publish" action.)</td></tr>
+        <tr><td>Presence channel</td><td>Separate, ephemeral, LWW-per-user</td><td>Route cursors through the doc op log</td><td>Never merge them — cursors would bloat the durable log and pay reliable-delivery cost for disposable data.</td></tr>
+        <tr><td>Offline depth</td><td>Blip + reload survival (IndexedDB)</td><td>True multi-hour offline; or none</td><td>Go full offline (and hence CRDT) if the product promises plane-mode editing; drop to none for a purely live tool.</td></tr>
+        <tr><td>Ordering authority</td><td>Central server sequences ops</td><td>Fully peer-to-peer (CRDT, no server)</td><td>P2P if you genuinely need serverless/edge collaboration; otherwise a server sequencer simplifies persistence, auth, and catch-up.</td></tr>
+        <tr><td>Build vs buy the algorithm</td><td>Use a proven library (Yjs/Automerge)</td><td>Hand-roll OT/CRDT</td><td>Only hand-roll in a specialist round or if you have a genuinely novel data type. For an interview, choosing the library <em>is</em> the senior answer.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="qa">Interview Q&amp;A</h2>
+
+    <details class="qa">
+      <summary>1. What's the single most important thing to say in the first two minutes?</summary>
+      <div class="answer">
+        <p>Reframe the problem: this isn't a text-editor question, it's a <strong>distributed-state-convergence</strong>
+        question that happens to render as text. N clients each hold a replica of one document, apply local edits instantly
+        (or the app feels broken), propagate them, and must all converge to the identical result regardless of arrival
+        order. Everything else — toolbar, cursors, avatars — is set dressing around that.</p>
+        <p>Then scope: plain vs rich text, and how many concurrent editors per doc, because those two answers decide your
+        conflict-resolution family. Naming the core and the scoping questions up front is what separates you from the
+        candidate who starts drawing a toolbar.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>2. WebSockets or SSE for this — and why?</summary>
+      <div class="answer">
+        <p>WebSockets, because collaborative editing is <strong>bidirectional and high-frequency</strong>: the client
+        pushes its own edits up constantly and the server pushes everyone else's edits down constantly. A WebSocket is one
+        full-duplex connection built for exactly that. SSE is server-to-client only, so I'd need a separate POST channel for
+        the client's own edits — two half-connections doing one socket's job.</p>
+        <p>But I'd give SSE its due: it's the better choice when push is one-way — notifications, a live dashboard, streaming
+        LLM tokens, or a read-only viewer of the doc — and its <code>EventSource</code> gives you auto-reconnect with
+        <code>Last-Event-ID</code> replay for free, which on a WebSocket I have to build myself. Long polling is a fallback
+        only if proxies block WS.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>3. Explain LWW, OT, and CRDT — and which would you pick?</summary>
+      <div class="answer">
+        <p><strong>LWW:</strong> timestamp each write, later wins, the earlier is discarded — no merge. Right for coarse,
+        rarely-colliding state (a title, a cell, a shape's colour); catastrophic for free text because it silently drops
+        someone's edit. <strong>OT:</strong> keep both edits but transform an incoming op's positions against the concurrent
+        ops it didn't see (in "HAT", an insert at 0 shifts a later delete's index by one). Preserves everything, needs a
+        central sequencer, famously hard to implement correctly — Google Docs uses it. <strong>CRDT:</strong> design the
+        structure so ops commute — every character gets a stable id so "insert after X" is unambiguous regardless of order —
+        so it converges with no central server and works offline/P2P; Figma and Yjs/Automerge apps use it, at the cost of
+        metadata overhead.</p>
+        <p>I'd pick a CRDT via a library like Yjs for a new build (convergence + offline + undo without hand-rolling
+        transforms), note OT as the proven server-mediated alternative, and use plain field-level LWW if the state is
+        coarse. And I'd flag that actually implementing OT or a CRDT is specialist work — at design level I'm choosing the
+        family and the library.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>4. Isn't picking a library a cop-out? Shouldn't I implement the algorithm?</summary>
+      <div class="answer">
+        <p>For a frontend system design round, choosing the right family and a proven library <em>is</em> the senior
+        answer — it shows judgment about build-vs-buy and honesty about risk. Correct OT transform functions and correct
+        CRDT merges are research-grade; teams that rolled their own have shipped convergence bugs that corrupt documents.
+        Reaching for Yjs/Automerge is what an experienced engineer actually does.</p>
+        <p>The one exception is an explicit <em>specialist</em> round (the JD says "distributed systems" or "collaborative
+        infrastructure"), where they may want you to derive a transform on the board. That's rare for a React role, and
+        you'd know it from the posting. In the normal round, over-implementing here means you've spent your best minutes
+        proving something they didn't ask for.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>5. Why can't I just have clients PUT the whole document string?</summary>
+      <div class="answer">
+        <p>Because you can't merge two concurrent PUTs of a blob without losing one — whoever writes last clobbers the other
+        person's edit entirely (that's LWW on the worst possible granularity). The document has to be modelled as an
+        append-only <strong>log of operations</strong>, and the visible text is a projection of replaying that log. It's the
+        same discipline as a double-entry ledger: you never store and mutate a balance, you derive it from immutable
+        entries.</p>
+        <p>The op log also buys you history, undo, and a well-defined merge point. The server periodically snapshots so new
+        joiners don't replay from the beginning, and hands them snapshot + ops-since.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>6. How do I make my own typing feel instant while still syncing?</summary>
+      <div class="answer">
+        <p>Optimistic local apply. A keystroke applies to the local replica <em>immediately</em> and updates the UI, on one
+        branch; on an independent branch the op is sent to the server. You never gate your own typing on a server ack — that
+        would add a round trip to every character and feel broken. The applied-but-not-yet-acked ops sit in a
+        <code>pending</code> buffer.</p>
+        <p>That buffer does triple duty: it makes typing instant, it's what inbound remote ops get transformed against (since
+        my local edits have shifted positions the server hasn't seen), and it's exactly what I replay after a reconnect.
+        Managing <code>pending</code> correctly — never dropping, never double-applying — is the core of client correctness.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>7. Someone edits offline for a while, then reconnects. What happens?</summary>
+      <div class="answer">
+        <p>It's a rebase — literally <code>git pull --rebase</code>. While offline the editor keeps working: ops apply to the
+        local replica and pile up in the <code>pending</code> buffer (persisted to IndexedDB for true offline). On reconnect
+        I send <code>resume(fromVersion)</code>, the server streams back the ops I missed, I transform my pending ops on top
+        of those (rebasing their positions onto the newer base), send them, get acks, and the buffer drains.</p>
+        <p>On a CRDT this is nearly free because ops commute — you just exchange missing updates and both converge. On OT you
+        run each pending op through the transform against each missed op. Multi-hour offline with big divergence is where
+        CRDTs decisively win; for a few-second blip the in-memory buffer alone is enough.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>8. How do remote cursors work, and what's the gotcha?</summary>
+      <div class="answer">
+        <p>Presence rides a separate ephemeral channel — last-write-wins per user, throttled to ~30ms, never persisted —
+        because a cursor position is high-frequency and worthless a frame later. You render carets and selections in an
+        absolutely-positioned <strong>overlay</strong> on top of the text (compute pixel rects from character offsets via
+        Range), never inside the editable content, so you don't corrupt the document.</p>
+        <p>The gotcha: a remote cursor's position is an index into <em>their</em> version of the doc, so if I have local
+        un-acked edits it points at the wrong character on my screen and jitters as I type. You must transform remote cursor
+        positions through the same op machinery as edits — or use a CRDT's relative-position / sticky-index API, which
+        handles it for you.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>9. Why keep presence separate from the document?</summary>
+      <div class="answer">
+        <p>Because they're opposite kinds of data. Document ops must be persisted forever, delivered reliably and in order,
+        and merged to converge. Presence — cursors, selections, who's online — is ephemeral, high-frequency, lossy-tolerant
+        (only the latest matters), and must <em>not</em> be persisted. Routing cursor movements through the durable op log
+        would bloat it with thousands of worthless entries, slow snapshot replay, and pay reliable-delivery cost for data
+        that's stale instantly.</p>
+        <p>So presence gets its own channel with LWW-per-user semantics and no durability, while the document gets the
+        reliable, ordered, converging op log. Separating them cleanly is a fast senior tell.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>10. How does collaborative undo work — and why is it hard?</summary>
+      <div class="answer">
+        <p>It's harder than single-player undo because "undo my last change" must undo <em>your</em> op specifically, not
+        whatever happened most recently globally. If I type, you type, and I hit undo, I should remove my insert, not yours.
+        So undo is per-user: you keep a per-actor stack of your own ops and generate an <em>inverse</em> op (an undo of an
+        insert is a delete), which then flows through the same transform/merge pipeline as any edit so it lands correctly
+        against everyone else's concurrent work.</p>
+        <p>This is exactly why an op log (not a blob) matters, and it's another reason to lean on a CRDT library — Yjs ships
+        an <code>UndoManager</code> that scopes undo to an origin. Awareness-level is fine here: know that collaborative undo
+        is per-user and inverse-op-based, and that libraries solve it.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>11. How does the backend scale this — connections and fan-out?</summary>
+      <div class="answer">
+        <p>This is the frontend round so I'd keep it brief and defer to the chat-system page (tutorial 11), but the shape:
+        WebSocket connections are stateful, so you need many gateway servers each holding a subset of sockets, and all
+        editors of one document must be routed to the same place — typically shard by <code>docId</code> so one document's
+        collaborators share a server (or coordinate through Redis pub/sub). That server sequences the doc's ops, appends to
+        the log, and fans out to the room.</p>
+        <p>The load is modest per document (a handful of editors), so the scaling challenge is number of <em>documents</em>
+        and total connections, not ops-per-doc — very different from a feed. I'd mention sticky routing by doc, a snapshot
+        strategy so replay stays bounded, and horizontal gateways, then steer back to the client, which is what this round
+        grades.</p>
+      </div>
+    </details>
+
+    <details class="qa">
+      <summary>12. What does the editor surface itself use — contenteditable?</summary>
+      <div class="answer">
+        <p>For plain text a <code>&lt;textarea&gt;</code> is fine and I'd say so. For rich text you need
+        <code>contenteditable</code>, but raw contenteditable is notoriously inconsistent across browsers, so in practice
+        you build on an editor framework — ProseMirror, Slate, Lexical, TipTap — that gives you a controlled document model
+        and a stable API over contenteditable. Crucially, those frameworks expose a <em>document model</em> with positions,
+        which is exactly what plugs into the op/CRDT layer (Yjs has bindings for ProseMirror, Lexical, etc.).</p>
+        <p>The point to make: I keep the editor a thin projection over my document model and let the framework own
+        contenteditable's quirks, so the interesting concurrency logic lives in the sync engine, not tangled into DOM
+        event handling.</p>
+      </div>
+    </details>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2 id="takeaways">What to remember</h2>
+
+    <p>
+      If you revise one thing before this round, revise the opening reframe and the three-family table. The rest is you
+      being calm about what's awareness-level.
+    </p>
+
+    <ul>
+      <li><strong>It's not a text editor, it's distributed-state convergence.</strong> N replicas of one document, each
+        applying local edits instantly, all converging to the identical result regardless of arrival order. Say that first;
+        it reframes everything and tells the interviewer you've seen the archetype.</li>
+
+      <li><strong>Separate the three layers: editor UI · document model · sync engine.</strong> The editor is a thin
+        projection that emits intents; the model is the local replica; the sync engine applies optimistically, sends, and
+        merges inbound. That boundary is what lets you swap the conflict algorithm without touching the UI.</li>
+
+      <li><strong>WebSockets, because editing is bidirectional and high-frequency.</strong> Both sides push constantly over
+        one full-duplex connection. SSE is the right call only when push is one-way (feeds, notifications, LLM streams,
+        read-only viewers) — and its free auto-reconnect-with-<code>Last-Event-ID</code> is a genuine advantage you'd
+        rebuild by hand on a socket. Long polling is a proxy-blocked fallback.</li>
+
+      <li><strong>LWW vs OT vs CRDT — know the intuition, the trade-off, and who uses each.</strong> LWW: later wins, drops
+        data, fine for coarse fields, fatal for text. OT: transform incoming ops' positions against concurrent ones, needs
+        a central sequencer, hard to implement — Google Docs. CRDT: stable per-char ids so ops commute, converges with no
+        server, offline/P2P — Figma, Yjs/Automerge.</li>
+
+      <li><strong>This is awareness-level and you should say so.</strong> You pick the family and the library; you don't
+        hand-derive transforms on the board unless it's a specialist round. Choosing Yjs <em>is</em> the senior answer, not
+        a dodge.</li>
+
+      <li><strong>Match the algorithm to collision granularity.</strong> Coarse, rarely-colliding fields → field-level LWW,
+        and reaching for a CRDT there is over-engineering. Free-flowing shared text → OT or CRDT. Derive the choice from the
+        requirement, don't name-drop the trendy option.</li>
+
+      <li><strong>Model the doc as an op log; the text is a projection.</strong> Never PUT a blob — two concurrent blob
+        writes can't merge. Same discipline as a ledger: derive, don't store-and-mutate. Snapshot periodically so replay
+        stays bounded.</li>
+
+      <li><strong>Optimistic local apply + a <code>pending</code> buffer is the core of the client.</strong> Apply your
+        keystroke now, queue the op, send independently. That buffer makes typing instant, is what remote ops transform
+        against, and is what you replay on reconnect. Never drop it, never double-apply it.</li>
+
+      <li><strong>Presence is a separate, ephemeral, lossy channel.</strong> Cursors and selections ride LWW-per-user,
+        throttled to ~30ms, never persisted, rendered in an overlay — never through the durable op log. And transform remote
+        cursor positions against your local edits or they jitter a character off as you type.</li>
+
+      <li><strong>Reconnect is a rebase — <code>git pull --rebase</code>.</strong> Fetch missed ops, replay your pending
+        edits on top transforming positions, drain the buffer. Blip tolerance is nearly free; reload survival needs
+        IndexedDB; true multi-hour offline is where CRDTs decisively win. Back it with backoff+jitter and idempotent,
+        versioned op application.</li>
+
+      <li><strong>Underneath it's local-first:</strong> the local replica is the source of truth and the network is a
+        background sync detail. That's why your edits are never laggy and offline degrades gracefully — the same
+        optimistic-UI and server-state-as-cache instincts from the feed round, pushed to their limit.</li>
+    </ul>
+
+    <div class="senior">One last calibration, because it's the meta-skill this page teaches: the winning move here is
+      <em>confident scoping of your own depth.</em> You demonstrate that you understand OT and CRDTs deeply enough to choose
+      between them and name their trade-offs, and in the same breath you say implementing them is a library's job — so you
+      spend your minutes on the parts a frontend engineer owns: transport, optimistic apply, presence, and reconnect. That
+      combination — real understanding plus honest scope — is exactly what a 7-YOE candidate sounds like and a 3-YOE one
+      doesn't.</div>
+  </section>
+
+  <nav class="page-nav">
+    <a href="22-design-system.html">← 22 — Design System</a>
+    <a href="24-lld-solid-patterns.html">24 — LLD: SOLID &amp; Patterns →</a>
+  </nav>
+
+</main>
+</body>
+</html>
